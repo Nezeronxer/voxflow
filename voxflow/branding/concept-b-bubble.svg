@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- VoxFlow — Concept B: speech bubble of text lines + blinking cursor -->
+  <rect width="256" height="256" fill="#ffffff"/>
+
+  <!-- bubble -->
+  <path d="M64 40
+           h128 a32 32 0 0 1 32 32
+           v66 a32 32 0 0 1 -32 32
+           h-58 l-40 34 v-34
+           h-30 a32 32 0 0 1 -32 -32
+           v-66 a32 32 0 0 1 32 -32 Z" fill="#2FCB7E"/>
+
+  <!-- text lines -->
+  <rect x="64" y="78"  width="112" height="13" rx="6.5" fill="#ffffff"/>
+  <rect x="64" y="100" width="128" height="13" rx="6.5" fill="#ffffff"/>
+  <rect x="64" y="122" width="70"  height="13" rx="6.5" fill="#ffffff"/>
+  <!-- blinking cursor -->
+  <rect x="142" y="119" width="12" height="19" rx="3" fill="#3B82F6"/>
+</svg>

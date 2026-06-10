@@ -1,0 +1,23 @@
+# build artifacts
+/voxflow/node_modules/
+/voxflow/dist/
+/voxflow/src-tauri/target/
+
+# transient logs / scratch
+*.log
+_journal_block.md
+
+# model weights and prebuilt binaries — fetched, not versioned
+/voxflow/src-tauri/resources/whisper/
+/voxflow/src-tauri/resources/whisper-cuda/
+/voxflow/src-tauri/resources/models/
+/voxflow/src-tauri/resources/vad/
+
+# installer build output
+/installer/Output/
+
+# unrelated local scratch (other projects)
+/_s.sh
+/_subs_data.bin
+
+# runtime data lives in %LOCALAPPDATA%\VoxFlow, never in repo

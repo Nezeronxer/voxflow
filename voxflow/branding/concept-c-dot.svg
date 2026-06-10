@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- VoxFlow — Concept C: the record dot, alive (friendly blob mascot) -->
+  <rect width="256" height="256" fill="#ffffff"/>
+
+  <!-- soft pulse ring -->
+  <circle cx="128" cy="130" r="98" fill="#3B82F6" opacity="0.10"/>
+  <circle cx="128" cy="130" r="76" fill="#3B82F6" opacity="0.14"/>
+
+  <!-- blob body -->
+  <path d="M128 44
+           C176 44 212 78 212 124
+           C212 172 178 210 128 210
+           C78 210 44 172 44 124
+           C44 78 80 44 128 44 Z" fill="#3B82F6"/>
+  <!-- highlight -->
+  <ellipse cx="98" cy="98" rx="34" ry="26" fill="#6AA2FF" opacity="0.55"/>
+
+  <!-- eyes -->
+  <ellipse cx="104" cy="120" rx="14" ry="17" fill="#ffffff"/>
+  <ellipse cx="156" cy="120" rx="14" ry="17" fill="#ffffff"/>
+  <circle cx="107" cy="124" r="7" fill="#15233A"/>
+  <circle cx="159" cy="124" r="7" fill="#15233A"/>
+
+  <!-- smile -->
+  <path d="M104 156 q24 26 50 0" stroke="#15233A" stroke-width="8" fill="none" stroke-linecap="round"/>
+
+  <!-- little antenna sound tick -->
+  <rect x="122" y="20" width="12" height="22" rx="6" fill="#FFD23F"/>
+</svg>

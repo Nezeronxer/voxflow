@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- VoxFlow installer mark — MONOCHROME (editorial). Transparent bg. -->
+  <!-- speech bubble (near-black, matches UI inverse blocks) -->
+  <path d="M58 44
+           H198 a34 34 0 0 1 34 34
+           V136 a34 34 0 0 1 -34 34
+           H118 l-40 34 v-34
+           H58 a34 34 0 0 1 -34 -34
+           V78 a34 34 0 0 1 34 -34 Z" fill="#161616"/>
+  <!-- text lines -->
+  <rect x="56" y="72"  width="120" height="14" rx="7" fill="#ffffff"/>
+  <rect x="56" y="98"  width="140" height="14" rx="7" fill="#ffffff"/>
+  <rect x="56" y="124" width="74"  height="14" rx="7" fill="#ffffff"/>
+  <!-- cursor (mid-grey: distinct from both black bubble and white lines) -->
+  <rect x="140" y="120" width="13" height="22" rx="3" fill="#9a9a9a"/>
+</svg>
