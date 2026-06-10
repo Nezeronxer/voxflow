@@ -1,0 +1,73 @@
+name: Build VoxFlow Installer
+
+# Builds the VoxFlow per-user Inno Setup installer on Windows.
+#
+# Assumptions about what is committed to the repo (NOT produced by this CI):
+#   - The whisper sidecar binaries are committed at
+#       voxflow/src-tauri/resources/whisper/Release/
+#     (ggml-base.dll, ggml-cpu.dll, ggml.dll, whisper.dll, whisper-cli.exe,
+#      whisper-server.exe). They ship as Tauri bundle resources and are copied
+#      next to voxflow.exe by the build into target/release/resources/.
+#   - The Inno Setup script and its assets are committed at the repo-root
+#       installer/  (installer/VoxFlow.iss, installer/assets/).
+#     The compiled installer is emitted to installer/Output/.
+#
+# NOTE: this CI rebuilds voxflow.exe from source. The Tauri app is built WITHOUT
+# the NSIS bundler (`--no-bundle`); packaging is handled exclusively by the Inno
+# Setup script (installer/VoxFlow.iss), which replaces the old NSIS installer.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-installer:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install frontend dependencies
+        working-directory: voxflow
+        run: npm ci
+
+      # Build the Tauri app WITHOUT the NSIS bundler. `--no-bundle` skips Tauri's
+      # own installer packaging (we use Inno Setup instead) and produces:
+      #   voxflow/src-tauri/target/release/voxflow.exe
+      #   voxflow/src-tauri/target/release/resources/   (incl. whisper/Release/*)
+      # The whisper sidecar binaries committed at
+      # voxflow/src-tauri/resources/whisper/Release/ are bundle resources and
+      # land under target/release/resources/whisper/Release/ during this step.
+      - name: Build Tauri app (no bundle)
+        working-directory: voxflow
+        run: npx tauri build --no-bundle
+
+      # Install the Inno Setup 6 compiler (ISCC.exe).
+      # Verify Chocolatey installs Inno Setup 6.7+ (ISCC features used by
+      # VoxFlow.iss assume 6.x). If Chocolatey ships an older build, pin an
+      # explicit version, e.g.:  choco install innosetup --version=6.7.1 -y
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      # Compile the installer. ISCC.exe lives at the fixed 64-bit-host path.
+      # The leading `&` is PowerShell's call operator (required to invoke a
+      # quoted executable path).
+      - name: Compile Inno Setup installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\VoxFlow.iss'
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxFlow-Setup
+          path: installer\Output\*.exe

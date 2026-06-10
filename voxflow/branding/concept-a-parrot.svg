@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- VoxFlow — Concept A: Parakeet (волнистый попугайчик). Палитра: mint/yellow/blue/dark -->
+  <rect width="256" height="256" fill="#ffffff"/>
+
+  <!-- tail -->
+  <rect x="104" y="186" width="22" height="58" rx="11" fill="#1FA968" transform="rotate(10 115 215)"/>
+  <rect x="120" y="190" width="20" height="50" rx="10" fill="#178A55" transform="rotate(22 130 215)"/>
+
+  <!-- body -->
+  <ellipse cx="110" cy="158" rx="58" ry="60" fill="#2FCB7E"/>
+  <ellipse cx="100" cy="172" rx="36" ry="42" fill="#5BDD9C"/>
+
+  <!-- wing -->
+  <path d="M150 128 C156 172 134 206 100 206 C90 176 96 142 120 126 C133 118 145 119 150 128 Z" fill="#1FA968"/>
+  <!-- wavy stripes (budgie / "волнистый") -->
+  <path d="M110 150 q10 -7 22 -3" stroke="#FFD23F" stroke-width="5" fill="none" stroke-linecap="round"/>
+  <path d="M106 167 q10 -7 22 -3" stroke="#FFD23F" stroke-width="5" fill="none" stroke-linecap="round"/>
+  <path d="M104 184 q10 -7 22 -3" stroke="#FFD23F" stroke-width="5" fill="none" stroke-linecap="round"/>
+
+  <!-- head -->
+  <circle cx="120" cy="94" r="48" fill="#2FCB7E"/>
+  <!-- yellow face / forehead -->
+  <path d="M94 72 C110 52 150 54 160 76 C150 90 116 94 98 88 C90 84 89 78 94 72 Z" fill="#FFD23F"/>
+
+  <!-- beak -->
+  <path d="M158 98 C184 96 194 107 189 117 C184 127 165 127 155 119 C149 113 151 103 158 98 Z" fill="#FF9F2E"/>
+  <path d="M157 117 q14 6 27 0" stroke="#E2861C" stroke-width="2.5" fill="none" stroke-linecap="round"/>
+
+  <!-- eye -->
+  <circle cx="140" cy="92" r="9" fill="#15233A"/>
+  <circle cx="143" cy="89" r="3" fill="#ffffff"/>
+  <!-- blue cheek (accent = record dot) -->
+  <circle cx="146" cy="113" r="7" fill="#3B82F6"/>
+
+  <!-- speech cue -->
+  <rect x="164" y="26" width="68" height="46" rx="14" fill="#3B82F6"/>
+  <path d="M178 70 L164 84 L192 71 Z" fill="#3B82F6"/>
+  <rect x="178" y="40" width="40" height="6" rx="3" fill="#ffffff"/>
+  <rect x="178" y="54" width="24" height="6" rx="3" fill="#ffffff"/>
+  <rect x="206" y="53" width="6" height="8" rx="2" fill="#FFD23F"/>
+</svg>

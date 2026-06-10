@@ -1,0 +1,78 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VoxFlow",
+  "version": "0.2.0",
+  "identifier": "com.voxflow.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "VoxFlow",
+        "width": 940,
+        "height": 660,
+        "minWidth": 720,
+        "minHeight": 520,
+        "visible": false,
+        "resizable": true,
+        "center": true
+      },
+      {
+        "label": "overlay",
+        "url": "index.html#/overlay",
+        "width": 240,
+        "height": 70,
+        "transparent": true,
+        "decorations": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focus": false,
+        "resizable": false,
+        "shadow": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "publisher": "VoxFlow",
+    "copyright": "© 2026 VoxFlow",
+    "category": "Productivity",
+    "shortDescription": "Локальный голосовой ввод",
+    "longDescription": "VoxFlow — локальная диктовка: горячая клавиша → речь по-русски → чистый текст в активном окне. Полностью офлайн.",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "resources/whisper/Release/*",
+      "resources/whisper-cuda/Release/*",
+      "resources/vad/*"
+    ],
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": ["Russian"],
+        "installerIcon": "icons/icon-mono.ico",
+        "headerImage": "installer/installer-header.bmp",
+        "sidebarImage": "installer/installer-sidebar.bmp",
+        "uninstallerIcon": "icons/icon-mono.ico",
+        "installerHooks": "installer/hooks.nsh"
+      }
+    }
+  }
+}

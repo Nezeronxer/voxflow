@@ -1,0 +1,1676 @@
+/* ============================================================
+   VoxFlow — строгая чёрно-белая монохромная тема
+   Направление: Разворот (editorial)
+   Палитра: #FFFFFF, #FAFAFA, #E5E5E5, #A3A3A3, #525252, #171717, #0A0A0A
+   Шрифты (офлайн, ./assets/fonts.css): IBM Plex Sans, IBM Plex Mono, Unbounded
+   ============================================================ */
+
+:root {
+  /* ============================================================
+     VoxFlow — Editorial B/W redesign ("Разворот")
+     Palette: ONLY 7 greys — #FFFFFF #FAFAFA #E5E5E5 #A3A3A3 #525252 #171717 #0A0A0A
+     No color anywhere. Contrast = size / weight / spacing / line / inversion.
+     Базовая палитра ниже = СВЕТЛАЯ тема; тёмная — переопределение всех
+     токенов в :root[data-theme="dark"] (атрибут ставит main.tsx/App.tsx).
+     ============================================================ */
+
+  color-scheme: light; /* нативные контролы (select-дропдаун, скроллбары) — светлые */
+
+  /* — Canvas & surfaces (white paper, no fills) — */
+  --bg: #FFFFFF;            /* page canvas = white paper */
+  --bg-elev: #FAFAFA;       /* sidebar "table of contents" — barely-there off-white */
+  --bg-card: #FFFFFF;       /* sections live on paper, separated by hairlines not fills */
+  --bg-card-hover: #FAFAFA; /* hover = faint brighten, never a tint */
+  --bg-input: #FFFFFF;      /* fields are underlined, not boxed */
+
+  /* — Hairlines — */
+  --border: #E5E5E5;        /* hairline rule 1px — section/table/field dividers */
+  --border-strong: #A3A3A3; /* underline default for inputs, stronger rules */
+
+  /* — Ink (text scale) — */
+  --text: #171717;          /* body / primary ink */
+  --text-dim: #525252;      /* secondary text */
+  --text-faint: #A3A3A3;    /* meta, kickers, footnotes, mono micro-labels */
+
+  /* — "Accent" = black; soft/glow are colorless rgba where R=G=B — */
+  --accent: #0A0A0A;        /* near-black = the only "accent" */
+  --accent-hover: #171717;  /* hover shifts brightness, not hue */
+  --accent-soft: rgba(10, 10, 10, 0.05);   /* faint grey wash, colorless */
+  --accent-glow: rgba(10, 10, 10, 0.00);   /* no glow — fully transparent */
+
+  /* — Semantic channels recolored to grey (meaning carried by form/weight/motion/text) — */
+  --green: #171717;         /* success = filled black mark / heavy check */
+  --red: #0A0A0A;           /* recording/error = blackest ink + form/animation */
+  --amber: #525252;         /* warning/busy = mid-grey, expressed by text/shape */
+
+  /* — Radii: uniform 2–4px everywhere — */
+  --radius: 4px;
+  --radius-sm: 2px;
+  --radius-lg: 4px;         /* lg capped at 4px */
+
+  /* — Shadow: flat. Hairline only, no glow, no color — */
+  --shadow-card: none;
+
+  /* — Fonts: bundled offline only; fallback is brand-free generic — */
+  --font: "IBM Plex Sans", sans-serif;             /* body stack */
+  --font-display: "Unbounded", sans-serif;         /* H1/H2, hero numerals, active nav */
+  --font-mono: "IBM Plex Mono", monospace;         /* kickers, codes, tabular numerals, micro-labels */
+
+  /* ============================================================
+     Auxiliary tokens (documented in styleLaw — builders MUST reuse these names)
+     ============================================================ */
+
+  /* Inversion — the dispatch / "передовица номера". Black block, white ink. */
+  --invert-bg: #0A0A0A;        /* inverted block base (hero, recording capsule) */
+  --invert-bg-elev: #171717;   /* inverted secondary surface / primary button base */
+  --invert-ink: #FFFFFF;       /* ink on black */
+  --invert-ink-dim: #A3A3A3;   /* secondary ink on black */
+  --invert-border: rgba(255, 255, 255, 0.14); /* hairline on black, colorless */
+
+  /* Полупрозрачные слои НА инверс-блоке (ореол орба, пульс-кольцо rec-dot).
+     Вынесены в токены, чтобы тёмная тема могла обратить их вместе с блоком. */
+  --invert-halo-1: rgba(255, 255, 255, 0.12); /* внутреннее кольцо ореола орба */
+  --invert-halo-2: rgba(255, 255, 255, 0.05); /* внешнее кольцо ореола орба */
+  --invert-ring: rgba(255, 255, 255, 0.5);    /* пульс-кольцо rec-dot */
+  --invert-ring-soft: rgba(255, 255, 255, 0.18); /* статичная обводка rec-dot */
+
+  /* Ink НА акцентной (чёрной) кнопке — в тёмной теме акцент светлеет,
+     и ink на нём должен темнеть (раньше был захардкожен #fff). */
+  --accent-ink: #FFFFFF;
+
+  /* Единственная «всплывающая» тень (тост) — colorless, R=G=B */
+  --shadow-pop: 0 6px 24px rgba(10, 10, 10, 0.12);
+
+  /* Слабый смысловой фон (fallback ErrorBoundary и т.п.) */
+  --surface-2: rgba(10, 10, 10, 0.04);
+
+  /* Semantic aliases for clarity (all grey) */
+  --ink: #171717;              /* canonical body ink */
+  --ink-strong: #0A0A0A;       /* blackest ink for emphasis/H1 */
+  --paper: #FFFFFF;            /* canonical canvas */
+
+  /* Editorial margin column ("редакторская подпись на полях") */
+  --margin-col: 64px;          /* width of the left section-number rail */
+  --margin-rule: #E5E5E5;      /* the 1px hairline vertical of the rail */
+  --margin-ink: #A3A3A3;       /* section number / micro-label ink */
+
+  /* Typographic system constants */
+  --kicker-spacing: 0.18em;    /* letter-spacing for Plex Mono caps kickers/labels */
+  --table-head-ink: #525252;   /* table header Plex Mono uppercase */
+
+  /* Motion — restrained, brightness/border only */
+  --ease: ease-out;
+  --dur: 160ms;
+  --transition: all 160ms ease-out;
+
+  /* — Спейсинг-шкала 4/8/12/16/24/32 — для новых и правленых правил — */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+}
+
+/* ============================================================
+   ТЁМНАЯ ТЕМА — та же editorial-ДНК на обращённой бумаге.
+   Бумага темнеет (#0E0E10 / #141416), ink светлеет (#F2F2F2),
+   hairline #2A2A2C. Инверс-блоки (передовица-hero, активный nav,
+   primary-кнопка, пилюля overlay) переворачиваются: светлая плашка,
+   тёмный ink. Все серые строго нейтральные — никакой синьки,
+   контраст по-прежнему размером/весом/линией/инверсией.
+   Атрибут data-theme ставится на <html> ДО рендера (main.tsx)
+   и обновляется мгновенно при смене настройки (App.tsx).
+   ============================================================ */
+:root[data-theme="dark"] {
+  color-scheme: dark; /* нативные контролы и скроллбары — тёмные */
+
+  /* — Canvas & surfaces: тёмная бумага — */
+  --bg: #0E0E10;
+  --bg-elev: #141416;       /* сайдбар-«оглавление» — едва светлее полотна */
+  --bg-card: #0E0E10;
+  --bg-card-hover: #141416; /* hover = лёгкое высветление, не цветной tint */
+  --bg-input: #0E0E10;
+
+  /* — Hairlines — */
+  --border: #2A2A2C;
+  --border-strong: #5A5A5E;
+
+  /* — Ink — */
+  --text: #F2F2F2;
+  --text-dim: #A6A6AB;
+  --text-faint: #6E6E73;
+
+  /* — «Акцент» = светлый ink (зеркало светлой темы, hue нет) — */
+  --accent: #F2F2F2;
+  --accent-hover: #FFFFFF;
+  --accent-ink: #0E0E10;    /* тёмный ink на светлой акцент-кнопке */
+  --accent-soft: rgba(242, 242, 242, 0.14);
+  --accent-glow: rgba(242, 242, 242, 0.00);
+
+  /* — Семантика остаётся серой (смысл несут форма/вес/текст) — */
+  --green: #F2F2F2;
+  --red: #FFFFFF;
+  --amber: #A6A6AB;
+
+  /* — Инверсия НАОБОРОТ: блок-передовица = светлая плашка, тёмный ink — */
+  --invert-bg: #F2F2F2;
+  --invert-bg-elev: #E7E7E9;
+  --invert-ink: #0E0E10;
+  --invert-ink-dim: #525256;
+  --invert-border: rgba(10, 10, 12, 0.16);
+  --invert-halo-1: rgba(10, 10, 12, 0.16);
+  --invert-halo-2: rgba(10, 10, 12, 0.07);
+  --invert-ring: rgba(10, 10, 12, 0.45);
+  --invert-ring-soft: rgba(10, 10, 12, 0.20);
+
+  /* — Канонические алиасы — */
+  --ink: #F2F2F2;
+  --ink-strong: #FFFFFF;
+  --paper: #0E0E10;
+
+  /* — Маргиналии / таблицы — */
+  --margin-rule: #2A2A2C;
+  --margin-ink: #6E6E73;
+  --table-head-ink: #A6A6AB;
+
+  /* — Тень тоста: на тёмной бумаге плотнее, по-прежнему бесцветная — */
+  --shadow-pop: 0 6px 24px rgba(0, 0, 0, 0.55);
+  --surface-2: rgba(242, 242, 242, 0.06);
+}
+
+/* Стрелка select зашита data-URI (var() внутри url() не работает) —
+   в тёмной теме дублируем картинку со светлым штрихом (#A6A6AB). */
+:root[data-theme="dark"] select {
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23A6A6AB' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+}
+
+/* ---------- Секция A ---------- */
+/* ============================================================
+   VoxFlow — Editorial B/W redesign ("Разворот")
+   SECTION A — base & shell
+   ============================================================ */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  user-select: none;
+}
+
+#root {
+  height: 100vh;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--ink-strong);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: var(--radius-lg);
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
+}
+
+/* ============================================================
+   App shell
+   ============================================================ */
+
+.app {
+  display: grid;
+  grid-template-columns: 248px 1fr;
+  height: 100vh;
+  overflow: hidden;
+  background: var(--bg);
+}
+
+/* Sidebar — "table of contents" */
+.sidebar {
+  background: var(--bg-elev);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 22px 16px;
+  gap: 6px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 4px 8px 20px;
+}
+
+.brand-mark {
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius);
+  background: var(--invert-bg);
+  color: var(--invert-ink);
+  display: grid;
+  place-items: center;
+  box-shadow: var(--shadow-card);
+  flex: none;
+}
+.brand-mark svg {
+  width: 19px;
+  height: 19px;
+}
+
+.brand-name {
+  font-family: var(--font-display);
+  font-size: 16px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--ink-strong);
+}
+.brand-sub {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  font-weight: 500;
+  letter-spacing: var(--kicker-spacing);
+  text-transform: uppercase;
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+
+.nav-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  font-size: 13.5px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 160ms ease-out, color 160ms ease-out,
+    border-color 160ms ease-out;
+}
+.nav-item:hover {
+  background: var(--bg-card-hover);
+  color: var(--text);
+}
+.nav-item.active {
+  background: var(--invert-bg-elev);
+  color: var(--invert-ink);
+  border-color: var(--invert-bg-elev);
+  font-family: var(--font-display);
+  font-weight: 700;
+}
+.nav-item .ico {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  opacity: 0.9;
+}
+.nav-item.active .ico {
+  color: var(--invert-ink);
+  opacity: 1;
+}
+
+.sidebar-foot {
+  margin-top: auto;
+  padding: 12px 10px 2px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  letter-spacing: var(--kicker-spacing);
+  text-transform: uppercase;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dot-ok {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: none;
+}
+
+/* Content */
+.content {
+  overflow-y: auto;
+  padding: 34px 40px 60px;
+}
+.content-inner {
+  max-width: 820px;
+  margin: 0 auto;
+}
+
+.page-head {
+  margin-bottom: 26px;
+}
+.page-title {
+  font-family: var(--font-display);
+  font-size: 24px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0;
+  color: var(--ink-strong);
+}
+.page-desc {
+  color: var(--text-dim);
+  font-size: 13.5px;
+  margin: 6px 0 0;
+}
+
+/* ---------- Секция B ---------- */
+/* ============================================================
+   Cards & layout primitives
+   ============================================================ */
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 22px;
+  box-shadow: var(--shadow-card);
+}
+.card + .card {
+  margin-top: 18px;
+}
+.card-title {
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--ink-strong);
+  margin: 0 0 2px;
+}
+.card-head {
+  margin-bottom: 18px;
+}
+.card-head .sub {
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.grid-2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.grid-3 {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+}
+
+/* Form rows */
+.field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 13px 0;
+  border-bottom: 1px solid var(--border);
+}
+.field:last-child {
+  border-bottom: none;
+}
+.field-label {
+  font-size: 13.5px;
+  font-weight: 500;
+  color: var(--text);
+}
+.field-hint {
+  font-size: 12px;
+  color: var(--text-faint);
+  margin-top: 3px;
+  max-width: 380px;
+}
+.field-control {
+  flex: none;
+}
+
+/* Inputs */
+input[type="text"],
+input[type="number"],
+select,
+textarea {
+  background: var(--bg-input);
+  border: none;
+  border-bottom: 1px solid var(--border-strong);
+  color: var(--text);
+  border-radius: 0;
+  padding: 9px 2px;
+  font-size: 13.5px;
+  font-family: var(--font);
+  outline: none;
+  transition: border-color var(--dur) var(--ease);
+  user-select: text;
+}
+input[type="text"]:focus,
+input[type="number"]:focus,
+select:focus,
+textarea:focus {
+  border-bottom-color: var(--ink-strong);
+  box-shadow: 0 1px 0 0 var(--ink-strong);
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--text-faint);
+}
+select {
+  cursor: pointer;
+  min-width: 180px;
+  appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%23525252' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><polyline points='6 9 12 15 18 9'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 4px center;
+  padding-right: 28px;
+}
+input[type="number"] {
+  width: 92px;
+}
+textarea {
+  width: 100%;
+  resize: vertical;
+  min-height: 64px;
+  line-height: 1.5;
+}
+.input-mono {
+  font-family: var(--font-mono);
+  letter-spacing: 0.02em;
+}
+
+/* Hotkey capture — выглядит как подчёркнутое поле, но это кнопка-ловушка клавиш */
+.hotkey-capture {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+}
+.hotkey-btn {
+  width: 180px;
+  text-align: left;
+  background: var(--bg-input);
+  border: none;
+  border-bottom: 1px solid var(--border-strong);
+  border-radius: 0;
+  color: var(--text);
+  padding: 9px 2px;
+  font-size: 13.5px;
+  cursor: pointer;
+  transition: border-color var(--dur) var(--ease);
+}
+.hotkey-btn:hover {
+  border-bottom-color: var(--ink-strong);
+}
+.hotkey-btn.capturing {
+  color: var(--text-faint);
+  border-bottom-style: dashed;
+  border-bottom-color: var(--ink-strong);
+  box-shadow: 0 1px 0 0 var(--ink-strong);
+  animation: hotkeyPulse 1s steps(2, jump-none) infinite;
+}
+@keyframes hotkeyPulse {
+  50% { opacity: 0.45; }
+}
+.hotkey-error {
+  font-family: var(--font);
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--text-faint);
+  max-width: 240px;
+  text-align: right;
+}
+
+/* Buttons */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-input);
+  color: var(--text);
+  border-radius: var(--radius-sm);
+  padding: 9px 16px;
+  font-size: 13.5px;
+  font-weight: 600;
+  font-family: var(--font);
+  cursor: pointer;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease), transform 0.08s var(--ease);
+  user-select: none;
+  white-space: nowrap;
+}
+.btn:hover {
+  background: var(--bg-card-hover);
+  border-color: var(--ink-strong);
+}
+.btn:active {
+  transform: translateY(1px);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.btn-primary {
+  background: var(--invert-bg-elev);
+  border-color: transparent;
+  color: var(--invert-ink);
+  box-shadow: none;
+}
+.btn-primary:hover {
+  background: var(--invert-bg);
+  border-color: transparent;
+}
+.btn-danger {
+  color: var(--text);
+  border-color: var(--border-strong);
+}
+.btn-danger:hover {
+  background: var(--bg-card-hover);
+  color: var(--ink-strong);
+  border-color: var(--ink-strong);
+}
+.btn-sm {
+  padding: 6px 11px;
+  font-size: 12.5px;
+}
+.btn-ghost {
+  background: transparent;
+  border-color: transparent;
+}
+.btn-ghost:hover {
+  background: var(--bg-card-hover);
+}
+
+/* Toggle switch */
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 44px;
+  height: 25px;
+  flex: none;
+}
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.switch .track {
+  position: absolute;
+  inset: 0;
+  background: var(--border);
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+  cursor: pointer;
+}
+.switch .thumb {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 19px;
+  height: 19px;
+  border-radius: 50%;
+  background: var(--paper);
+  border: 1px solid var(--border-strong);
+  transition: transform var(--dur) var(--ease), background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+  pointer-events: none;
+}
+.switch input:checked + .track {
+  background: var(--invert-bg);
+  border-color: var(--invert-bg);
+}
+.switch input:checked + .track .thumb {
+  transform: translateX(19px);
+  background: var(--invert-ink);
+  border-color: var(--invert-ink);
+}
+
+/* Tables */
+.table {
+  width: 100%;
+  border-collapse: collapse;
+}
+.table th {
+  text-align: left;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: var(--kicker-spacing);
+  color: var(--table-head-ink);
+  font-weight: 600;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13.5px;
+  vertical-align: middle;
+}
+.table tr:last-child td {
+  border-bottom: none;
+}
+.table td.mono {
+  font-family: var(--font-mono);
+  color: var(--ink-strong);
+}
+.table-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Badges / pills */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--kicker-spacing);
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-strong);
+  color: var(--text-dim);
+}
+.badge.ok {
+  color: var(--green);
+  border-color: var(--ink-strong);
+  background: var(--paper);
+}
+.badge.accent {
+  color: var(--invert-ink);
+  border-color: var(--invert-bg);
+  background: var(--invert-bg);
+}
+
+/* Empty state */
+.empty {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+
+.add-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+}
+.add-row input {
+  flex: 1;
+}
+
+.row-flex {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* ---------- Секция C ---------- */
+/* ============================================================
+   Dashboard
+   ============================================================ */
+
+.hero {
+  display: flex;
+  align-items: center;
+  gap: 26px;
+  background: var(--invert-bg);
+  border: 1px solid var(--invert-bg);
+  border-radius: var(--radius-lg);
+  padding: 28px;
+  box-shadow: var(--shadow-card);
+  color: var(--invert-ink);
+}
+.mic-orb {
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  flex: none;
+  display: grid;
+  place-items: center;
+  background: var(--invert-bg-elev);
+  border: 1px solid var(--invert-border);
+  position: relative;
+  /* FPS: статичный box-shadow на базе можно переключать через transition (не покадрово). */
+  transition: border-color 0.3s ease-out;
+  /* C3: появление орба — пружинистый вход через transform: scale() + opacity
+     (GPU-композит), а НЕ width/height/margin (layout-thrashing). */
+  animation: orbEnter 0.42s cubic-bezier(0.2, 0.8, 0.2, 1.2) both;
+  transform-origin: center;
+}
+/* GPU-композит: только transform + opacity. Лёгкий «перелёт» масштаба даёт
+   ощущение пружины благодаря cubic-bezier с >1 на выходе. */
+@keyframes orbEnter {
+  from {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+.mic-orb svg {
+  width: 38px;
+  height: 38px;
+  color: var(--invert-ink-dim);
+  transition: color 0.2s;
+}
+/* FPS: ореол вынесен в ::after-псевдоэлемент. Анимируем ТОЛЬКО transform: scale()
+   + opacity (GPU-композит, без перерисовки каждый кадр). Размытие статично на
+   псевдоэлементе — blur НЕ анимируется. По умолчанию ореол скрыт (opacity:0). */
+.mic-orb::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  /* Кольца ореола — токены: в тёмной теме инверс-блок светлый и ореол темнеет. */
+  box-shadow: 0 0 0 6px var(--invert-halo-1),
+    0 0 0 7px var(--invert-halo-2);
+  opacity: 0;
+  transform: scale(1);
+  transform-origin: center;
+  pointer-events: none;
+  will-change: transform, opacity;
+  transition: opacity 0.3s ease-out;
+}
+.mic-orb.live {
+  border-color: var(--invert-ink);
+}
+.mic-orb.live::after {
+  opacity: 1;
+  /* Пульс — пульсация ореола через scale+opacity, без анимации box-shadow/blur. */
+  animation: orbPulse 1.8s ease-in-out infinite;
+}
+.mic-orb.live svg {
+  color: var(--invert-ink);
+}
+.mic-orb.busy {
+  border-color: var(--invert-ink-dim);
+}
+.mic-orb.busy::after {
+  /* Занятость — статичный приглушённый ореол, без анимации. */
+  opacity: 0.6;
+}
+.mic-orb.busy svg {
+  color: var(--invert-ink-dim);
+}
+/* GPU-композит: только transform + opacity. */
+@keyframes orbPulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: scale(1.5);
+    opacity: 0.45;
+  }
+}
+
+.hero-body {
+  flex: 1;
+}
+.hero-status {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--invert-ink-dim);
+  text-transform: uppercase;
+  letter-spacing: var(--kicker-spacing);
+  margin-bottom: 4px;
+}
+.hero-title {
+  font-family: var(--font-display);
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  margin: 0 0 12px;
+  color: var(--invert-ink);
+}
+.hero-meta {
+  display: flex;
+  gap: 18px;
+  font-size: 13px;
+  color: var(--invert-ink-dim);
+}
+.hero-meta b {
+  color: var(--invert-ink);
+}
+.kbd {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--invert-bg-elev);
+  border: 1px solid var(--invert-border);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+  padding: 2px 8px;
+  color: var(--invert-ink);
+}
+
+.stat-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+}
+.stat-val {
+  font-family: var(--font-display);
+  font-size: 28px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+}
+.stat-label {
+  font-size: 12.5px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.stat-val.accent {
+  color: var(--ink-strong);
+}
+
+.transcript-box {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 16px 18px;
+  min-height: 78px;
+  font-size: 14.5px;
+  line-height: 1.6;
+  color: var(--text);
+  user-select: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.transcript-box.placeholder {
+  color: var(--text-faint);
+  font-style: italic;
+  display: grid;
+  place-items: center;
+  text-align: center;
+}
+
+/* Live equalizer (dashboard recording) */
+.eq {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 16px;
+}
+/* FPS: фиксированная height + анимация transform: scaleY() от основания (как .bars).
+   Раньше анимировалась height (4↔16px) — layout-thrashing (reflow+repaint каждый
+   кадр). scaleY композитится на GPU; transform-origin:bottom + align-items:flex-end
+   сохраняют рост столбиков снизу вверх. */
+.eq span {
+  width: 3px;
+  height: 16px;
+  background: var(--red);
+  border-radius: var(--radius-sm);
+  transform-origin: bottom;
+  will-change: transform;
+  animation: eq 0.9s ease-in-out infinite;
+}
+.eq span:nth-child(1) {
+  animation-delay: -0.6s;
+}
+.eq span:nth-child(2) {
+  animation-delay: -0.3s;
+}
+.eq span:nth-child(3) {
+  animation-delay: -0.45s;
+}
+.eq span:nth-child(4) {
+  animation-delay: -0.15s;
+}
+.eq span:nth-child(5) {
+  animation-delay: -0.5s;
+}
+/* GPU-композит: только transform. */
+@keyframes eq {
+  0%,
+  100% {
+    transform: scaleY(0.25); /* ~4px из 16px */
+  }
+  50% {
+    transform: scaleY(1); /* 16px */
+  }
+}
+
+/* ============================================================
+   Model section
+   ============================================================ */
+
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 15px 0;
+  border-bottom: 1px solid var(--border);
+}
+.model-row:last-child {
+  border-bottom: none;
+}
+.model-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius);
+  background: var(--paper);
+  border: 1px solid var(--border-strong);
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+.model-icon svg {
+  width: 20px;
+  height: 20px;
+  color: var(--ink-strong);
+}
+.model-info {
+  flex: 1;
+  min-width: 0;
+}
+.model-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.model-size {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+.model-row.selected {
+  border-radius: var(--radius);
+  background: var(--invert-bg);
+  padding-left: 12px;
+  padding-right: 12px;
+  border-bottom-color: transparent;
+  color: var(--invert-ink);
+}
+.model-row.selected .model-name {
+  color: var(--invert-ink);
+}
+.model-row.selected .model-size {
+  color: var(--invert-ink-dim);
+}
+.model-row.selected .model-icon {
+  background: var(--invert-bg-elev);
+  border-color: var(--invert-border);
+}
+.model-row.selected .model-icon svg {
+  color: var(--invert-ink);
+}
+
+.progress {
+  height: 6px;
+  width: 160px;
+  background: var(--border);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.progress .bar {
+  height: 100%;
+  background: var(--ink-strong);
+  border-radius: 999px;
+  /* 300мс — частые догрузочные тики (download_model) сливаются в плавный ход. */
+  transition: width 300ms var(--ease);
+}
+.progress-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.progress-pct {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+  min-width: 34px;
+}
+
+/* History */
+.hist-item {
+  padding: 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.hist-item:last-child {
+  border-bottom: none;
+}
+.hist-meta {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  letter-spacing: var(--kicker-spacing);
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-bottom: 5px;
+}
+.hist-app {
+  color: var(--ink-strong);
+  font-weight: 600;
+}
+.hist-text {
+  font-size: 13.5px;
+  line-height: 1.55;
+  color: var(--text);
+  user-select: text;
+}
+
+/* ---------- Секция D ---------- */
+/* ============================================================
+   Overlay window
+   ============================================================ */
+
+body.overlay-body {
+  background: transparent !important;
+  overflow: hidden;
+}
+body.overlay-body #root {
+  background: transparent;
+}
+
+.overlay-root {
+  height: 100vh;
+  display: grid;
+  /* Снизу по центру: плашка прижата к низу окна и растёт ВВЕРХ по мере текста. */
+  place-items: end center;
+  padding-bottom: 24px;
+  box-sizing: border-box;
+  background: transparent;
+}
+
+.pill {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 44px;
+  max-width: 560px;
+  padding: 9px 18px;
+  /* Скруглённый прямоугольник: при одной строке (min-height 44) читается как пилюля,
+     при переносе плавно становится растущей карточкой. */
+  border-radius: 22px;
+  background: var(--invert-bg);
+  border: 1px solid var(--invert-border);
+  box-shadow: none;
+  backdrop-filter: blur(14px);
+  color: var(--invert-ink);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--kicker-spacing);
+  box-sizing: border-box;
+  /* C1/C3: появление и трансформация — через transition по классу .is-visible,
+     а НЕ через keyframe на монтировании. Узел .pill постоянно в DOM, поэтому
+     смена содержимого (recording↔transcribing) НЕ переигрывает анимацию входа —
+     плашка плавно трансформируется. Скрытое состояние — лёгкий сдвиг вниз + scale. */
+  opacity: 0;
+  transform: translateY(6px) scale(0.985);
+  pointer-events: none;
+  /* FPS (D): border-color убран из transition (визуально не виден на полупрозрачной
+     hairline-рамке, но добавлял лишний интерполируемый property в каждый кадр входа). */
+  transition:
+    opacity 180ms ease-out,
+    transform 180ms ease-out,
+    background 180ms ease-out;
+}
+.pill.is-visible {
+  opacity: 1;
+  transform: none;
+}
+
+/* Ненавязчивая метка «оффлайн» (D): облако было недоступно → сработал авто-fallback
+   на локальный whisper. Маленькая моно-капс плашка справа в пилюле, без цвета. */
+.pill-offline {
+  flex: none;
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--invert-border);
+  color: var(--invert-ink-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--kicker-spacing);
+  white-space: nowrap;
+}
+
+/* Живой частичный текст — серый, обычным шрифтом (не моно/капс), чтобы слова
+   читались естественно. ПЕРЕНОСИТСЯ на новые строки (без троеточия); по высоте
+   ограничен ~5 строками и плавно проматывается к низу — всегда виден свежий хвост. */
+.partial-text {
+  min-width: 0;
+  flex: 1;
+  max-height: 7.3em; /* ~5 строк при line-height 1.46 */
+  overflow-y: auto;
+  scroll-behavior: smooth;
+  scrollbar-width: none; /* Firefox: скрыть полосу */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  color: var(--invert-ink-dim);
+  text-transform: none;
+  letter-spacing: normal;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.46;
+  font-weight: 500;
+}
+.partial-text::-webkit-scrollbar {
+  display: none; /* WebView2/Chromium: скрыть полосу */
+}
+
+/* Каждый символ — отдельный inline-span. При монтировании мягко проявляется
+   (chIn: opacity+blur, ~190мс) → текст «течёт» плавно, покадрово. Смена класса
+   volatile→committed (фиксация префикса) плавно переводит цвет серый→чёрный
+   через transition, без скачка. white-space наследуется от .partial-text (pre-wrap),
+   поэтому пробелы в спанах сохраняются и перенос строк работает. */
+.ch {
+  transition: color 240ms ease;
+  animation: chIn 190ms ease-out both;
+}
+.ch.committed {
+  color: var(--invert-ink); /* стабильный текст — белый ink на чёрном */
+}
+.ch.volatile {
+  color: var(--invert-ink-dim); /* изменчивый хвост — серый */
+}
+/* FPS (D): убран filter: blur() — он форсит дорогую растеризацию слоя на КАЖДЫЙ
+   из десятков символов, втекающих в кадр. Оставлена дешёвая opacity 0→1 + лёгкий
+   transform translateY (композитится на GPU, без layout/paint), чего достаточно
+   для эффекта «втекания». */
+@keyframes chIn {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Бегущая каретка-кружок на конце текста: маленький круг, стоит вплотную за
+   последним символом (inline → переносится вместе с текстом). Монохром —
+   выражена формой/движением/прозрачностью, без цвета. */
+.caret {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 2px;
+  border-radius: 50%;
+  background: var(--invert-ink);
+  vertical-align: baseline;
+  will-change: transform, opacity;
+}
+.caret.is-typing {
+  animation: caretPulse 1s ease-in-out infinite;
+}
+.caret.is-idle {
+  animation: caretBlink 1.3s steps(1, end) infinite;
+}
+@keyframes caretPulse {
+  0%,
+  100% {
+    transform: scale(1);
+    opacity: 0.95;
+  }
+  50% {
+    transform: scale(1.3);
+    opacity: 0.5;
+  }
+}
+@keyframes caretBlink {
+  0%,
+  55% {
+    opacity: 0.85;
+  }
+  56%,
+  100% {
+    opacity: 0.18;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .caret.is-typing,
+  .caret.is-idle {
+    animation: none;
+    opacity: 0.85;
+  }
+  .ch {
+    animation: none;
+    transform: none;
+    transition: none;
+  }
+  /* Орб: без пружинистого входа и без пульсации — статичное конечное состояние. */
+  .mic-orb {
+    animation: none;
+    transform: none;
+    opacity: 1;
+  }
+  .mic-orb.live::after {
+    animation: none;
+    transform: none;
+    opacity: 1;
+  }
+  /* Rec-dot: гасим пульс-кольцо, оставляем статичную метку. */
+  .rec-dot::after {
+    animation: none;
+    opacity: 0;
+  }
+}
+.rec-dot {
+  position: relative;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--invert-ink);
+  /* Статичный box-shadow допустим — он не анимируется (не перерисовывается в кадре).
+     Обводка — токен: обращается вместе с инверс-блоком в тёмной теме. */
+  box-shadow: 0 0 0 1px var(--invert-ring-soft);
+  flex: none;
+}
+/* FPS: пульс-кольцо вынесено в ::after. Анимируем ТОЛЬКО transform: scale() +
+   opacity (GPU-композит), вместо разрастающегося box-shadow (repaint каждый кадр).
+   Кольцо нарисовано статичным border, расширяется через scale. */
+.rec-dot::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  border: 2px solid var(--invert-ring); /* токен: кольцо темнеет в тёмной теме */
+  transform: scale(1);
+  transform-origin: center;
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: recPulse 1.4s ease-out infinite;
+}
+/* GPU-композит: только transform + opacity. */
+@keyframes recPulse {
+  0% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+  70% {
+    transform: scale(2.8);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(2.8);
+    opacity: 0;
+  }
+}
+
+.bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2.5px;
+  height: 18px;
+}
+/* FPS (D): фиксированная height + анимация transform: scaleY() от основания.
+   Раньше анимировалась height (4↔18px) — это layout-thrashing (reflow + repaint
+   каждый кадр). scaleY композитится на GPU (без reflow). transform-origin:bottom
+   и align-items:flex-end сохраняют рост столбиков снизу вверх, как было. */
+.bars span {
+  width: 3px;
+  height: 18px;
+  background: var(--invert-ink);
+  border-radius: 2px;
+  transform-origin: bottom;
+  will-change: transform;
+  animation: bars 0.85s ease-in-out infinite;
+}
+.bars span:nth-child(1) {
+  animation-delay: -0.7s;
+}
+.bars span:nth-child(2) {
+  animation-delay: -0.2s;
+}
+.bars span:nth-child(3) {
+  animation-delay: -0.5s;
+}
+.bars span:nth-child(4) {
+  animation-delay: -0.1s;
+}
+@keyframes bars {
+  0%,
+  100% {
+    transform: scaleY(0.22); /* ~4px из 18px */
+  }
+  50% {
+    transform: scaleY(1); /* 18px */
+  }
+}
+
+.spinner {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  border: 2px solid var(--invert-border);
+  border-top-color: var(--invert-ink);
+  animation: spin 0.7s linear infinite;
+  flex: none;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ============================================================
+   Toast / banner notice (B3: «выберите модель», ошибки движка)
+   ============================================================ */
+.toast-stack {
+  position: fixed;
+  top: var(--sp-4);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 1000;
+  max-width: 560px;
+  width: calc(100% - 48px);
+}
+
+.toast {
+  /* position+overflow — чтобы полоска-прогресс автозакрытия (.toast-life)
+     прижималась к нижней кромке и обрезалась по скруглению. */
+  position: relative;
+  overflow: hidden;
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border-radius: var(--radius);
+  border: 1px solid var(--border-strong);
+  background: var(--bg-card);
+  box-shadow: var(--shadow-pop);
+  font-size: 13px;
+  color: var(--text);
+  animation: toastIn 0.2s ease-out;
+}
+.toast + .toast {
+  margin-top: var(--sp-2);
+}
+.toast-warning {
+  border-left: 3px solid var(--amber);
+}
+.toast-error {
+  border-left: 3px solid var(--red);
+}
+.toast-msg {
+  flex: 1;
+  min-width: 0;
+}
+.toast-action {
+  flex: none;
+  cursor: pointer;
+  border: 1px solid var(--border-strong);
+  background: var(--accent);
+  color: var(--accent-ink); /* токен: в тёмной теме акцент светлый → ink тёмный */
+  font-size: 12px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: var(--radius-sm);
+}
+.toast-action:hover {
+  background: var(--accent-hover);
+}
+.toast-close {
+  flex: none;
+  cursor: pointer;
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 18px;
+  line-height: 1;
+  padding: 0 4px;
+}
+.toast-close:hover {
+  color: var(--text);
+}
+@keyframes toastIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Overlay-пилюля с предупреждением «нет модели» — обычный (не uppercase) текст. */
+.pill-warn {
+  text-transform: none;
+  letter-spacing: normal;
+  font-family: var(--font);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+/* ============================================================
+   FPS-метр (dev-only) — маленький моно-бейдж в левом нижнем углу.
+   Монтируется только в DEV или при localStorage voxfps=1. Число
+   обновляется напрямую через textContent (без React setState).
+   ============================================================ */
+.fps-meter {
+  position: fixed;
+  bottom: 8px;
+  left: 8px;
+  z-index: 2000;
+  pointer-events: none;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: var(--kicker-spacing);
+  padding: 3px 7px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--invert-border);
+  background: var(--invert-bg);
+  color: var(--invert-ink-dim);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+/* ---------- Секция E — темы и полировка (задача №4) ---------- */
+/* ============================================================
+   Сегмент-переключатель (группа «Вид» в «Управлении»): ряд кнопок
+   в общей hairline-рамке; активный сегмент — инверсия, как
+   .nav-item.active. Монохром, без заливок-подсветок.
+   ============================================================ */
+.seg {
+  display: inline-flex;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+.seg-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--font);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: var(--sp-2) var(--sp-4);
+  cursor: pointer;
+  white-space: nowrap;
+  border-left: 1px solid var(--border); /* hairline-шов между сегментами */
+  transition: background var(--dur) var(--ease), color var(--dur) var(--ease),
+    border-color var(--dur) var(--ease);
+}
+.seg-btn:first-child {
+  border-left: none;
+}
+.seg-btn:hover {
+  background: var(--bg-card-hover);
+  color: var(--text);
+}
+.seg-btn.active {
+  background: var(--invert-bg-elev);
+  color: var(--invert-ink);
+  border-left-color: var(--invert-bg-elev);
+}
+/* Шов справа от активного сегмента сливаем с инверсией — линия не двоится. */
+.seg-btn.active + .seg-btn {
+  border-left-color: transparent;
+}
+
+/* ============================================================
+   Смена вкладки: контент мягко проявляется снизу (fade+rise 160мс).
+   Только transform+opacity (GPU-композит, без layout). Ремоунт через
+   key={tab} на ErrorBoundary (App.tsx) переигрывает вход.
+   ============================================================ */
+.tab-fade {
+  animation: tabIn var(--dur) var(--ease) both;
+}
+@keyframes tabIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ============================================================
+   Тосты: info/success живут 6с и закрываются сами; полоска-прогресс
+   по нижней кромке через scaleX (НЕ width — GPU-композит). Длительность
+   зеркалит TOAST_LIFE_MS в ui.tsx — меняешь там, меняй и тут.
+   warning/error — только вручную (пользователь должен успеть прочитать).
+   ============================================================ */
+.toast-info {
+  border-left: 3px solid var(--border-strong);
+}
+.toast-success {
+  border-left: 3px solid var(--green);
+}
+.toast-life {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: var(--ink-strong);
+  transform-origin: left;
+  will-change: transform;
+  animation: toastLife 6s linear forwards;
+}
+@keyframes toastLife {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+/* Выход тоста — transform+opacity; узел удаляется ПОСЛЕ транзишена (ui.tsx
+   ждёт TOAST_EXIT_MS=200мс), иначе исчезновение было бы мгновенным. */
+.toast-leaving {
+  opacity: 0;
+  transform: translateY(-6px);
+  transition: opacity 200ms var(--ease), transform 200ms var(--ease);
+}
+
+/* ============================================================
+   Клавиатурный фокус: видимое ink-кольцо ТОЛЬКО на :focus-visible —
+   мышиные клики не подсвечиваем (у полей остаётся свой underline-фокус).
+   ============================================================ */
+.btn:focus-visible,
+.seg-btn:focus-visible,
+.toast-action:focus-visible,
+.toast-close:focus-visible,
+.hotkey-btn:focus-visible,
+.nav-item:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--ink-strong);
+  outline-offset: 2px;
+}
+.seg-btn:focus-visible {
+  outline-offset: -2px; /* внутри обрезанной (overflow:hidden) рамки группы */
+}
+.switch input:focus-visible + .track {
+  outline: 2px solid var(--ink-strong);
+  outline-offset: 2px;
+}
+
+/* ============================================================
+   prefers-reduced-motion: декоративное движение гасим. Автозакрытие
+   тостов остаётся (JS-таймер) — полоска просто скрыта; spinner НЕ
+   трогаем (его вращение — необходимая обратная связь «идёт работа»).
+   ============================================================ */
+@media (prefers-reduced-motion: reduce) {
+  .tab-fade {
+    animation: none;
+  }
+  .toast {
+    animation: none;
+  }
+  .toast-life {
+    animation: none;
+    opacity: 0;
+  }
+  .toast-leaving {
+    transition: none;
+  }
+  .seg-btn,
+  .nav-item,
+  .btn,
+  .progress .bar {
+    transition: none;
+  }
+  /* Эквалайзеры — чисто декоративные: замораживаем на среднем столбике. */
+  .eq span,
+  .bars span {
+    animation: none;
+    transform: scaleY(0.45);
+  }
+  .hotkey-btn.capturing {
+    animation: none;
+  }
+}

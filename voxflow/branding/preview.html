@@ -1,0 +1,54 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8">
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#ffffff; font-family:'Segoe UI',sans-serif; color:#15233A; padding:28px; }
+  .row { display:flex; align-items:flex-end; gap:34px; padding:22px 8px; border-bottom:1px solid #eef0f3; }
+  .row:last-child { border-bottom:none; }
+  .label { width:150px; }
+  .label h2 { font-size:18px; }
+  .label p { font-size:12px; color:#7a8595; margin-top:4px; }
+  .cell { text-align:center; }
+  .cell img { display:block; background:#fff; }
+  .cell .s256 { width:128px; height:128px; }
+  .cell .s64  { width:64px;  height:64px;  }
+  .cell .s32  { width:32px;  height:32px;  }
+  .cell .s16  { width:16px;  height:16px;  }
+  .cap { font-size:10px; color:#9aa4b2; margin-top:6px; }
+  .tray { background:#1f2733; border-radius:6px; padding:8px 10px; display:inline-flex; gap:8px; align-items:center; }
+  h1 { font-size:22px; margin-bottom:6px; }
+  .sub { font-size:13px; color:#7a8595; margin-bottom:18px; }
+</style></head>
+<body>
+  <h1>VoxFlow — концепты иконки</h1>
+  <div class="sub">белый фон · без микрофона · проверка читаемости 128 / 64 / 32 / 16 px (+ строка трея)</div>
+
+  <div class="row">
+    <div class="label"><h2>A · Попугай</h2><p>parakeet, «повторяет речь». Основной.</p></div>
+    <div class="cell"><img class="s256" src="concept-a-parrot.svg"><div class="cap">128</div></div>
+    <div class="cell"><img class="s64"  src="concept-a-parrot.svg"><div class="cap">64</div></div>
+    <div class="cell"><img class="s32"  src="concept-a-parrot.svg"><div class="cap">32</div></div>
+    <div class="cell"><img class="s16"  src="concept-a-parrot.svg"><div class="cap">16</div></div>
+    <div class="cell"><div class="tray"><img class="s16" src="concept-a-parrot.svg"><img class="s16" src="concept-a-parrot.svg" style="opacity:.5"></div><div class="cap">трей</div></div>
+  </div>
+
+  <div class="row">
+    <div class="label"><h2>B · Пузырь текста</h2><p>строки + мигающий курсор.</p></div>
+    <div class="cell"><img class="s256" src="concept-b-bubble.svg"><div class="cap">128</div></div>
+    <div class="cell"><img class="s64"  src="concept-b-bubble.svg"><div class="cap">64</div></div>
+    <div class="cell"><img class="s32"  src="concept-b-bubble.svg"><div class="cap">32</div></div>
+    <div class="cell"><img class="s16"  src="concept-b-bubble.svg"><div class="cap">16</div></div>
+    <div class="cell"><div class="tray"><img class="s16" src="concept-b-bubble.svg"><img class="s16" src="concept-b-bubble.svg" style="opacity:.5"></div><div class="cap">трей</div></div>
+  </div>
+
+  <div class="row">
+    <div class="label"><h2>C · Синяя точка</h2><p>маскот из плашки записи.</p></div>
+    <div class="cell"><img class="s256" src="concept-c-dot.svg"><div class="cap">128</div></div>
+    <div class="cell"><img class="s64"  src="concept-c-dot.svg"><div class="cap">64</div></div>
+    <div class="cell"><img class="s32"  src="concept-c-dot.svg"><div class="cap">32</div></div>
+    <div class="cell"><img class="s16"  src="concept-c-dot.svg"><div class="cap">16</div></div>
+    <div class="cell"><div class="tray"><img class="s16" src="concept-c-dot.svg"><img class="s16" src="concept-c-dot.svg" style="opacity:.5"></div><div class="cap">трей</div></div>
+  </div>
+</body>
+</html>

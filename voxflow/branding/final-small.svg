@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- VoxFlow icon — SMALL (16..32px). Bigger bubble, 2 thick lines, fat cursor. -->
+  <path d="M44 36
+           H212 a40 40 0 0 1 40 40
+           V148 a40 40 0 0 1 -40 40
+           H120 l-46 40 v-40
+           H44 a40 40 0 0 1 -40 -40
+           V76 a40 40 0 0 1 40 -40 Z" fill="#2FCB7E"/>
+  <rect x="50" y="76"  width="140" height="24" rx="12" fill="#ffffff"/>
+  <rect x="50" y="120" width="86"  height="24" rx="12" fill="#ffffff"/>
+  <rect x="150" y="115" width="22" height="34" rx="5" fill="#3B82F6"/>
+</svg>
