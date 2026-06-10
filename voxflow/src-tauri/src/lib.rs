@@ -14,6 +14,7 @@ mod inject;
 mod models;
 mod net;
 mod ollama;
+mod parakeet;
 mod paths;
 mod postprocess;
 mod rewrite;
