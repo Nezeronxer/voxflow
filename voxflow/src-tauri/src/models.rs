@@ -158,6 +158,10 @@ fn catalog_size(name: &str) -> u64 {
         .unwrap_or(0)
 }
 
+fn is_whisper_catalog_name(name: &str) -> bool {
+    CATALOG.iter().any(|e| e.name == name)
+}
+
 pub fn delete(name: &str) -> Result<()> {
     // Каталожная ONNX-модель — это каталог, а не одиночный файл: сносим целиком
     // (вместе с .part).
@@ -167,6 +171,9 @@ pub fn delete(name: &str) -> Result<()> {
             std::fs::remove_dir_all(dir)?;
         }
         return Ok(());
+    }
+    if !is_whisper_catalog_name(name) {
+        return Err(anyhow!("Неизвестная модель: {name}"));
     }
     let p = crate::paths::model_path(name);
     if p.exists() {
@@ -426,5 +433,13 @@ mod tests {
                 m.name
             );
         }
+    }
+
+    #[test]
+    fn delete_rejects_path_traversal_names() {
+        assert!(delete("..\\voxflow.db").is_err());
+        assert!(delete("../voxflow.db").is_err());
+        assert!(delete("C:\\Users\\Public\\victim.bin").is_err());
+        assert!(is_whisper_catalog_name("ggml-base.bin"));
     }
 }

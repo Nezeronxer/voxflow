@@ -25,3 +25,8 @@ build:
 Do not build release installers from a plain `cargo build --release` binary:
 that path can point WebView2 at the dev server. Use `npm run tauri -- build
 --no-bundle` first.
+
+If dictation quality is poor, change the language/model first. For Russian use
+the Russian route with GigaAM; for mixed or multilingual speech use auto/Whisper.
+Cloud STT is BYOK and can help on difficult microphones or languages, but online
+providers depend on the user's network, quota and API stability.

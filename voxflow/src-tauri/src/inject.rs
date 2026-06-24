@@ -440,7 +440,7 @@ fn paste_text(
 ) -> Result<()> {
     // Снимок текущего буфера: текст ИЛИ картинка (best-effort: пустой/нечитаемый
     // формат — нечего восстанавливать, см. ClipSnapshot).
-    let prev = clipboard_snapshot();
+    let prev = clipboard_snapshot().or_else(|| Some(ClipSnapshot::Text(String::new())));
 
     // Положить наш текст (с ретраями ×3 по 30мс — см. clipboard_set_retry).
     clipboard_set_retry(text)?;

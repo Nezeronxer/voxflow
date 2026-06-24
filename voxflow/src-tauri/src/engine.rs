@@ -73,7 +73,7 @@ pub enum EngineCmd {
     Shutdown,
 }
 
-const PARAGRAPH_GAP_SAMPLES: usize = 4 * 16000;
+const PARAGRAPH_GAP_SAMPLES: usize = 8 * 16000;
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -247,10 +247,7 @@ enum LocalRoute {
     GigaAm,
     /// en при установленном Parakeet.
     Parakeet,
-    /// auto при установленном Parakeet: партиалы/сегменты гонит Parakeet,
-    /// кириллические сегменты в финале перегоняются через GigaAM.
-    ParakeetAuto,
-    /// Всё остальное (en/auto без Parakeet, прочие языки, whisper-движки).
+    /// Всё остальное (auto/прочие языки/whisper-движки).
     Whisper,
 }
 
@@ -259,7 +256,6 @@ fn local_route(s: &Settings) -> LocalRoute {
     match s.language.as_str() {
         "ru" if s.engine == "gigaam" => LocalRoute::GigaAm,
         "en" if s.engine == "gigaam" && parakeet_ready() => LocalRoute::Parakeet,
-        "auto" if s.engine == "gigaam" && parakeet_ready() => LocalRoute::ParakeetAuto,
         _ => LocalRoute::Whisper,
     }
 }
@@ -277,6 +273,36 @@ fn detect_lang_label(text: &str) -> Option<&'static str> {
         return Some("en");
     }
     None
+}
+
+fn word_count(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|w| w.chars().any(char::is_alphabetic))
+        .count()
+}
+
+fn has_cyrillic(text: &str) -> bool {
+    text.chars()
+        .any(|c| ('а'..='я').contains(&c.to_ascii_lowercase()) || c == 'ё' || c == 'Ё')
+}
+
+fn prefer_gigaam_for_auto(whisper_text: &str, gigaam_text: &str) -> bool {
+    let g = gigaam_text.trim();
+    if g.is_empty() || !crate::parakeet::is_mostly_cyrillic(g) {
+        return false;
+    }
+    let w = whisper_text.trim();
+    if w.is_empty() {
+        return true;
+    }
+    let gw = word_count(g);
+    let ww = word_count(w);
+    if crate::parakeet::is_mostly_cyrillic(w) {
+        return gw + 2 >= ww;
+    }
+    // Типичный сбой whisper auto на русской речи: короткая латинская фраза
+    // вроде "After" / "Państwo, unze" вместо полноценной русской диктовки.
+    !has_cyrillic(w) && gw >= 3 && (ww <= 2 || gw >= ww.saturating_mul(2))
 }
 
 /// Заранее поднять и прогреть резидентные модели (GigaAM/Parakeet/VAD или
@@ -346,16 +372,13 @@ fn warmup(ctx: EngineCtx) {
             warm_parakeet(&ctx);
             return;
         }
-        LocalRoute::ParakeetAuto => {
-            warm_parakeet(&ctx);
-            // В auto кириллические сегменты финала перегоняются через GigaAM —
-            // греем и его, если модель на месте (НЕ скачиваем).
-            if crate::gigaam::dir_ready(&paths::gigaam_dir()) {
-                warm_gigaam(&ctx);
-            }
-            return;
-        }
         LocalRoute::Whisper => {}
+    }
+    if s.language == "auto"
+        && s.engine == "gigaam"
+        && crate::gigaam::dir_ready(&paths::gigaam_dir())
+    {
+        warm_gigaam(&ctx);
     }
     if s.engine == "whisper_cli" {
         dbg_log("warmup: cli — пропуск");
@@ -550,6 +573,29 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
     // Сегментная схема: VAD находит паузы; завершённые сегменты фиксируются
     // (committed растёт монотонно по построению), активный сегмент
     // перераспознаётся каждый тик (volatile, серый). По тишине ASR не гоняем.
+    if s.language == "auto" && s.engine == "gigaam" {
+        if ensure_gigaam(ctx, &s).is_ok() {
+            // Auto сохраняет все языки в финале, но русскому live-preview нужен
+            // быстрый и сильный движок. Whisper auto слишком медленно обновлял
+            // кружок, а Parakeet давал мусор по русской речи. Поэтому в auto
+            // показываем быстрый GigaAM-preview только в кружке (без live-вставки).
+            let mut preview_settings = s.clone();
+            preview_settings.stream_mode = "never".into();
+            start_local_partial_loop(
+                capture,
+                ctx,
+                &preview_settings,
+                Arc::clone(&ctx.gigaam),
+                LocalLoopTuning {
+                    tick_ms: 220,
+                    max_seg_samples: 25 * 16000,
+                    fixed_lang: Some("ru"),
+                },
+            );
+            return;
+        }
+        dbg_log("partial: auto+gigaam preview недоступен — пробуем whisper-стрим");
+    }
     match local_route(&s) {
         LocalRoute::GigaAm => {
             if ensure_gigaam(ctx, &s).is_err() {
@@ -572,7 +618,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
             );
             return;
         }
-        LocalRoute::Parakeet | LocalRoute::ParakeetAuto => {
+        LocalRoute::Parakeet => {
             if ensure_parakeet(ctx, &s).is_ok() {
                 // en/auto: партиалы гонит Parakeet БЕЗ двойного прогона (RU-перегон
                 // кириллических сегментов — только в финале); язык бейджа
@@ -853,7 +899,7 @@ fn cloud_partial_loop(
         }
         let _ = app.emit(
             "partial",
-            serde_json::json!({ "text": full, "committed": committed, "volatile": volatile, "seq": seq }),
+            live_partial_payload(&full, &committed, &volatile, seq, None),
         );
     }
     let _ = std::fs::remove_file(&wav);
@@ -924,10 +970,24 @@ fn clean_live_partial(
     snippets: &[postprocess::Snippet],
     corrections: &[postprocess::Correction],
 ) -> (String, String, String) {
-    let committed = clean_live_text(committed, s, dict, snippets, corrections);
-    let volatile = clean_live_text(volatile, s, dict, snippets, corrections);
-    let full = join_partial(&committed, &volatile);
-    (committed, volatile, full)
+    let committed_clean = clean_live_text(committed, s, dict, snippets, corrections);
+    let full_raw = join_partial(committed, volatile);
+    let full = clean_live_text(&full_raw, s, dict, snippets, corrections);
+    if full.is_empty() {
+        return (String::new(), String::new(), String::new());
+    }
+    if committed.trim().is_empty() {
+        return (String::new(), full.clone(), full);
+    }
+    if volatile.trim().is_empty() {
+        return (full.clone(), String::new(), full);
+    }
+    if !committed_clean.is_empty() {
+        if let Some(rest) = full.strip_prefix(&committed_clean) {
+            return (committed_clean, rest.trim_start().to_string(), full);
+        }
+    }
+    (String::new(), full.clone(), full)
 }
 
 /// Похоже ли `b` на переговорённую заново версию `a` (человек ошибся, сделал
@@ -1230,7 +1290,7 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
         let lang = a.tuning.fixed_lang.or_else(|| detect_lang_label(&full));
         let _ = a.app.emit(
             "partial",
-            serde_json::json!({ "text": full, "committed": committed, "volatile": volatile, "seq": a.seq, "lang": lang }),
+            live_partial_payload(&full, &committed, &volatile, a.seq, lang),
         );
 
         // Живая вставка в поле (always/auto) — как у whisper-петли.
@@ -1393,7 +1453,7 @@ fn partial_loop(a: PartialLoopArgs) {
         // совместимости, committed/volatile — новый контракт (стабильный + хвост).
         let _ = a.app.emit(
             "partial",
-            serde_json::json!({ "text": full, "committed": committed, "volatile": volatile, "seq": a.seq }),
+            live_partial_payload(&full, &committed, &volatile, a.seq, None),
         );
 
         // Живая вставка для auto/always (never — только пилюля).
@@ -1599,13 +1659,15 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             abort: st.abort,
             start_fp: st.start_fp,
         };
+        let target_fp = live.start_fp.clone();
         if ctx.settings.lock().play_sounds {
             sound::play(false);
         }
         set_status(&ctx.app, "transcribing");
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
-            if let Err(err) = process_utterance(&ctx2, samples, rate, Some(live), my_gen) {
+            if let Err(err) = process_utterance(&ctx2, samples, rate, Some(live), my_gen, target_fp)
+            {
                 log::error!("process_utterance: {err:#}");
                 report_process_err(&ctx2.app, &err);
             }
@@ -1625,8 +1687,10 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
 
     // Тяжёлую обработку выносим в отдельный поток, чтобы движок мог принять новую запись.
     let ctx2 = ctx.clone();
+    let actx = crate::app_context::detect();
+    let target_fp = (actx.exe, actx.title);
     std::thread::spawn(move || {
-        if let Err(err) = process_utterance(&ctx2, samples, rate, None, my_gen) {
+        if let Err(err) = process_utterance(&ctx2, samples, rate, None, my_gen, target_fp) {
             log::error!("process_utterance: {err:#}");
             report_process_err(&ctx2.app, &err);
         }
@@ -1727,6 +1791,14 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
 
     emit_improve_status(&ctx.app, "rewriting", "Улучшаю текст");
     let mut s = ctx.settings.lock().clone();
+    let cloud_or_remote_rewrite = match s.ai_backend.as_str() {
+        "gemini" | "openai_compat" => true,
+        "ollama" => !crate::net::is_loopback_base_url(&s.ollama_url),
+        _ => false,
+    };
+    if cloud_or_remote_rewrite {
+        s.ai_backend = "off".into();
+    }
     let corrections = {
         let conn = ctx.db.lock();
         load_corrections(&conn)
@@ -1769,11 +1841,12 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
         true,
     );
     if !used_model {
-        emit_improve_status(
-            &ctx.app,
-            "fallback_rules",
-            "Модель недоступна, применены локальные правила",
-        );
+        let message = if cloud_or_remote_rewrite {
+            "Глобальное улучшение не отправляет выделенный текст в облако, применены локальные правила"
+        } else {
+            "Модель недоступна, применены локальные правила"
+        };
+        emit_improve_status(&ctx.app, "fallback_rules", message);
     }
     if ctx.gen.load(Ordering::SeqCst) != my_gen {
         return Ok(());
@@ -1882,6 +1955,7 @@ fn process_utterance(
     rate: u32,
     live: Option<LiveState>,
     my_gen: u64,
+    target_fp: (String, String),
 ) -> anyhow::Result<()> {
     if samples.is_empty() {
         return Ok(());
@@ -1902,7 +1976,8 @@ fn process_utterance(
 
     // Уникальное имя WAV на диктовку (C4): исключает гонку на общем файле, когда
     // финал предыдущей диктовки ещё в полёте, а уже стартовала следующая.
-    let wav = paths::tmp_dir().join(format!("utterance_{my_gen}.wav"));
+    let wav = paths::unique_tmp_path(&format!("utterance_{my_gen}"), "wav");
+    let _wav_guard = paths::TempFileGuard::new(wav.clone());
     audio::write_wav_16k_mono(&wav, &trimmed)?;
 
     // Словарь и сниппеты из БД (под локом).
@@ -2047,9 +2122,16 @@ fn process_utterance(
     // Контекст окна нужен и для тона, и для payload Ollama — детектим один раз.
     // Тон = категория приложения (Gmail→formal, мессенджеры→casual, промпты→work).
     let actx = crate::app_context::detect();
+    if (actx.exe.clone(), actx.title.clone()) != target_fp {
+        dbg_log("финал: окно изменилось до рерайта — вставка отменена");
+        erase_live_draft(ctx, live.as_ref(), my_gen);
+        return Ok(());
+    }
     dbg_log(&format!(
-        "app: exe={} title={:?} → {}",
-        actx.exe, actx.title, actx.category
+        "app: exe={} title_len={} → {}",
+        actx.exe,
+        actx.title.chars().count(),
+        actx.category
     ));
     // Тон по приложению считаем через category_for — он учитывает пользовательские
     // app_profile_overrides (ветка B) ПЕРЕД встроенной таблицей классификации.
@@ -2140,6 +2222,7 @@ fn process_utterance(
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
+    let mut final_inserted = false;
     let t_inj = Instant::now();
     match (live.as_ref(), live_mode) {
         (Some(l), "always") | (Some(l), "auto") => {
@@ -2166,8 +2249,10 @@ fn process_utterance(
                         log::warn!("финальная clipboard-вставка с абзацами: {e}");
                     } else if l.stream_mode == "always" {
                         *l.injected.lock() = text.clone();
+                        final_inserted = true;
                     } else {
                         *l.committed.lock() = text.clone();
+                        final_inserted = true;
                     }
                 } else {
                     let flat = flatten_breaks(&text);
@@ -2175,23 +2260,35 @@ fn process_utterance(
                         log::warn!("финальная реконсиляция: {e}");
                     } else if l.stream_mode == "always" {
                         *l.injected.lock() = flat;
+                        final_inserted = true;
                     } else {
                         *l.committed.lock() = flat;
+                        final_inserted = true;
                     }
                 }
             }
         }
         _ => {
             // never-режим или петли не было — поведение как раньше (вставка целиком).
+            let cur = crate::app_context::detect();
+            if (cur.exe, cur.title) != target_fp {
+                dbg_log("финал: целевое окно изменилось — вставка отменена");
+                drop(inject_guard);
+                return Ok(());
+            }
             // Ошибку пробрасываем ПОСЛЕ уборки временного WAV (иначе утечка в tmp).
             if let Err(e) = inject::inject(&text, &s.paste_method) {
                 drop(inject_guard);
                 let _ = std::fs::remove_file(&wav);
                 return Err(e);
             }
+            final_inserted = true;
         }
     }
     drop(inject_guard); // освобождаем замок клавиш сразу после вставки
+    if final_inserted {
+        emit_final_preview(&ctx.app, &text, my_gen, lang_badge);
+    }
     let inject_ms = t_inj.elapsed().as_millis() as u64;
     // Сквозной замер этапов финала: отпускание клавиши → текст в поле.
     dbg_log(&format!(
@@ -2344,7 +2441,6 @@ fn ensure_server(
     model: &std::path::Path,
     threads: u32,
 ) -> anyhow::Result<u16> {
-    const PORT: u16 = 8771;
     let mut guard = ctx.server.lock();
     let need_start = match guard.as_mut() {
         Some(srv) => {
@@ -2357,10 +2453,24 @@ fn ensure_server(
         if let Some(mut old) = guard.take() {
             let _ = old.child.kill();
         }
-        let srv = asr::start_server(whisper_dir, model, PORT, threads)?;
-        *guard = Some(srv);
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..5 {
+            let port = asr::reserve_loopback_port()?;
+            match asr::start_server(whisper_dir, model, port, threads) {
+                Ok(srv) => {
+                    *guard = Some(srv);
+                    return Ok(port);
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("whisper-server не поднялся")));
     }
-    Ok(PORT)
+    if let Some(srv) = guard.as_ref() {
+        Ok(srv.port)
+    } else {
+        Err(anyhow::anyhow!("whisper-server не инициализирован"))
+    }
 }
 
 /// Типизированная ошибка «модель не установлена» — чтобы отличать её от прочих
@@ -2398,7 +2508,7 @@ fn no_model_installed(s: &Settings) -> bool {
     let whisper_ready = || whisper_model_installed(s);
     match local_route(s) {
         LocalRoute::GigaAm => !crate::gigaam::dir_ready(&paths::gigaam_dir()) && !whisper_ready(),
-        LocalRoute::Parakeet | LocalRoute::ParakeetAuto => {
+        LocalRoute::Parakeet => {
             !crate::parakeet::dir_ready(&paths::parakeet_dir()) && !whisper_ready()
         }
         LocalRoute::Whisper => !whisper_ready(),
@@ -2471,6 +2581,69 @@ fn set_status(app: &AppHandle, status: &str) {
     let _ = app.emit("status", status);
 }
 
+fn live_partial_payload(
+    text: &str,
+    committed: &str,
+    volatile: &str,
+    seq: u64,
+    lang: Option<&'static str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "text": text,
+        "committed": committed,
+        "volatile": volatile,
+        "seq": seq,
+        "lang": lang,
+        "processed": true,
+    })
+}
+
+fn final_preview_payload(text: &str, seq: u64, lang: Option<&'static str>) -> serde_json::Value {
+    serde_json::json!({
+        "text": text,
+        "committed": text,
+        "volatile": "",
+        "seq": seq,
+        "lang": lang,
+        "processed": true,
+        "final": true,
+    })
+}
+
+fn emit_final_preview(app: &AppHandle, text: &str, seq: u64, lang: Option<&'static str>) {
+    let _ = app.emit("partial", final_preview_payload(text, seq, lang));
+}
+
+#[cfg(test)]
+mod overlay_event_tests {
+    use super::*;
+
+    #[test]
+    fn live_partial_payload_is_marked_processed() {
+        let payload = live_partial_payload("Привет мир", "Привет", "мир", 7, None);
+
+        assert_eq!(payload["text"], "Привет мир");
+        assert_eq!(payload["committed"], "Привет");
+        assert_eq!(payload["volatile"], "мир");
+        assert_eq!(payload["seq"], 7);
+        assert_eq!(payload["processed"], true);
+        assert!(payload.get("final").is_none());
+    }
+
+    #[test]
+    fn final_preview_payload_is_marked_and_committed() {
+        let payload = final_preview_payload("Исправленный текст.", 42, Some("ru"));
+
+        assert_eq!(payload["text"], "Исправленный текст.");
+        assert_eq!(payload["committed"], "Исправленный текст.");
+        assert_eq!(payload["volatile"], "");
+        assert_eq!(payload["seq"], 42);
+        assert_eq!(payload["lang"], "ru");
+        assert_eq!(payload["processed"], true);
+        assert_eq!(payload["final"], true);
+    }
+}
+
 fn emit_error(app: &AppHandle, msg: &str) {
     let _ = app.emit("error", serde_json::json!({ "message": msg }));
 }
@@ -2494,17 +2667,8 @@ fn emit_no_model(app: &AppHandle) {
     );
 }
 
-/// Нужен ли сегменту auto-маршрута RU-перегон через GigaAM: кириллический
-/// скрипт (RU-качество GigaAM выше) ЛИБО Parakeet вернул пусто/пробелы —
-/// вероятный русский сегмент, который Parakeet не разобрал; без перегона он
-/// молча выпадал бы из финального текста.
-fn needs_ru_rerun(parakeet_text: &str) -> bool {
-    crate::parakeet::is_mostly_cyrillic(parakeet_text) || parakeet_text.trim().is_empty()
-}
-
 /// Локальный ASR с роутингом по языку (PLAN §2): ru → GigaAM (как раньше),
-/// en → Parakeet, auto → Parakeet с RU-перегоном кириллических сегментов через
-/// GigaAM; фолбэк всех маршрутов — whisper. Общий VAD-гейт тишины для
+/// en → Parakeet, auto/прочие языки → whisper. Общий VAD-гейт тишины для
 /// резидентных движков. Возвращает (текст, язык для бейджа overlay).
 fn local_asr(
     ctx: &EngineCtx,
@@ -2585,73 +2749,49 @@ fn local_asr(
                 }
                 Err(e) => log::warn!("parakeet недоступен ({e}); откат на whisper"),
             },
-            LocalRoute::ParakeetAuto => match ensure_parakeet(ctx, s) {
-                Ok(()) => {
-                    // RU-перегон кириллических сегментов — через GigaAM, если его
-                    // модель на месте (лениво грузим; неудача не валит auto-путь).
-                    if crate::gigaam::dir_ready(&paths::gigaam_dir()) {
-                        if let Err(e) = ensure_gigaam(ctx, s) {
-                            log::warn!(
-                                "auto: gigaam не загрузился ({e}); кириллица останется от Parakeet"
-                            );
-                        }
-                    }
-                    let mut pguard = ctx.parakeet.lock();
-                    let mut gguard = ctx.gigaam.lock();
-                    if let Some(p) = pguard.as_mut() {
-                        let mut gref = gguard.as_mut();
-                        let res = local_transcribe_long(&ctx.vad_final, samples_16k, &mut |seg| {
-                            let t = p.transcribe(seg)?;
-                            // Сегмент с кириллическим скриптом перегоняется через
-                            // GigaAM (RU-качество выше). ПУСТОЙ ответ Parakeet —
-                            // тоже: это, как правило, русский сегмент, который он
-                            // не разобрал; без перегона сегмент молча терялся бы
-                            // (is_mostly_cyrillic("")==false). Пусто отдаём только
-                            // если ОБА движка дали пусто. Ошибка GigaAM — оставляем
-                            // текст Parakeet. Партиалы двойной прогон не делают —
-                            // RU-перегон случается ТОЛЬКО здесь, в финале.
-                            if needs_ru_rerun(&t) {
-                                if let Some(g) = gref.as_mut() {
-                                    match g.transcribe(seg) {
-                                        Ok(rt) if !rt.trim().is_empty() => return Ok(rt),
-                                        Ok(_) => {}
-                                        Err(e) => log::warn!(
-                                            "auto: RU-перегон gigaam ошибка: {e:#}; оставляем Parakeet"
-                                        ),
-                                    }
-                                }
-                            }
-                            Ok(t)
-                        });
-                        match res {
-                            Ok(t) => {
-                                emit_stt_mode(&ctx.app, "parakeet", false);
-                                dbg_log(&format!(
-                                    "[lat] vad={vad_ms}мс auto(parakeet+gigaam): asr готов, {} символов",
-                                    t.chars().count()
-                                ));
-                                let lang = detect_lang_label(&t);
-                                return Ok((postprocess::dedup_repeated_ngrams(&t), lang));
-                            }
-                            Err(e) => log::warn!("auto (parakeet) ошибка: {e:#}; откат на whisper"),
-                        }
-                    }
-                }
-                Err(e) => log::warn!("auto: parakeet недоступен ({e}); откат на whisper"),
-            },
             LocalRoute::Whisper => unreachable!(),
         }
     }
-    // en/auto без Parakeet — текущее поведение (whisper) + разовая дружелюбная
-    // подсказка, что с Parakeet будет лучше.
-    if route == LocalRoute::Whisper
-        && s.engine == "gigaam"
-        && matches!(s.language.as_str(), "en" | "auto")
-    {
+    // en без Parakeet — текущее поведение (whisper) + разовая дружелюбная
+    // подсказка, что с Parakeet будет лучше. Для auto подсказку не показываем:
+    // это штатный мультиязычный whisper-маршрут.
+    if route == LocalRoute::Whisper && s.engine == "gigaam" && s.language == "en" {
         hint_parakeet_once(&ctx.app);
     }
-    let _g = ctx.asr_lock.lock();
-    Ok((local_transcribe(ctx, s, dict, wav)?, None))
+    let whisper_text = {
+        let _g = ctx.asr_lock.lock();
+        local_transcribe(ctx, s, dict, wav)?
+    };
+    if s.language == "auto"
+        && s.engine == "gigaam"
+        && crate::gigaam::dir_ready(&paths::gigaam_dir())
+    {
+        match ensure_gigaam(ctx, s) {
+            Ok(()) => {
+                let mut guard = ctx.gigaam.lock();
+                if let Some(g) = guard.as_mut() {
+                    match local_transcribe_long(&ctx.vad_final, samples_16k, &mut |seg| {
+                        g.transcribe(seg)
+                    }) {
+                        Ok(t) if prefer_gigaam_for_auto(&whisper_text, &t) => {
+                            emit_stt_mode(&ctx.app, "gigaam", false);
+                            dbg_log(&format!(
+                                "auto: выбран GigaAM вместо whisper auto (whisper_len={}, gigaam_len={})",
+                                whisper_text.chars().count(),
+                                t.chars().count()
+                            ));
+                            return Ok((postprocess::dedup_repeated_ngrams(&t), Some("ru")));
+                        }
+                        Ok(_) => {}
+                        Err(e) => log::warn!("auto: GigaAM final fallback ошибка: {e:#}"),
+                    }
+                }
+            }
+            Err(e) => log::warn!("auto: GigaAM final fallback недоступен ({e})"),
+        }
+    }
+    let lang = detect_lang_label(&whisper_text);
+    Ok((whisper_text, lang))
 }
 
 /// Разовая (на сессию) подсказка для en/auto без установленного Parakeet:
@@ -2839,8 +2979,20 @@ mod seg_tests {
     #[test]
     fn paragraph_gap_keeps_short_continuation_together() {
         assert!(!gap_starts_paragraph(true, 3 * 16000));
-        assert!(gap_starts_paragraph(true, 4 * 16000));
+        assert!(!gap_starts_paragraph(true, 4 * 16000));
+        assert!(gap_starts_paragraph(true, 8 * 16000));
         assert!(!gap_starts_paragraph(false, 10 * 16000));
+    }
+
+    #[test]
+    fn live_partial_is_cleaned_as_one_preview() {
+        let s = Settings::default();
+        let (committed, volatile, full) =
+            clean_live_partial("ну короче привет", "мир", &s, &[], &[], &[]);
+
+        assert_eq!(committed, "Привет");
+        assert_eq!(volatile, "мир");
+        assert_eq!(full, "Привет мир");
     }
 
     #[test]
@@ -2848,15 +3000,17 @@ mod seg_tests {
         assert_eq!(flatten_breaks("а\n\nб  в"), "а б в");
     }
 
-    /// Auto-роутер: RU-перегон нужен кириллице И пустому ответу Parakeet
-    /// (русский сегмент, который Parakeet не разобрал, иначе молча терялся).
     #[test]
-    fn needs_ru_rerun_on_cyrillic_and_empty() {
-        assert!(needs_ru_rerun("привет, как дела"));
-        assert!(needs_ru_rerun("")); // пустой ответ Parakeet — пробуем GigaAM
-        assert!(needs_ru_rerun("   \n")); // только пробелы — то же самое
-        assert!(!needs_ru_rerun("hello world")); // латиница остаётся за Parakeet
-        assert!(needs_ru_rerun("привет hello")); // смешанный с перевесом кириллицы
+    fn auto_prefers_gigaam_when_whisper_turns_russian_into_short_latin() {
+        assert!(prefer_gigaam_for_auto(
+            "Państwo, unze",
+            "Пользователь говорит обычный русский текст"
+        ));
+        assert!(prefer_gigaam_for_auto("After", "Исправь это пожалуйста"));
+        assert!(!prefer_gigaam_for_auto(
+            "please update the prompt",
+            "Пожалуйста обнови промпт"
+        ));
     }
 
     #[test]
@@ -2876,6 +3030,16 @@ mod seg_tests {
 
         s.engine = "gigaam".to_string();
         assert_eq!(local_route(&s), LocalRoute::GigaAm);
+    }
+
+    #[test]
+    fn auto_language_uses_whisper_for_final_multilingual_route() {
+        let s = Settings {
+            engine: "gigaam".to_string(),
+            language: "auto".to_string(),
+            ..Settings::default()
+        };
+        assert_eq!(local_route(&s), LocalRoute::Whisper);
     }
 }
 
@@ -2955,6 +3119,14 @@ fn clamp_chars(value: &str, max_chars: usize) -> String {
 
 fn one_line_instruction(value: &str) -> String {
     clamp_chars(&compact_instruction_source(value), 1800)
+}
+
+fn app_label_for_payload(actx: &crate::app_context::AppContext) -> String {
+    if !actx.exe.trim().is_empty() {
+        one_line_instruction(&actx.exe)
+    } else {
+        "неизвестно".to_string()
+    }
 }
 
 fn build_smart_prompt_instruction_from_source(source: &str) -> Option<String> {
@@ -3072,13 +3244,7 @@ fn build_voiceflow_payload(
     tone: &str,
     smart_instruction: Option<&str>,
 ) -> String {
-    let actual = if !actx.title.trim().is_empty() {
-        actx.title.as_str()
-    } else if !actx.exe.is_empty() {
-        actx.exe.as_str()
-    } else {
-        "неизвестно"
-    };
+    let actual = app_label_for_payload(actx);
     let app = match tone {
         "ai" => format!("AI prompt ({actual})"),
         "formal" => format!("Gmail ({actual})"),
@@ -3259,7 +3425,8 @@ mod smart_prompt_tests {
             Some(prompt),
         );
 
-        assert!(payload.contains("[ПРИЛОЖЕНИЕ]: AI prompt (ChatGPT)"));
+        assert!(payload.contains("[ПРИЛОЖЕНИЕ]: AI prompt (chrome.exe)"));
+        assert!(!payload.contains("ChatGPT"));
         assert!(payload.contains("[ПОЛЬЗОВАТЕЛЬСКАЯ ИНСТРУКЦИЯ]:"));
         assert!(payload.contains("Делай из диктовки промпт для Codex"));
         assert!(payload.contains("[ДИКТОВКА]: я объясни мне"));

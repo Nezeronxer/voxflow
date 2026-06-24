@@ -123,7 +123,12 @@ pub fn process(text: &str, s: &Settings, dict: &[Dict], snippets: &[Snippet]) ->
         }
     }
 
-    // 5) Капитализация + чистка пробелов.
+    // 5) ASR иногда вставляет произвольные переносы строк по сегментам/паузам.
+    // Для диктовки это не смысловая разметка: случайный "\n" не должен превращать
+    // середину фразы в новый абзац и новую заглавную букву.
+    t = normalize_dictation_breaks(&t);
+
+    // 6) Капитализация + чистка пробелов.
     if s.auto_punct {
         t = capitalize_sentences(&t);
     }
@@ -515,6 +520,71 @@ fn replace_word_ci(text: &str, term: &str, repl: &str) -> String {
     out
 }
 
+fn normalize_dictation_breaks(text: &str) -> String {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if !normalized.contains('\n') {
+        return normalized;
+    }
+    let lines: Vec<&str> = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    if looks_like_list_block(&lines) {
+        return lines.join("\n");
+    }
+    lines.join(" ")
+}
+
+fn looks_like_list_block(lines: &[&str]) -> bool {
+    let list_items = lines
+        .iter()
+        .filter(|line| starts_with_list_marker(line))
+        .count();
+    list_items >= 2
+        || (list_items >= 1
+            && lines
+                .first()
+                .map(|line| line.ends_with(':'))
+                .unwrap_or(false))
+}
+
+fn starts_with_list_marker(line: &str) -> bool {
+    let s = line.trim_start();
+    if s.starts_with("- ") || s.starts_with("* ") || s.starts_with("• ") {
+        return true;
+    }
+    let mut chars = s.char_indices();
+    let mut last_digit_end = 0usize;
+    let mut has_digit = false;
+    for (idx, ch) in chars.by_ref() {
+        if ch.is_ascii_digit() {
+            has_digit = true;
+            last_digit_end = idx + ch.len_utf8();
+            continue;
+        }
+        break;
+    }
+    if !has_digit {
+        return false;
+    }
+    let rest = &s[last_digit_end..];
+    let Some(marker) = rest.chars().next() else {
+        return false;
+    };
+    if marker != '.' && marker != ')' {
+        return false;
+    }
+    rest[marker.len_utf8()..]
+        .chars()
+        .next()
+        .map(char::is_whitespace)
+        .unwrap_or(false)
+}
+
 fn capitalize_sentences(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cap_next = true;
@@ -524,8 +594,7 @@ fn capitalize_sentences(text: &str) -> String {
             cap_next = false;
         } else {
             out.push(ch);
-            // Новый абзац ('\n') — тоже начало предложения.
-            if ".!?…".contains(ch) || ch == '\n' {
+            if ".!?…".contains(ch) {
                 cap_next = true;
             }
         }
@@ -718,13 +787,26 @@ mod filler_tests {
     }
 
     #[test]
-    fn paragraphs_preserved_and_capitalized() {
+    fn incidental_asr_breaks_do_not_create_paragraphs() {
         let s = st(true, true);
         assert_eq!(
             process("абзац один.\n\nабзац два, э-э, текст.", &s, &[], &[]),
-            "Абзац один.\n\nАбзац два, текст."
+            "Абзац один. Абзац два, текст."
+        );
+        assert_eq!(
+            process("это должно\nбыть одним предложением", &s, &[], &[]),
+            "Это должно быть одним предложением"
         );
         assert_eq!(normalize_spaces("а\n\n\n\nб"), "а\n\nб");
+    }
+
+    #[test]
+    fn list_like_breaks_survive() {
+        let s = st(false, true);
+        assert_eq!(
+            process("План:\n1. первое\n2. второе", &s, &[], &[]),
+            "План:\n1. Первое\n2. Второе"
+        );
     }
 
     #[test]
@@ -765,10 +847,9 @@ mod filler_tests {
             process("hello world. this is fine! is it? yes", &s, &[], &[]),
             "Hello world. This is fine! Is it? Yes"
         );
-        // '\n' — тоже начало предложения, как и в RU-кейсе.
         assert_eq!(
             process("first line.\n\nsecond line", &s, &[], &[]),
-            "First line.\n\nSecond line"
+            "First line. Second line"
         );
     }
 
@@ -831,7 +912,7 @@ mod filler_tests {
     }
 
     #[test]
-    fn self_correction_preserves_lines() {
+    fn self_correction_collapses_incidental_lines() {
         let s = st(true, true);
         assert_eq!(
             process(
@@ -840,7 +921,7 @@ mod filler_tests {
                 &[],
                 &[]
             ),
-            "Первая строка\nВстреча послезавтра"
+            "Первая строка встреча послезавтра"
         );
     }
 

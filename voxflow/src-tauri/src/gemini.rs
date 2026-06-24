@@ -28,15 +28,23 @@ pub fn available(api_key: &str) -> bool {
 
 /// Распознать WAV-файл через Gemini (cloud ASR). Возвращает только текст.
 ///
-/// `language` — код/название языка для подсказки модели (ru = русский).
+/// `language` — код/название языка для подсказки модели; "auto" = определить язык.
 pub fn transcribe(api_key: &str, model: &str, wav: &Path, language: &str) -> Result<String> {
     // Читаем WAV и кодируем в base64.
     let bytes = std::fs::read(wav)
         .map_err(|e| anyhow!("не удалось прочитать WAV {}: {e}", wav.display()))?;
     let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
 
+    let lang_hint = match language.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => {
+            "Автоматически определи язык речи. Не переводи текст: сохрани язык оригинала."
+        }
+        "ru" | "russian" => "Язык речи: русский.",
+        "en" | "english" => "Язык речи: English.",
+        other => return transcribe_with_language_hint(api_key, model, wav, &b64, other),
+    };
     let prompt = format!(
-        "Транскрибируй это аудио ДОСЛОВНО на языке {language} (ru = русский). \
+        "Транскрибируй это аудио ДОСЛОВНО. {lang_hint} \
          Верни ТОЛЬКО распознанный текст, без кавычек и комментариев."
     );
 
@@ -50,6 +58,29 @@ pub fn transcribe(api_key: &str, model: &str, wav: &Path, language: &str) -> Res
         "generationConfig": { "temperature": 0 }
     });
 
+    call(api_key, model, &body)
+}
+
+fn transcribe_with_language_hint(
+    api_key: &str,
+    model: &str,
+    _wav: &Path,
+    b64: &str,
+    language: &str,
+) -> Result<String> {
+    let prompt = format!(
+        "Транскрибируй это аудио ДОСЛОВНО. Язык речи: {language}. \
+         Не переводи текст. Верни ТОЛЬКО распознанный текст, без кавычек и комментариев."
+    );
+    let body = serde_json::json!({
+        "contents": [{
+            "parts": [
+                { "text": prompt },
+                { "inline_data": { "mime_type": "audio/wav", "data": b64 } }
+            ]
+        }],
+        "generationConfig": { "temperature": 0 }
+    });
     call(api_key, model, &body)
 }
 
@@ -74,12 +105,9 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
     let url = format!("{BASE_URL}/{model}:generateContent");
 
     // Тело запроса — во временный файл (большой base64 не влезает в argv).
-    let req_path = crate::paths::tmp_dir().join("gemini_req.json");
     let payload = serde_json::to_vec(body).map_err(|e| anyhow!("сериализация тела: {e}"))?;
-    std::fs::write(&req_path, &payload)
-        .map_err(|e| anyhow!("не удалось записать {}: {e}", req_path.display()))?;
-
-    let data_arg = format!("@{}", req_path.display());
+    let req = net::TempPayload::write_json("gemini_req", &payload)?;
+    let data_arg = req.curl_data_arg();
     let auth_header = format!("x-goog-api-key: {api_key}");
 
     // Прокси-aware curl из общего модуля net (CREATE_NO_WINDOW уже внутри).

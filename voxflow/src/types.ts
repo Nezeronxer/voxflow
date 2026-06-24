@@ -78,7 +78,7 @@ export const DEFAULT_SETTINGS: Settings = {
   improve_hotkey: "F8",
   mode: "hold",
   input_device: "",
-  language: "ru",
+  language: "auto",
   // Зеркало Rust-дефолтов (settings.rs). Расхождение раньше позволяло UI
   // застампить в БД engine=whisper_cli и навсегда выключить живой ввод (B2).
   model: "ggml-large-v3-turbo-q5_0.bin",
@@ -190,6 +190,12 @@ export interface PartialEvent {
   text: string;
   committed: string;
   volatile: string;
+  // true — text/committed/volatile уже прошли live postprocess и пригодны
+  // для показа в синей пилюле во время записи.
+  processed?: boolean;
+  // true — это уже финальный исправленный preview после postprocess/LLM,
+  // который overlay показывает во время status=="transcribing" вместо raw live draft.
+  final?: boolean;
   // seq — монотонный счётчик диктовки; отбрасываем партиалы старее текущей записи.
   seq?: number;
   // Язык диктовки для бейджа (контракт overlay). Партиалы, отброшенные

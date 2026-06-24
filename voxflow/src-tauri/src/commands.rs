@@ -58,11 +58,13 @@ fn err<E: std::fmt::Display>(x: E) -> String {
 
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> Settings {
-    state.settings.lock().clone()
+    state.settings.lock().clone().redacted_for_renderer()
 }
 
 #[tauri::command]
-pub fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings) -> R<()> {
+pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Settings) -> R<()> {
+    let previous = state.settings.lock().clone();
+    settings.preserve_empty_secrets_from(&previous);
     apply_autostart(&app, settings.autostart);
     // Сначала ПИШЕМ в БД и только при успехе обновляем снимок в памяти — чтобы
     // провал записи был виден во фронте (B4), а не проглатывался молча.
@@ -86,7 +88,7 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, settings: Settings)
     // живёт спрятанным (hide, React смонтирован) с устаревшим снапшотом и без
     // этого события откатывало бы смену языка из трея своим безусловным flush'ем
     // на visibilitychange (lost update).
-    if let Err(e) = app.emit("settings_changed", &settings) {
+    if let Err(e) = app.emit("settings_changed", settings.clone().redacted_for_renderer()) {
         log::warn!("settings_changed не разослалось: {e}");
     }
     // Язык сменился → фоновый прогрев движка под новые настройки: без него первый
@@ -763,13 +765,13 @@ pub async fn stt_test(state: State<'_, AppState>) -> Result<String, String> {
     }
 
     // Маленький тестовый WAV: 0.4 c тишины (16к * 0.4 = 6400 сэмплов).
-    let wav = crate::paths::tmp_dir().join("stt_test.wav");
-    if let Err(e) = crate::audio::write_wav_16k_mono(&wav, &vec![0.0f32; 6400]) {
+    let wav = crate::paths::TempFileGuard::new(crate::paths::unique_tmp_path("stt_test", "wav"));
+    if let Err(e) = crate::audio::write_wav_16k_mono(wav.path(), &vec![0.0f32; 6400]) {
         return Err(format!("не удалось создать тестовый WAV: {e}"));
     }
 
     let provider = s.stt_provider.clone();
-    match crate::cloud_stt::transcribe(&s, &wav) {
+    match crate::cloud_stt::transcribe(&s, wav.path()) {
         Ok(_) => Ok(format!("ок: {provider} ответил")),
         Err(e) => {
             // Классифицируем ошибку в русскую строку, БЕЗ ключа в тексте.
