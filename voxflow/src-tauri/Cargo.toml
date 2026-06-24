@@ -2,7 +2,8 @@
 name = "voxflow"
 version = "1.0.1"
 description = "Local-first voice dictation for Windows"
-authors = ["VoxFlow"]
+authors = ["Nezeronxer"]
+license = "LicenseRef-Proprietary"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
