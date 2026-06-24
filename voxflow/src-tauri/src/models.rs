@@ -1,5 +1,6 @@
 //! Каталог и загрузка моделей с HuggingFace в %LOCALAPPDATA%\VoxFlow\models:
-//! whisper (одиночные GGML .bin) и GigaAM-v3 (набор ONNX-файлов в models/gigaam/).
+//! whisper (одиночные GGML .bin), GigaAM-v3 (набор ONNX-файлов в models/gigaam/)
+//! и Parakeet TDT v3 (набор ONNX-файлов в models/parakeet/).
 //!
 //! Качаем системным `curl` (HTTPS через SChannel на Windows) — без тяжёлого
 //! HTTP-стека и без C-сборок TLS. Прогресс — поллингом размера .part-файла.
@@ -22,22 +23,68 @@ pub struct ModelInfo {
     pub label: String,
     pub size_mb: u32,
     pub installed: bool,
-    /// "gigaam" — каталог ONNX-файлов (models/gigaam/), "whisper" — одиночный ggml-*.bin.
+    /// "gigaam"/"parakeet" — каталог ONNX-файлов, "whisper" — одиночный ggml-*.bin.
     /// Зеркалится в types.ts (ModelInfo.kind) — фронт по нему рисует hero-карточку.
     pub kind: String,
 }
 
 /// Имя каталожного пункта GigaAM (это НЕ файл — набор из 4 файлов в models/gigaam/).
 pub const GIGAAM_NAME: &str = "gigaam-v3";
-const GIGAAM_BASE_URL: &str = "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/";
-/// Суммарный размер 4 файлов GigaAM (~226 МБ десятичных) для каталога.
-const GIGAAM_SIZE_MB: u32 = 217;
+/// Имя каталожного пункта Parakeet TDT v3 (набор из 4 файлов в models/parakeet/).
+pub const PARAKEET_NAME: &str = "parakeet-v3";
 
-/// Защита от двойного запуска загрузки GigaAM: автозагрузка при первом старте
-/// (ensure_default_models) и клик «Скачать» в UI могут прилететь одновременно —
-/// два параллельных curl в один .part порвали бы файл. У whisper-моделей такой
-/// гонки нет (качаются только по клику), поэтому атомик заведён только тут.
+/// Защита от двойного запуска загрузки каталожной модели: автозагрузка при первом
+/// старте (ensure_default_models) и клик «Скачать» в UI могут прилететь
+/// одновременно — два параллельных curl в один .part порвали бы файл. У
+/// whisper-моделей такой гонки нет (качаются только по клику).
 static GIGAAM_DOWNLOADING: AtomicBool = AtomicBool::new(false);
+static PARAKEET_DOWNLOADING: AtomicBool = AtomicBool::new(false);
+
+/// Многофайловая ONNX-модель: каталог в models/<dir> вместо одиночного .bin.
+/// Механизм скачивания/докачки/удаления общий (run_download_dir), записи
+/// различаются только данными.
+struct DirModel {
+    name: &'static str,
+    label: &'static str,
+    /// Суммарный размер файлов для каталога (как видит пользователь).
+    size_mb: u32,
+    kind: &'static str,
+    base_url: &'static str,
+    files: &'static [(&'static str, u64)],
+    dir: fn() -> std::path::PathBuf,
+    ready: fn(&std::path::Path) -> bool,
+    downloading: &'static AtomicBool,
+}
+
+const DIR_MODELS: &[DirModel] = &[
+    // GigaAM — ПЕРВОЙ записью: дефолтный движок, фронт ждёт её первой строкой list().
+    DirModel {
+        name: GIGAAM_NAME,
+        label: "GigaAM-v3 — русский (рекомендуется)",
+        size_mb: 217,
+        kind: "gigaam",
+        base_url: "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/",
+        files: crate::gigaam::GIGAAM_FILES,
+        dir: gigaam_dir,
+        ready: crate::gigaam::dir_ready,
+        downloading: &GIGAAM_DOWNLOADING,
+    },
+    DirModel {
+        name: PARAKEET_NAME,
+        label: "Parakeet TDT v3 — английский + автоопределение языка",
+        size_mb: 640,
+        kind: "parakeet",
+        base_url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/",
+        files: crate::parakeet::PARAKEET_FILES,
+        dir: crate::paths::parakeet_dir,
+        ready: crate::parakeet::dir_ready,
+        downloading: &PARAKEET_DOWNLOADING,
+    },
+];
+
+fn find_dir_model(name: &str) -> Option<&'static DirModel> {
+    DIR_MODELS.iter().find(|m| m.name == name)
+}
 
 struct Entry {
     name: &'static str,
@@ -79,15 +126,16 @@ fn gigaam_dir() -> std::path::PathBuf {
 }
 
 pub fn list() -> Vec<ModelInfo> {
-    let mut out = Vec::with_capacity(CATALOG.len() + 1);
-    // GigaAM — ПЕРВОЙ строкой: дефолтный движок, фронт рисует её hero-карточкой.
-    out.push(ModelInfo {
-        name: GIGAAM_NAME.to_string(),
-        label: "GigaAM-v3 — русский (рекомендуется)".to_string(),
-        size_mb: GIGAAM_SIZE_MB,
-        installed: crate::gigaam::dir_ready(&gigaam_dir()),
-        kind: "gigaam".to_string(),
-    });
+    let mut out = Vec::with_capacity(CATALOG.len() + DIR_MODELS.len());
+    // Каталожные ONNX-модели — первыми строками (GigaAM — самой первой:
+    // дефолтный движок), фронт рисует их hero-карточками.
+    out.extend(DIR_MODELS.iter().map(|m| ModelInfo {
+        name: m.name.to_string(),
+        label: m.label.to_string(),
+        size_mb: m.size_mb,
+        installed: (m.ready)(&(m.dir)()),
+        kind: m.kind.to_string(),
+    }));
     out.extend(CATALOG.iter().map(|e| ModelInfo {
         name: e.name.to_string(),
         label: e.label.to_string(),
@@ -111,9 +159,10 @@ fn catalog_size(name: &str) -> u64 {
 }
 
 pub fn delete(name: &str) -> Result<()> {
-    // GigaAM — это каталог, а не одиночный файл: сносим целиком (вместе с .part).
-    if name == GIGAAM_NAME {
-        let dir = gigaam_dir();
+    // Каталожная ONNX-модель — это каталог, а не одиночный файл: сносим целиком
+    // (вместе с .part).
+    if let Some(m) = find_dir_model(name) {
+        let dir = (m.dir)();
         if dir.exists() {
             std::fs::remove_dir_all(dir)?;
         }
@@ -129,6 +178,7 @@ pub fn delete(name: &str) -> Result<()> {
 /// Автозагрузка дефолтной модели при первом запуске: GigaAM не на месте и не
 /// качается → стартуем скачивание в фоне. Зовётся интегратором из setup (lib.rs);
 /// прогресс фронт увидит обычными событиями model:progress под именем "gigaam-v3".
+/// Parakeet (~640 МБ) сюда сознательно НЕ входит — качается только по кнопке в UI.
 pub fn ensure_default_models(app: AppHandle) {
     if crate::gigaam::dir_ready(&gigaam_dir()) {
         return;
@@ -141,24 +191,24 @@ pub fn ensure_default_models(app: AppHandle) {
 
 /// Запустить загрузку в фоновом потоке. События: `model:progress` / `model:done` / `model:error`.
 pub fn start_download(app: AppHandle, name: String) -> Result<()> {
-    if name == GIGAAM_NAME {
+    if let Some(m) = find_dir_model(&name) {
         // Уже качается → молча выходим: события прогресса и так летят от первого
         // потока, второй curl поверх того же .part устроил бы кашу.
-        if GIGAAM_DOWNLOADING
+        if m.downloading
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
             return Ok(());
         }
         std::thread::spawn(move || {
-            let r = run_download_gigaam(&app);
-            GIGAAM_DOWNLOADING.store(false, Ordering::SeqCst);
+            let r = run_download_dir(&app, m);
+            m.downloading.store(false, Ordering::SeqCst);
             if let Err(e) = r {
-                log::error!("download {GIGAAM_NAME}: {e:#}");
+                log::error!("download {}: {e:#}", m.name);
                 let _ = app.emit(
                     "model:error",
                     // "error" читает фронт (types.ts), "message" — для обратной совместимости.
-                    serde_json::json!({ "name": GIGAAM_NAME, "error": e.to_string(), "message": e.to_string() }),
+                    serde_json::json!({ "name": m.name, "error": e.to_string(), "message": e.to_string() }),
                 );
             }
         });
@@ -179,22 +229,28 @@ pub fn start_download(app: AppHandle, name: String) -> Result<()> {
     Ok(())
 }
 
-/// Скачать 4 файла GigaAM последовательно в models/gigaam/. Прогресс — СУММАРНЫЙ
-/// (готовые байты всех файлов / общий размер) под единым именем "gigaam-v3".
+/// Скачать файлы каталожной ONNX-модели последовательно в её каталог. Прогресс —
+/// СУММАРНЫЙ (готовые байты всех файлов / общий размер) под единым именем модели.
 /// Файл с уже правильным размером — скип: докачка после обрыва сети/закрытия
 /// приложения продолжает с первого недокачанного файла.
-fn run_download_gigaam(app: &AppHandle) -> Result<()> {
-    let dir = gigaam_dir();
+fn run_download_dir(app: &AppHandle, m: &DirModel) -> Result<()> {
+    let dir = (m.dir)();
     std::fs::create_dir_all(&dir)?;
-    let total: u64 = crate::gigaam::GIGAAM_FILES.iter().map(|(_, s)| *s).sum();
+    let total: u64 = m.files.iter().map(|(_, s)| *s).sum();
     let mut base: u64 = 0; // байты уже завершённых файлов (вклад в суммарный прогресс)
 
-    for (fname, fsize) in crate::gigaam::GIGAAM_FILES {
+    for (fname, fsize) in m.files {
         let dest = dir.join(fname);
-        // Критерий готовности как в gigaam::dir_ready: бинарь — точный размер,
-        // vocab (.txt) — просто непустой (текст может прилететь с CRLF).
+        // Критерий готовности как в gigaam/parakeet::dir_ready: бинарь — точный
+        // размер, vocab (.txt) — просто непустой (текст может прилететь с CRLF).
         let done = std::fs::metadata(&dest)
-            .map(|m| if fname.ends_with(".txt") { m.len() > 0 } else { m.len() == *fsize })
+            .map(|m| {
+                if fname.ends_with(".txt") {
+                    m.len() > 0
+                } else {
+                    m.len() == *fsize
+                }
+            })
             .unwrap_or(false);
         if done {
             base += fsize;
@@ -204,7 +260,7 @@ fn run_download_gigaam(app: &AppHandle) -> Result<()> {
         // .part уникален: расширения файлов различны, with_extension не конфликтует.
         let part = dest.with_extension("part");
         let _ = std::fs::remove_file(&part);
-        let url = format!("{GIGAAM_BASE_URL}{fname}");
+        let url = format!("{}{fname}", m.base_url);
 
         let mut cmd = Command::new("curl");
         cmd.arg("-L")
@@ -226,7 +282,7 @@ fn run_download_gigaam(app: &AppHandle) -> Result<()> {
             let received = base + std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
             let _ = app.emit(
                 "model:progress",
-                serde_json::json!({ "name": GIGAAM_NAME, "received": received, "total": total }),
+                serde_json::json!({ "name": m.name, "received": received, "total": total }),
             );
             if let Some(status) = child.try_wait()? {
                 if status.success() {
@@ -243,9 +299,9 @@ fn run_download_gigaam(app: &AppHandle) -> Result<()> {
 
     let _ = app.emit(
         "model:progress",
-        serde_json::json!({ "name": GIGAAM_NAME, "received": total, "total": total }),
+        serde_json::json!({ "name": m.name, "received": total, "total": total }),
     );
-    let _ = app.emit("model:done", serde_json::json!({ "name": GIGAAM_NAME }));
+    let _ = app.emit("model:done", serde_json::json!({ "name": m.name }));
     Ok(())
 }
 
@@ -313,4 +369,62 @@ fn content_length(url: &str) -> Option<u64> {
         }
     }
     last
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Регрессия: запись Parakeet в каталоге согласована с константами parakeet.rs
+    /// (имя, kind, URL, размер каталога соответствует сумме файлов).
+    #[test]
+    fn parakeet_dir_model_consistent() {
+        let m = find_dir_model(PARAKEET_NAME).expect("parakeet-v3 должен быть в DIR_MODELS");
+        assert_eq!(m.kind, "parakeet");
+        assert!(
+            m.base_url
+                .starts_with("https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx")
+                && m.base_url.ends_with('/'),
+            "base_url: {}",
+            m.base_url
+        );
+        assert_eq!(m.files.len(), crate::parakeet::PARAKEET_FILES.len());
+        // size_mb каталога = сумма байтов файлов в МиБ (округление ±1).
+        let mib = (m.files.iter().map(|(_, s)| *s).sum::<u64>() / 1_048_576) as i64;
+        assert!(
+            (m.size_mb as i64 - mib).abs() <= 1,
+            "size_mb={} а файлы={mib} МиБ",
+            m.size_mb
+        );
+    }
+
+    /// Регрессия: GigaAM остаётся ПЕРВОЙ строкой list() (фронт рисует hero именно
+    /// по ней), Parakeet присутствует, installed отражает реальное состояние диска.
+    #[test]
+    fn list_keeps_gigaam_first_and_reports_parakeet() {
+        let l = list();
+        assert_eq!(l[0].name, GIGAAM_NAME);
+        let p = l
+            .iter()
+            .find(|m| m.name == PARAKEET_NAME)
+            .expect("parakeet-v3 в list()");
+        assert_eq!(p.kind, "parakeet");
+        assert_eq!(
+            p.installed,
+            crate::parakeet::dir_ready(&crate::paths::parakeet_dir())
+        );
+    }
+
+    /// Регрессия: имена каталожных ONNX-моделей не пересекаются с whisper-каталогом —
+    /// иначе delete/start_download свернули бы не туда.
+    #[test]
+    fn dir_model_names_do_not_collide_with_whisper() {
+        for m in DIR_MODELS {
+            assert!(
+                !CATALOG.iter().any(|e| e.name == m.name),
+                "коллизия имени {}",
+                m.name
+            );
+        }
+    }
 }

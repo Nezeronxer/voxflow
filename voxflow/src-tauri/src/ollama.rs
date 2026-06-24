@@ -142,8 +142,8 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
         return Err(anyhow!("Ollama недоступна по {url}: {}", err.trim()));
     }
 
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| anyhow!("ответ Ollama — не JSON: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("ответ Ollama — не JSON: {e}"))?;
 
     // Явная ошибка сервера (например, модель не установлена).
     if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
@@ -163,11 +163,15 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
     // переписанный текст — не инжектим монолог, а деградируем на текст после правил.
     if cleaned.is_empty() {
         log::warn!("Ollama вернул пустой текст; raw len={}", out.stdout.len());
-        return Err(anyhow!("Ollama вернул пустой ответ (нет текста в message.content)"));
+        return Err(anyhow!(
+            "Ollama вернул пустой ответ (нет текста в message.content)"
+        ));
     }
     if looks_like_reasoning(&cleaned, user) {
         log::warn!("Ollama: ответ похож на рассуждение/эхо промпта — деградация на правила");
-        return Err(anyhow!("Ollama: ответ не похож на переписанный текст (рефайн пропущен)"));
+        return Err(anyhow!(
+            "Ollama: ответ не похож на переписанный текст (рефайн пропущен)"
+        ));
     }
 
     Ok(cleaned)

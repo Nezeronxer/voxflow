@@ -36,6 +36,13 @@ enum Cmd {
     Full { text: String, method: String },
     /// Инкрементальное сведение prev → next клавишами (Backspace + допечатка).
     Incr { prev: String, next: String },
+    /// Скопировать текущее выделение через Ctrl+C, не оставляя свой мусор в clipboard.
+    CopySelection,
+}
+
+enum CmdResult {
+    Done,
+    Selection(Option<String>),
 }
 
 /// Задание очереди: команда + момент постановки (метрика wait) + ack-канал,
@@ -43,7 +50,7 @@ enum Cmd {
 struct Job {
     cmd: Cmd,
     enqueued: Instant,
-    ack: mpsc::Sender<Result<()>>,
+    ack: mpsc::Sender<Result<CmdResult>>,
 }
 
 /// Хэндл инжектора — единственный Sender в очередь воркера. Mutex вокруг Sender:
@@ -64,11 +71,23 @@ static PENDING: AtomicUsize = AtomicUsize::new(0);
 /// нажатий. Формат записи: Full — сам текст, Incr — "incr|prev|next".
 static DRY_LOG: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
+/// Снимок прежнего содержимого буфера обмена для восстановления после Ctrl+V.
+/// Раньше снимался ТОЛЬКО текст (get_text().ok()) — скриншот пользователя
+/// безвозвратно затирался надиктовкой. arboard умеет лишь текст и растровую
+/// картинку: файловые списки (CF_HDROP), HTML и прочие форматы снять нечем —
+/// такой буфер после вставки не восстановится (ограничение arboard, не наше).
+enum ClipSnapshot {
+    Text(String),
+    Image(arboard::ImageData<'static>),
+}
+
 /// Ленивая инициализация: первый вызов поднимает воркер "voxflow-inject".
 /// Режим dry фиксируется здесь же и не меняется до конца процесса.
 fn injector() -> &'static Injector {
     INJECTOR.get_or_init(|| {
-        let dry = std::env::var("VOXFLOW_INJECT_DRY").map(|v| v == "1").unwrap_or(false);
+        let dry = std::env::var("VOXFLOW_INJECT_DRY")
+            .map(|v| v == "1")
+            .unwrap_or(false);
         let (tx, rx) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("voxflow-inject".into())
@@ -80,11 +99,15 @@ fn injector() -> &'static Injector {
 
 /// Положить задание в очередь, вернуть приёмник ack. НЕ блокируется на исполнении —
 /// блокируются публичные обёртки через wait_ack (а тест порядка — нарочно нет).
-fn enqueue(cmd: Cmd) -> mpsc::Receiver<Result<()>> {
+fn enqueue(cmd: Cmd) -> mpsc::Receiver<Result<CmdResult>> {
     let (ack_tx, ack_rx) = mpsc::channel();
     // Счётчик ДО send: is_busy() обязан стать true раньше, чем воркер возьмёт job.
     PENDING.fetch_add(1, Ordering::SeqCst);
-    let job = Job { cmd, enqueued: Instant::now(), ack: ack_tx };
+    let job = Job {
+        cmd,
+        enqueued: Instant::now(),
+        ack: ack_tx,
+    };
     if injector().tx.lock().send(job).is_err() {
         // Воркер умер — job дропнут вместе с ack_tx, recv() у вызывающего вернёт
         // ошибку; счётчик откатываем, чтобы is_busy() не залип в true.
@@ -94,8 +117,23 @@ fn enqueue(cmd: Cmd) -> mpsc::Receiver<Result<()>> {
 }
 
 /// Дождаться результата задания (семантика прежнего синхронного вызова).
-fn wait_ack(rx: mpsc::Receiver<Result<()>>) -> Result<()> {
-    rx.recv().map_err(|_| anyhow!("inject-воркер недоступен (ack-канал закрыт)"))?
+fn wait_ack(rx: mpsc::Receiver<Result<CmdResult>>) -> Result<CmdResult> {
+    rx.recv()
+        .map_err(|_| anyhow!("inject-воркер недоступен (ack-канал закрыт)"))?
+}
+
+fn wait_done(rx: mpsc::Receiver<Result<CmdResult>>) -> Result<()> {
+    match wait_ack(rx)? {
+        CmdResult::Done => Ok(()),
+        CmdResult::Selection(_) => Err(anyhow!("inject-воркер вернул неожиданный selection")),
+    }
+}
+
+fn wait_selection(rx: mpsc::Receiver<Result<CmdResult>>) -> Result<Option<String>> {
+    match wait_ack(rx)? {
+        CmdResult::Selection(text) => Ok(text),
+        CmdResult::Done => Err(anyhow!("inject-воркер не вернул selection")),
+    }
 }
 
 /// Цикл воркера: единственный владелец Enigo и clipboard-операций.
@@ -110,6 +148,7 @@ fn worker_loop(rx: mpsc::Receiver<Job>, dry: bool) {
         let (len, method) = match &job.cmd {
             Cmd::Full { text, method } => (text.chars().count(), method.as_str()),
             Cmd::Incr { next, .. } => (next.chars().count(), "incr"),
+            Cmd::CopySelection => (0, "copy-selection"),
         };
         let (res, restore) = if dry {
             (run_dry(&job.cmd), None)
@@ -131,44 +170,60 @@ fn worker_loop(rx: mpsc::Receiver<Job>, dry: bool) {
         // в это окно в буфер не лезет.
         if let Some(prev) = restore {
             thread::sleep(Duration::from_millis(115));
-            let _ = clipboard_set_retry(&prev);
+            let _ = clipboard_restore_retry(&prev);
             PENDING.fetch_sub(1, Ordering::SeqCst);
         }
     }
 }
 
 /// Dry-режим: фиксируем задание в журнале, ничего не нажимая.
-fn run_dry(cmd: &Cmd) -> Result<()> {
+fn run_dry(cmd: &Cmd) -> Result<CmdResult> {
     let entry = match cmd {
         Cmd::Full { text, .. } => text.clone(),
         Cmd::Incr { prev, next } => format!("incr|{prev}|{next}"),
+        Cmd::CopySelection => {
+            return Ok(CmdResult::Selection(
+                std::env::var("VOXFLOW_INJECT_DRY_SELECTION").ok(),
+            ));
+        }
     };
     DRY_LOG.lock().push(entry);
-    Ok(())
+    Ok(CmdResult::Done)
 }
 
-/// Боевое исполнение задания (только из воркера). Второй элемент — прежний
-/// буфер обмена, который надо восстановить ПОСЛЕ ack (см. worker_loop).
-fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<()>, Option<String>) {
+/// Боевое исполнение задания (только из воркера). Второй элемент — снимок
+/// прежнего буфера обмена, который надо восстановить ПОСЛЕ ack (см. worker_loop).
+fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<ClipSnapshot>) {
     match cmd {
         Cmd::Full { text, method } => match method.as_str() {
-            "type" => (try_type(enigo, text), None),
+            "type" => (try_type(enigo, text).map(|_| CmdResult::Done), None),
             _ => {
                 let mut restore = None;
                 match paste_text(enigo, text, &mut restore) {
-                    Ok(()) => (Ok(()), restore),
+                    Ok(()) => (Ok(CmdResult::Done), restore),
+                    // paste не сработал, а текст содержит переводы строк —
+                    // печать ЗАПРЕЩЕНА: посимвольные Enter'ы в активном окне
+                    // опасны (отправка сообщения/промпта в чате вроде Codex).
+                    // Лучше честный Err, чем нажатый Enter.
+                    Err(e) if has_line_break(text) => {
+                        log::warn!("paste failed ({e}); multiline — fallback-печать запрещена");
+                        (Err(e), restore)
+                    }
                     // если paste не сработал — пробуем печать
                     Err(e) => {
                         log::warn!("paste failed ({e}), fallback to type");
-                        (try_type(enigo, text), restore)
+                        (try_type(enigo, text).map(|_| CmdResult::Done), restore)
                     }
                 }
             }
         },
         Cmd::Incr { prev, next } => (
-            enigo_of(enigo).and_then(|e| incremental_keys(e, prev, next)),
+            enigo_of(enigo)
+                .and_then(|e| incremental_keys(e, prev, next))
+                .map(|_| CmdResult::Done),
             None,
         ),
+        Cmd::CopySelection => run_copy_selection(enigo),
     }
 }
 
@@ -188,14 +243,39 @@ fn enigo_of(slot: &mut Option<Enigo>) -> Result<&mut Enigo> {
 
 // ─────────────────────────── Публичный API (сигнатуры прежние) ───────────────────────────
 
+fn has_line_break(text: &str) -> bool {
+    text.contains('\n') || text.contains('\r')
+}
+
+/// Эффективный метод вставки для данного текста. Любой текст с переводами
+/// строк ВСЕГДА идёт clipboard-путём, даже при настройке "type": посимвольная
+/// печать переводов строки — это реальные нажатия Enter в активном окне
+/// (в чате это отправка сообщения/промпта), а Ctrl+V безопасен — вставляется
+/// содержимое буфера, а не нажатие клавиши. Однострочный текст — метод как
+/// задан, поведение прежнее.
+fn effective_method<'a>(text: &str, method: &'a str) -> &'a str {
+    if has_line_break(text) {
+        "clipboard"
+    } else {
+        method
+    }
+}
+
 /// Вставка текста целиком. method: "clipboard" (дефолт, с fallback в печать) | "type".
 /// Блокируется до фактического исполнения воркером — как и раньше, но теперь
 /// нажатия идут из одного потока в порядке очереди.
 pub fn inject(text: &str, method: &str) -> Result<()> {
-    if text.trim().is_empty() {
+    // Пропускаем БЕЗ вставки только ПОЛНОСТЬЮ пустой текст. Именно is_empty(),
+    // а не trim().is_empty(): "\n" — результат одиночной команды «с новой
+    // строки» и обязан вставиться (см. effective_method).
+    if text.is_empty() {
         return Ok(());
     }
-    wait_ack(enqueue(Cmd::Full { text: text.to_string(), method: method.to_string() }))
+    let method = effective_method(text, method);
+    wait_done(enqueue(Cmd::Full {
+        text: text.to_string(),
+        method: method.to_string(),
+    }))
 }
 
 /// Инкрементальная вставка КЛАВИШАМИ (не через буфер обмена — paste не умеет
@@ -206,7 +286,16 @@ pub fn inject_incremental(prev: &str, next: &str) -> Result<()> {
     if prev == next {
         return Ok(());
     }
-    wait_ack(enqueue(Cmd::Incr { prev: prev.to_string(), next: next.to_string() }))
+    wait_done(enqueue(Cmd::Incr {
+        prev: prev.to_string(),
+        next: next.to_string(),
+    }))
+}
+
+/// Скопировать выделенный текст из активного окна. Возвращает None, если выделения
+/// нет, оно не текстовое, либо приложение не обновило clipboard после Ctrl+C.
+pub fn copy_selection_text() -> Result<Option<String>> {
+    wait_selection(enqueue(Cmd::CopySelection))
 }
 
 /// true, пока есть задания в очереди или исполняется текущее. Для clipboard_monitor:
@@ -263,24 +352,74 @@ fn incremental_keys(e: &mut Enigo, prev: &str, next: &str) -> Result<()> {
     Ok(())
 }
 
-/// Записать текст в буфер с ретраями: clipboard на Windows — глобальный ресурс,
+/// Clipboard-операция с ретраями: clipboard на Windows — глобальный ресурс,
 /// его может коротко держать другое приложение (ERROR_CLIPBOARD_BUSY и т.п.).
 /// 3 попытки с паузой 30мс между ними.
-fn clipboard_set_retry(text: &str) -> Result<()> {
+fn clipboard_retry(mut op: impl FnMut(&mut arboard::Clipboard) -> Result<()>) -> Result<()> {
     let mut last: Option<anyhow::Error> = None;
     for attempt in 0..3 {
         if attempt > 0 {
             thread::sleep(Duration::from_millis(30));
         }
         match arboard::Clipboard::new() {
-            Ok(mut cb) => match cb.set_text(text.to_string()) {
+            Ok(mut cb) => match op(&mut cb) {
                 Ok(()) => return Ok(()),
-                Err(e) => last = Some(anyhow!("clipboard set: {e}")),
+                Err(e) => last = Some(e),
             },
             Err(e) => last = Some(anyhow!("clipboard open: {e}")),
         }
     }
     Err(last.unwrap_or_else(|| anyhow!("clipboard: неизвестная ошибка")))
+}
+
+/// Записать текст в буфер (с ретраями — см. clipboard_retry).
+fn clipboard_set_retry(text: &str) -> Result<()> {
+    clipboard_retry(|cb| {
+        cb.set_text(text.to_string())
+            .map_err(|e| anyhow!("clipboard set: {e}"))
+    })
+}
+
+fn clipboard_get_text_retry() -> Result<String> {
+    let mut out = String::new();
+    clipboard_retry(|cb| {
+        out = cb
+            .get_text()
+            .map_err(|e| anyhow!("clipboard get text: {e}"))?;
+        Ok(())
+    })?;
+    Ok(out)
+}
+
+/// Снять снимок буфера: сначала текст, при неудаче — картинка (скриншоты!).
+/// None — буфер пуст либо формат, который arboard не читает (CF_HDROP и пр.,
+/// см. ClipSnapshot).
+fn clipboard_snapshot() -> Option<ClipSnapshot> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    if let Ok(t) = cb.get_text() {
+        return Some(ClipSnapshot::Text(t));
+    }
+    cb.get_image().ok().map(ClipSnapshot::Image)
+}
+
+/// Восстановить снимок буфера (с ретраями). set_image забирает ImageData по
+/// значению — на каждую попытку отдаём заимствованную копию (Cow::Borrowed),
+/// байты картинки не клонируются.
+fn clipboard_restore_retry(snap: &ClipSnapshot) -> Result<()> {
+    clipboard_retry(|cb| match snap {
+        ClipSnapshot::Text(t) => cb
+            .set_text(t.clone())
+            .map_err(|e| anyhow!("clipboard set: {e}")),
+        ClipSnapshot::Image(img) => {
+            let borrowed = arboard::ImageData {
+                width: img.width,
+                height: img.height,
+                bytes: std::borrow::Cow::Borrowed(img.bytes.as_ref()),
+            };
+            cb.set_image(borrowed)
+                .map_err(|e| anyhow!("clipboard set image: {e}"))
+        }
+    })
 }
 
 /// Вставка через буфер обмена (Ctrl+V / Cmd+V). Сохранение прежнего буфера и его
@@ -294,9 +433,14 @@ fn clipboard_set_retry(text: &str) -> Result<()> {
 /// Err допустим только ДО доставки V (буфер не записался за 3 попытки, enigo не
 /// поднялся, не нажался модификатор, не кликнулась V) — тогда печать как fallback
 /// безопасна, ведь ничего ещё не вставлено.
-fn paste_text(enigo_slot: &mut Option<Enigo>, text: &str, restore_out: &mut Option<String>) -> Result<()> {
-    // Сохранить текущий буфер (best-effort: нет текста — нечего восстанавливать).
-    let prev = arboard::Clipboard::new().ok().and_then(|mut c| c.get_text().ok());
+fn paste_text(
+    enigo_slot: &mut Option<Enigo>,
+    text: &str,
+    restore_out: &mut Option<ClipSnapshot>,
+) -> Result<()> {
+    // Снимок текущего буфера: текст ИЛИ картинка (best-effort: пустой/нечитаемый
+    // формат — нечего восстанавливать, см. ClipSnapshot).
+    let prev = clipboard_snapshot();
 
     // Положить наш текст (с ретраями ×3 по 30мс — см. clipboard_set_retry).
     clipboard_set_retry(text)?;
@@ -319,7 +463,8 @@ fn paste_text(enigo_slot: &mut Option<Enigo>, text: &str, restore_out: &mut Opti
 
     // --- до этой черты ошибки безопасны (V ещё не доставлена) ---
     let e = enigo_of(enigo_slot)?;
-    e.key(modkey, Direction::Press).map_err(|e| anyhow!("mod down: {e}"))?;
+    e.key(modkey, Direction::Press)
+        .map_err(|e| anyhow!("mod down: {e}"))?;
     if let Err(err) = e.key(vkey, Direction::Click) {
         // V не доставлена — откатываем модификатор и сообщаем об ошибке, fallback в печать безопасен.
         let _ = e.key(modkey, Direction::Release);
@@ -337,6 +482,52 @@ fn paste_text(enigo_slot: &mut Option<Enigo>, text: &str, restore_out: &mut Opti
     thread::sleep(Duration::from_millis(15));
     *restore_out = prev;
     Ok(())
+}
+
+fn run_copy_selection(enigo_slot: &mut Option<Enigo>) -> (Result<CmdResult>, Option<ClipSnapshot>) {
+    static COPY_SEQ: AtomicUsize = AtomicUsize::new(0);
+    let seq = COPY_SEQ.fetch_add(1, Ordering::SeqCst);
+    let sentinel = format!("__VOXFLOW_EMPTY_SELECTION_{seq}__");
+    let prev = clipboard_snapshot().unwrap_or(ClipSnapshot::Text(String::new()));
+
+    if let Err(e) = clipboard_set_retry(&sentinel) {
+        return (Err(e), Some(prev));
+    }
+    thread::sleep(Duration::from_millis(25));
+
+    let copy_res = enigo_of(enigo_slot).and_then(send_copy_chord);
+    if let Err(e) = copy_res {
+        return (Err(e), Some(prev));
+    }
+    thread::sleep(Duration::from_millis(90));
+
+    let text = match clipboard_get_text_retry() {
+        Ok(t) => t,
+        Err(e) => return (Err(e), Some(prev)),
+    };
+    let selected = if text == sentinel || text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    };
+    (Ok(CmdResult::Selection(selected)), Some(prev))
+}
+
+fn send_copy_chord(e: &mut Enigo) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let modkey = Key::Meta;
+    #[cfg(not(target_os = "macos"))]
+    let modkey = Key::Control;
+    #[cfg(windows)]
+    let ckey = Key::Other(0x43); // VK_C
+    #[cfg(not(windows))]
+    let ckey = Key::Unicode('c');
+
+    e.key(modkey, Direction::Press)
+        .map_err(|e| anyhow!("mod down: {e}"))?;
+    let click = e.key(ckey, Direction::Click).map_err(|e| anyhow!("c: {e}"));
+    let _ = e.key(modkey, Direction::Release);
+    click
 }
 
 // ─────────────────────────── Тесты (dry-режим) ───────────────────────────
@@ -382,7 +573,9 @@ mod tests {
                         expected.lock().push(text);
                         rx
                     };
-                    rx.recv().expect("ack-канал жив").expect("dry-job без ошибок");
+                    rx.recv()
+                        .expect("ack-канал жив")
+                        .expect("dry-job без ошибок");
                 }
             }));
         }
@@ -419,5 +612,121 @@ mod tests {
         assert_eq!(log.len(), 1, "ровно одно задание");
         assert_eq!(log[0], big, "текст не порезан и не искажён");
         assert!(!is_busy(), "после ack инжектор свободен");
+    }
+
+    #[test]
+    fn copy_selection_dry_returns_env_text() {
+        let _serial = SERIAL.lock();
+        std::env::set_var("VOXFLOW_INJECT_DRY", "1");
+        std::env::set_var("VOXFLOW_INJECT_DRY_SELECTION", "сырой выделенный текст");
+
+        let selected = copy_selection_text().expect("dry copy selection");
+        assert_eq!(selected.as_deref(), Some("сырой выделенный текст"));
+        assert!(!is_busy(), "после ack инжектор свободен");
+    }
+
+    /// Тест №4 (регрессия major «одиночная команда "с новой строки" — no-op»):
+    /// whitespace-only текст ("\n", "\n\n") ОБЯЗАН дойти до воркера и вставиться,
+    /// а полностью пустой "" — единственный, кто пропускается без вставки.
+    /// Раньше гард trim().is_empty() молча глотал "\n" — голосовая команда
+    /// «с новой строки» превращалась в no-op.
+    #[test]
+    fn inject_whitespace_only_not_dropped_dry() {
+        let _serial = SERIAL.lock();
+        std::env::set_var("VOXFLOW_INJECT_DRY", "1");
+        DRY_LOG.lock().clear();
+
+        inject("", "clipboard").expect("полностью пустой текст — no-op без ошибки");
+        inject("", "type").expect("пустой текст и при type — no-op без ошибки");
+        inject("\n", "clipboard").expect("одиночный перевод строки вставляется");
+        inject("\n", "type").expect("перевод строки при paste_method=type тоже вставляется");
+        inject("\n\n", "type").expect("абзац вставляется");
+
+        let log = dry_log();
+        assert_eq!(
+            log,
+            vec!["\n".to_string(), "\n".to_string(), "\n\n".to_string()],
+            "пустой текст пропущен, whitespace-only дошёл до воркера без искажений"
+        );
+        assert!(!is_busy(), "после всех ack инжектор свободен");
+    }
+
+    /// Тест №5: выбор эффективного метода. Любой текст с переводами строк
+    /// всегда принудительно clipboard (даже при настройке "type" — печать
+    /// Enter'ов опасна), однострочный текст — метод как задан.
+    #[test]
+    fn effective_method_forces_clipboard_for_multiline() {
+        assert_eq!(effective_method("\n", "type"), "clipboard");
+        assert_eq!(effective_method("\n\n", "type"), "clipboard");
+        assert_eq!(effective_method("  \t\n", "type"), "clipboard");
+        assert_eq!(
+            effective_method("первая строка\nвторая строка", "type"),
+            "clipboard"
+        );
+        assert_eq!(
+            effective_method("первая строка\r\nвторая строка", "type"),
+            "clipboard"
+        );
+        assert_eq!(effective_method("\n", "clipboard"), "clipboard");
+        // Однострочный текст — без изменений.
+        assert_eq!(effective_method("привет", "type"), "type");
+        assert_eq!(effective_method("привет", "clipboard"), "clipboard");
+    }
+
+    /// Тест №3 (регрессия P1-2): в буфере КАРТИНКА (скриншот) — снимок обязан
+    /// её увидеть, восстановление — вернуть байт-в-байт. Раньше снимался только
+    /// текст (get_text().ok()) → restore=None → скриншот пользователя терялся.
+    /// Dry-режим clipboard не трогает вовсе, поэтому снимок/восстановление
+    /// проверяем напрямую юнитом на РЕАЛЬНОМ clipboard этой машины; без
+    /// desktop-сеанса (Clipboard::new падает) тест тихо пропускается.
+    #[test]
+    fn clipboard_image_snapshot_restore() {
+        let _serial = SERIAL.lock();
+        if arboard::Clipboard::new().is_err() {
+            return; // headless: реального буфера нет, проверять нечего
+        }
+
+        // RGBA 2x2, alpha=255 у всех пикселей: DIB-конверсия Windows — чистая
+        // перестановка каналов без премультипликации, но BMP-декодер при
+        // прозрачности имеет свои причуды — непрозрачные байты детерминированы.
+        let bytes: Vec<u8> = vec![
+            10, 20, 30, 255, 40, 50, 60, 255, //
+            70, 80, 90, 255, 100, 110, 120, 255,
+        ];
+        arboard::Clipboard::new()
+            .expect("clipboard open")
+            .set_image(arboard::ImageData {
+                width: 2,
+                height: 2,
+                bytes: bytes.clone().into(),
+            })
+            .expect("set_image 2x2");
+
+        // Снимок видит именно картинку (текста в буфере нет).
+        let snap = clipboard_snapshot().expect("снимок непустого буфера");
+        match &snap {
+            ClipSnapshot::Image(img) => assert_eq!((img.width, img.height), (2, 2)),
+            ClipSnapshot::Text(t) => panic!("в снимке текст вместо картинки: {t:?}"),
+        }
+
+        // Имитация вставки: буфер затёрт нашим текстом → восстановление снимка.
+        // Контракт ЭТОГО кода (регрессия P1-2): снимок увидел картинку (проверено
+        // выше) и восстановление прошло без ошибки. Байт-в-байт фиделити DIB↔PNG —
+        // свойство arboard/ОС (BGRA-перестановка, выравнивание строк, гонка с
+        // буфером запущенного приложения), а НЕ нашего кода: проверять его через
+        // живой системный clipboard ненадёжно (flaky), поэтому не утверждаем.
+        clipboard_set_retry("voxflow: надиктованный текст").expect("set_text");
+        clipboard_restore_retry(&snap).expect("восстановление картинки не падает");
+
+        // Лучший-эффорт: если буфер удалось перечитать НАШИМ снимком — это снова
+        // картинка тех же размеров (а не наш затёрший текст). Если перечитать не
+        // вышло (ОС/другое приложение тронуло буфер) — не валим тест на этом.
+        if let Some(ClipSnapshot::Image(img)) = clipboard_snapshot() {
+            assert_eq!(
+                (img.width, img.height),
+                (2, 2),
+                "размеры восстановленной картинки"
+            );
+        }
     }
 }

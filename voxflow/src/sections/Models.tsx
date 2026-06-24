@@ -42,6 +42,90 @@ function fmtEta(sec: number): string {
   return `осталось ${m}:${String(s % 60).padStart(2, "0")}`;
 }
 
+// Hero-карточка каталожной ONNX-модели (GigaAM/Parakeet): статус, суммарный
+// прогресс со скоростью/ETA, скачать/удалить. Логика и классы общие — карточки
+// различаются только данными.
+function HeroModelCard({
+  model,
+  prog,
+  subtitle,
+  onDownload,
+  onDelete,
+}: {
+  model: ModelInfo;
+  prog?: Progress;
+  subtitle: string;
+  onDownload: (name: string) => void;
+  onDelete: (name: string) => void;
+}) {
+  const dl = prog && !prog.error ? prog : undefined;
+  const pct =
+    dl && dl.total > 0
+      ? Math.min(100, Math.round((dl.received / dl.total) * 100))
+      : 0;
+  return (
+    <div className="card" style={{ borderColor: "var(--border-strong)" }}>
+      <div className="model-row" style={{ borderBottom: "none" }}>
+        <div className="model-icon">
+          <Icon.Cube />
+        </div>
+        <div className="model-info">
+          <div className="model-name">
+            {model.label}{" "}
+            {model.installed && <span className="badge ok">✓ Установлена</span>}
+          </div>
+          <div className="model-size">
+            {subtitle} · {fmtSize(model.size_mb)}
+            {prog?.error ? (
+              <span style={{ color: "var(--red)", marginLeft: 8 }}>
+                {prog.error}
+              </span>
+            ) : null}
+          </div>
+        </div>
+
+        {dl ? (
+          <div
+            className="progress-wrap"
+            style={{ flexDirection: "column", alignItems: "flex-end", gap: 6 }}
+          >
+            <div className="progress-wrap">
+              <div className="progress">
+                <div className="bar" style={{ width: `${pct}%` }} />
+              </div>
+              <span className="progress-pct">{pct}%</span>
+            </div>
+            {/* «12 МБ/с · осталось 0:18» — скорость EMA + ETA по ней */}
+            {dl.speed && dl.eta !== undefined ? (
+              <span className="model-size">
+                {fmtSpeed(dl.speed)} · {fmtEta(dl.eta)}
+              </span>
+            ) : (
+              <span className="model-size">скачивание…</span>
+            )}
+          </div>
+        ) : model.installed ? (
+          <button
+            className="btn btn-sm btn-danger"
+            onClick={() => onDelete(model.name)}
+            title="Удалить"
+          >
+            <Icon.Trash className="ico" />
+          </button>
+        ) : (
+          <button
+            className="btn btn-sm btn-primary"
+            onClick={() => onDownload(model.name)}
+          >
+            <Icon.Download className="ico" />
+            Скачать
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
+
 export default function Models({
   settings,
   update,
@@ -136,17 +220,13 @@ export default function Models({
     refresh();
   }
 
-  // Бэкенд кладёт GigaAM первой строкой (kind:"gigaam"); рисуем её отдельной
-  // hero-карточкой, остальное (whisper) — привычным списком ниже.
+  // Бэкенд кладёт каталожные ONNX-модели первыми строками (kind:"gigaam"/"parakeet");
+  // рисуем их hero-карточками, остальное (whisper) — привычным списком ниже.
   const giga = models.find((m) => m.kind === "gigaam");
-  const whisperModels = models.filter((m) => m.kind !== "gigaam");
-
-  const gigaProg = giga ? progress[giga.name] : undefined;
-  const gigaDownloading = !!gigaProg && !gigaProg.error;
-  const gigaPct =
-    gigaProg && gigaProg.total > 0
-      ? Math.min(100, Math.round((gigaProg.received / gigaProg.total) * 100))
-      : 0;
+  const para = models.find((m) => m.kind === "parakeet");
+  const whisperModels = models.filter(
+    (m) => m.kind !== "gigaam" && m.kind !== "parakeet"
+  );
 
   return (
     <div className="content-inner">
@@ -178,80 +258,49 @@ export default function Models({
         </div>
       )}
 
-      {/* ── Hero-карточка GigaAM: основная русская модель, ставится/удаляется здесь ── */}
-      {giga && (
-        <div
-          className="card"
-          style={{ borderColor: "var(--border-strong)" }}
-        >
-          <div className="model-row" style={{ borderBottom: "none" }}>
-            <div className="model-icon">
-              <Icon.Cube />
-            </div>
-            <div className="model-info">
-              <div className="model-name">
-                {giga.label}{" "}
-                {giga.installed && (
-                  <span className="badge ok">✓ Установлена</span>
-                )}
-              </div>
-              <div className="model-size">
-                Русская речь, пунктуация, офлайн на CPU ·{" "}
-                {fmtSize(giga.size_mb)}
-                {gigaProg?.error ? (
-                  <span style={{ color: "var(--red)", marginLeft: 8 }}>
-                    {gigaProg.error}
-                  </span>
-                ) : null}
-              </div>
-            </div>
-
-            {gigaDownloading ? (
-              <div className="progress-wrap" style={{ flexDirection: "column", alignItems: "flex-end", gap: 6 }}>
-                <div className="progress-wrap">
-                  <div className="progress">
-                    <div className="bar" style={{ width: `${gigaPct}%` }} />
-                  </div>
-                  <span className="progress-pct">{gigaPct}%</span>
-                </div>
-                {/* «12 МБ/с · осталось 0:18» — скорость EMA + ETA по ней */}
-                {gigaProg.speed && gigaProg.eta !== undefined ? (
-                  <span className="model-size">
-                    {fmtSpeed(gigaProg.speed)} · {fmtEta(gigaProg.eta)}
-                  </span>
-                ) : (
-                  <span className="model-size">скачивание…</span>
-                )}
-              </div>
-            ) : giga.installed ? (
-              <button
-                className="btn btn-sm btn-danger"
-                onClick={() => onDelete(giga.name)}
-                title="Удалить"
-              >
-                <Icon.Trash className="ico" />
-              </button>
-            ) : (
-              <button
-                className="btn btn-sm btn-primary"
-                onClick={() => onDownload(giga.name)}
-              >
-                <Icon.Download className="ico" />
-                Скачать
-              </button>
-            )}
+      {/* Подсказка: для EN/авто нужен Parakeet — мягкий call-to-action. */}
+      {(settings.language === "en" || settings.language === "auto") &&
+        para &&
+        !para.installed && (
+          <div className="toast" role="status">
+            <span className="toast-msg">
+              Для английского и автоопределения языка скачайте модель Parakeet
+              TDT v3 ниже — без неё английская речь распознаётся запасным
+              Whisper.
+            </span>
           </div>
-        </div>
+        )}
+
+      {/* ── Hero-карточка GigaAM: основная русская модель ── */}
+      {giga && (
+        <HeroModelCard
+          model={giga}
+          prog={progress[giga.name]}
+          subtitle="Русская речь, пунктуация, офлайн на CPU"
+          onDownload={onDownload}
+          onDelete={onDelete}
+        />
       )}
 
-      {/* ── Whisper: запасной движок; выбор активной модели (settings.model) как раньше ── */}
+      {/* ── Hero-карточка Parakeet: английский + автоопределение языка ── */}
+      {para && (
+        <HeroModelCard
+          model={para}
+          prog={progress[para.name]}
+          subtitle="Английский и ещё 24 языка, автоопределение, офлайн на CPU"
+          onDownload={onDownload}
+          onDelete={onDelete}
+        />
+      )}
+
+      {/* ── Whisper: универсальный локальный движок; выбор активной модели как раньше ── */}
       <div className="card">
         <div className="card-head">
           <div className="card-title">
-            Whisper (английский / запасной движок)
+            Whisper (все языки)
           </div>
           <div className="sub">
-            Используется, когда движок переключён на Whisper
+            Универсальная локальная модель для auto и языков вне быстрых RU/EN маршрутов
           </div>
         </div>
 
@@ -334,27 +383,40 @@ export default function Models({
         <div className="card-head">
           <div className="card-title">Параметры распознавания</div>
         </div>
-        <Field label="Язык" hint="Язык речи для модели распознавания">
+        <Field label="Язык" hint="Auto подходит для смешанной речи и остальных языков. RU/EN используют быстрые локальные модели, остальные языки идут через локальный whisper-server или выбранный облачный STT.">
           <Select
             value={settings.language}
             onChange={(v) => update({ language: v })}
             options={[
+              { value: "auto", label: "Все языки (авто)" },
               { value: "ru", label: "Русский" },
               { value: "en", label: "English" },
-              { value: "auto", label: "Авто" },
+              { value: "uk", label: "Українська" },
+              { value: "de", label: "Deutsch" },
+              { value: "fr", label: "Français" },
+              { value: "es", label: "Español" },
+              { value: "it", label: "Italiano" },
+              { value: "pt", label: "Português" },
+              { value: "pl", label: "Polski" },
+              { value: "tr", label: "Türkçe" },
+              { value: "zh", label: "中文" },
+              { value: "ja", label: "日本語" },
+              { value: "ko", label: "한국어" },
+              { value: "ar", label: "العربية" },
+              { value: "hi", label: "हिन्दी" },
             ]}
           />
         </Field>
         <Field
           label="Движок"
-          hint="GigaAM — русская модель, быстро на CPU. Whisper Server — модель в памяти (быстрые повторы). Whisper CLI — грузит модель каждый раз."
+          hint="Авто-локальный — быстрый RU/EN через GigaAM/Parakeet. Whisper Server держит универсальную модель в памяти для всех языков. Whisper CLI грузит модель каждый раз."
         >
           <Select
             value={settings.engine}
             onChange={(v) => update({ engine: v })}
             options={[
-              { value: "gigaam", label: "GigaAM (русский, рекомендуется)" },
-              { value: "whisper_server", label: "Whisper Server (быстро)" },
+              { value: "gigaam", label: "Авто-локальный RU/EN (быстро)" },
+              { value: "whisper_server", label: "Whisper Server (все языки)" },
               { value: "whisper_cli", label: "Whisper CLI (медленнее)" },
             ]}
           />

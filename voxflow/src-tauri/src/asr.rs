@@ -41,9 +41,11 @@ pub struct AsrParams<'a> {
 pub fn transcribe_cli(p: &AsrParams) -> anyhow::Result<String> {
     // Имя бинарника зависит от платформы; соседние DLL подхватываются
     // за счёт `current_dir(whisper_dir)`.
-    let exe = p
-        .whisper_dir
-        .join(if cfg!(windows) { "whisper-cli.exe" } else { "whisper-cli" });
+    let exe = p.whisper_dir.join(if cfg!(windows) {
+        "whisper-cli.exe"
+    } else {
+        "whisper-cli"
+    });
 
     let mut cmd = Command::new(&exe);
     cmd.current_dir(p.whisper_dir);
@@ -249,14 +251,12 @@ pub fn transcribe_server(
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow!("curl /inference: {e}"))?;
+    let out = cmd.output().map_err(|e| anyhow!("curl /inference: {e}"))?;
     if !out.status.success() {
         return Err(anyhow!("whisper-server /inference: код {}", out.status));
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    Ok(parse_verbose(&raw))
+    Ok(parse_verbose(&raw, language))
 }
 
 /// Транскрибировать WAV через whisper-server БЕЗ гейта уверенности.
@@ -265,11 +265,7 @@ pub fn transcribe_server(
 /// мы показываем его в пилюле серым и (опционально) вставляем инкрементально,
 /// но НЕ применяем порог уверенности (его место — финальный проход).
 /// Таймаут короче (10 c), чтобы зависший тик не блокировал петлю надолго.
-pub fn transcribe_server_partial(
-    port: u16,
-    wav: &Path,
-    language: &str,
-) -> anyhow::Result<String> {
+pub fn transcribe_server_partial(port: u16, wav: &Path, language: &str) -> anyhow::Result<String> {
     let url = format!("http://127.0.0.1:{port}/inference");
     let file_arg = format!("file=@{}", wav.display());
     let lang_arg = format!("language={language}");
@@ -391,7 +387,7 @@ pub fn dedup_repeats(text: &str) -> String {
 
 /// Разобрать verbose_json и применить гейт уверенности.
 /// Возвращает текст, ТОЛЬКО если модель уверена; иначе пустую строку (не вставляем мусор).
-fn parse_verbose(json: &str) -> String {
+fn parse_verbose(json: &str, requested_language: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(json.trim()) {
         Ok(v) => v,
         Err(_) => return clean_server_text(json), // не JSON — вернём как есть
@@ -428,13 +424,15 @@ fn parse_verbose(json: &str) -> String {
         }
     }
 
-    let det_lang = v.get("detected_language").and_then(|x| x.as_str()).unwrap_or("");
+    let det_lang = v
+        .get("detected_language")
+        .and_then(|x| x.as_str())
+        .unwrap_or("");
     let det_prob = v
         .get("detected_language_probability")
         .and_then(|x| x.as_f64())
         .unwrap_or(0.0);
-    let lang_mismatch =
-        !det_lang.is_empty() && det_lang != "russian" && det_lang != "ru" && det_prob > 0.60;
+    let lang_mismatch = language_mismatch(requested_language, det_lang, det_prob);
 
     let (mean, frac_low) = if probs.is_empty() {
         (1.0, 0.0)
@@ -458,18 +456,40 @@ fn parse_verbose(json: &str) -> String {
         0.0
     };
 
-    let reject = mean < MIN_MEAN_PROB
-        || frac_low > MAX_LOW_FRAC
-        || nsp_reject
-        || lang_mismatch;
+    let reject = mean < MIN_MEAN_PROB || frac_low > MAX_LOW_FRAC || nsp_reject || lang_mismatch;
 
     if reject || text.is_empty() {
         log::info!(
-            "ASR отклонён: mean={mean:.2} frac_low={frac_low:.2} nsp_frac={nsp_frac:.2} ({nsp_high}/{seg_count}) lang={det_lang}/{det_prob:.2} text={text:?}"
+            "ASR отклонён: mean={mean:.2} frac_low={frac_low:.2} nsp_frac={nsp_frac:.2} ({nsp_high}/{seg_count}) req_lang={requested_language} lang={det_lang}/{det_prob:.2} text={text:?}"
         );
         return String::new();
     }
     text
+}
+
+fn canonical_gate_language(language: &str) -> Option<&'static str> {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "ru" | "russian" => Some("ru"),
+        "en" | "english" => Some("en"),
+        _ => None,
+    }
+}
+
+fn language_mismatch(
+    requested_language: &str,
+    detected_language: &str,
+    detected_probability: f64,
+) -> bool {
+    if detected_probability <= 0.60 || detected_language.trim().is_empty() {
+        return false;
+    }
+    let Some(requested) = canonical_gate_language(requested_language) else {
+        return false;
+    };
+    match canonical_gate_language(detected_language) {
+        Some(detected) => detected != requested,
+        None => true,
+    }
 }
 
 /// Сервер может вернуть text или json {"text":"..."} — нормализуем в чистый текст.
@@ -488,4 +508,20 @@ fn clean_server_text(s: &str) -> String {
         }
     }
     t.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn language_gate_respects_auto_and_manual_ru_en() {
+        assert!(!language_mismatch("auto", "english", 0.95));
+        assert!(!language_mismatch("de", "german", 0.95));
+        assert!(!language_mismatch("ru", "russian", 0.95));
+        assert!(!language_mismatch("en", "english", 0.95));
+        assert!(language_mismatch("ru", "english", 0.95));
+        assert!(language_mismatch("en", "russian", 0.95));
+        assert!(!language_mismatch("ru", "english", 0.40));
+    }
 }

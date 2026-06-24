@@ -10,6 +10,7 @@
 //   stream — пришёл partial с текстом: до 400×~140, посимвольная печать (rAF);
 //   trans  — пилюля scale(.96), кольцо-спиннер поверх орба;
 //   done   — галочка на 900 мс после расшифровки → плавно обратно в idle;
+//   latch  — подтверждение двойного тапа: запись зафиксирована без удержания;
 //   notice — краткое предупреждение (no_model / error) поверх любого состояния.
 //
 // Переходы геометрии — CSS-«пружина» cubic-bezier(0.22,1.2,0.36,1) 140 мс:
@@ -29,10 +30,21 @@ import type {
   SttModeEvent,
   LevelEvent,
   ErrorEvent as EngineErrorEvent,
+  HotkeyLatchEvent,
 } from "./types";
 
 // Режим пилюли = статус бэкенда + локальные надстройки (stream/done/notice).
-type PillMode = "idle" | "rec" | "stream" | "trans" | "done" | "notice";
+type PillMode = "idle" | "rec" | "stream" | "trans" | "done" | "latch" | "notice";
+
+// Контракт мультиязычности (RU/EN/auto): события "partial" и "status" МОГУТ
+// нести опциональное поле lang: "ru" | "en" | null — язык, определённый STT.
+// Бэкенд начнёт слать его следующей волной; до неё (и при lang:null) фронт
+// работает как раньше — бейдж просто скрыт. types.ts правит другая волна,
+// поэтому расширение типизировано локально, поверх существующих контрактов.
+type DetectedLang = "ru" | "en" | null;
+type PartialWithLang = PartialEvent & { lang?: DetectedLang };
+// "status": legacy-строка (текущий бэкенд) ЛИБО объект { status, lang }.
+type StatusPayload = string | { status?: string; lang?: DetectedLang };
 
 // Желаемый размер overlay-окна под каждый режим (ЛОГИЧЕСКИЕ px): пилюля + поля
 // под glow/тень; для idle/done — запас под hover-рост (80×20) и тултип сверху.
@@ -43,6 +55,7 @@ const BOX: Record<PillMode, { w: number; h: number }> = {
   trans: { w: 140, h: 64 },
   stream: { w: 424, h: 168 },
   done: { w: 220, h: 80 }, // как idle — меньше дёрганий окна при переходе done→idle
+  latch: { w: 300, h: 82 },
   notice: { w: 424, h: 92 },
 };
 
@@ -69,9 +82,14 @@ export default function Overlay() {
   // («выберите модель» / ошибка движка) в всегда-видимой пилюле (~3 c).
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [latchNotice, setLatchNotice] = useState<HotkeyLatchEvent | null>(null);
+  const latchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // D: метка «оффлайн» — облако было недоступно, сработал авто-fallback на
   // локальный whisper ("stt_mode" offline=true). Сбрасывается на новой записи.
   const [offline, setOffline] = useState(false);
+  // Язык текущей диктовки от бэкенда (lang в "partial"/"status"). null =
+  // не определён / старый бэкенд без поля → бейдж скрыт. Сброс на новой записи.
+  const [lang, setLang] = useState<DetectedLang>(null);
 
   // Плавный поток ПОСИМВОЛЬНО (как у Aqua Voice). partial-тики приходят рывками раз
   // в ~700 мс целыми кусками; чтобы текст «втекал» непрерывно, а бегущий кружок-каретка
@@ -281,9 +299,26 @@ export default function Overlay() {
         doneTimer.current = null;
       }
     };
+    const clearLatch = () => {
+      if (latchTimer.current) {
+        clearTimeout(latchTimer.current);
+        latchTimer.current = null;
+      }
+      setLatchNotice(null);
+    };
 
-    const offStatus = subscribe<string>("status", (e) => {
-      const v = e.payload;
+    // Применить lang из события: поля нет (undefined) — старый бэкенд, ничего
+    // не меняем; null/незнакомое значение — язык не определён, бейдж прячем.
+    const applyLang = (l: DetectedLang | undefined) => {
+      if (l === undefined) return;
+      setLang(l === "ru" || l === "en" ? l : null);
+    };
+
+    const offStatus = subscribe<StatusPayload>("status", (e) => {
+      // Совместимость: текущий бэкенд шлёт строку, следующая волна МОЖЕТ слать
+      // объект { status, lang } — принимаем оба варианта (см. StatusPayload).
+      const p = e.payload;
+      const v = typeof p === "string" ? p : p?.status;
       if (v !== "recording" && v !== "transcribing" && v !== "idle") return;
       const prev = statusRef.current;
       statusRef.current = v;
@@ -295,6 +330,8 @@ export default function Overlay() {
         clearDone();
         setDone(false);
         setOffline(false);
+        // Язык прошлой диктовки не «бликует» в новой: бейдж скрыт до первого lang.
+        setLang(null);
         // Дедуп по seq порог здесь НЕ трогаем (счётчик монотонный): у новой диктовки
         // seq строго больше, её партиалы пройдут сами, а эхо прошлой отфильтруется.
         resetTextEngine();
@@ -311,6 +348,7 @@ export default function Overlay() {
         kickLevel();
       } else {
         // idle. Если завершилась расшифровка — 900 мс галочка, затем мини-пилюля.
+        clearLatch();
         if (prev === "transcribing") {
           clearDone();
           setDone(true);
@@ -322,9 +360,12 @@ export default function Overlay() {
         resetTextEngine();
         kickLevel(); // дать спрингам опасть, цикл сам заснёт
       }
+      // lang из самого события (если бэкенд прислал) — ПОСЛЕ сброса на recording,
+      // чтобы lang, пришедший вместе со стартом записи, не был тут же затёрт.
+      applyLang(typeof p === "object" && p !== null ? p.lang : undefined);
     });
 
-    const offPartial = subscribe<PartialEvent>("partial", (e) => {
+    const offPartial = subscribe<PartialWithLang>("partial", (e) => {
       // Дедуп: партиал старее текущей диктовки — это эхо прошлой записи (StrictMode/
       // async-гонки), игнорируем. seq константен внутри диктовки (= поколение) и строго
       // растёт между ними, поэтому "<" пропускает все партиалы текущей и режет эхо прошлой.
@@ -333,6 +374,9 @@ export default function Overlay() {
         if (seq < currentSeqRef.current) return;
         currentSeqRef.current = seq;
       }
+      // Язык от STT (опционален): обновляем после дедупа — эхо прошлой записи
+      // не перетирает бейдж текущей. setState с тем же значением React гасит сам.
+      applyLang(e.payload?.lang);
       const committed = (e.payload.committed ?? "").trim();
       const volatileTail = (e.payload.volatile ?? "").trim();
       // Фоллбэк для старого бэкенда без committed/volatile: весь text как volatile.
@@ -379,6 +423,19 @@ export default function Overlay() {
       noticeTimer.current = setTimeout(() => setNotice(null), 3000);
     });
 
+    const offHotkeyLatch = subscribe<HotkeyLatchEvent>("hotkey_latch", (e) => {
+      const payload = e.payload ?? {};
+      setLatchNotice({
+        message: payload.message || "Режим без удержания",
+        detail: payload.detail || "Двойное нажатие",
+      });
+      if (latchTimer.current) clearTimeout(latchTimer.current);
+      latchTimer.current = setTimeout(() => {
+        latchTimer.current = null;
+        setLatchNotice(null);
+      }, 1150);
+    });
+
     // D: какой STT реально отработал диктовку. offline=true → облако было недоступно
     // и сработал авто-fallback на локальный whisper. Показываем ненавязчивую метку
     // «оффлайн»; сбрасывается при старте следующей записи (см. status).
@@ -386,13 +443,14 @@ export default function Overlay() {
       setOffline(e.payload?.offline === true);
     });
 
-    unlisteners.push(offStatus, offPartial, offLevel, offNoModel, offError, offSttMode);
+    unlisteners.push(offStatus, offPartial, offLevel, offNoModel, offError, offHotkeyLatch, offSttMode);
 
     return () => {
       stopRaf();
       stopScrollRaf();
       stopLevelRaf();
       if (noticeTimer.current) clearTimeout(noticeTimer.current);
+      if (latchTimer.current) clearTimeout(latchTimer.current);
       clearDone();
       for (const fn of unlisteners) fn();
     };
@@ -404,7 +462,9 @@ export default function Overlay() {
   const mode: PillMode =
     notice != null
       ? "notice"
-      : done
+      : latchNotice != null
+        ? "latch"
+        : done
         ? "done"
         : status === "transcribing"
           ? "trans"
@@ -486,6 +546,7 @@ export default function Overlay() {
       <FpsMeter />
       <div
         className={`aq-pill aq-${mode}`}
+        ref={pillRef}
         data-tauri-drag-region
         title={
           offline && mode === "trans"
@@ -498,8 +559,25 @@ export default function Overlay() {
           Зажмите Right Ctrl — диктовка
         </span>
 
+        {/* Бейдж определённого языка: только пока идёт диктовка и бэкенд прислал
+            lang. position:absolute в углу пилюли (см. .aq-lang) — не участвует в
+            layout, поэтому overlay_box/ResizeObserver и hit-rect не меняются. */}
+        {lang != null && (mode === "rec" || mode === "stream" || mode === "trans") && (
+          <span className="aq-lang">{lang.toUpperCase()}</span>
+        )}
+
         {mode === "notice" ? (
           <span className="aq-msg">{notice}</span>
+        ) : mode === "latch" ? (
+          <span className="aq-latch-copy">
+            <span className="aq-latch-mark" aria-hidden>
+              2×
+            </span>
+            <span>
+              <strong>{latchNotice?.message || "Режим без удержания"}</strong>
+              <small>{latchNotice?.detail || "Двойное нажатие"}</small>
+            </span>
+          </span>
         ) : mode === "done" ? (
           // Галочка done: проявляется keyframe'ом, пилюля сама ужмётся в idle через 900 мс.
           <svg className="aq-check" viewBox="0 0 12 12" aria-hidden>

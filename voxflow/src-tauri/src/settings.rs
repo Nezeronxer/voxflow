@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct Settings {
     /// Клавиша hold-to-talk (rdev-имя), напр. "ControlRight".
     pub hotkey: String,
+    /// Клавиша улучшения выделенного текста. Работает одиночным нажатием.
+    pub improve_hotkey: String,
     /// "hold" | "toggle".
     pub mode: String,
     /// Имя устройства ввода ("" = системное по умолчанию).
@@ -28,10 +30,18 @@ pub struct Settings {
     pub auto_punct: bool,
     /// Тон: "very_casual" | "casual" | "neutral" | "formal".
     pub tone: String,
+    /// Включить пользовательскую инструкцию стиля для модельного рерайта.
+    pub smart_prompt_enabled: bool,
+    /// Человеческое описание задачи/стиля, из которого UI собирает внутреннюю инструкцию.
+    pub smart_prompt_source: String,
+    /// Внутренняя инструкция для модели: как превращать диктовку в готовый текст.
+    pub smart_prompt_instruction: String,
     /// "clipboard" | "type".
     pub paste_method: String,
     /// Звук старт/стоп.
     pub play_sounds: bool,
+    /// Глушить системный вывод на время диктовки и восстанавливать после stop/Esc.
+    pub auto_mute: bool,
     /// Автозапуск с системой.
     pub autostart: bool,
     /// Учиться на речи пользователя: сбор датасета (аудио↔текст) + адаптивный biasing.
@@ -48,7 +58,7 @@ pub struct Settings {
     pub ollama_model: String,
     /// Использовать облачный ИИ для распознавания (ASR) вместо локального whisper.
     pub cloud_asr: bool,
-    /// Авто-стиль по приложению (Gmail→формально, мессенджеры→casual, нейросети→чётко).
+    /// Legacy-флаг совместимости настроек; профили приложений теперь применяются всегда.
     pub tone_by_app: bool,
     /// Потоков для whisper (0 = авто).
     pub threads: u32,
@@ -102,6 +112,9 @@ pub struct Settings {
     /// Пользовательские переопределения профиля тона по приложению
     /// (проверяются ПЕРЕД встроенной таблицей app_context).
     pub app_profile_overrides: Vec<ProfileOverride>,
+    /// Пользовательские правила превращения диктовки в промпт для отдельных
+    /// нейросетей/AI-чатов. Пустой список = только общий smart prompt.
+    pub ai_prompt_rules: Vec<AiPromptRule>,
 }
 
 /// Пользовательское правило: если `pattern` встречается в имени exe или заголовке
@@ -116,10 +129,22 @@ pub struct ProfileOverride {
     pub profile: String,
 }
 
+/// Правило для AI-окна: если `pattern` встречается в exe или заголовке, добавить
+/// эти пользовательские инструкции к LLM-рерайту перед вставкой.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct AiPromptRule {
+    /// Подстрока для поиска в имени exe ИЛИ заголовке окна.
+    #[serde(rename = "match")]
+    pub pattern: String,
+    /// Пользовательские правила: как оформлять диктовку для этой нейросети.
+    pub prompt: String,
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
             hotkey: "ControlRight".into(),
+            improve_hotkey: "F8".into(),
             mode: "hold".into(),
             input_device: String::new(),
             language: "ru".into(),
@@ -133,8 +158,12 @@ impl Default for Settings {
             remove_fillers: true,
             auto_punct: true,
             tone: "neutral".into(),
+            smart_prompt_enabled: true,
+            smart_prompt_source: String::new(),
+            smart_prompt_instruction: String::new(),
             paste_method: "clipboard".into(),
             play_sounds: true,
+            auto_mute: true,
             autostart: false,
             personalize: true,
             ai_backend: "ollama".into(),
@@ -163,6 +192,7 @@ impl Default for Settings {
             rewrite_key: String::new(),
             proxy_url: String::new(),
             app_profile_overrides: Vec::new(),
+            ai_prompt_rules: Vec::new(),
         }
     }
 }
@@ -196,12 +226,13 @@ impl Settings {
     }
 
     /// Ключ для облачного rewrite (OpenAI-совместимый chat): из настроек, иначе
-    /// из окружения. Пробует REWRITE_API_KEY → OPENAI_API_KEY. Не логируется.
+    /// из окружения. Пробует REWRITE_API_KEY → OPENROUTER_API_KEY → OPENAI_API_KEY.
+    /// Не логируется.
     pub fn resolve_rewrite_key(&self) -> String {
         if !self.rewrite_key.trim().is_empty() {
             return self.rewrite_key.trim().to_string();
         }
-        for k in ["REWRITE_API_KEY", "OPENAI_API_KEY"] {
+        for k in rewrite_key_env_order(&self.rewrite_base_url) {
             if let Ok(v) = std::env::var(k) {
                 if !v.trim().is_empty() {
                     return v.trim().to_string();
@@ -209,6 +240,18 @@ impl Settings {
             }
         }
         String::new()
+    }
+
+    /// Облачный STT реально активен: провайдер облачный И ключ есть (из настроек
+    /// или окружения). Без ключа облачный провайдер de-facto уходит в локальный
+    /// фолбэк — поэтому все три потребителя (гард старта, петля партиалов, финал)
+    /// сверяются именно с этим условием, а не только со строкой провайдера.
+    pub fn cloud_stt_active(&self) -> bool {
+        match self.stt_provider.as_str() {
+            "openai_compat" => !self.resolve_oai_key().is_empty(),
+            "deepgram" => !self.resolve_deepgram_key().is_empty(),
+            _ => false,
+        }
     }
 
     /// Ключ Deepgram: из настроек, иначе из env DEEPGRAM_API_KEY. Не логируется.
@@ -224,6 +267,14 @@ impl Settings {
     }
 }
 
+fn rewrite_key_env_order(base_url: &str) -> [&'static str; 3] {
+    if base_url.to_ascii_lowercase().contains("openrouter.ai") {
+        ["REWRITE_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"]
+    } else {
+        ["REWRITE_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
+    }
+}
+
 pub fn load(conn: &Connection) -> Settings {
     match crate::db::kv_get(conn, "settings") {
         Some(j) => serde_json::from_str(&j).unwrap_or_default(),
@@ -235,4 +286,29 @@ pub fn save(conn: &Connection, s: &Settings) -> anyhow::Result<()> {
     let j = serde_json::to_string(s)?;
     crate::db::kv_set(conn, "settings", &j)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openrouter_key_env_order_prefers_openrouter_before_openai() {
+        assert_eq!(
+            rewrite_key_env_order("https://openrouter.ai/api/v1"),
+            ["REWRITE_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"]
+        );
+        assert_eq!(
+            rewrite_key_env_order("https://api.openai.com/v1"),
+            ["REWRITE_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn legacy_settings_json_defaults_ai_prompt_rules() {
+        let json = r#"{"hotkey":"ControlRight","ai_backend":"off"}"#;
+        let s: Settings = serde_json::from_str(json).expect("legacy settings parse");
+        assert_eq!(s.hotkey, "ControlRight");
+        assert!(s.ai_prompt_rules.is_empty());
+    }
 }

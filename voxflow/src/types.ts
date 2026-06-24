@@ -2,6 +2,7 @@
 
 export interface Settings {
   hotkey: string;
+  improve_hotkey: string;
   mode: string;
   input_device: string;
   language: string;
@@ -11,9 +12,14 @@ export interface Settings {
   verbatim: boolean;
   remove_fillers: boolean;
   auto_punct: boolean;
+  // "very_casual" | "casual" | "neutral" | "work" | "formal" | "doc" | "ai"
   tone: string;
+  smart_prompt_enabled: boolean;
+  smart_prompt_source: string;
+  smart_prompt_instruction: string;
   paste_method: string;
   play_sounds: boolean;
+  auto_mute: boolean;
   autostart: boolean;
   personalize: boolean;
   threads: number;
@@ -41,15 +47,35 @@ export interface Settings {
   deepgram_key: string;
   proxy_url: string;
   app_profile_overrides: ProfileOverride[];
+  ai_prompt_rules: AiPromptRule[];
 }
 
 export interface ProfileOverride {
   match: string; // подстрока в exe/заголовке (lowercase)
-  profile: string; // verbatim|ai|formal|work|casual|doc|neutral
+  profile: string; // verbatim|code|ai|formal|work|casual|doc|neutral
+}
+
+export interface AiPromptRule {
+  match: string; // подстрока в exe/заголовке нейросети
+  prompt: string; // пользовательские правила переписывания диктовки под эту нейросеть
+}
+
+export interface ActiveAppContext {
+  exe: string;
+  title: string;
+  profile: string;
+  builtin_profile: string;
+}
+
+export interface TransformResult {
+  ok: boolean;
+  text: string;
+  message: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
   hotkey: "ControlRight",
+  improve_hotkey: "F8",
   mode: "hold",
   input_device: "",
   language: "ru",
@@ -62,8 +88,12 @@ export const DEFAULT_SETTINGS: Settings = {
   remove_fillers: true,
   auto_punct: true,
   tone: "neutral",
+  smart_prompt_enabled: true,
+  smart_prompt_source: "",
+  smart_prompt_instruction: "",
   paste_method: "clipboard",
   play_sounds: true,
+  auto_mute: true,
   autostart: false,
   personalize: true,
   threads: 0,
@@ -89,6 +119,7 @@ export const DEFAULT_SETTINGS: Settings = {
   deepgram_key: "",
   proxy_url: "",
   app_profile_overrides: [],
+  ai_prompt_rules: [],
 };
 
 export interface ModelInfo {
@@ -110,7 +141,8 @@ export interface Stats {
 }
 
 export interface HistoryItem {
-  ts: number;
+  /** Бэкенд отдаёт строку "YYYY-MM-DD HH:MM:SS" (commands.rs get_history). */
+  ts: string;
   text: string;
   app: string;
   words: number;
@@ -145,6 +177,11 @@ export interface TranscriptEvent {
   seq?: number;
 }
 
+// Язык текущей диктовки, определённый STT (бейдж в пилюле): поле отсутствует →
+// старый бэкенд, ничего не менять; null → язык не определён, бейдж скрыт;
+// "ru"/"en" → бейдж RU/EN. Незнакомое значение трактуется как null.
+export type DetectedLang = "ru" | "en" | null;
+
 // Живой (негейченый) частичный текст — стримится в пилюлю во время записи.
 // text — полный (committed + volatile), для обратной совместимости со старыми
 // слушателями. committed — стабильный префикс, который НЕ переписывается
@@ -155,6 +192,9 @@ export interface PartialEvent {
   volatile: string;
   // seq — монотонный счётчик диктовки; отбрасываем партиалы старее текущей записи.
   seq?: number;
+  // Язык диктовки для бейджа (контракт overlay). Партиалы, отброшенные
+  // seq-дедупом, lang тоже НЕ применяют.
+  lang?: DetectedLang;
 }
 
 // Событие "no_model": модель не выбрана/не установлена (B3). Фронт показывает
@@ -166,6 +206,11 @@ export interface NoModelEvent {
 // Общая ошибка движка (микрофон/сервер/прочее) — событие "error".
 export interface ErrorEvent {
   message: string;
+}
+
+export interface HotkeyLatchEvent {
+  message?: string;
+  detail?: string;
 }
 
 // Гейт уверенности отклонил распознавание — событие "norecog".
@@ -204,3 +249,11 @@ export interface LevelEvent {
 }
 
 export type OverlayStatus = "idle" | "recording" | "transcribing";
+
+// Событие "status": legacy-строка (как раньше) ЛИБО объект { status, lang } —
+// бэкенд шлёт объект, когда знает язык диктовки (бейдж в пилюле). На
+// status=="recording" фронт сначала сбрасывает lang в null (новая диктовка),
+// затем применяет lang из этого же события, если оно объект и поле прислано.
+export type StatusPayload =
+  | string
+  | { status?: string; lang?: DetectedLang };

@@ -1,8 +1,8 @@
 [package]
 name = "voxflow"
-version = "0.2.0"
-description = "A Tauri App"
-authors = ["you"]
+version = "0.4.0"
+description = "Local-first voice dictation for Windows"
+authors = ["VoxFlow"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -37,8 +37,8 @@ tauri-plugin-autostart = "2.5.1"
 tauri-plugin-single-instance = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 base64 = "0.22.1"
+windows = { version = "0.61.3", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com"] }
 # ONNX Runtime для GigaAM-v3 (русский ASR) и Silero VAD. Статическая линковка
 # prebuilt-бинарей (download-binaries) — cmake/clang не нужны, onnxruntime.dll
 # не дистрибутируется. CPU EP по умолчанию.
 ort = "=2.0.0-rc.12"
-

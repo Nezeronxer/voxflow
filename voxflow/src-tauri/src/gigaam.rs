@@ -109,8 +109,8 @@ impl GigaAm {
         let decoder = mk("v3_e2e_rnnt_decoder.int8.onnx", 1)?;
         let joint = mk("v3_e2e_rnnt_joint.int8.onnx", 1)?;
 
-        let vocab_raw = std::fs::read_to_string(dir.join("v3_e2e_rnnt_vocab.txt"))
-            .context("чтение vocab")?;
+        let vocab_raw =
+            std::fs::read_to_string(dir.join("v3_e2e_rnnt_vocab.txt")).context("чтение vocab")?;
         let mut vocab = vec![String::new(); VOCAB_SIZE];
         for line in vocab_raw.lines() {
             let line = line.trim_end_matches('\r');
@@ -129,21 +129,25 @@ impl GigaAm {
         // Периодический Hann: hanning(321)[:-1] → w[i] = 0.5 − 0.5·cos(2πi/320).
         let mut window = [0f32; N_FFT];
         for (i, w) in window.iter_mut().enumerate() {
-            *w = bf16_round((0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / N_FFT as f64).cos()) as f32);
+            *w = bf16_round(
+                (0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / N_FFT as f64).cos()) as f32,
+            );
         }
 
         // HTK-мел-банк 161×64 (f_min=0, f_max=8000, norm=None), bf16-округление.
         let hz_to_mel = |f: f64| 2595.0 * (1.0 + f / 700.0).log10();
         let mel_to_hz = |m: f64| 700.0 * (10f64.powf(m / 2595.0) - 1.0);
         let m_max = hz_to_mel(8000.0);
-        let pts: Vec<f64> = (0..N_MELS + 2).map(|i| mel_to_hz(m_max * i as f64 / (N_MELS + 1) as f64)).collect();
+        let pts: Vec<f64> = (0..N_MELS + 2)
+            .map(|i| mel_to_hz(m_max * i as f64 / (N_MELS + 1) as f64))
+            .collect();
         let mut fbanks = vec![[0f32; N_BINS]; N_MELS];
-        for f in 0..N_BINS {
-            let freq = 8000.0 * f as f64 / (N_BINS - 1) as f64;
-            for m in 0..N_MELS {
+        for (m, bank) in fbanks.iter_mut().enumerate().take(N_MELS) {
+            for (f, cell) in bank.iter_mut().enumerate().take(N_BINS) {
+                let freq = 8000.0 * f as f64 / (N_BINS - 1) as f64;
                 let up = (freq - pts[m]) / (pts[m + 1] - pts[m]);
                 let down = (pts[m + 2] - freq) / (pts[m + 2] - pts[m + 1]);
-                fbanks[m][f] = bf16_round(up.min(down).max(0.0) as f32);
+                *cell = bf16_round(up.min(down).max(0.0) as f32);
             }
         }
 
@@ -158,8 +162,22 @@ impl GigaAm {
             }
         }
 
-        log::info!("[gigaam] загружен за {} мс ({} потоков)", t0.elapsed().as_millis(), threads);
-        Ok(Self { encoder, decoder, joint, vocab, window, fbanks, dft_cos, dft_sin, last_stats: TranscribeStats::default() })
+        log::info!(
+            "[gigaam] загружен за {} мс ({} потоков)",
+            t0.elapsed().as_millis(),
+            threads
+        );
+        Ok(Self {
+            encoder,
+            decoder,
+            joint,
+            vocab,
+            window,
+            fbanks,
+            dft_cos,
+            dft_sin,
+            last_stats: TranscribeStats::default(),
+        })
     }
 
     /// Распознать 16 кГц mono f32. Для буферов длиннее ~30 с качество деградирует
@@ -181,14 +199,14 @@ impl GigaAm {
             for n in 0..N_FFT {
                 wf[n] = frame[n] * self.window[n];
             }
-            for k in 0..N_BINS {
+            for (k, slot) in spec.iter_mut().enumerate().take(N_BINS) {
                 let (mut re, mut im) = (0f32, 0f32);
                 let (ck, sk) = (&self.dft_cos[k], &self.dft_sin[k]);
                 for n in 0..N_FFT {
                     re += wf[n] * ck[n];
                     im -= wf[n] * sk[n];
                 }
-                spec[k] = re * re + im * im;
+                *slot = re * re + im * im;
             }
             for m in 0..N_MELS {
                 let fb = &self.fbanks[m];
@@ -203,16 +221,24 @@ impl GigaAm {
 
         // ── Энкодер: [1,64,T] → encoded [1,768,T'], encoded_len i32 ──
         let t_enc = Instant::now();
-        let feats = Tensor::from_array((vec![1i64, N_MELS as i64, n_frames as i64], features)).oc("feats")?;
+        let feats = Tensor::from_array((vec![1i64, N_MELS as i64, n_frames as i64], features))
+            .oc("feats")?;
         let lens = Tensor::from_array((vec![1i64], vec![n_frames as i64])).oc("lens")?;
-        let enc_out = self.encoder.run(ort::inputs!["audio_signal" => feats, "length" => lens]).oc("encoder.run")?;
-        let (enc_shape, enc_data) = enc_out["encoded"].try_extract_tensor::<f32>().oc("encoded")?;
+        let enc_out = self
+            .encoder
+            .run(ort::inputs!["audio_signal" => feats, "length" => lens])
+            .oc("encoder.run")?;
+        let (enc_shape, enc_data) = enc_out["encoded"]
+            .try_extract_tensor::<f32>()
+            .oc("encoded")?;
         let enc_dims: Vec<i64> = enc_shape.iter().copied().collect();
         if enc_dims.len() != 3 || enc_dims[1] as usize != ENC_DIM {
             return Err(anyhow!("encoded: неожиданная форма {enc_dims:?}"));
         }
         let tp = enc_dims[2] as usize;
-        let (_, len_data) = enc_out["encoded_len"].try_extract_tensor::<i32>().oc("encoded_len")?;
+        let (_, len_data) = enc_out["encoded_len"]
+            .try_extract_tensor::<i32>()
+            .oc("encoded_len")?;
         let enc_len = (len_data.first().copied().unwrap_or(tp as i32) as usize).min(tp);
         // Копируем (enc_out живёт по ссылке на Session — отпускаем заём до декодера).
         let enc_data: Vec<f32> = enc_data.to_vec();
@@ -238,9 +264,14 @@ impl GigaAm {
             if dec_cache.is_none() {
                 let last = *tokens.last().unwrap_or(&BLANK_ID);
                 let x = Tensor::from_array((vec![1i64, 1], vec![last])).oc("x")?;
-                let th = Tensor::from_array((vec![1i64, 1, PRED_HIDDEN as i64], h.clone())).oc("h")?;
-                let tc = Tensor::from_array((vec![1i64, 1, PRED_HIDDEN as i64], c.clone())).oc("c")?;
-                let out = self.decoder.run(ort::inputs!["x" => x, "h.1" => th, "c.1" => tc]).oc("decoder.run")?;
+                let th =
+                    Tensor::from_array((vec![1i64, 1, PRED_HIDDEN as i64], h.clone())).oc("h")?;
+                let tc =
+                    Tensor::from_array((vec![1i64, 1, PRED_HIDDEN as i64], c.clone())).oc("c")?;
+                let out = self
+                    .decoder
+                    .run(ort::inputs!["x" => x, "h.1" => th, "c.1" => tc])
+                    .oc("decoder.run")?;
                 let (_, d) = out["dec"].try_extract_tensor::<f32>().oc("dec")?;
                 let (_, hh) = out["h"].try_extract_tensor::<f32>().oc("h'")?;
                 let (_, cc) = out["c"].try_extract_tensor::<f32>().oc("c'")?;
@@ -255,9 +286,14 @@ impl GigaAm {
             for ch in 0..ENC_DIM {
                 enc_frame[ch] = enc_data[ch * tp + t];
             }
-            let te = Tensor::from_array((vec![1i64, ENC_DIM as i64, 1], enc_frame.clone())).oc("enc_frame")?;
-            let td = Tensor::from_array((vec![1i64, PRED_HIDDEN as i64, 1], dec_out)).oc("dec_in")?;
-            let jout = self.joint.run(ort::inputs!["enc" => te, "dec" => td]).oc("joint.run")?;
+            let te = Tensor::from_array((vec![1i64, ENC_DIM as i64, 1], enc_frame.clone()))
+                .oc("enc_frame")?;
+            let td =
+                Tensor::from_array((vec![1i64, PRED_HIDDEN as i64, 1], dec_out)).oc("dec_in")?;
+            let jout = self
+                .joint
+                .run(ort::inputs!["enc" => te, "dec" => td])
+                .oc("joint.run")?;
             let (_, logits) = jout["joint"].try_extract_tensor::<f32>().oc("joint")?;
             let n = logits.len();
             let logits = &logits[n - VOCAB_SIZE..];
@@ -291,7 +327,10 @@ impl GigaAm {
         let decoder_ms = t_dec.elapsed().as_millis() as u64;
 
         // ── Текст: конкатенация токенов + чистка пробелов (DECODE_SPACE_PATTERN) ──
-        let joined: String = tokens.iter().map(|&i| self.vocab[i as usize].as_str()).collect();
+        let joined: String = tokens
+            .iter()
+            .map(|&i| self.vocab[i as usize].as_str())
+            .collect();
         let text = clean_spaces(&joined);
 
         self.last_stats = TranscribeStats {
@@ -350,13 +389,18 @@ mod tests {
         match spec.sample_format {
             hound::SampleFormat::Int => {
                 let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
-                r.into_samples::<i32>().map(|x| x.unwrap_or(0) as f32 / max).collect()
+                r.into_samples::<i32>()
+                    .map(|x| x.unwrap_or(0) as f32 / max)
+                    .collect()
             }
-            hound::SampleFormat::Float => r.into_samples::<f32>().map(|x| x.unwrap_or(0.0)).collect(),
+            hound::SampleFormat::Float => {
+                r.into_samples::<f32>().map(|x| x.unwrap_or(0.0)).collect()
+            }
         }
     }
 
     #[test]
+    #[ignore = "requires local GigaAM models and private real-voice WAV files"]
     fn gigaam_e2e_real_voice() {
         let dir = models_dir();
         assert!(dir_ready(&dir), "модели GigaAM не найдены в {dir:?}");
@@ -375,12 +419,22 @@ mod tests {
                 "{wav}\n  → {text:?}\n  audio={}мс frontend={}мс encoder={}мс decoder={}мс total={}мс",
                 st.audio_ms, st.frontend_ms, st.encoder_ms, st.decoder_ms, st.total_ms
             );
-            assert!(!text.trim().is_empty(), "пустой результат на реальном голосе");
             assert!(
-                text.chars().any(|c| ('а'..='я').contains(&c.to_ascii_lowercase()) || c == 'ё' || ('А'..='Я').contains(&c)),
+                !text.trim().is_empty(),
+                "пустой результат на реальном голосе"
+            );
+            assert!(
+                text.chars()
+                    .any(|c| ('а'..='я').contains(&c.to_ascii_lowercase())
+                        || c == 'ё'
+                        || ('А'..='Я').contains(&c)),
                 "ожидалась кириллица, получено: {text:?}"
             );
-            assert!(st.total_ms < 1500, "transcribe слишком медленный: {} мс", st.total_ms);
+            assert!(
+                st.total_ms < 1500,
+                "transcribe слишком медленный: {} мс",
+                st.total_ms
+            );
         }
     }
 

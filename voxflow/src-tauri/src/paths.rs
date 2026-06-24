@@ -50,6 +50,12 @@ pub fn gigaam_dir() -> PathBuf {
     d
 }
 
+/// Каталог моделей Parakeet TDT v3 (models/parakeet). Без create_dir_all:
+/// installed-статус читается по metadata, каталог создаёт сам загрузчик.
+pub fn parakeet_dir() -> PathBuf {
+    models_dir().join(crate::parakeet::PARAKEET_DIR)
+}
+
 /// Dev-копия Silero VAD (вшита на этапе компиляции).
 const DEV_VAD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/vad/silero_vad.onnx");
 
@@ -57,7 +63,10 @@ const DEV_VAD: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/vad/silero
 pub fn vad_model_path(app: Option<&AppHandle>) -> PathBuf {
     if let Some(app) = app {
         if let Ok(r) = app.path().resource_dir() {
-            for c in [r.join("resources").join("vad").join("silero_vad.onnx"), r.join("vad").join("silero_vad.onnx")] {
+            for c in [
+                r.join("resources").join("vad").join("silero_vad.onnx"),
+                r.join("vad").join("silero_vad.onnx"),
+            ] {
                 if c.exists() {
                     return c;
                 }
@@ -78,7 +87,10 @@ pub fn vad_model_path(app: Option<&AppHandle>) -> PathBuf {
 
 /// Dev-копии бинарей whisper (вшиты на этапе компиляции): CPU и CUDA.
 const DEV_WHISPER_CPU: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/whisper/Release");
-const DEV_WHISPER_CUDA: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/whisper-cuda/Release");
+const DEV_WHISPER_CUDA: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/whisper-cuda/Release"
+);
 
 /// Есть ли NVIDIA-GPU с драйвером (наличие nvcuda.dll в System32).
 pub fn has_nvidia() -> bool {
@@ -133,10 +145,18 @@ pub fn whisper_dir_standalone() -> PathBuf {
 }
 
 pub fn whisper_cli_name() -> &'static str {
-    if cfg!(windows) { "whisper-cli.exe" } else { "whisper-cli" }
+    if cfg!(windows) {
+        "whisper-cli.exe"
+    } else {
+        "whisper-cli"
+    }
 }
 
 #[allow(dead_code)] // задел под whisper-server (persistent), пока используем cli one-shot
 pub fn whisper_server_name() -> &'static str {
-    if cfg!(windows) { "whisper-server.exe" } else { "whisper-server" }
+    if cfg!(windows) {
+        "whisper-server.exe"
+    } else {
+        "whisper-server"
+    }
 }

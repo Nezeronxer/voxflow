@@ -95,8 +95,7 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
         // обесценивает диктовку (пользователь уже ждёт). Не успел — вставляем
         // текст после правил (graceful-деградация выше по стеку).
         .arg("10")
-        .arg("-H")
-        .arg(&auth_header)
+        // Content-Type не секрет — остаётся в argv.
         .arg("-H")
         .arg("Content-Type: application/json")
         .arg("-X")
@@ -105,8 +104,9 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
         .arg(&data_arg)
         .arg(&url);
 
-    let out = cmd
-        .output()
+    // Ключ (x-goog-api-key) — через stdin-конфиг curl (-K -), НЕ в argv:
+    // командная строка процесса видна другим процессам пользователя.
+    let out = net::curl_secret(cmd, &[auth_header])
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
 
     if !out.status.success() && out.stdout.is_empty() {
@@ -115,8 +115,8 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
         return Err(anyhow!("curl завершился с ошибкой: {}", err.trim()));
     }
 
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| anyhow!("ответ Gemini — не JSON: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("ответ Gemini — не JSON: {e}"))?;
 
     // Явная ошибка API.
     if let Some(err) = v.get("error") {
@@ -148,7 +148,9 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
     if trimmed.is_empty() {
         // Возможно сработал safety/блок без поля error — отдаём диагностику без ключа.
         log::warn!("Gemini вернул пустой текст; raw len={}", out.stdout.len());
-        return Err(anyhow!("Gemini вернул пустой ответ (нет текста в candidates)"));
+        return Err(anyhow!(
+            "Gemini вернул пустой ответ (нет текста в candidates)"
+        ));
     }
 
     Ok(trimmed.to_string())

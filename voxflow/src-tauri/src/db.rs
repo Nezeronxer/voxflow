@@ -83,6 +83,35 @@ pub fn open() -> Result<Connection> {
     open_at(&crate::paths::db_path())
 }
 
+/// Открыть БД СТРОГО read-only — для диагностических CLI-путей (селфтесты).
+/// Никогда не трогает пользовательский файл: без создания БД, без recovery,
+/// без карантина, без смены journal_mode (read-only поверх существующего WAL
+/// допустим). Любая проблема (нет файла, malformed, неподнимаемый WAL) = Err;
+/// что делать дальше — решает вызывающий (селфтесты уходят на дефолты).
+/// Инцидент 2026-06-11: --stream-selftest через open() заквантинил битую
+/// voxflow.db и пересоздал её — настройки пользователя были сброшены.
+pub fn open_readonly() -> Result<Connection> {
+    open_readonly_at(&crate::paths::db_path())
+}
+
+fn open_readonly_at(path: &Path) -> Result<Connection> {
+    use rusqlite::OpenFlags;
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Подождать снятия блокировки, если GUI-процесс параллельно держит БД.
+    let _ = conn.busy_timeout(Duration::from_millis(5000));
+    // SQLite открывает файл лениво: мусор/повреждение всплывают только на первом
+    // запросе. Проверяем здесь, чтобы вызывающий получил честный Err, а не тихо
+    // «пустую» БД. Read-only: ни чинить, ни уносить в карантин нельзя.
+    let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
+    if check != "ok" {
+        anyhow::bail!("quick_check (read-only): {check}");
+    }
+    Ok(conn)
+}
+
 /// Открыть БД по пути с самовосстановлением: если файл не открывается или не
 /// проходит quick_check (например, «database disk image is malformed» после
 /// жёсткого убийства процесса) — убрать его в карантин рядом
@@ -162,7 +191,13 @@ pub fn kv_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
 }
 
 /// Записать диктовку в историю и обновить дневную статистику.
-pub fn record_dictation(conn: &Connection, text: &str, app: &str, words: u32, ms: u64) -> Result<()> {
+pub fn record_dictation(
+    conn: &Connection,
+    text: &str,
+    app: &str,
+    words: u32,
+    ms: u64,
+) -> Result<()> {
     let now = chrono::Local::now();
     let ts = now.format("%Y-%m-%d %H:%M:%S").to_string();
     let day = now.format("%Y-%m-%d").to_string();
@@ -213,6 +248,55 @@ mod tests {
         assert_eq!(kv_get(&conn, "k").as_deref(), Some("v"));
         // мусор уехал в карантин рядом
         assert!(has_corrupt_sibling(&p), "нет файла-карантина *.corrupt-*");
+    }
+
+    #[test]
+    fn open_readonly_at_garbage_untouched() {
+        let p = tmp_db("ro-garbage");
+        let junk: &[u8] = b"this is definitely not an sqlite database, just junk";
+        std::fs::write(&p, junk).unwrap();
+        assert!(
+            open_readonly_at(&p).is_err(),
+            "мусорный файл не должен открываться read-only"
+        );
+        // файл цел байт-в-байт: ни карантина, ни пересоздания, ни sidecar'ов
+        assert_eq!(
+            std::fs::read(&p).unwrap(),
+            junk,
+            "read-only путь изменил файл"
+        );
+        assert!(
+            !has_corrupt_sibling(&p),
+            "read-only путь унёс файл в карантин"
+        );
+        assert!(!sibling(&p, "-wal").exists(), "read-only путь создал -wal");
+    }
+
+    #[test]
+    fn open_readonly_at_missing_file_not_created() {
+        let p = tmp_db("ro-missing");
+        assert!(
+            open_readonly_at(&p).is_err(),
+            "несуществующая БД не должна открываться"
+        );
+        assert!(!p.exists(), "read-only открытие создало файл БД");
+    }
+
+    #[test]
+    fn open_readonly_at_reads_but_rejects_writes() {
+        let p = tmp_db("ro-read");
+        {
+            let conn = open_at(&p).expect("создать здоровую БД");
+            kv_set(&conn, "k", "v").unwrap();
+        }
+        let conn = open_readonly_at(&p).expect("здоровая БД должна читаться");
+        assert_eq!(kv_get(&conn, "k").as_deref(), Some("v"));
+        assert!(
+            kv_set(&conn, "k", "w").is_err(),
+            "запись через read-only соединение прошла"
+        );
+        // и после попытки записи значение не изменилось
+        assert_eq!(kv_get(&conn, "k").as_deref(), Some("v"));
     }
 
     #[test]

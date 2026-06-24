@@ -63,7 +63,7 @@ export default function Control({
 
         <Field
           label="Горячая клавиша"
-          hint="Нажмите на поле и нажмите любую клавишу — она станет горячей. В режиме «Удержание» лучше брать Ctrl / Alt / F-клавишу: печатная клавиша (буква, цифра) будет печататься в активном окне. Клавиша Fn на Windows обычно не перехватывается."
+          hint="Нажмите поле и клавишу. Для удержания лучше Ctrl, Alt или F-клавиши."
         >
           <HotkeyCapture
             value={settings.hotkey}
@@ -72,8 +72,18 @@ export default function Control({
         </Field>
 
         <Field
+          label="Улучшить выделенное"
+          hint="Одиночное нажатие берёт выделенный текст, чистит его и заменяет в активном поле. Esc отменяет незавершённую обработку."
+        >
+          <HotkeyCapture
+            value={settings.improve_hotkey}
+            onChange={(code) => update({ improve_hotkey: code })}
+          />
+        </Field>
+
+        <Field
           label="Режим"
-          hint="«Удержание» — пока клавиша зажата; ДВОЙНОЕ нажатие — защёлка (остаётся включённым, выключить одним нажатием). «Переключатель» — нажал/нажал."
+          hint="«Удержание» пишет, пока клавиша зажата. «Переключатель» — нажал/нажал."
         >
           <Select
             value={settings.mode}
@@ -125,6 +135,16 @@ export default function Control({
           <Switch
             checked={settings.play_sounds}
             onChange={(v) => update({ play_sounds: v })}
+          />
+        </Field>
+
+        <Field
+          label="Автомьют"
+          hint="Глушить системный звук на время диктовки и возвращать после остановки или Esc"
+        >
+          <Switch
+            checked={settings.auto_mute}
+            onChange={(v) => update({ auto_mute: v })}
           />
         </Field>
 
