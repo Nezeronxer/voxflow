@@ -3,7 +3,7 @@
 ## Highlights
 
 - Local-first Windows dictation with hold-to-talk, toggle mode and double-press latch.
-- Dictation overlay hotfix: after silence the blue pill shows the settled processed text, and the final insertion waits behind a visible `Готовлю` spinner.
+- Dictation overlay hotfix: after the user stops dictation, the pill switches directly to the `Готовлю` spinner and no longer revives the old text line or `готово` badge after final insertion.
 - Final ASR hotfix: long silence is compacted before final recognition, and rare stale/hallucinated tails are rejected when they do not match the live preview.
 - App-aware rewrite profiles for chats, mail, AI prompts, code and documents.
 - Voice-guided prompt rewrite: write a base prompt, speak an edit instruction, preview and apply the rewritten result.
@@ -36,8 +36,8 @@ Then build the installer from the repository root:
 ## Release Artifact
 
 - `VoxFlow-Setup-1.0.1.exe`
-- Size: `288045771` bytes
-- SHA256: `0EE3551C9A2AE784250D450D389F091DC8CC1F14AFDAE42CD58827D7C65E716D`
+- Size: `287992596` bytes
+- SHA256: `57D936A75F2E4B07F116819300F9FDC2016442B29C1AD516BA47C88192F9109D`
 
 ## Verified For This Build
 
@@ -45,10 +45,10 @@ Then build the installer from the repository root:
 - `npm audit --audit-level=high` — OK, 0 vulnerabilities.
 - `cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check` — OK.
 - `cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings` — OK.
-- `cargo test --manifest-path src-tauri\Cargo.toml --lib -- --nocapture` — OK, 115 passed, 5 ignored.
+- `cargo test --manifest-path src-tauri\Cargo.toml --lib` — OK, 115 passed, 5 ignored.
 - `npm run tauri -- build --no-bundle` — OK, release exe built as `voxflow v1.0.1`.
 - Inno Setup compile — OK, created `VoxFlow-Setup-1.0.1.exe`.
-- Silent per-user install — OK, registry and installed resources verified under `%LOCALAPPDATA%\VoxFlow`.
+- Silent per-user install — OK, registry version `1.0.1`, installed exe SHA256 `FFF0276BF1B282EB50DD46D3B9A8C15417EBAF17D3C7B9BDAAFF44CBCD53D208`, and resources verified under `%LOCALAPPDATA%\VoxFlow`.
 - Installer visual QA — OK, welcome and additional-tasks screens checked in the Russian wizard.
 
 ## Known Limits

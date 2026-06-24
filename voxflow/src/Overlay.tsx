@@ -374,23 +374,20 @@ export default function Overlay() {
         setDone(false);
         // Финальная обработка/вставка началась: старое settled-«готово» больше
         // не должно висеть на экране. Пока backend готовит и вставляет текст,
-        // показываем явный spinner «Готовлю»; финальный preview вернётся после idle.
-        clearFinalHold();
+        // показываем только явный spinner «Готовлю».
+        resetTextEngine();
         kickLevel();
       } else {
-        // idle. Если завершилась расшифровка — 900 мс галочка, затем мини-пилюля.
+        // idle. После финальной обработки не возвращаем старую текстовую плашку:
+        // текст уже вставлен в целевое приложение, overlay должен свернуться.
         clearLatch();
-        if (finalHoldRef.current) {
+        if (prev === "transcribing") {
           clearDone();
           setDone(false);
-        } else if (prev === "transcribing") {
-          clearDone();
-          setDone(true);
-          doneTimer.current = setTimeout(() => {
-            doneTimer.current = null;
-            setDone(false);
-          }, 900);
           resetTextEngine();
+        } else if (finalHoldRef.current) {
+          clearDone();
+          setDone(false);
         } else {
           resetTextEngine();
         }
@@ -412,9 +409,10 @@ export default function Overlay() {
       }
       const isFinalPreview = e.payload?.final === true;
       const isSettledPreview = e.payload?.settled === true;
-      const isProcessedPreview =
-        e.payload?.processed === true || isFinalPreview || isSettledPreview;
-      if (statusRef.current === "transcribing" && !isProcessedPreview) {
+      if (statusRef.current === "transcribing") {
+        return;
+      }
+      if ((isFinalPreview || isSettledPreview) && statusRef.current !== "recording") {
         return;
       }
       if (!isFinalPreview && !isSettledPreview && finalHoldRef.current) {
