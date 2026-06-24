@@ -2,19 +2,18 @@
 // FPS. Считаем кадры через requestAnimationFrame + performance.now(); число
 // обновляем НАПРЯМУЮ через ref → node.textContent, без React setState каждый кадр
 // (иначе сам метр генерировал бы перерисовку и врал бы о производительности).
-// Дисплей освежается не чаще ~3 раз/сек. Рендерится только в DEV или когда в
-// localStorage стоит voxfps=1. rAF чистится при размонтировании.
+// Дисплей освежается не чаще ~3 раз/сек. По умолчанию не рендерится даже в dev:
+// включается только вручную через localStorage voxfps=1. rAF чистится при
+// размонтировании.
 
 import { useEffect, useRef } from "react";
 
 export default function FpsMeter() {
   const ref = useRef<HTMLDivElement | null>(null);
 
-  // Показываем метр только в dev-сборке либо по ручному флагу voxfps=1.
+  // Показываем метр только по ручному флагу, чтобы debug UI не попадал в QA.
   const enabled =
-    import.meta.env.DEV ||
-    (typeof localStorage !== "undefined" &&
-      localStorage.getItem("voxfps") === "1");
+    typeof localStorage !== "undefined" && localStorage.getItem("voxfps") === "1";
 
   useEffect(() => {
     if (!enabled) return;

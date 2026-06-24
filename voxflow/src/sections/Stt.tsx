@@ -103,6 +103,18 @@ export default function Stt({
       ([k, v]) => (settings as unknown as Record<string, unknown>)[k] === v,
     ),
   );
+  const providerName =
+    provider === "deepgram"
+      ? "Deepgram"
+      : provider === "openai_compat"
+        ? "OpenAI-compatible"
+        : "Локальный whisper";
+  const providerMode = isLocal ? "Офлайн и приватно" : "Облако с фолбэком";
+  const providerHint = isLocal
+    ? "Аудио остаётся на устройстве"
+    : settings.stt_fallback_local
+      ? "При ошибке вернётся на локальный whisper"
+      : "Нужны сеть и API-ключ";
 
   async function onTest() {
     setTesting(true);
@@ -126,48 +138,66 @@ export default function Stt({
         desc="Облачный движок распознавания речи. Локальный whisper остаётся по умолчанию и приватен — аудио не покидает устройство."
       />
 
-      <div className="card">
-        <div className="card-head">
-          <div className="card-title">Провайдер STT</div>
-          <div className="sub">
-            Какой движок распознаёт речь. При недоступности облака возможен
-            авто-возврат на локальный whisper (тумблер ниже).
+      <div className="card cloud-card">
+        <div className="cloud-provider-head">
+          <div>
+            <div className="card-title">Провайдер STT</div>
+            <p className="cloud-provider-copy">
+              Какой движок распознаёт речь. Облако подключается как BYOK-режим,
+              локальный whisper остаётся приватным запасным вариантом.
+            </p>
+          </div>
+          <div className="cloud-provider-status" aria-live="polite">
+            <span>{providerName}</span>
+            <strong>{providerMode}</strong>
+            <small>{providerHint}</small>
           </div>
         </div>
 
-        <Field
-          label="Готовые пресеты"
-          hint="Один клик — провайдер, адрес и модель заполнятся сами. Groq · whisper-large-v3 — сильная модель «уровня Aqua», бесплатно."
-        >
-          <div style={{ display: "flex", flexWrap: "wrap", gap: 8, maxWidth: 520 }}>
+        <div className="cloud-presets">
+          <div className="cloud-presets-head">
+            <div>
+              <div className="field-label">Готовые пресеты</div>
+              <div className="field-hint">
+                Один клик заполнит провайдера, адрес и модель. Groq ·
+                whisper-large-v3 — сильный бесплатный старт.
+              </div>
+            </div>
+            <div className="cloud-presets-active">
+              {activePreset ? activePreset.label : "Свой набор"}
+            </div>
+          </div>
+
+          <div className="cloud-preset-grid">
             {STT_PRESETS.map((p) => {
               const active = activePreset?.id === p.id;
               return (
                 <button
                   key={p.id}
-                  className={active ? "btn btn-primary" : "btn"}
-                  style={{ fontSize: 12.5 }}
+                  type="button"
+                  className={active ? "cloud-preset is-active" : "cloud-preset"}
                   onClick={() => {
                     setResult(null);
                     update(p.patch);
                   }}
+                  aria-pressed={active}
                 >
-                  {p.label}
-                  {p.badge ? ` · ${p.badge}` : ""}
+                  <span className="cloud-preset-main">{p.label}</span>
+                  <span className="cloud-preset-meta">
+                    {p.badge ?? (p.id === "local" ? "без ключа" : "API-ключ")}
+                  </span>
                 </button>
               );
             })}
           </div>
-        </Field>
 
-        {activePreset?.keyHint && (
-          <div
-            className="field-hint"
-            style={{ marginTop: -6, marginBottom: 14, maxWidth: "none" }}
-          >
-            {activePreset.keyHint}
+          <div className="cloud-preset-note">
+            {activePreset?.keyHint ??
+              (activePreset
+                ? "Локальный режим выбран: ключ и проверка соединения не нужны."
+                : "Пресет не выбран: можно вручную указать провайдера, URL и модель ниже.")}
           </div>
-        )}
+        </div>
 
         <Field
           label="Движок распознавания"
@@ -298,7 +328,7 @@ export default function Stt({
           </>
         )}
 
-        <div className="add-row" style={{ alignItems: "center" }}>
+        <div className="add-row stt-test-row">
           <button
             className="btn btn-primary"
             onClick={onTest}
@@ -308,12 +338,10 @@ export default function Stt({
             {testing ? "Проверка…" : "Проверить"}
           </button>
           {result && (
-            <span style={{ fontSize: 13, color: "var(--text-dim)" }}>
-              {result}
-            </span>
+            <span className="stt-test-result">{result}</span>
           )}
           {isLocal && !result && (
-            <span style={{ fontSize: 12.5, color: "var(--amber)" }}>
+            <span className="stt-test-local">
               Локальный whisper не требует проверки соединения
             </span>
           )}

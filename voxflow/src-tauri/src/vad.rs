@@ -8,8 +8,8 @@
 
 use std::path::Path;
 
-use anyhow::Result;
 use crate::gigaam::OrtCtx;
+use anyhow::Result;
 use ort::session::Session;
 use ort::value::Tensor;
 
@@ -31,7 +31,11 @@ impl SileroVad {
             .oc("intra_threads")? // модель крошечная, потоки только мешают
             .commit_from_file(model_path)
             .oc(&format!("загрузка Silero VAD: {model_path:?}"))?;
-        Ok(Self { session, state: vec![0f32; STATE_LEN], context: [0f32; CONTEXT] })
+        Ok(Self {
+            session,
+            state: vec![0f32; STATE_LEN],
+            context: [0f32; CONTEXT],
+        })
     }
 
     /// Сброс стрима (новая запись): state и контекст в нули.
@@ -48,12 +52,14 @@ impl SileroVad {
         let n = chunk512.len().min(CHUNK);
         input[CONTEXT..CONTEXT + n].copy_from_slice(&chunk512[..n]);
 
-        let t_in = Tensor::from_array((vec![1i64, (CONTEXT + CHUNK) as i64], input.clone())).oc("input")?;
+        let t_in = Tensor::from_array((vec![1i64, (CONTEXT + CHUNK) as i64], input.clone()))
+            .oc("input")?;
         let t_state = Tensor::from_array((vec![2i64, 1, 128], self.state.clone())).oc("state")?;
         let t_sr = Tensor::from_array((vec![1i64], vec![16000i64])).oc("sr")?;
         let out = self
             .session
-            .run(ort::inputs!["input" => t_in, "state" => t_state, "sr" => t_sr]).oc("vad.run")?;
+            .run(ort::inputs!["input" => t_in, "state" => t_state, "sr" => t_sr])
+            .oc("vad.run")?;
         let (_, prob) = out["output"].try_extract_tensor::<f32>().oc("output")?;
         let p = prob.first().copied().unwrap_or(0.0);
         let (_, st) = out["stateN"].try_extract_tensor::<f32>().oc("stateN")?;
@@ -75,7 +81,6 @@ impl SileroVad {
         self.reset();
         Ok(false)
     }
-
 }
 
 #[cfg(test)]
@@ -84,10 +89,14 @@ mod tests {
     use std::path::PathBuf;
 
     fn model_path() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/resources/vad/silero_vad.onnx"))
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/resources/vad/silero_vad.onnx"
+        ))
     }
 
     #[test]
+    #[ignore = "requires a private real-voice WAV fixture in LOCALAPPDATA"]
     fn vad_voice_vs_silence() {
         let mut vad = SileroVad::load(&model_path()).expect("load");
 
@@ -97,7 +106,10 @@ mod tests {
         )
         .expect("wav");
         let max = (1i64 << (r.spec().bits_per_sample - 1)) as f32;
-        let voice: Vec<f32> = r.into_samples::<i32>().map(|x| x.unwrap_or(0) as f32 / max).collect();
+        let voice: Vec<f32> = r
+            .into_samples::<i32>()
+            .map(|x| x.unwrap_or(0) as f32 / max)
+            .collect();
 
         vad.reset();
         let mut max_p = 0f32;
@@ -112,12 +124,21 @@ mod tests {
         }
         let per_chunk_us = t0.elapsed().as_micros() / chunks.max(1) as u128;
         println!("голос: max prob = {max_p:.3}, {per_chunk_us} мкс/чанк, чанков {chunks}");
-        assert!(max_p > 0.8, "на реальном голосе ожидалась prob>0.8, got {max_p}");
-        assert!(per_chunk_us < 2000, "process_chunk слишком медленный: {per_chunk_us} мкс");
+        assert!(
+            max_p > 0.8,
+            "на реальном голосе ожидалась prob>0.8, got {max_p}"
+        );
+        assert!(
+            per_chunk_us < 2000,
+            "process_chunk слишком медленный: {per_chunk_us} мкс"
+        );
         assert!(vad.has_speech(&voice, 0.5).unwrap());
 
         // Тишина → речи нет.
         let silence = vec![0f32; 16000];
-        assert!(!vad.has_speech(&silence, 0.5).unwrap(), "на нулях речи быть не должно");
+        assert!(
+            !vad.has_speech(&silence, 0.5).unwrap(),
+            "на нулях речи быть не должно"
+        );
     }
 }

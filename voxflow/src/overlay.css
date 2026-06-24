@@ -53,9 +53,11 @@
    data-tauri-drag-region (Tauri проверяет атрибут именно на event.target),
    поэтому перетаскивание работает с любой точки, кроме текстовой зоны. */
 .aq-tip,
+.aq-lang,
 .aq-orbwrap,
 .aq-bars,
 .aq-check,
+.aq-latch-copy,
 .aq-msg {
   pointer-events: none;
 }
@@ -105,6 +107,15 @@
 .aq-done {
   width: 48px;
   height: 26px;
+}
+
+/* latch: подтверждение double-press, что запись закреплена без удержания. */
+.aq-latch {
+  width: 276px;
+  height: 48px;
+  padding: 7px 12px;
+  justify-content: flex-start;
+  animation: aq-latch-pop 180ms cubic-bezier(0.22, 1.2, 0.36, 1) both;
 }
 
 /* notice: краткое предупреждение (no_model / error) — тёмная плашка с текстом. */
@@ -313,6 +324,41 @@
   }
 }
 
+/* ---------- Бейдж определённого языка (RU/EN) ---------- */
+
+/* Ярлычок поверх верхней кромки пилюли, у правого угла. Абсолютное позициони-
+   рование выключает его из layout: размеры пилюли не меняются → overlay_box,
+   ResizeObserver и hit-rect (getBoundingClientRect пилюли) живут как раньше;
+   pointer-events:none (группа выше) — drag с любой точки тоже не страдает.
+   Выступ вверх (top:-7px) помещается в запас окна над пилюлей (BOX в Overlay.tsx:
+   для rec/trans над пилюлей ~15 px). Монохром в духе .aq-offline. */
+.aq-lang {
+  position: absolute;
+  top: -7px;
+  right: 12px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: #000;
+  border: 0.5px solid rgba(156, 163, 175, 0.8);
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  line-height: 1.3;
+  color: rgba(255, 255, 255, 0.7);
+  /* Мягкое проявление при первом lang; смена RU↔EN узел не перемонтирует. */
+  animation: aq-lang-in 160ms ease-out both;
+}
+@keyframes aq-lang-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* Метка «офлайн» (авто-fallback на локальный whisper) — ненавязчиво в потоке. */
 .aq-offline {
   display: inline-block;
@@ -328,7 +374,56 @@
   vertical-align: 1px;
 }
 
-/* ---------- Галочка done и текст notice ---------- */
+/* ---------- Latch, галочка done и текст notice ---------- */
+
+.aq-latch-copy {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.aq-latch-copy span:last-child {
+  display: grid;
+  gap: 1px;
+  min-width: 0;
+}
+.aq-latch-copy strong {
+  color: rgba(255, 255, 255, 0.95);
+  font-size: 12px;
+  font-weight: 650;
+  line-height: 1.15;
+}
+.aq-latch-copy small {
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1.15;
+}
+.aq-latch-mark {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  border: 0.5px solid rgba(255, 255, 255, 0.22);
+  color: rgba(255, 255, 255, 0.95);
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0;
+}
+@keyframes aq-latch-pop {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.94);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
 
 .aq-check {
   width: 12px;
@@ -357,4 +452,17 @@
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aq-pill,
+  .aq-tip,
+  .aq-latch,
+  .aq-check,
+  .aq-ring,
+  .aq-caret {
+    transition-duration: 1ms !important;
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+  }
 }

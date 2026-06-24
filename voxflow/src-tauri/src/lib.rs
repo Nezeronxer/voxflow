@@ -19,7 +19,9 @@ mod paths;
 mod postprocess;
 mod rewrite;
 mod settings;
+mod system_audio;
 mod vad;
+mod voice_cmds;
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -30,11 +32,24 @@ use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, PhysicalPosition, PhysicalSize};
 use tauri_plugin_autostart::MacosLauncher;
 
-use commands::AppState;
+use commands::{AppState, OverlayHitRect};
 use engine::EngineCmd;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // CLI-селфтесты Parakeet/LID. Диспатч здесь, а не в main.rs: main.rs правится
+    // другим кластером, а неизвестные ему флаги всё равно проваливаются в run().
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() >= 3 && args[1] == "--parakeet-selftest" {
+            parakeet_selftest(&args[2]);
+            return;
+        }
+        if args.len() >= 3 && args[1] == "--lid-selftest" {
+            lid_selftest(&args[2]);
+            return;
+        }
+    }
     tauri::Builder::default()
         // ПЕРВЫМ: единственный экземпляр процесса. Иначе старый и новый voxflow.exe
         // открывают ОДИН voxflow.db и затирают настройки друг друга (B4). Колбэк
@@ -54,8 +69,19 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
 
-            // БД + настройки
-            let conn = db::open().expect("open db");
+            // БД + настройки. P2-7: не молчаливый краш через .expect, а понятное
+            // окно (permission denied / занятый файл / диск) и корректный выход.
+            let conn = match db::open() {
+                Ok(c) => c,
+                Err(e) => {
+                    fatal_startup_error(&format!(
+                        "Не удалось открыть базу данных VoxFlow:\n{e:#}\n\n\
+                         Проверьте права доступа к папке\n{}\nи свободное место на диске.",
+                        paths::data_dir().display()
+                    ));
+                    std::process::exit(1);
+                }
+            };
             let loaded = settings::load(&conn);
             let db_arc = Arc::new(Mutex::new(conn));
             let settings_arc = Arc::new(Mutex::new(loaded));
@@ -64,7 +90,7 @@ pub fn run() {
             // Канал движка
             let (tx, rx) = std::sync::mpsc::channel::<EngineCmd>();
 
-            engine::spawn(
+            let engine = engine::spawn(
                 handle.clone(),
                 rx,
                 db_arc.clone(),
@@ -79,9 +105,11 @@ pub fn run() {
             app.manage(AppState {
                 db: db_arc,
                 settings: settings_arc,
+                engine,
                 engine_tx: Mutex::new(tx),
                 recording,
                 overlay_hit: overlay_hit.clone(),
+                lang_menu: Mutex::new(None), // заполнит build_tray ниже
             });
 
             build_tray(&handle)?;
@@ -96,7 +124,11 @@ pub fn run() {
             {
                 use tauri_plugin_autostart::ManagerExt;
                 let mgr = handle.autolaunch();
-                let res = if want_autostart { mgr.enable() } else { mgr.disable() };
+                let res = if want_autostart {
+                    mgr.enable()
+                } else {
+                    mgr.disable()
+                };
                 if let Err(e) = res {
                     log::error!("autostart reconcile ({want_autostart}) failed: {e}");
                 }
@@ -160,7 +192,11 @@ pub fn run() {
             commands::snippet_upsert,
             commands::snippet_delete,
             commands::show_main_window,
+            commands::active_app_context,
             commands::ai_test,
+            commands::rewrite_prompt_with_instruction,
+            commands::transform_text,
+            commands::default_app_profile_presets,
             commands::stt_test,
             commands::corrections_list,
             commands::corrections_upsert,
@@ -172,12 +208,58 @@ pub fn run() {
         .expect("error while running VoxFlow");
 }
 
+/// Показать фатальную ошибку старта понятным окном (GUI ещё не поднят, поэтому
+/// нативный MessageBoxW) и продублировать в лог/стдерр. Используется до
+/// инициализации Tauri — P2-7 (молчаливый краш db::open().expect).
+fn fatal_startup_error(text: &str) {
+    log::error!("{text}");
+    eprintln!("{text}");
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, utype: u32) -> i32;
+        }
+        let wide = |s: &str| -> Vec<u16> {
+            std::ffi::OsStr::new(s)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        let t = wide(text);
+        let c = wide("VoxFlow — ошибка запуска");
+        // 0x10 = MB_ICONERROR.
+        unsafe {
+            MessageBoxW(0, t.as_ptr(), c.as_ptr(), 0x10);
+        }
+    }
+}
+
+/// Настройки для headless-селфтестов: БД открывается СТРОГО read-only.
+/// Инцидент 2026-06-11: --stream-selftest через db::open() заквантинил
+/// повреждённую voxflow.db (.corrupt-<ts>) и пересоздал её свежей — настройки
+/// пользователя (включая API-ключ) были сброшены. Диагностика не имеет права
+/// «чинить» или создавать пользовательскую БД: любая ошибка чтения (нет файла,
+/// malformed, неподнимаемый WAL) → eprintln-предупреждение и Settings::default(),
+/// файл остаётся нетронутым. Recovery-путь остаётся только в GUI (run() → setup).
+fn cli_load_settings(tag: &str) -> settings::Settings {
+    match db::open_readonly() {
+        Ok(conn) => settings::load(&conn),
+        Err(e) => {
+            eprintln!(
+                "[{tag}] БД не прочитана ({e:#}) — продолжаю на настройках по умолчанию, файл БД не трогаю"
+            );
+            settings::Settings::default()
+        }
+    }
+}
+
 /// Диагностический прогон ASR + постобработки на готовом 16 кГц WAV (без GUI/микрофона).
 /// Используется как `voxflow.exe --selftest <wav>` для проверки пайплайна кодом приложения.
 pub fn selftest(wav_path: &str) {
     use std::path::Path;
-    let conn = db::open().expect("open db");
-    let s = settings::load(&conn);
+    let s = cli_load_settings("selftest");
     let whisper_dir = paths::whisper_dir_standalone();
     let model = {
         let m = paths::model_path(&s.model);
@@ -197,7 +279,11 @@ pub fn selftest(wav_path: &str) {
     eprintln!("[selftest] whisper_dir = {whisper_dir:?}");
     eprintln!("[selftest] model       = {model:?}");
     eprintln!("[selftest] wav         = {wav_path}");
-    eprintln!("[selftest] language    = {}, threads = {}", s.language, s.effective_threads());
+    eprintln!(
+        "[selftest] language    = {}, threads = {}",
+        s.language,
+        s.effective_threads()
+    );
 
     let params = asr::AsrParams {
         whisper_dir: &whisper_dir,
@@ -223,8 +309,7 @@ pub fn selftest(wav_path: &str) {
 pub fn stream_selftest(wav_path: &str) {
     use std::time::Instant;
 
-    let conn = db::open().expect("open db");
-    let s = settings::load(&conn);
+    let s = cli_load_settings("stream");
     let whisper_dir = paths::whisper_dir_standalone();
     let model = {
         let m = paths::model_path(&s.model);
@@ -283,7 +368,10 @@ pub fn stream_selftest(wav_path: &str) {
     };
     let full16 = audio::resample_to_16k(&mono, in_rate);
     let dur_s = full16.len() as f32 / 16000.0;
-    eprintln!("[stream] длительность аудио ≈ {dur_s:.2} c, сэмплов(16к)={}", full16.len());
+    eprintln!(
+        "[stream] длительность аудио ≈ {dur_s:.2} c, сэмплов(16к)={}",
+        full16.len()
+    );
 
     // Поднимаем whisper-server напрямую (вне Tauri-контекста) и ждём готовности.
     const PORT: u16 = 8771;
@@ -297,7 +385,10 @@ pub fn stream_selftest(wav_path: &str) {
             return;
         }
     };
-    eprintln!("[stream] сервер готов за {} мс", t_boot.elapsed().as_millis());
+    eprintln!(
+        "[stream] сервер готов за {} мс",
+        t_boot.elapsed().as_millis()
+    );
 
     // Прогрев (как в warmup): первый запрос грузит/инициализирует модель.
     {
@@ -367,11 +458,13 @@ pub fn stt_test_cli(wav: &str) {
     use std::path::Path;
     use std::time::Instant;
 
-    let conn = db::open().expect("open db");
-    let s = settings::load(&conn);
+    let s = cli_load_settings("stt-test");
     eprintln!("[stt-test] provider = {}", s.stt_provider);
     eprintln!("[stt-test] language = {}", s.language);
-    eprintln!("[stt-test] proxy    = {}", net::proxy_configured(&s.proxy_url));
+    eprintln!(
+        "[stt-test] proxy    = {}",
+        net::proxy_configured(&s.proxy_url)
+    );
     eprintln!("[stt-test] wav      = {wav}");
 
     let t0 = Instant::now();
@@ -396,10 +489,7 @@ pub fn stt_test_cli(wav: &str) {
 /// переключает click-through. Вне пилюли окно прозрачно для мыши — кнопки
 /// фуллскрин-приложений под оверлеем остаются кликабельными. Во время зажатой
 /// ЛКМ состояние не переключаем (не рвать drag пилюли).
-fn spawn_overlay_hover_poller(
-    app: &tauri::AppHandle,
-    hit: Arc<Mutex<Option<(f64, f64, f64, f64)>>>,
-) {
+fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitRect>>) {
     #[cfg(windows)]
     {
         #[link(name = "user32")]
@@ -414,7 +504,9 @@ fn spawn_overlay_hover_poller(
                 let mut interactive = false;
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(120));
-                    let Some(ov) = app.get_webview_window("overlay") else { continue };
+                    let Some(ov) = app.get_webview_window("overlay") else {
+                        continue;
+                    };
                     let mut pt = [0i32; 2];
                     if unsafe { GetCursorPos(&mut pt) } == 0 {
                         continue;
@@ -486,7 +578,11 @@ pub fn gigaam_selftest(wav_path: &str) {
             return;
         }
     };
-    eprintln!("[gigaam] загружен за {} мс ({} потоков)", t.elapsed().as_millis(), threads);
+    eprintln!(
+        "[gigaam] загружен за {} мс ({} потоков)",
+        t.elapsed().as_millis(),
+        threads
+    );
     let t = Instant::now();
     let _ = g.transcribe(&vec![0.0f32; 8000]);
     eprintln!("[gigaam] прогрев {} мс", t.elapsed().as_millis());
@@ -496,16 +592,24 @@ pub fn gigaam_selftest(wav_path: &str) {
     let spec = reader.spec();
     let chans = spec.channels as usize;
     let raw: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.into_samples::<f32>().map(|x| x.unwrap_or(0.0)).collect(),
+        hound::SampleFormat::Float => reader
+            .into_samples::<f32>()
+            .map(|x| x.unwrap_or(0.0))
+            .collect(),
         hound::SampleFormat::Int => {
             let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader.into_samples::<i32>().map(|x| x.unwrap_or(0) as f32 / max).collect()
+            reader
+                .into_samples::<i32>()
+                .map(|x| x.unwrap_or(0) as f32 / max)
+                .collect()
         }
     };
     let mono: Vec<f32> = if chans <= 1 {
         raw
     } else {
-        raw.chunks(chans).map(|f| f.iter().sum::<f32>() / f.len() as f32).collect()
+        raw.chunks(chans)
+            .map(|f| f.iter().sum::<f32>() / f.len() as f32)
+            .collect()
     };
     let full16 = audio::resample_to_16k(&mono, spec.sample_rate);
     eprintln!("[gigaam] аудио {:.2} c", full16.len() as f32 / 16000.0);
@@ -513,7 +617,11 @@ pub fn gigaam_selftest(wav_path: &str) {
     // VAD-гейт.
     let t = Instant::now();
     let speech = vad.has_speech(&full16, 0.5).unwrap_or(true);
-    eprintln!("[gigaam] vad-гейт {} мс, речь={}", t.elapsed().as_millis(), speech);
+    eprintln!(
+        "[gigaam] vad-гейт {} мс, речь={}",
+        t.elapsed().as_millis(),
+        speech
+    );
 
     // Имитация партиал-тиков: нарастающие срезы по 1 c. Для длинных файлов
     // ограничиваемся первыми 20 c (в бою активный сегмент не растёт дольше —
@@ -525,7 +633,11 @@ pub fn gigaam_selftest(wav_path: &str) {
         tick += 1;
         let t = Instant::now();
         let txt = g.transcribe(&full16[..cut]).unwrap_or_default();
-        println!("[p{tick:02} @ {:>4.1}c | {:>5} мс] {txt:?}", cut as f32 / 16000.0, t.elapsed().as_millis());
+        println!(
+            "[p{tick:02} @ {:>4.1}c | {:>5} мс] {txt:?}",
+            cut as f32 / 16000.0,
+            t.elapsed().as_millis()
+        );
         cut += 16000;
     }
 
@@ -535,7 +647,8 @@ pub fn gigaam_selftest(wav_path: &str) {
     let trimmed = audio::trim_silence(&full16, 16000);
     let vad_arc = std::sync::Arc::new(parking_lot::Mutex::new(Some(vad)));
     let t = Instant::now();
-    let txt = engine::gigaam_transcribe_long(&mut g, &vad_arc, &trimmed).unwrap_or_default();
+    let txt = engine::local_transcribe_long(&vad_arc, &trimmed, &mut |seg| g.transcribe(seg))
+        .unwrap_or_default();
     let wall = t.elapsed().as_millis();
     let st = g.last_stats;
     println!("TEXT  : {txt:?}");
@@ -545,12 +658,181 @@ pub fn gigaam_selftest(wav_path: &str) {
     );
 }
 
+/// WAV → mono f32 16 кГц (общий код headless-селфтестов Parakeet/LID).
+fn read_wav_mono_16k(wav_path: &str) -> Vec<f32> {
+    let reader = hound::WavReader::open(wav_path).expect("открыть WAV");
+    let spec = reader.spec();
+    let chans = spec.channels as usize;
+    let raw: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Float => reader
+            .into_samples::<f32>()
+            .map(|x| x.unwrap_or(0.0))
+            .collect(),
+        hound::SampleFormat::Int => {
+            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+            reader
+                .into_samples::<i32>()
+                .map(|x| x.unwrap_or(0) as f32 / max)
+                .collect()
+        }
+    };
+    let mono: Vec<f32> = if chans <= 1 {
+        raw
+    } else {
+        raw.chunks(chans)
+            .map(|f| f.iter().sum::<f32>() / f.len() as f32)
+            .collect()
+    };
+    audio::resample_to_16k(&mono, spec.sample_rate)
+}
+
+fn request_shutdown(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.engine.restore_auto_mute();
+        let _ = state.engine_tx.lock().send(EngineCmd::Shutdown);
+    }
+}
+
+/// Headless-проверка Parakeet TDT v3 (без GUI/микрофона): тайминги load/warmup,
+/// транскрипт и раскладка инференса по этапам — по образцу --gigaam-selftest.
+/// Запуск: `voxflow.exe --parakeet-selftest <wav>`.
+pub fn parakeet_selftest(wav_path: &str) {
+    use std::time::Instant;
+
+    let dir = paths::parakeet_dir();
+    eprintln!("[parakeet] модели: {dir:?}");
+    if !parakeet::dir_ready(&dir) {
+        eprintln!("[parakeet] ОШИБКА: модель не установлена (вкладка «Модель» → Parakeet TDT v3)");
+        return;
+    }
+    let threads = settings::Settings::default().effective_threads() as usize;
+    let t = Instant::now();
+    let mut p = match parakeet::Parakeet::load(&dir, threads) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[parakeet] ОШИБКА загрузки: {e:#}");
+            return;
+        }
+    };
+    let load_ms = t.elapsed().as_millis();
+    eprintln!("[parakeet] загружен за {load_ms} мс ({threads} потоков)");
+    let t = Instant::now();
+    let _ = p.transcribe(&vec![0.0f32; 8000]);
+    let warm_ms = t.elapsed().as_millis();
+    eprintln!("[parakeet] прогрев {warm_ms} мс");
+
+    let full16 = read_wav_mono_16k(wav_path);
+    eprintln!("[parakeet] аудио {:.2} c", full16.len() as f32 / 16000.0);
+    let trimmed = audio::trim_silence(&full16, 16000);
+    let t = Instant::now();
+    let txt = p.transcribe(&trimmed).unwrap_or_default();
+    let wall = t.elapsed().as_millis();
+    let st = p.last_stats;
+    println!("TEXT  : {txt:?}");
+    println!(
+        "[lat] load={load_ms}мс warmup={warm_ms}мс audio={}мс frontend={}мс encoder={}мс decoder={}мс infer-стенка {wall} мс",
+        st.audio_ms, st.frontend_ms, st.encoder_ms, st.decoder_ms
+    );
+}
+
+/// Headless-проверка LID-роутера (language="auto"): Parakeet транскрибирует,
+/// скрипт текста определяет язык; кириллица → перегон через GigaAM — ровно как
+/// auto-маршрут финала. Печатает определённый язык, выбранный маршрут и текст.
+/// Запуск: `voxflow.exe --lid-selftest <wav>`.
+pub fn lid_selftest(wav_path: &str) {
+    use std::time::Instant;
+
+    let pdir = paths::parakeet_dir();
+    if !parakeet::dir_ready(&pdir) {
+        eprintln!("[lid] ОШИБКА: модель Parakeet не установлена — auto-роутер недоступен");
+        return;
+    }
+    let threads = settings::Settings::default().effective_threads() as usize;
+    let mut p = match parakeet::Parakeet::load(&pdir, threads) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[lid] parakeet ОШИБКА загрузки: {e:#}");
+            return;
+        }
+    };
+    let _ = p.transcribe(&vec![0.0f32; 8000]); // прогрев
+
+    let full16 = read_wav_mono_16k(wav_path);
+    let trimmed = audio::trim_silence(&full16, 16000);
+    eprintln!("[lid] аудио {:.2} c", trimmed.len() as f32 / 16000.0);
+    let t = Instant::now();
+    let draft = p.transcribe(&trimmed).unwrap_or_default();
+    let p_ms = t.elapsed().as_millis();
+    let cyr = parakeet::is_mostly_cyrillic(&draft);
+    let lang = if cyr {
+        "ru"
+    } else if draft.chars().any(|c| c.is_ascii_alphabetic()) {
+        "en"
+    } else {
+        "??"
+    };
+    println!("LANG  : {lang}");
+    println!("DRAFT : {draft:?} ({p_ms} мс, parakeet)");
+    if cyr && gigaam::dir_ready(&paths::gigaam_dir()) {
+        let mut g = match gigaam::GigaAm::load(&paths::gigaam_dir(), threads) {
+            Ok(g) => g,
+            Err(e) => {
+                eprintln!("[lid] gigaam ОШИБКА загрузки: {e:#}");
+                println!("ROUTE : parakeet (gigaam не загрузился)");
+                println!("TEXT  : {draft:?}");
+                return;
+            }
+        };
+        let _ = g.transcribe(&vec![0.0f32; 8000]); // прогрев
+        let t = Instant::now();
+        let txt = g.transcribe(&trimmed).unwrap_or_default();
+        println!("ROUTE : parakeet → gigaam (кириллический скрипт)");
+        println!("TEXT  : {txt:?} ({} мс, gigaam)", t.elapsed().as_millis());
+    } else {
+        println!("ROUTE : parakeet");
+        println!("TEXT  : {draft:?}");
+    }
+}
+
 fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{CheckMenuItem, Submenu};
+
     let settings_i = MenuItem::with_id(app, "settings", "Настройки", true, None::<&str>)?;
     let toggle_i = MenuItem::with_id(app, "toggle", "Старт / стоп диктовки", true, None::<&str>)?;
     let quit_i = MenuItem::with_id(app, "quit", "Выход", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
-    let menu = Menu::with_items(app, &[&settings_i, &toggle_i, &sep, &quit_i])?;
+
+    // Подменю «Язык» — быстрое переключение Авто/RU/EN без открытия настроек.
+    // Начальное состояние галок — из сохранённых настроек (AppState уже managed).
+    let lang0 = app
+        .try_state::<AppState>()
+        .map(|st| st.settings.lock().language.clone())
+        .unwrap_or_else(|| "ru".into());
+    let lang_auto = CheckMenuItem::with_id(
+        app,
+        "lang_auto",
+        "Авто",
+        true,
+        lang0 == "auto",
+        None::<&str>,
+    )?;
+    let lang_ru =
+        CheckMenuItem::with_id(app, "lang_ru", "Русский", true, lang0 == "ru", None::<&str>)?;
+    let lang_en =
+        CheckMenuItem::with_id(app, "lang_en", "English", true, lang0 == "en", None::<&str>)?;
+    let lang_sub = Submenu::with_items(app, "Язык", true, &[&lang_auto, &lang_ru, &lang_en])?;
+
+    // Клоны итемов — в AppState: save_settings синхронизирует галки и при смене
+    // языка из UI, и при клике в трее (единая точка синхронизации).
+    if let Some(state) = app.try_state::<AppState>() {
+        *state.lang_menu.lock() = Some(commands::LangMenu {
+            auto: lang_auto.clone(),
+            ru: lang_ru.clone(),
+            en: lang_en.clone(),
+        });
+    }
+
+    let menu = Menu::with_items(app, &[&settings_i, &toggle_i, &lang_sub, &sep, &quit_i])?;
 
     let _tray = TrayIconBuilder::with_id("voxflow-tray")
         .icon(app.default_window_icon().expect("default icon").clone())
@@ -565,10 +847,24 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
                     let _ = state.engine_tx.lock().send(EngineCmd::Toggle);
                 }
             }
-            "quit" => {
+            id @ ("lang_auto" | "lang_ru" | "lang_en") => {
+                let lang = match id {
+                    "lang_ru" => "ru",
+                    "lang_en" => "en",
+                    _ => "auto",
+                };
                 if let Some(state) = app.try_state::<AppState>() {
-                    let _ = state.engine_tx.lock().send(EngineCmd::Shutdown);
+                    // Тот же путь, что и сохранение из UI (commands::save_settings):
+                    // БД → снимок в памяти → автозапуск → синхронизация галок трея.
+                    let mut s = state.settings.lock().clone();
+                    s.language = lang.to_string();
+                    if let Err(e) = commands::save_settings(app.clone(), state, s) {
+                        log::error!("трей: смена языка не сохранилась: {e}");
+                    }
                 }
+            }
+            "quit" => {
+                request_shutdown(app);
                 app.exit(0);
             }
             _ => {}

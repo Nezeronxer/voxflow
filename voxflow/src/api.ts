@@ -12,6 +12,9 @@ import type {
   DictionaryEntry,
   SnippetEntry,
   CorrectionEntry,
+  ActiveAppContext,
+  ProfileOverride,
+  TransformResult,
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 
@@ -163,7 +166,7 @@ export function snippetUpsert(
   is_template: boolean,
 ): Promise<void> {
   return safe<void>(async () => {
-    await invoke("snippet_upsert", { id, trigger, content, is_template });
+    await invoke("snippet_upsert", { id, trigger, content, isTemplate: is_template });
   }, undefined);
 }
 
@@ -179,9 +182,60 @@ export function showMainWindow(): Promise<void> {
   }, undefined);
 }
 
-export function aiTest(): Promise<{ ok: boolean; message: string }> {
-  return safe<{ ok: boolean; message: string }>(
-    () => invoke<{ ok: boolean; message: string }>("ai_test"),
+export function activeAppContext(): Promise<ActiveAppContext> {
+  return safe<ActiveAppContext>(() => invoke<ActiveAppContext>("active_app_context"), {
+    exe: "",
+    title: "",
+    profile: "neutral",
+    builtin_profile: "neutral",
+  });
+}
+
+export function defaultAppProfilePresets(): Promise<ProfileOverride[]> {
+  return safe<ProfileOverride[]>(
+    () => invoke<ProfileOverride[]>("default_app_profile_presets"),
+    [],
+  );
+}
+
+export function transformText(
+  text: string,
+  transform: string,
+): Promise<TransformResult> {
+  return safe<TransformResult>(
+    () => invoke<TransformResult>("transform_text", { text, transform }),
+    { ok: false, text: "", message: "—" },
+  );
+}
+
+export function rewritePromptWithInstruction(
+  originalPrompt: string,
+  voiceInstruction: string,
+): Promise<TransformResult> {
+  return safe<TransformResult>(
+    () =>
+      invoke<TransformResult>("rewrite_prompt_with_instruction", {
+        originalPrompt,
+        voiceInstruction,
+      }),
+    {
+      ok: false,
+      text: "",
+      message: "Переработка prompt доступна внутри приложения VoxFlow.",
+    },
+  );
+}
+
+export type AiModelOption = { value: string; label: string };
+export type AiTestResult = {
+  ok: boolean;
+  message: string;
+  models?: AiModelOption[];
+};
+
+export function aiTest(): Promise<AiTestResult> {
+  return safe<AiTestResult>(
+    () => invoke<AiTestResult>("ai_test"),
     { ok: false, message: "—" },
   );
 }

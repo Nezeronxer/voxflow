@@ -99,6 +99,7 @@ pub fn classify(exe: &str, title: &str) -> String {
                 "chatgpt",
                 "chat.openai",
                 "openai",
+                "codex",
                 "claude.ai",
                 "claude",
                 "gemini.google",
@@ -190,7 +191,7 @@ pub fn classify(exe: &str, title: &str) -> String {
     ];
 
     for rule in rules {
-        if rule.exes.iter().any(|e| exe == *e) || rule.markers.iter().any(|m| any(m)) {
+        if rule.exes.contains(&exe) || rule.markers.iter().any(|m| any(m)) {
             return rule.profile.to_string();
         }
     }
@@ -248,18 +249,73 @@ pub fn category_for(
             // Неизвестный профиль — правило игнорируем.
             log::warn!(
                 "app_profile_overrides: неизвестный профиль {:?} в правиле (pattern {:?}) пропущен",
-                profile, pat
+                profile,
+                pat
             );
             continue;
         }
         if exe_lc.contains(&pat) || title_lc.contains(&pat) {
             // `code` — пользовательский псевдоним verbatim (rewrite выключен).
-            let resolved = if profile == "code" { "verbatim" } else { profile };
+            let resolved = if profile == "code" {
+                "verbatim"
+            } else {
+                profile
+            };
             return resolved.to_string();
         }
     }
 
     classify(&exe_lc, &title_lc)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::category_for;
+    use crate::settings::ProfileOverride;
+
+    fn ov(pattern: &str, profile: &str) -> ProfileOverride {
+        ProfileOverride {
+            pattern: pattern.to_string(),
+            profile: profile.to_string(),
+        }
+    }
+
+    #[test]
+    fn override_beats_builtin_profile() {
+        let rules = vec![ov("telegram", "formal")];
+        assert_eq!(category_for("telegram.exe", "Chat", &rules), "formal");
+    }
+
+    #[test]
+    fn first_matching_override_wins() {
+        let rules = vec![ov("chrome", "ai"), ov("chatgpt", "formal")];
+        assert_eq!(category_for("chrome.exe", "ChatGPT", &rules), "ai");
+    }
+
+    #[test]
+    fn empty_and_invalid_overrides_are_skipped() {
+        let rules = vec![ov("  ", "formal"), ov("telegram", "unknown")];
+        assert_eq!(category_for("telegram.exe", "Chat", &rules), "casual");
+    }
+
+    #[test]
+    fn code_alias_resolves_to_verbatim() {
+        let rules = vec![ov("cursor", "code")];
+        assert_eq!(category_for("cursor.exe", "main.rs", &rules), "verbatim");
+    }
+
+    #[test]
+    fn matching_is_case_insensitive_across_exe_and_title() {
+        let rules = vec![ov("CoDeX", "ai"), ov("Quarterly", "doc")];
+        assert_eq!(category_for("codex.exe", "Prompt", &rules), "ai");
+        assert_eq!(category_for("word.exe", "Quarterly Plan", &rules), "doc");
+    }
+
+    #[test]
+    fn codex_is_builtin_ai_context() {
+        assert_eq!(super::classify("codex.exe", "New prompt"), "ai");
+        assert_eq!(super::classify("chrome.exe", "codex - openai"), "ai");
+    }
 }
 
 // ===========================================================================
@@ -316,10 +372,7 @@ mod platform {
     /// Извлекает из полного пути имя файла (компонент после последнего
     /// `\\` или `/`) и приводит его к нижнему регистру.
     fn file_name_lowercase(full_path: &str) -> String {
-        let name = full_path
-            .rsplit(|c| c == '\\' || c == '/')
-            .next()
-            .unwrap_or(full_path);
+        let name = full_path.rsplit(['\\', '/']).next().unwrap_or(full_path);
         name.to_lowercase()
     }
 

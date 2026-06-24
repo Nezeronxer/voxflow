@@ -22,6 +22,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build-installer:
     runs-on: windows-latest
@@ -33,14 +36,50 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Set up Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Install frontend dependencies
         working-directory: voxflow
         run: npm ci
+
+      - name: Frontend build
+        working-directory: voxflow
+        run: npm run build
+
+      - name: NPM high-severity audit
+        working-directory: voxflow
+        run: npm audit --audit-level=high
+
+      - name: Rust format check
+        working-directory: voxflow
+        run: cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check
+
+      - name: Rust clippy
+        working-directory: voxflow
+        run: cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
+
+      - name: Rust unit tests
+        working-directory: voxflow
+        run: cargo test --manifest-path src-tauri\Cargo.toml --lib
+
+      - name: Verify bundled runtime resources
+        shell: pwsh
+        run: |
+          $required = @(
+            "voxflow/src-tauri/resources/whisper/Release/whisper-cli.exe",
+            "voxflow/src-tauri/resources/whisper/Release/whisper-server.exe",
+            "voxflow/src-tauri/resources/vad/silero_vad.onnx"
+          )
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          if ($missing) {
+            $missing | ForEach-Object { Write-Error "Missing bundled runtime resource: $_" }
+            throw "Bundled runtime resources are required before building the installer."
+          }
 
       # Build the Tauri app WITHOUT the NSIS bundler. `--no-bundle` skips Tauri's
       # own installer packaging (we use Inno Setup instead) and produces:
@@ -71,3 +110,21 @@ jobs:
         with:
           name: VoxFlow-Setup
           path: installer\Output\*.exe
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $installer = Get-ChildItem installer\Output\VoxFlow-Setup-*.exe | Select-Object -First 1
+          if (-not $installer) {
+            throw "Installer artifact was not produced."
+          }
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $installer.FullName --clobber
+          } else {
+            gh release create $tag $installer.FullName --title "VoxFlow $tag" --generate-notes
+          }

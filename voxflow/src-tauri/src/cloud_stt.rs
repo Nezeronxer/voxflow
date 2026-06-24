@@ -49,9 +49,6 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path) -> Result<String> {
     cmd.arg("-s")
         .arg("-m")
         .arg(TIMEOUT_SECS)
-        // ключ только в заголовке, не в URL/логе
-        .arg("-H")
-        .arg(&auth)
         .arg("-F")
         .arg(&file_arg)
         .arg("-F")
@@ -64,9 +61,10 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path) -> Result<String> {
     net::apply_proxy(&mut cmd, &s.proxy_url);
     cmd.arg(&url);
 
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow!("curl /audio/transcriptions: {e}"))?;
+    // Ключ — через stdin-конфиг curl (-K -), НЕ в argv: командная строка
+    // процесса видна другим процессам пользователя.
+    let out =
+        net::curl_secret(cmd, &[auth]).map_err(|e| anyhow!("curl /audio/transcriptions: {e}"))?;
     if !out.status.success() {
         // НЕ логируем тело (могут быть заголовки/эхо); только код процесса curl.
         log::warn!("openai_compat STT: curl завершился с кодом {}", out.status);
@@ -121,8 +119,7 @@ pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
     cmd.arg("-s")
         .arg("-m")
         .arg(TIMEOUT_SECS)
-        .arg("-H")
-        .arg(&auth)
+        // Content-Type не секрет — остаётся в argv.
         .arg("-H")
         .arg("Content-Type: audio/wav")
         .arg("--data-binary")
@@ -130,17 +127,16 @@ pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
     net::apply_proxy(&mut cmd, &s.proxy_url);
     cmd.arg(&url);
 
-    let out = cmd
-        .output()
-        .map_err(|e| anyhow!("curl /v1/listen: {e}"))?;
+    // Ключ — через stdin-конфиг curl (-K -), НЕ в argv (виден в Task Manager/WMI).
+    let out = net::curl_secret(cmd, &[auth]).map_err(|e| anyhow!("curl /v1/listen: {e}"))?;
     if !out.status.success() {
         log::warn!("deepgram STT: curl завершился с кодом {}", out.status);
         return Err(anyhow!("сеть/прокси недоступны (curl код {})", out.status));
     }
 
     let body = String::from_utf8_lossy(&out.stdout);
-    let v: serde_json::Value = serde_json::from_str(body.trim())
-        .map_err(|_| anyhow!("deepgram STT: ответ не JSON"))?;
+    let v: serde_json::Value =
+        serde_json::from_str(body.trim()).map_err(|_| anyhow!("deepgram STT: ответ не JSON"))?;
 
     // Deepgram при ошибке отдаёт {"err_code":..,"err_msg":..} или {"error":..}.
     if let Some(msg) = v.get("err_msg").and_then(|m| m.as_str()) {

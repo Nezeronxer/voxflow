@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VoxFlow",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "identifier": "com.voxflow.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -50,7 +50,7 @@
     "copyright": "© 2026 VoxFlow",
     "category": "Productivity",
     "shortDescription": "Локальный голосовой ввод",
-    "longDescription": "VoxFlow — локальная диктовка: горячая клавиша → речь по-русски → чистый текст в активном окне. Полностью офлайн.",
+    "longDescription": "VoxFlow — локальная диктовка: горячая клавиша → речь → чистый текст в активном окне. Локальный режим работает по умолчанию; облачные провайдеры подключаются только со своим ключом.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

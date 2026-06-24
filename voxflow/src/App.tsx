@@ -21,6 +21,7 @@ import History from "./sections/History";
 import Ai from "./sections/Ai";
 import Stt from "./sections/Stt";
 import Corrections from "./sections/Corrections";
+import Applications from "./sections/Applications";
 import { ErrorBoundary } from "./ErrorBoundary";
 
 // Иконка «Облако» для вкладки STT. Inline-компонент (а не Icon.* из ui.tsx),
@@ -49,6 +50,7 @@ type TabId =
   | "dictionary"
   | "snippets"
   | "corrections"
+  | "applications"
   | "ai"
   | "stt"
   | "history";
@@ -61,6 +63,7 @@ const NAV: { id: TabId; label: string; icon: (p: { className?: string }) => Reac
   { id: "dictionary", label: "Словарь", icon: Icon.Book },
   { id: "snippets", label: "Сниппеты", icon: Icon.Code },
   { id: "corrections", label: "Исправления", icon: Icon.Check },
+  { id: "applications", label: "Приложения", icon: Icon.Sliders },
   { id: "ai", label: "ИИ", icon: Icon.Sparkles },
   { id: "stt", label: "Облако", icon: CloudIcon },
   { id: "history", label: "История", icon: Icon.Clock },
@@ -73,6 +76,24 @@ type Notice = {
   action?: TabId;
 };
 
+// Детерминированная сериализация настроек для сравнения «локальное == бэкенд».
+// Обычный JSON.stringify не годится: payload с бэкенда идёт в порядке полей
+// Rust-структуры (serde), а локальный объект — в порядке ключей DEFAULT_SETTINGS,
+// поэтому одинаковые по содержимому объекты дали бы разные строки. Сортируем
+// ключи на всех уровнях вложенности (replacer вызывается рекурсивно).
+function stableSerialize(value: unknown): string {
+  return JSON.stringify(value, (_key, val) =>
+    val && typeof val === "object" && !Array.isArray(val)
+      ? Object.keys(val as Record<string, unknown>)
+          .sort()
+          .reduce<Record<string, unknown>>((acc, k) => {
+            acc[k] = (val as Record<string, unknown>)[k];
+            return acc;
+          }, {})
+      : val,
+  );
+}
+
 export default function App() {
   const [tab, setTab] = useState<TabId>("dashboard");
   const [settings, setSettings] = useState<Settings>({ ...DEFAULT_SETTINGS });
@@ -84,12 +105,22 @@ export default function App() {
   // Держим последние настройки в ref, чтобы flush'ить их синхронно при сокрытии окна.
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  // Анти lost-update: сериализация последних настроек, ПОЛУЧЕННЫХ с бэкенда
+  // (initial load + событие settings_changed). Если локальное состояние от неё
+  // не отличается — сейв (debounce/flush) подавляем: иначе спрятанное окно
+  // перетирало бы смену языка из трея своим устаревшим снапшотом.
+  const lastFromBackendRef = useRef<string>("");
+  // Сериализация последнего снапшота, ОТПРАВЛЕННОГО нами в save_settings: по ней
+  // отличаем эхо собственного сейва (его не применяем — локальное состояние могло
+  // уйти вперёд) от настоящей внешней смены (например, язык из трея).
+  const lastSentRef = useRef<string>("");
 
   // Initial load.
   useEffect(() => {
     let alive = true;
     getSettings().then((s) => {
       if (!alive) return;
+      lastFromBackendRef.current = stableSerialize(s);
       setSettings(s);
       loadedRef.current = true;
       setLoaded(true);
@@ -97,6 +128,29 @@ export default function App() {
     return () => {
       alive = false;
     };
+  }, []);
+
+  // Лекарство от lost update: окно прячется (hide), React остаётся смонтированным,
+  // и раньше смена языка из трея (commands::save_settings) откатывалась устаревшим
+  // снапшотом при flush на visibilitychange. Теперь бэкенд после каждого успешного
+  // save_settings шлёт settings_changed с полными настройками — применяем их и
+  // запоминаем как «последнее с бэкенда» для подавления эха.
+  useEffect(() => {
+    const off = subscribe<Settings>("settings_changed", (e) => {
+      if (!e.payload) return;
+      const s: Settings = { ...DEFAULT_SETTINGS, ...e.payload };
+      const ser = stableSerialize(s);
+      const isEcho = ser === lastSentRef.current;
+      lastFromBackendRef.current = ser;
+      // Эхо собственного сейва или состояние уже совпадает — не дёргаем setState:
+      // затирать более свежие локальные правки (пользователь продолжает печатать,
+      // пока invoke летит) нельзя, а лишний ре-рендер ни к чему.
+      if (isEcho || ser === stableSerialize(settingsRef.current)) return;
+      // Сразу и в ref — flush при сокрытии окна может случиться до ре-рендера.
+      settingsRef.current = s;
+      setSettings(s);
+    });
+    return off;
   }, []);
 
   // Тема: применяем после загрузки настроек и мгновенно при каждой смене.
@@ -140,6 +194,11 @@ export default function App() {
     if (!loadedRef.current) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
+      const ser = stableSerialize(settings);
+      // Эхо-подавление: состояние не отличается от последнего полученного с
+      // бэкенда (initial load / settings_changed) — писать нечего.
+      if (ser === lastFromBackendRef.current) return;
+      lastSentRef.current = ser;
       saveSettings(settings);
     }, 400);
     return () => {
@@ -157,7 +216,13 @@ export default function App() {
         clearTimeout(saveTimer.current);
         saveTimer.current = null;
       }
-      saveSettings(settingsRef.current);
+      const cur = settingsRef.current;
+      const ser = stableSerialize(cur);
+      // Не отличаемся от бэкенда — flush не нужен. Именно этот безусловный сейв
+      // раньше откатывал смену языка из трея устаревшим снапшотом окна.
+      if (ser === lastFromBackendRef.current) return;
+      lastSentRef.current = ser;
+      saveSettings(cur);
     };
     const onVis = () => {
       if (document.visibilityState === "hidden") flush();
@@ -202,7 +267,7 @@ export default function App() {
           </div>
           <div>
             <div className="brand-name">VoxFlow</div>
-            <div className="brand-sub">Локальная диктовка</div>
+            <div className="brand-sub">Бесплатная локальная диктовка</div>
           </div>
         </div>
 
@@ -235,7 +300,7 @@ export default function App() {
 
         <div className="sidebar-foot">
           <span className="dot-ok" />
-          {loaded ? "Офлайн · всё локально" : "Загрузка…"}
+          {loaded ? "Бесплатная диктовка · локально" : "Загрузка…"}
         </div>
       </aside>
 
@@ -257,6 +322,9 @@ export default function App() {
             {tab === "dictionary" && <Dictionary />}
             {tab === "snippets" && <Snippets />}
             {tab === "corrections" && <Corrections />}
+            {tab === "applications" && (
+              <Applications settings={settings} update={update} />
+            )}
             {tab === "ai" && <Ai settings={settings} update={update} />}
             {tab === "stt" && <Stt settings={settings} update={update} />}
             {tab === "history" && <History />}

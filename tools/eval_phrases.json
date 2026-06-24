@@ -1,0 +1,22 @@
+{
+  "ru": [
+    "Привет, запиши пожалуйста встречу на завтра в три часа дня.",
+    "Отправь отчёт по продажам за второй квартал на почту руководителю.",
+    "Сегодня хорошая погода, давай прогуляемся по парку после работы.",
+    "Нужно купить молоко, хлеб, яйца и что-нибудь к чаю.",
+    "Программа распознаёт речь локально, без отправки данных в облако.",
+    "Перезвони мне через пятнадцать минут, я сейчас на совещании.",
+    "Добавь в список задач проверку установщика и обновление документации.",
+    "Искусственный интеллект помогает быстрее набирать длинные тексты голосом."
+  ],
+  "en": [
+    "Hello, please schedule a meeting for tomorrow at three in the afternoon.",
+    "Send the quarterly sales report to the team lead by email.",
+    "The weather is great today, let's take a walk in the park after work.",
+    "We need to buy milk, bread, eggs, and something for tea.",
+    "The application recognizes speech locally without sending data to the cloud.",
+    "Call me back in fifteen minutes, I am in a meeting right now.",
+    "Add installer verification and documentation updates to the task list.",
+    "Artificial intelligence helps you type long texts much faster by voice."
+  ]
+}

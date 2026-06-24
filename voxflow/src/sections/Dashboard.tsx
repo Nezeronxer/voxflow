@@ -67,7 +67,7 @@ export default function Dashboard({ settings }: { settings: Settings }) {
     <div className="content-inner">
       <PageHead
         title="Главная"
-        desc="Локальная голосовая диктовка. Всё распознаётся на вашем устройстве."
+        desc="Бесплатная локальная диктовка: работает на вашем устройстве и готова сразу после запуска."
       />
 
       {/* Hero */}
@@ -83,8 +83,7 @@ export default function Dashboard({ settings }: { settings: Settings }) {
               Горячая клавиша: <span className="kbd">{prettyHotkey(settings.hotkey)}</span>
             </span>
             <span>
-              Режим:{" "}
-              <b>{settings.mode === "toggle" ? "Переключатель" : "Удержание"}</b>
+              Режим: <b>{settings.mode === "toggle" ? "Переключатель" : "Удержание"}</b>
             </span>
           </div>
         </div>

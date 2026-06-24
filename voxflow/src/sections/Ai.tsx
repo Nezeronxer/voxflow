@@ -1,7 +1,83 @@
-import { useState } from "react";
-import { aiTest } from "../api";
+import { useEffect, useState } from "react";
+import { aiTest, saveSettings, type AiModelOption } from "../api";
 import { PageHead, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
+
+type Option = AiModelOption;
+
+const GEMINI_MODELS: Option[] = [
+  { value: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+  { value: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+  { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+];
+
+const OLLAMA_MODELS: Option[] = [
+  { value: "qwen3:4b", label: "Qwen3 4B" },
+  { value: "qwen3:8b", label: "Qwen3 8B" },
+  { value: "llama3.1:8b", label: "Llama 3.1 8B" },
+  { value: "gemma3:4b", label: "Gemma 3 4B" },
+  { value: "voiceflow", label: "VoiceFlow profile" },
+];
+
+const OPENAI_COMPAT_PROVIDERS = [
+  {
+    value: "openrouter",
+    label: "OpenRouter",
+    baseUrl: "https://openrouter.ai/api/v1",
+    hint: "Много моделей через один OpenAI-compatible API.",
+    keyHint: "OPENROUTER_API_KEY",
+    models: [],
+  },
+  {
+    value: "groq",
+    label: "Groq",
+    baseUrl: "https://api.groq.com/openai/v1",
+    hint: "Быстрые OpenAI-compatible модели Groq.",
+    keyHint: "REWRITE_API_KEY",
+    models: [
+      { value: "llama-3.3-70b-versatile", label: "Llama 3.3 70B Versatile" },
+      { value: "llama-3.1-8b-instant", label: "Llama 3.1 8B Instant" },
+    ],
+  },
+  {
+    value: "openai",
+    label: "OpenAI",
+    baseUrl: "https://api.openai.com/v1",
+    hint: "Официальный OpenAI API.",
+    keyHint: "OPENAI_API_KEY",
+    models: [
+      { value: "gpt-4o-mini", label: "GPT-4o mini" },
+      { value: "gpt-4o", label: "GPT-4o" },
+      { value: "gpt-4.1-mini", label: "GPT-4.1 mini" },
+    ],
+  },
+  {
+    value: "aqua",
+    label: "Aqua / Avalon",
+    baseUrl: "https://api.aqua.sh/v1",
+    hint: "Aqua OpenAI-compatible endpoint.",
+    keyHint: "REWRITE_API_KEY",
+    models: [
+      { value: "claude-3-5-haiku", label: "Claude 3.5 Haiku" },
+      { value: "gpt-4o-mini", label: "GPT-4o mini" },
+    ],
+  },
+] as const;
+
+function withCurrentOption(options: readonly Option[], current: string): Option[] {
+  const value = current.trim();
+  if (!value || options.some((option) => option.value === value)) return [...options];
+  return [{ value, label: `Текущая: ${value}` }, ...options];
+}
+
+function providerFromBaseUrl(baseUrl: string) {
+  const normalized = baseUrl.trim().replace(/\/+$/, "").toLowerCase();
+  return (
+    OPENAI_COMPAT_PROVIDERS.find(
+      (provider) => provider.baseUrl.toLowerCase() === normalized,
+    ) ?? OPENAI_COMPAT_PROVIDERS[0]
+  );
+}
 
 export default function Ai({
   settings,
@@ -14,18 +90,59 @@ export default function Ai({
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(
     null,
   );
+  const [openRouterModels, setOpenRouterModels] = useState<Option[]>([]);
 
   const backend = settings.ai_backend;
   const aiOff = backend === "off";
+  const rewriteProvider = providerFromBaseUrl(settings.rewrite_base_url);
+  const isOpenRouter = rewriteProvider.value === "openrouter";
   // Облачный ASR доступен только для Gemini — Qwen3 в Ollama чисто текстовый.
   const cloudAsrDisabled = backend !== "gemini";
+
+  useEffect(() => {
+    setOpenRouterModels([]);
+  }, [backend, settings.rewrite_base_url, settings.rewrite_key]);
+
+  function applyOpenAiCompatProvider(providerValue: string) {
+    const provider =
+      OPENAI_COMPAT_PROVIDERS.find((item) => item.value === providerValue) ??
+      OPENAI_COMPAT_PROVIDERS[0];
+    const providerIsOpenRouter = provider.value === "openrouter";
+    const keepModel = provider.models.some(
+      (model) => model.value === settings.rewrite_model,
+    );
+    setResult(null);
+    setOpenRouterModels([]);
+    update({
+      rewrite_base_url: provider.baseUrl,
+      rewrite_model: providerIsOpenRouter
+        ? ""
+        : keepModel
+        ? settings.rewrite_model
+        : provider.models[0]?.value ?? "",
+    });
+  }
 
   async function onTest() {
     setTesting(true);
     setResult(null);
     try {
+      const saved = await saveSettings(settings);
+      if (!saved) {
+        setResult({ ok: false, message: "Не удалось сохранить настройки" });
+        return;
+      }
       const r = await aiTest();
       setResult(r);
+      if (isOpenRouter && r.ok && r.models?.length) {
+        setOpenRouterModels(r.models);
+        const current = settings.rewrite_model.trim();
+        if (!r.models.some((model) => model.value === current)) {
+          update({ rewrite_model: r.models[0].value });
+        }
+      } else if (isOpenRouter) {
+        setOpenRouterModels([]);
+      }
     } finally {
       setTesting(false);
     }
@@ -57,11 +174,29 @@ export default function Ai({
               // Сбрасываем прошлый результат проверки и стейл-флаг cloud_asr
               // (он только для Gemini) — UI и хранилище не должны расходиться.
               setResult(null);
-              update(
-                v === "gemini"
-                  ? { ai_backend: v }
-                  : { ai_backend: v, cloud_asr: false },
-              );
+              setOpenRouterModels([]);
+              if (v === "openai_compat") {
+                const provider = settings.rewrite_base_url.trim()
+                  ? rewriteProvider
+                  : OPENAI_COMPAT_PROVIDERS[0];
+                const providerIsOpenRouter = provider.value === "openrouter";
+                update({
+                  ai_backend: v,
+                  cloud_asr: false,
+                  rewrite_base_url: provider.baseUrl,
+                  rewrite_model: providerIsOpenRouter
+                    ? ""
+                    : settings.rewrite_model.trim() ||
+                      provider.models[0]?.value ||
+                      "",
+                });
+              } else {
+                update(
+                  v === "gemini"
+                    ? { ai_backend: v }
+                    : { ai_backend: v, cloud_asr: false },
+                );
+              }
             }}
             options={[
               { value: "off", label: "Выключен" },
@@ -70,7 +205,7 @@ export default function Ai({
               {
                 value: "openai_compat",
                 label:
-                  "Облачный (OpenAI-совместимый: Claude Haiku / OpenAI / Groq)",
+                  "Облачный (OpenRouter / OpenAI-compatible)",
               },
             ]}
           />
@@ -108,14 +243,12 @@ export default function Ai({
 
             <Field
               label="Модель"
-              hint="Идентификатор модели у выбранного бэкенда"
+              hint="Выберите модель Gemini для обработки текста"
             >
-              <input
-                type="text"
-                placeholder="gemini-2.5-flash"
+              <Select
                 value={settings.ai_model}
-                onChange={(e) => update({ ai_model: e.currentTarget.value })}
-                style={{ width: 260 }}
+                onChange={(v) => update({ ai_model: v })}
+                options={withCurrentOption(GEMINI_MODELS, settings.ai_model)}
               />
             </Field>
           </>
@@ -136,13 +269,14 @@ export default function Ai({
               />
             </Field>
 
-            <Field label="Модель" hint="Идентификатор модели в Ollama">
-              <input
-                type="text"
-                placeholder="qwen3:4b"
+            <Field label="Модель" hint="Выберите локальную модель Ollama">
+              <Select
                 value={settings.ollama_model}
-                onChange={(e) => update({ ollama_model: e.currentTarget.value })}
-                style={{ width: 260 }}
+                onChange={(v) => update({ ollama_model: v })}
+                options={withCurrentOption(
+                  OLLAMA_MODELS,
+                  settings.ollama_model,
+                )}
               />
             </Field>
 
@@ -169,31 +303,16 @@ export default function Ai({
         {backend === "openai_compat" && (
           <>
             <Field
-              label="Base URL"
-              hint="Адрес OpenAI-совместимого API. Avalon: https://api.aqua.sh/v1 · OpenAI: https://api.openai.com/v1 · Groq: https://api.groq.com/openai/v1"
+              label="Провайдер"
+              hint={rewriteProvider.hint}
             >
-              <input
-                type="text"
-                className="input-mono"
-                placeholder="https://api.groq.com/openai/v1"
-                value={settings.rewrite_base_url}
-                onChange={(e) =>
-                  update({ rewrite_base_url: e.currentTarget.value })
-                }
-                style={{ width: 320 }}
-              />
-            </Field>
-
-            <Field
-              label="Модель"
-              hint="Идентификатор chat-модели у провайдера"
-            >
-              <input
-                type="text"
-                placeholder="llama-3.3-70b-versatile / claude-3-5-haiku"
-                value={settings.rewrite_model}
-                onChange={(e) => update({ rewrite_model: e.currentTarget.value })}
-                style={{ width: 320 }}
+              <Select
+                value={rewriteProvider.value}
+                onChange={applyOpenAiCompatProvider}
+                options={OPENAI_COMPAT_PROVIDERS.map((provider) => ({
+                  value: provider.value,
+                  label: provider.label,
+                }))}
               />
             </Field>
 
@@ -205,7 +324,11 @@ export default function Ai({
                 type="password"
                 placeholder="Вставьте ключ"
                 value={settings.rewrite_key}
-                onChange={(e) => update({ rewrite_key: e.currentTarget.value })}
+                onChange={(e) => {
+                  setResult(null);
+                  setOpenRouterModels([]);
+                  update({ rewrite_key: e.currentTarget.value });
+                }}
                 style={{ width: 260 }}
               />
             </Field>
@@ -215,8 +338,53 @@ export default function Ai({
               style={{ marginTop: -6, marginBottom: 14, maxWidth: "none" }}
             >
               Или переменная окружения <code>REWRITE_API_KEY</code> /{" "}
-              <code>OPENAI_API_KEY</code>; в коде/логах не хранится.
+              <code>{rewriteProvider.keyHint}</code> / <code>OPENAI_API_KEY</code>;
+              в коде/логах не хранится.
             </div>
+
+            {isOpenRouter ? (
+              openRouterModels.length > 0 ? (
+                <Field
+                  label="Бесплатная модель"
+                  hint={`Base URL: ${rewriteProvider.baseUrl}`}
+                >
+                  <Select
+                    value={
+                      openRouterModels.some(
+                        (model) => model.value === settings.rewrite_model,
+                      )
+                        ? settings.rewrite_model
+                        : openRouterModels[0]?.value ?? ""
+                    }
+                    onChange={(v) => update({ rewrite_model: v })}
+                    options={openRouterModels}
+                  />
+                </Field>
+              ) : (
+                <Field
+                  label="Бесплатная модель"
+                  hint="Список появится только после успешной проверки OpenRouter-ключа"
+                >
+                  <span className="field-hint" style={{ maxWidth: 280 }}>
+                    Вставьте ключ и нажмите «Проверить».
+                  </span>
+                </Field>
+              )
+            ) : (
+              <Field
+                label="Модель"
+                hint={`Base URL: ${rewriteProvider.baseUrl}`}
+              >
+                <Select
+                  value={settings.rewrite_model}
+                  onChange={(v) => update({ rewrite_model: v })}
+                  options={withCurrentOption(
+                    rewriteProvider.models,
+                    settings.rewrite_model,
+                  )}
+                />
+              </Field>
+            )}
           </>
         )}
 
@@ -236,7 +404,7 @@ export default function Ai({
                 color: result.ok ? "var(--green)" : "var(--red)",
               }}
             >
-              {result.ok ? "Подключение работает" : result.message}
+              {result.ok ? result.message || "Подключение работает" : result.message}
             </span>
           )}
           {aiOff && !result && (
@@ -277,16 +445,6 @@ export default function Ai({
               onChange={(v) => update({ cloud_asr: v })}
             />
           </span>
-        </Field>
-
-        <Field
-          label="Авто-стиль по приложению"
-          hint="Gmail → официально, мессенджеры → неформально, нейросети → чёткий стиль"
-        >
-          <Switch
-            checked={settings.tone_by_app}
-            onChange={(v) => update({ tone_by_app: v })}
-          />
         </Field>
 
         {aiOff && (

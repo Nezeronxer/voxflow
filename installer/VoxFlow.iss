@@ -1,8 +1,14 @@
 ﻿; ============================================================================
 ;  VoxFlow — per-user neon-dark installer
-;  Inno Setup 6.7 script. Compile with:
+;  Inno Setup 6.7 script. IMPORTANT: build the packaged Tauri exe first.
+;    cd voxflow
+;    npm run tauri -- build --no-bundle
+;  Then compile with:
 ;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\VoxFlow.iss
-;  Output: installer\Output\VoxFlow-Setup-0.2.0.exe
+;  Output: installer\Output\VoxFlow-Setup-0.4.0.exe
+;
+;  Do NOT compile this installer after a plain `cargo build --release`: that
+;  Tauri binary stays in dev mode and opens http://localhost:1420 in WebView2.
 ; ----------------------------------------------------------------------------
 ;  PER-USER install (PrivilegesRequired=lowest, HKCU, {localappdata}\VoxFlow).
 ;  Wizard sequence: Welcome -> Destination -> Select Additional Tasks ->
@@ -13,7 +19,7 @@
 ; ============================================================================
 
 #define AppName    "VoxFlow"
-#define AppVersion "0.2.0"
+#define AppVersion "0.4.0"
 #define Publisher  "Крылов Анатолий Евгеньевич"
 #define AppExe     "voxflow.exe"
 #define SrcDir     "..\voxflow\src-tauri\target\release"
@@ -24,7 +30,7 @@ AppId={{B2F1A9E0-7C4D-4E8A-9F3B-1A2C5D6E7F80}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
-VersionInfoVersion=0.2.0.0
+VersionInfoVersion=0.4.0.0
 
 ; --- Per-user install: no elevation, current user only. ---
 PrivilegesRequired=lowest
@@ -43,7 +49,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 
 ; --- Output ---
 OutputDir=Output
-OutputBaseFilename=VoxFlow-Setup-0.2.0
+OutputBaseFilename=VoxFlow-Setup-{#AppVersion}
 Compression=lzma2/ultra64
 SolidCompression=yes
 

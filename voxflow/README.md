@@ -1,7 +1,27 @@
-# Tauri + React + Typescript
+# VoxFlow App
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+Tauri + React desktop app for VoxFlow. The repository root contains the user
+README, installer script and release workflow; this folder contains the app
+source.
 
-## Recommended IDE Setup
+## Local QA
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+```powershell
+npm ci
+npm run build
+cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check
+cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path src-tauri\Cargo.toml --lib
+npm run tauri -- build --no-bundle
+```
+
+Build the Inno installer from the repository root after the packaged Tauri
+build:
+
+```powershell
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ".\installer\VoxFlow.iss"
+```
+
+Do not build release installers from a plain `cargo build --release` binary:
+that path can point WebView2 at the dev server. Use `npm run tauri -- build
+--no-bundle` first.
