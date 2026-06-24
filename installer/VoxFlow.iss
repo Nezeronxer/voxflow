@@ -5,7 +5,7 @@
 ;    npm run tauri -- build --no-bundle
 ;  Then compile with:
 ;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\VoxFlow.iss
-;  Output: installer\Output\VoxFlow-Setup-1.0.0.exe
+;  Output: installer\Output\VoxFlow-Setup-1.0.1.exe
 ;
 ;  Do NOT compile this installer after a plain `cargo build --release`: that
 ;  Tauri binary stays in dev mode and opens http://localhost:1420 in WebView2.
@@ -19,7 +19,7 @@
 ; ============================================================================
 
 #define AppName    "VoxFlow"
-#define AppVersion "1.0.0"
+#define AppVersion "1.0.1"
 #define Publisher  "Крылов Анатолий Евгеньевич"
 #define AppExe     "voxflow.exe"
 #define SrcDir     "..\voxflow\src-tauri\target\release"
@@ -30,7 +30,7 @@ AppId={{B2F1A9E0-7C4D-4E8A-9F3B-1A2C5D6E7F80}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
-VersionInfoVersion=1.0.0.0
+VersionInfoVersion=1.0.1.0
 
 ; --- Per-user install: no elevation, current user only. ---
 PrivilegesRequired=lowest
@@ -268,8 +268,15 @@ begin
     WizardForm.WelcomeLabel2.Font.Color := clSecondary;
 
   { --- Finished page text --- }
+  if WizardForm.FinishedHeadingLabel <> nil then
+    WizardForm.FinishedHeadingLabel.Font.Color := clText;
   if WizardForm.FinishedLabel <> nil then
     WizardForm.FinishedLabel.Font.Color := clText;
+  if WizardForm.RunList <> nil then
+  begin
+    WizardForm.RunList.Color := clPanel;
+    WizardForm.RunList.Font.Color := clText;
+  end;
 
   { --- Destination page --- }
   if WizardForm.SelectDirLabel <> nil then
@@ -307,6 +314,28 @@ begin
     WizardForm.StatusLabel.Font.Color := clSecondary;
   if WizardForm.FilenameLabel <> nil then
     WizardForm.FilenameLabel.Font.Color := clSecondary;
+
+  { --- Preparing page / close-running-apps prompt --- }
+  if WizardForm.PreparingLabel <> nil then
+  begin
+    WizardForm.PreparingLabel.Color := clBase;
+    WizardForm.PreparingLabel.Font.Color := clSecondary;
+  end;
+  if WizardForm.PreparingMemo <> nil then
+  begin
+    WizardForm.PreparingMemo.Color := clPanel;
+    WizardForm.PreparingMemo.Font.Color := clText;
+  end;
+  if WizardForm.PreparingYesRadio <> nil then
+  begin
+    WizardForm.PreparingYesRadio.Color := clBase;
+    WizardForm.PreparingYesRadio.Font.Color := clText;
+  end;
+  if WizardForm.PreparingNoRadio <> nil then
+  begin
+    WizardForm.PreparingNoRadio.Color := clBase;
+    WizardForm.PreparingNoRadio.Font.Color := clText;
+  end;
 
   { --- Buttons: neon-cyan accent on the primary action --- }
   if WizardForm.NextButton <> nil then

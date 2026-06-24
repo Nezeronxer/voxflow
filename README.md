@@ -4,9 +4,9 @@ VoxFlow превращает речь в текст и вставляет рез
 чат, браузер, документ, IDE или окно Codex. По умолчанию он работает локально,
 а облачные провайдеры включаются только в формате BYOK — со своим ключом.
 
-![status](https://img.shields.io/badge/platform-Windows-blue) ![version](https://img.shields.io/badge/version-1.0-green) ![privacy](https://img.shields.io/badge/privacy-local%20or%20BYOK-orange)
+![status](https://img.shields.io/badge/platform-Windows-blue) ![version](https://img.shields.io/badge/version-1.0.1-green) ![privacy](https://img.shields.io/badge/privacy-local%20or%20BYOK-orange)
 
-## Что умеет v1.0
+## Что умеет v1.0.1
 
 - Hold-to-talk и toggle-диктовка через глобальную горячую клавишу.
 - Автовосстановление звука после диктовки через режим auto-mute.
@@ -23,7 +23,7 @@ VoxFlow превращает речь в текст и вставляет рез
 Локальный release installer собирается сюда:
 
 ```powershell
-installer\Output\VoxFlow-Setup-1.0.0.exe
+installer\Output\VoxFlow-Setup-1.0.1.exe
 ```
 
 Установка идёт в профиль текущего пользователя:
@@ -101,7 +101,7 @@ plain `cargo build --release`, иначе WebView может искать dev se
 
 ## Локальный QA перед публикацией
 
-Минимальный gate для v1.0:
+Минимальный gate для v1.0.1:
 
 ```powershell
 cd "C:\Моя папка\wispr flow\voxflow"

@@ -57,8 +57,11 @@
 .aq-orbwrap,
 .aq-bars,
 .aq-check,
+.aq-done-copy,
+.aq-final-badge,
 .aq-latch-copy,
-.aq-msg {
+.aq-msg,
+.aq-trans-copy {
   pointer-events: none;
 }
 
@@ -105,7 +108,7 @@
 
 /* done: компактная пилюля с галочкой на 900 мс, затем плавный спад в idle. */
 .aq-done {
-  width: 48px;
+  width: 92px;
   height: 26px;
 }
 
@@ -374,6 +377,21 @@
   vertical-align: 1px;
 }
 
+.aq-final-badge {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border: 1px solid rgba(255, 255, 255, 0.26);
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.72);
+  vertical-align: 1px;
+  animation: aq-lang-in 160ms ease-out both;
+}
+
 /* ---------- Latch, галочка done и текст notice ---------- */
 
 .aq-latch-copy {
@@ -414,6 +432,27 @@
   font-weight: 800;
   letter-spacing: 0;
 }
+
+.aq-trans-copy {
+  color: rgba(255, 255, 255, 0.78);
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.aq-done-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: rgba(255, 255, 255, 0.92);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+
 @keyframes aq-latch-pop {
   from {
     opacity: 0;

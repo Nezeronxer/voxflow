@@ -1,6 +1,6 @@
 [package]
 name = "voxflow"
-version = "1.0.0"
+version = "1.0.1"
 description = "Local-first voice dictation for Windows"
 authors = ["VoxFlow"]
 edition = "2021"
