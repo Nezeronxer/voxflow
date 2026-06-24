@@ -45,6 +45,7 @@ type DetectedLang = "ru" | "en" | null;
 type PartialWithLang = PartialEvent & {
   lang?: DetectedLang;
   final?: boolean;
+  settled?: boolean;
   processed?: boolean;
 };
 // "status": legacy-строка (текущий бэкенд) ЛИБО объект { status, lang }.
@@ -56,9 +57,9 @@ type StatusPayload = string | { status?: string; lang?: DetectedLang };
 const BOX: Record<PillMode, { w: number; h: number }> = {
   idle: { w: 220, h: 80 },
   rec: { w: 140, h: 64 },
-  trans: { w: 140, h: 64 },
+  trans: { w: 176, h: 64 },
   stream: { w: 424, h: 168 },
-  done: { w: 220, h: 80 }, // как idle — меньше дёрганий окна при переходе done→idle
+  done: { w: 220, h: 80 }, // запас под короткое «Готово»
   latch: { w: 300, h: 82 },
   notice: { w: 424, h: 92 },
 };
@@ -94,7 +95,6 @@ export default function Overlay() {
   // Язык текущей диктовки от бэкенда (lang в "partial"/"status"). null =
   // не определён / старый бэкенд без поля → бейдж скрыт. Сброс на новой записи.
   const [lang, setLang] = useState<DetectedLang>(null);
-  const [processedPreview, setProcessedPreview] = useState(false);
   const [finalHold, setFinalHold] = useState(false);
   const finalHoldRef = useRef(false);
   const finalHoldTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -210,7 +210,6 @@ export default function Overlay() {
       lastFrameRef.current = 0;
       setShownBoth(0);
       setTypingOnce(false);
-      setProcessedPreview(false);
       clearFinalHold();
     };
 
@@ -336,7 +335,7 @@ export default function Overlay() {
         finalHoldRef.current = false;
         setFinalHold(false);
         if (statusRef.current === "idle") resetTextEngine();
-      }, 1600);
+      }, 3000);
     };
 
     // Применить lang из события: поля нет (undefined) — старый бэкенд, ничего
@@ -373,9 +372,10 @@ export default function Overlay() {
       } else if (v === "transcribing") {
         clearDone();
         setDone(false);
-        // Во время финальной обработки оставляем в пилюле последний обработанный
-        // live-preview, чтобы пользователь видел, что именно сейчас будет вставлено.
-        // Финальный partial.final=true позже заменит его точным результатом.
+        // Финальная обработка/вставка началась: старое settled-«готово» больше
+        // не должно висеть на экране. Пока backend готовит и вставляет текст,
+        // показываем явный spinner «Готовлю»; финальный preview вернётся после idle.
+        clearFinalHold();
         kickLevel();
       } else {
         // idle. Если завершилась расшифровка — 900 мс галочка, затем мини-пилюля.
@@ -411,9 +411,14 @@ export default function Overlay() {
         currentSeqRef.current = seq;
       }
       const isFinalPreview = e.payload?.final === true;
-      const isProcessedPreview = e.payload?.processed === true || isFinalPreview;
+      const isSettledPreview = e.payload?.settled === true;
+      const isProcessedPreview =
+        e.payload?.processed === true || isFinalPreview || isSettledPreview;
       if (statusRef.current === "transcribing" && !isProcessedPreview) {
         return;
+      }
+      if (!isFinalPreview && !isSettledPreview && finalHoldRef.current) {
+        clearFinalHold();
       }
       // Язык от STT (опционален): обновляем после дедупа — эхо прошлой записи
       // не перетирает бейдж текущей. setState с тем же значением React гасит сам.
@@ -439,15 +444,14 @@ export default function Overlay() {
       // Если ASR прислал большой новый кусок, не заставляем пользователя ждать
       // посимвольную анимацию всей фразы: держим максимум небольшой live-lag.
       if (previewChanged) {
-        const maxLiveLag = isFinalPreview ? 0 : 28;
+        const maxLiveLag = isFinalPreview || isSettledPreview ? 0 : 28;
         const lag = text.length - shownFloatRef.current;
         if (lag > maxLiveLag) {
           shownFloatRef.current = Math.max(0, text.length - maxLiveLag);
           setShownBoth(Math.floor(shownFloatRef.current));
         }
       }
-      setProcessedPreview(isProcessedPreview);
-      if (isFinalPreview) holdFinalPreview();
+      if (isFinalPreview || isSettledPreview) holdFinalPreview();
       kick();
     });
 
@@ -523,15 +527,13 @@ export default function Overlay() {
       ? "notice"
       : latchNotice != null
         ? "latch"
+        : status === "transcribing"
+        ? "trans"
         : finalHold && shown > 0
         ? "stream"
         : done
         ? "done"
-        : status === "transcribing"
-          ? processedPreview && shown > 0
-            ? "stream"
-            : "trans"
-          : status === "recording"
+        : status === "recording"
             ? shown > 0
               ? "stream"
               : "rec"
@@ -642,17 +644,19 @@ export default function Overlay() {
             </span>
           </span>
         ) : mode === "done" ? (
-          // Галочка done: проявляется keyframe'ом, пилюля сама ужмётся в idle через 900 мс.
-          <svg className="aq-check" viewBox="0 0 12 12" aria-hidden>
-            <path
-              d="M2.4 6.4l2.5 2.6 4.7-5.4"
-              fill="none"
-              stroke="#fff"
-              strokeWidth="1.6"
-              strokeLinecap="round"
-              strokeLinejoin="round"
-            />
-          </svg>
+          <span className="aq-done-copy">
+            <svg className="aq-check" viewBox="0 0 12 12" aria-hidden>
+              <path
+                d="M2.4 6.4l2.5 2.6 4.7-5.4"
+                fill="none"
+                stroke="#fff"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            <span>Готово</span>
+          </span>
         ) : showOrb ? (
           <>
             {/* Орб: статичный drop-shadow по спеке + динамический glow-слой, чей
@@ -702,23 +706,28 @@ export default function Overlay() {
                         офлайн
                       </span>
                     )}
+                    {finalHold && <span className="aq-final-badge">готово</span>}
                   </div>
                 );
               })()
             ) : (
               // 12 баров визуализатора; высоту/прозрачность пишет rAF-цикл громкости.
               // Пока событий "level" нет (бэкенд не готов) — стоят на CSS-минимуме.
-              <span className="aq-bars" aria-hidden>
-                {BAR_WEIGHTS.map((_, i) => (
-                  <span
-                    key={i}
-                    className="aq-bar"
-                    ref={(el) => {
-                      barEls.current[i] = el;
-                    }}
-                  />
-                ))}
-              </span>
+              mode === "trans" ? (
+                <span className="aq-trans-copy">Готовлю</span>
+              ) : (
+                <span className="aq-bars" aria-hidden>
+                  {BAR_WEIGHTS.map((_, i) => (
+                    <span
+                      key={i}
+                      className="aq-bar"
+                      ref={(el) => {
+                        barEls.current[i] = el;
+                      }}
+                    />
+                  ))}
+                </span>
+              )
             )}
           </>
         ) : null}

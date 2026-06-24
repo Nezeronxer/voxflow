@@ -1168,6 +1168,7 @@ fn start_local_partial_loop<T: LocalStt + Send + 'static>(
 fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
     const SPEECH_PROB: f32 = 0.35;
     const SIL_BOUND_MS: usize = 600;
+    const SETTLED_MS: usize = 3000;
     let tick_ms = a.tuning.tick_ms;
     let max_seg_samples = a.tuning.max_seg_samples;
 
@@ -1181,6 +1182,7 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
     let mut cur_seg_first_speech: Option<usize> = None;
     let mut seg_has_speech = false;
     let mut last_emitted: Option<(String, String)> = None;
+    let mut settled_emitted_for_end = 0usize;
 
     // Свой стриминговый VAD-state на диктовку.
     if let Some(v) = a.vad.lock().as_mut() {
@@ -1227,6 +1229,33 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             }
         }
         if !seg_has_speech {
+            let settled_silence = vad_pos.saturating_sub(prev_seg_end);
+            if prev_seg_end > 0
+                && !committed_segs.is_empty()
+                && settled_silence >= SETTLED_MS * 16
+                && settled_emitted_for_end != prev_seg_end
+            {
+                let (committed, volatile, full) = clean_live_partial(
+                    &render_segments(&committed_segs),
+                    "",
+                    &a.settings,
+                    &a.dict,
+                    &a.snippets,
+                    &a.corrections,
+                );
+                if !full.is_empty() && !a.stop.load(Ordering::Acquire) {
+                    settled_emitted_for_end = prev_seg_end;
+                    last_emitted = Some((committed.clone(), volatile.clone()));
+                    if a.stream_mode == "never" {
+                        *a.committed_field.lock() = full.clone();
+                    }
+                    let lang = a.tuning.fixed_lang.or_else(|| detect_lang_label(&full));
+                    let _ = a.app.emit(
+                        "partial",
+                        settled_partial_payload(&full, &committed, a.seq, lang),
+                    );
+                }
+            }
             continue; // в активном сегменте речи ещё нет — ASR не дёргаем
         }
         let silence_samples = vad_pos.saturating_sub(last_speech_end);
@@ -1284,6 +1313,12 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
         last_emitted = Some((committed.clone(), volatile.clone()));
         if a.stop.load(Ordering::Acquire) {
             break; // не показываем партиал поверх идущего финала
+        }
+        if a.stream_mode == "never" {
+            // В режиме «только плашка» это не поле ввода, а последний текст,
+            // который пользователь реально видел. Финал использует его как
+            // страховку против редких ASR-галлюцинаций/старого хвоста.
+            *a.committed_field.lock() = full.clone();
         }
         // Бейдж языка (контракт overlay): фиксированный "ru" у GigaAM-маршрута,
         // по скрипту текста у Parakeet (en/auto); null → бейдж скрыт.
@@ -1901,6 +1936,151 @@ impl LiveState {
             _ => false,
         }
     }
+
+    fn visible_preview(&self) -> String {
+        self.committed.lock().clone()
+    }
+}
+
+/// Финальный ASR не должен слушать длинную тишину: whisper особенно легко
+/// галлюцинирует на хвостах и паузах. Для WAV, который уходит в whisper/cloud,
+/// оставляем только речевые VAD-острова с небольшим запасом по краям.
+fn compact_speech_for_final_asr(
+    vad: &Arc<Mutex<Option<crate::vad::SileroVad>>>,
+    samples: &[f32],
+) -> Vec<f32> {
+    const SPEECH_PROB: f32 = 0.35;
+    const SIL_SPLIT: usize = 600 * 16;
+    const PAD: usize = 4800;
+    const JOIN_SILENCE: usize = 3200; // 200 мс между склеенными фразами
+
+    if samples.len() < 16000 / 5 {
+        return samples.to_vec();
+    }
+
+    let chunk = crate::vad::CHUNK;
+    let mut speech: Vec<bool> = Vec::with_capacity(samples.len() / chunk + 1);
+    {
+        let mut vg = vad.lock();
+        let Some(v) = vg.as_mut() else {
+            return samples.to_vec();
+        };
+        v.reset();
+        for c in samples.chunks(chunk) {
+            speech.push(v.process_chunk(c).unwrap_or(1.0) >= SPEECH_PROB);
+        }
+        v.reset();
+    }
+    if speech.is_empty() {
+        return samples.to_vec();
+    }
+    if !speech.iter().any(|&x| x) {
+        return Vec::new();
+    }
+
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0usize;
+    while i < speech.len() {
+        if !speech[i] {
+            i += 1;
+            continue;
+        }
+        let start_chunk = i;
+        let mut last_voiced = i;
+        let mut j = i + 1;
+        while j < speech.len() {
+            if speech[j] {
+                last_voiced = j;
+                j += 1;
+                continue;
+            }
+            let mut k = j;
+            while k < speech.len() && !speech[k] {
+                k += 1;
+            }
+            if (k - j) * chunk >= SIL_SPLIT {
+                break;
+            }
+            j = k;
+        }
+        let start = (start_chunk * chunk).saturating_sub(PAD);
+        let end = (((last_voiced + 1) * chunk) + PAD).min(samples.len());
+        if end > start {
+            spans.push((start, end));
+        }
+        i = j.max(last_voiced + 1);
+    }
+
+    if spans.is_empty() {
+        return Vec::new();
+    }
+    let kept: usize = spans.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    if spans.len() == 1 && kept + 16000 >= samples.len() {
+        return samples.to_vec();
+    }
+
+    let mut out = Vec::with_capacity(kept + JOIN_SILENCE.saturating_mul(spans.len()));
+    for (idx, (start, end)) in spans.into_iter().enumerate() {
+        if idx > 0 {
+            out.extend(std::iter::repeat_n(0.0, JOIN_SILENCE));
+        }
+        out.extend_from_slice(&samples[start..end]);
+    }
+    out
+}
+
+fn reconcile_final_with_live_preview(live: Option<&LiveState>, final_text: &str) -> String {
+    let Some(live) = live else {
+        return final_text.to_string();
+    };
+    if live.stream_mode != "never" {
+        return final_text.to_string();
+    }
+    let preview = live.visible_preview();
+    if looks_like_stale_final(&preview, final_text) {
+        dbg_log(&format!(
+            "финал: текст почти не совпал с live-preview (preview_len={}, final_len={}) — берём то, что видел пользователь",
+            preview.chars().count(),
+            final_text.chars().count()
+        ));
+        return preview;
+    }
+    final_text.to_string()
+}
+
+fn looks_like_stale_final(preview: &str, final_text: &str) -> bool {
+    let preview = preview.trim();
+    let final_text = final_text.trim();
+    if preview.is_empty() || final_text.is_empty() {
+        return false;
+    }
+
+    let p_tokens = lexical_tokens(preview);
+    let f_tokens = lexical_tokens(final_text);
+    if p_tokens.len() < 3 || f_tokens.len() < 4 {
+        return false;
+    }
+
+    let overlap = p_tokens.intersection(&f_tokens).count();
+    let overlap_ratio = overlap as f32 / p_tokens.len().min(f_tokens.len()) as f32;
+    let p_chars = preview.chars().count();
+    let f_chars = final_text.chars().count();
+    let final_has_big_tail = f_chars > p_chars + 40 || f_tokens.len() > p_tokens.len() + 8;
+
+    final_has_big_tail && overlap_ratio < 0.25
+}
+
+fn lexical_tokens(text: &str) -> HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter_map(|t| {
+            let t = t.trim();
+            if t.chars().count() < 2 {
+                None
+            } else {
+                Some(t.to_lowercase())
+            }
+        })
+        .collect()
 }
 
 /// Стереть уже напечатанный живой черновик (режимы always/auto): голосовая
@@ -1968,8 +2148,9 @@ fn process_utterance(
     let t_pre = Instant::now();
     let mono16 = audio::resample_to_16k(&samples, rate);
     let trimmed = audio::trim_silence(&mono16, 16000);
+    let speech_trimmed = compact_speech_for_final_asr(&ctx.vad_final, &trimmed);
     let pre_ms = t_pre.elapsed().as_millis() as u64;
-    if trimmed.len() < 16000 / 5 {
+    if speech_trimmed.len() < 16000 / 5 {
         // < ~0.2 c полезного звука — считаем, что речи не было
         return Ok(());
     }
@@ -1978,7 +2159,7 @@ fn process_utterance(
     // финал предыдущей диктовки ещё в полёте, а уже стартовала следующая.
     let wav = paths::unique_tmp_path(&format!("utterance_{my_gen}"), "wav");
     let _wav_guard = paths::TempFileGuard::new(wav.clone());
-    audio::write_wav_16k_mono(&wav, &trimmed)?;
+    audio::write_wav_16k_mono(&wav, &speech_trimmed)?;
 
     // Словарь и сниппеты из БД (под локом).
     let (dict, snippets) = {
@@ -2117,6 +2298,8 @@ fn process_utterance(
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
+
+    text = reconcile_final_with_live_preview(live.as_ref(), &text);
 
     // ── «Умный» рерайт под стиль активного приложения (Gemini/Ollama/OpenAI-compatible) ──
     // Контекст окна нужен и для тона, и для payload Ollama — детектим один раз.
@@ -2610,6 +2793,23 @@ fn final_preview_payload(text: &str, seq: u64, lang: Option<&'static str>) -> se
     })
 }
 
+fn settled_partial_payload(
+    text: &str,
+    committed: &str,
+    seq: u64,
+    lang: Option<&'static str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "text": text,
+        "committed": committed,
+        "volatile": "",
+        "seq": seq,
+        "lang": lang,
+        "processed": true,
+        "settled": true,
+    })
+}
+
 fn emit_final_preview(app: &AppHandle, text: &str, seq: u64, lang: Option<&'static str>) {
     let _ = app.emit("partial", final_preview_payload(text, seq, lang));
 }
@@ -2641,6 +2841,18 @@ mod overlay_event_tests {
         assert_eq!(payload["lang"], "ru");
         assert_eq!(payload["processed"], true);
         assert_eq!(payload["final"], true);
+    }
+
+    #[test]
+    fn settled_partial_payload_marks_silence_preview() {
+        let payload = settled_partial_payload("Готовый текст.", "Готовый текст.", 43, Some("ru"));
+
+        assert_eq!(payload["text"], "Готовый текст.");
+        assert_eq!(payload["volatile"], "");
+        assert_eq!(payload["seq"], 43);
+        assert_eq!(payload["processed"], true);
+        assert_eq!(payload["settled"], true);
+        assert!(payload.get("final").is_none());
     }
 }
 
@@ -3010,6 +3222,22 @@ mod seg_tests {
         assert!(!prefer_gigaam_for_auto(
             "please update the prompt",
             "Пожалуйста обнови промпт"
+        ));
+    }
+
+    #[test]
+    fn stale_final_guard_rejects_unseen_big_tail() {
+        assert!(looks_like_stale_final(
+            "Исправьте пожалуйста этот текст",
+            "Прошлая длинная фраза вообще из другой диктовки и старого сообщения которое пользователь сейчас не говорил"
+        ));
+    }
+
+    #[test]
+    fn stale_final_guard_accepts_same_dictation_with_more_words() {
+        assert!(!looks_like_stale_final(
+            "Исправьте пожалуйста этот текст",
+            "Исправьте пожалуйста этот текст и сделайте его немного понятнее"
         ));
     }
 

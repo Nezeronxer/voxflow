@@ -1,14 +1,17 @@
-# VoxFlow v1.0
+# VoxFlow v1.0.1
 
 ## Highlights
 
 - Local-first Windows dictation with hold-to-talk, toggle mode and double-press latch.
+- Dictation overlay hotfix: after silence the blue pill shows the settled processed text, and the final insertion waits behind a visible `Готовлю` spinner.
+- Final ASR hotfix: long silence is compacted before final recognition, and rare stale/hallucinated tails are rejected when they do not match the live preview.
 - App-aware rewrite profiles for chats, mail, AI prompts, code and documents.
 - Voice-guided prompt rewrite: write a base prompt, speak an edit instruction, preview and apply the rewritten result.
 - BYOK cloud STT and rewrite providers, including OpenRouter/OpenAI-compatible options.
 - Per-app prompt rules for AI tools such as Codex, ChatGPT, Claude, Gemini, DeepSeek, Grok and OpenRouter.
 - Auto-mute restore guard and safer app shutdown behavior.
 - Polished `Облако` settings UI with provider status, preset grid and local/cloud clarity.
+- Installer theme polish: the close-running-apps/preparing page, finished page and task list are readable in the dark neon wizard.
 
 ## Local QA Gate
 
@@ -32,8 +35,21 @@ Then build the installer from the repository root:
 
 ## Release Artifact
 
-- `VoxFlow-Setup-1.0.0.exe`
-- SHA256: `BF585D85BE46F0A8ADD39E097EB6892831C21E7D1094F973F659AB0C3ECB993A`
+- `VoxFlow-Setup-1.0.1.exe`
+- Size: `288045771` bytes
+- SHA256: `0EE3551C9A2AE784250D450D389F091DC8CC1F14AFDAE42CD58827D7C65E716D`
+
+## Verified For This Build
+
+- `npm run build` — OK.
+- `npm audit --audit-level=high` — OK, 0 vulnerabilities.
+- `cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check` — OK.
+- `cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings` — OK.
+- `cargo test --manifest-path src-tauri\Cargo.toml --lib -- --nocapture` — OK, 115 passed, 5 ignored.
+- `npm run tauri -- build --no-bundle` — OK, release exe built as `voxflow v1.0.1`.
+- Inno Setup compile — OK, created `VoxFlow-Setup-1.0.1.exe`.
+- Silent per-user install — OK, registry and installed resources verified under `%LOCALAPPDATA%\VoxFlow`.
+- Installer visual QA — OK, welcome and additional-tasks screens checked in the Russian wizard.
 
 ## Known Limits
 
