@@ -1,4 +1,4 @@
-# VoxFlow v0.4.0
+# VoxFlow v1.0
 
 ## Highlights
 
