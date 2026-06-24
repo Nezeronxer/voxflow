@@ -2,6 +2,7 @@
   "name": "voxflow",
   "private": true,
   "version": "1.0.1",
+  "license": "UNLICENSED",
   "type": "module",
   "scripts": {
     "dev": "vite",

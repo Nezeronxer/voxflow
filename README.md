@@ -4,7 +4,11 @@ VoxFlow превращает речь в текст и вставляет рез
 чат, браузер, документ, IDE или окно Codex. По умолчанию он работает локально,
 а облачные провайдеры включаются только в формате BYOK — со своим ключом.
 
-![status](https://img.shields.io/badge/platform-Windows-blue) ![version](https://img.shields.io/badge/version-1.0.1-green) ![privacy](https://img.shields.io/badge/privacy-local%20or%20BYOK-orange)
+![status](https://img.shields.io/badge/platform-Windows-blue) ![version](https://img.shields.io/badge/version-1.0.1-green) ![license](https://img.shields.io/badge/license-proprietary-red) ![privacy](https://img.shields.io/badge/privacy-local%20or%20BYOK-orange)
+
+VoxFlow — proprietary product by Nezeronxer. The source code is visible for
+review only; copying, redistribution, rebranding, resale, forks, clones and
+derivative products are prohibited without written permission. See [LICENSE](LICENSE).
 
 ## Что умеет v1.0.1
 
@@ -77,6 +81,14 @@ installer\Output\VoxFlow-Setup-1.0.1.exe
 - Fake/env key QA не требует реальных секретов.
 - Ключи должны быть замаскированы в UI и не должны попадать в `debug.log`.
 - Автозапуск включается только через настройку пользователя.
+
+## Лицензия
+
+Copyright (c) 2026 Nezeronxer. All rights reserved.
+
+VoxFlow не является open-source проектом. Код открыт только для просмотра и
+проверки. Нельзя копировать, перепродавать, переименовывать, публиковать форки,
+клоны или производные продукты без письменного разрешения Nezeronxer.
 
 ## Сборка из исходников
 

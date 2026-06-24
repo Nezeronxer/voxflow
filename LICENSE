@@ -1,0 +1,47 @@
+VoxFlow Proprietary License
+
+Copyright (c) 2026 Nezeronxer. All rights reserved.
+
+This repository and the VoxFlow software, including source code, binaries,
+installer scripts, user interface assets, documentation, product names, logos,
+and related materials, are proprietary works owned by Nezeronxer.
+
+The source code is made publicly visible only for transparency, review,
+issue reporting, and educational inspection. Public visibility does not grant
+any license or permission to use, copy, modify, merge, publish, distribute,
+sublicense, sell, rent, host, rebrand, reverse engineer, or create derivative
+works from VoxFlow or any part of this repository.
+
+You may not:
+
+- copy this project into another repository or product;
+- redistribute VoxFlow source code, installers, binaries, models, assets, or
+  documentation;
+- publish modified versions, forks, clones, ports, or derivative works;
+- remove or alter copyright, authorship, branding, or ownership notices;
+- use the VoxFlow name, logo, interface, or product identity in another
+  product or service;
+- sell, rent, sublicense, monetize, or commercially exploit VoxFlow without
+  prior written permission from Nezeronxer.
+
+End users may download and run official VoxFlow release binaries published by
+Nezeronxer for personal use, provided that the binaries are not redistributed,
+modified, rebranded, or bundled with another product.
+
+Any permission not expressly granted in this license is reserved by Nezeronxer.
+Written permission must be obtained from Nezeronxer before any use outside the
+limited inspection and official-binary personal-use permissions described
+above.
+
+Third-party dependencies included in or used by VoxFlow remain governed by
+their own respective licenses. This license applies only to VoxFlow-owned
+materials.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, AVAILABILITY, OR ERROR-FREE
+OPERATION. NEZERONXER SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER
+LIABILITY ARISING FROM OR RELATED TO THE SOFTWARE OR ITS USE.
+
+Unauthorized use, copying, redistribution, rebranding, resale, or creation of
+derivative works is prohibited and may result in legal action.
