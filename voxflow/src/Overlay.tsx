@@ -42,7 +42,11 @@ type PillMode = "idle" | "rec" | "stream" | "trans" | "done" | "latch" | "notice
 // работает как раньше — бейдж просто скрыт. types.ts правит другая волна,
 // поэтому расширение типизировано локально, поверх существующих контрактов.
 type DetectedLang = "ru" | "en" | null;
-type PartialWithLang = PartialEvent & { lang?: DetectedLang };
+type PartialWithLang = PartialEvent & {
+  lang?: DetectedLang;
+  final?: boolean;
+  processed?: boolean;
+};
 // "status": legacy-строка (текущий бэкенд) ЛИБО объект { status, lang }.
 type StatusPayload = string | { status?: string; lang?: DetectedLang };
 
@@ -90,6 +94,10 @@ export default function Overlay() {
   // Язык текущей диктовки от бэкенда (lang в "partial"/"status"). null =
   // не определён / старый бэкенд без поля → бейдж скрыт. Сброс на новой записи.
   const [lang, setLang] = useState<DetectedLang>(null);
+  const [processedPreview, setProcessedPreview] = useState(false);
+  const [finalHold, setFinalHold] = useState(false);
+  const finalHoldRef = useRef(false);
+  const finalHoldTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Плавный поток ПОСИМВОЛЬНО (как у Aqua Voice). partial-тики приходят рывками раз
   // в ~700 мс целыми кусками; чтобы текст «втекал» непрерывно, а бегущий кружок-каретка
@@ -101,6 +109,7 @@ export default function Overlay() {
   const committedLenRef = useRef(0);
   const shownRef = useRef(0);
   const [shown, setShown] = useState(0);
+  const [previewVersion, setPreviewVersion] = useState(0);
   const [typing, setTyping] = useState(false);
   // Дедуп по seq: МОНОТОННЫЙ счётчик (НЕ сбрасывается между диктовками). partial старее
   // currentSeq — это эхо прошлой записи (StrictMode/async-гонки), игнорируем. seq константен
@@ -184,6 +193,14 @@ export default function Overlay() {
         rafRef.current = null;
       }
     };
+    const clearFinalHold = () => {
+      if (finalHoldTimer.current) {
+        clearTimeout(finalHoldTimer.current);
+        finalHoldTimer.current = null;
+      }
+      finalHoldRef.current = false;
+      setFinalHold(false);
+    };
     // Полный сброс потока печати (новая диктовка / уход в покой).
     const resetTextEngine = () => {
       stopRaf();
@@ -193,6 +210,8 @@ export default function Overlay() {
       lastFrameRef.current = 0;
       setShownBoth(0);
       setTypingOnce(false);
+      setProcessedPreview(false);
+      clearFinalHold();
     };
 
     // Кадр потока: проявляем цель ПОСИМВОЛЬНО, ПОКАДРОВО (каждый кадр rAF ≈ 16.7 мс).
@@ -213,9 +232,9 @@ export default function Overlay() {
         setTypingOnce(false); // печать закончилась — один setState на смену
         return;
       }
-      // Символов/сек: плавный пол ~48, ускоряемся при отставании (чтобы успеть за
-      // речью до следующего partial-чанка), но без «вываливания» куска разом.
-      const cps = Math.max(48, Math.min(160, pending * 7));
+      // Символов/сек: live-кружок должен поспевать за речью. Небольшой хвост
+      // всё ещё проявляется плавно, но при большом отставании резко догоняем.
+      const cps = Math.max(180, Math.min(900, pending * 18));
       shownFloatRef.current = Math.min(total, shownFloatRef.current + (cps * dt) / 1000);
       const next = Math.floor(shownFloatRef.current);
       if (next !== shownRef.current) setShownBoth(next);
@@ -306,6 +325,19 @@ export default function Overlay() {
       }
       setLatchNotice(null);
     };
+    const holdFinalPreview = () => {
+      clearDone();
+      setDone(false);
+      if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
+      finalHoldRef.current = true;
+      setFinalHold(true);
+      finalHoldTimer.current = setTimeout(() => {
+        finalHoldTimer.current = null;
+        finalHoldRef.current = false;
+        setFinalHold(false);
+        if (statusRef.current === "idle") resetTextEngine();
+      }, 1600);
+    };
 
     // Применить lang из события: поля нет (undefined) — старый бэкенд, ничего
     // не меняем; null/незнакомое значение — язык не определён, бейдж прячем.
@@ -341,23 +373,27 @@ export default function Overlay() {
       } else if (v === "transcribing") {
         clearDone();
         setDone(false);
-        // Текстовая зона сворачивается в пилюлю со спиннером — печать дальше не нужна
-        // (текст храним, чистим на idle). Бары плавно опадают к минимуму.
-        stopRaf();
-        setTypingOnce(false);
+        // Во время финальной обработки оставляем в пилюле последний обработанный
+        // live-preview, чтобы пользователь видел, что именно сейчас будет вставлено.
+        // Финальный partial.final=true позже заменит его точным результатом.
         kickLevel();
       } else {
         // idle. Если завершилась расшифровка — 900 мс галочка, затем мини-пилюля.
         clearLatch();
-        if (prev === "transcribing") {
+        if (finalHoldRef.current) {
+          clearDone();
+          setDone(false);
+        } else if (prev === "transcribing") {
           clearDone();
           setDone(true);
           doneTimer.current = setTimeout(() => {
             doneTimer.current = null;
             setDone(false);
           }, 900);
+          resetTextEngine();
+        } else {
+          resetTextEngine();
         }
-        resetTextEngine();
         kickLevel(); // дать спрингам опасть, цикл сам заснёт
       }
       // lang из самого события (если бэкенд прислал) — ПОСЛЕ сброса на recording,
@@ -374,6 +410,11 @@ export default function Overlay() {
         if (seq < currentSeqRef.current) return;
         currentSeqRef.current = seq;
       }
+      const isFinalPreview = e.payload?.final === true;
+      const isProcessedPreview = e.payload?.processed === true || isFinalPreview;
+      if (statusRef.current === "transcribing" && !isProcessedPreview) {
+        return;
+      }
       // Язык от STT (опционален): обновляем после дедупа — эхо прошлой записи
       // не перетирает бейдж текущей. setState с тем же значением React гасит сам.
       applyLang(e.payload?.lang);
@@ -384,12 +425,29 @@ export default function Overlay() {
         committed || volatileTail
           ? (committed + " " + volatileTail).trim()
           : (e.payload.text ?? "").trim();
+      const nextCommittedLen = Math.min(committed.length, text.length);
+      const previewChanged =
+        targetTextRef.current !== text ||
+        committedLenRef.current !== nextCommittedLen;
       targetTextRef.current = text;
       // committed — префикс text; его длина в символах = граница «белое/серое».
-      committedLenRef.current = Math.min(committed.length, text.length);
+      committedLenRef.current = nextCommittedLen;
+      if (previewChanged) setPreviewVersion((v) => v + 1);
       // Хвост укоротился (whisper переписал короче) — подрезаем показанное, без скачка.
       if (shownFloatRef.current > text.length) shownFloatRef.current = text.length;
       if (shownRef.current > text.length) setShownBoth(text.length);
+      // Если ASR прислал большой новый кусок, не заставляем пользователя ждать
+      // посимвольную анимацию всей фразы: держим максимум небольшой live-lag.
+      if (previewChanged) {
+        const maxLiveLag = isFinalPreview ? 0 : 28;
+        const lag = text.length - shownFloatRef.current;
+        if (lag > maxLiveLag) {
+          shownFloatRef.current = Math.max(0, text.length - maxLiveLag);
+          setShownBoth(Math.floor(shownFloatRef.current));
+        }
+      }
+      setProcessedPreview(isProcessedPreview);
+      if (isFinalPreview) holdFinalPreview();
       kick();
     });
 
@@ -451,6 +509,7 @@ export default function Overlay() {
       stopLevelRaf();
       if (noticeTimer.current) clearTimeout(noticeTimer.current);
       if (latchTimer.current) clearTimeout(latchTimer.current);
+      if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
       clearDone();
       for (const fn of unlisteners) fn();
     };
@@ -464,10 +523,14 @@ export default function Overlay() {
       ? "notice"
       : latchNotice != null
         ? "latch"
+        : finalHold && shown > 0
+        ? "stream"
         : done
         ? "done"
         : status === "transcribing"
-          ? "trans"
+          ? processedPreview && shown > 0
+            ? "stream"
+            : "trans"
           : status === "recording"
             ? shown > 0
               ? "stream"
@@ -612,7 +675,11 @@ export default function Overlay() {
                 // по код-поинтам (кириллица ок).
                 const chars = Array.from(full.slice(0, vis));
                 return (
-                  <div className="aq-text" ref={scrollRef}>
+                  <div
+                    className="aq-text"
+                    ref={scrollRef}
+                    data-preview-version={previewVersion}
+                  >
                     {chars.map((ch, i) => (
                       <span
                         key={i}

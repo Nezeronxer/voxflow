@@ -1,7 +1,8 @@
 //! Облачный STT-слой (v1, финальный проход, БЕЗ WebSocket).
 //!
 //! Две REST-реализации: OpenAI-совместимый (Avalon/OpenAI/Groq) и Deepgram.
-//! Все HTTP идут через прокси-aware `net::curl()` + `net::apply_proxy`.
+//! Все HTTP идут через `net::curl()` + `net::curl_secret_with_proxy`, чтобы
+//! ключи и прокси-учетные данные не попадали в аргументы процесса.
 //!
 //! ЖЁСТКО: ключ НИКОГДА не попадает в лог и не уходит в URL — только в заголовок
 //! Authorization. Логируем лишь код/стадию ошибки.
@@ -39,6 +40,7 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path) -> Result<String> {
 
     // Базовый URL без хвостового слэша, чтобы не получить двойной "//".
     let base = s.oai_stt_base_url.trim().trim_end_matches('/');
+    net::ensure_https_or_loopback_base(base, "OpenAI-compatible STT Base URL")?;
     let url = format!("{base}/audio/transcriptions");
 
     let auth = format!("Authorization: Bearer {key}");
@@ -58,13 +60,12 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path) -> Result<String> {
         cmd.arg("-F").arg(format!("language={}", s.language));
     }
     cmd.arg("-F").arg("response_format=json");
-    net::apply_proxy(&mut cmd, &s.proxy_url);
     cmd.arg(&url);
 
     // Ключ — через stdin-конфиг curl (-K -), НЕ в argv: командная строка
     // процесса видна другим процессам пользователя.
-    let out =
-        net::curl_secret(cmd, &[auth]).map_err(|e| anyhow!("curl /audio/transcriptions: {e}"))?;
+    let out = net::curl_secret_with_proxy(cmd, &[auth], &s.proxy_url)
+        .map_err(|e| anyhow!("curl /audio/transcriptions: {e}"))?;
     if !out.status.success() {
         // НЕ логируем тело (могут быть заголовки/эхо); только код процесса curl.
         log::warn!("openai_compat STT: curl завершился с кодом {}", out.status);
@@ -100,6 +101,7 @@ pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
     }
 
     let base = s.deepgram_base.trim().trim_end_matches('/');
+    net::ensure_https_or_loopback_base(base, "Deepgram Base URL")?;
     // language=multi при auto (Deepgram-специфика мультиязычного распознавания),
     // иначе конкретный язык. model/smart_format/punctuate всегда.
     let lang = if s.language == "auto" {
@@ -124,11 +126,11 @@ pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
         .arg("Content-Type: audio/wav")
         .arg("--data-binary")
         .arg(&data_arg);
-    net::apply_proxy(&mut cmd, &s.proxy_url);
     cmd.arg(&url);
 
     // Ключ — через stdin-конфиг curl (-K -), НЕ в argv (виден в Task Manager/WMI).
-    let out = net::curl_secret(cmd, &[auth]).map_err(|e| anyhow!("curl /v1/listen: {e}"))?;
+    let out = net::curl_secret_with_proxy(cmd, &[auth], &s.proxy_url)
+        .map_err(|e| anyhow!("curl /v1/listen: {e}"))?;
     if !out.status.success() {
         log::warn!("deepgram STT: curl завершился с кодом {}", out.status);
         return Err(anyhow!("сеть/прокси недоступны (curl код {})", out.status));

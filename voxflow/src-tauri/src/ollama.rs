@@ -34,7 +34,9 @@ fn base(url: &str) -> String {
 /// Список установленных моделей через GET /api/tags. Возвращает имена из
 /// `models[*].name`. Если curl упал или ответ — не JSON, отдаёт понятную ошибку.
 pub fn list_models(url: &str) -> Result<Vec<String>> {
-    let endpoint = format!("{}/api/tags", base(url));
+    let base_url = base(url);
+    net::ensure_https_or_loopback_base(&base_url, "Ollama URL")?;
+    let endpoint = format!("{base_url}/api/tags");
 
     // Прокси-aware curl из общего модуля net (CREATE_NO_WINDOW уже внутри).
     // Ollama по умолчанию локальна (localhost), но через net::curl() env-прокси
@@ -79,7 +81,9 @@ pub fn list_models(url: &str) -> Result<Vec<String>> {
 /// POST /api/chat (stream=false). Размышления гибридной qwen3 глушим
 /// `/no_think` + `"think": false`, остаток `<think>…</think>` срезаем из ответа.
 pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String> {
-    let endpoint = format!("{}/api/chat", base(url));
+    let base_url = base(url);
+    net::ensure_https_or_loopback_base(&base_url, "Ollama URL")?;
+    let endpoint = format!("{base_url}/api/chat");
 
     // ВАЖНО: директиву /no_think в системном сообщении НЕ добавляем — у qwen3:4b она
     // reasoning не глушит, а наоборот протекает эхом литералом «/no_think» в ответ.
@@ -105,12 +109,9 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
     });
 
     // Тело запроса — во временный файл (как в gemini.rs): не упираемся в argv.
-    let req_path = crate::paths::tmp_dir().join("ollama_req.json");
     let payload = serde_json::to_vec(&body).map_err(|e| anyhow!("сериализация тела: {e}"))?;
-    std::fs::write(&req_path, &payload)
-        .map_err(|e| anyhow!("не удалось записать {}: {e}", req_path.display()))?;
-
-    let data_arg = format!("@{}", req_path.display());
+    let req = net::TempPayload::write_json("ollama_req", &payload)?;
+    let data_arg = req.curl_data_arg();
 
     // Прокси-aware curl из общего модуля net (CREATE_NO_WINDOW уже внутри).
     // Локальный Ollama обычно прямой; пустой proxy → net::apply_proxy не добавляет -x,

@@ -383,7 +383,7 @@ export default function Models({
         <div className="card-head">
           <div className="card-title">Параметры распознавания</div>
         </div>
-        <Field label="Язык" hint="Auto подходит для смешанной речи и остальных языков. RU/EN используют быстрые локальные модели, остальные языки идут через локальный whisper-server или выбранный облачный STT.">
+        <Field label="Язык" hint="Все языки — универсальный whisper auto. Для максимальной скорости можно явно выбрать RU или EN: тогда включатся быстрые локальные модели, если они установлены.">
           <Select
             value={settings.language}
             onChange={(v) => update({ language: v })}
@@ -409,13 +409,13 @@ export default function Models({
         </Field>
         <Field
           label="Движок"
-          hint="Авто-локальный — быстрый RU/EN через GigaAM/Parakeet. Whisper Server держит универсальную модель в памяти для всех языков. Whisper CLI грузит модель каждый раз."
+          hint="GigaAM/Parakeet — быстрые локальные модели для явного RU/EN. Whisper Server держит универсальную модель в памяти для всех языков. Whisper CLI грузит модель каждый раз."
         >
           <Select
             value={settings.engine}
             onChange={(v) => update({ engine: v })}
             options={[
-              { value: "gigaam", label: "Авто-локальный RU/EN (быстро)" },
+              { value: "gigaam", label: "GigaAM RU / Parakeet EN" },
               { value: "whisper_server", label: "Whisper Server (все языки)" },
               { value: "whisper_cli", label: "Whisper CLI (медленнее)" },
             ]}

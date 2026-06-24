@@ -147,7 +147,7 @@ impl Default for Settings {
             improve_hotkey: "F8".into(),
             mode: "hold".into(),
             input_device: String::new(),
-            language: "ru".into(),
+            language: "auto".into(),
             model: "ggml-large-v3-turbo-q5_0.bin".into(),
             // Основной локальный движок — GigaAM-v3 e2e RNNT (русский SOTA, реальное
             // время на CPU, пунктуация из коробки). whisper остаётся для en/auto
@@ -198,6 +198,29 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn redacted_for_renderer(mut self) -> Self {
+        self.ai_api_key.clear();
+        self.oai_stt_key.clear();
+        self.deepgram_key.clear();
+        self.rewrite_key.clear();
+        self
+    }
+
+    pub fn preserve_empty_secrets_from(&mut self, existing: &Settings) {
+        if self.ai_api_key.trim().is_empty() {
+            self.ai_api_key = existing.ai_api_key.clone();
+        }
+        if self.oai_stt_key.trim().is_empty() {
+            self.oai_stt_key = existing.oai_stt_key.clone();
+        }
+        if self.deepgram_key.trim().is_empty() {
+            self.deepgram_key = existing.deepgram_key.clone();
+        }
+        if self.rewrite_key.trim().is_empty() {
+            self.rewrite_key = existing.rewrite_key.clone();
+        }
+    }
+
     /// Число потоков для whisper (0 → половина логических ядер, минимум 2).
     pub fn effective_threads(&self) -> u32 {
         if self.threads > 0 {
@@ -215,6 +238,9 @@ impl Settings {
         if !self.oai_stt_key.trim().is_empty() {
             return self.oai_stt_key.trim().to_string();
         }
+        if !trusted_openai_compat_host(&self.oai_stt_base_url) {
+            return String::new();
+        }
         for k in ["STT_API_KEY", "OPENAI_API_KEY", "AVALON_API_KEY"] {
             if let Ok(v) = std::env::var(k) {
                 if !v.trim().is_empty() {
@@ -231,6 +257,9 @@ impl Settings {
     pub fn resolve_rewrite_key(&self) -> String {
         if !self.rewrite_key.trim().is_empty() {
             return self.rewrite_key.trim().to_string();
+        }
+        if !trusted_openai_compat_host(&self.rewrite_base_url) {
+            return String::new();
         }
         for k in rewrite_key_env_order(&self.rewrite_base_url) {
             if let Ok(v) = std::env::var(k) {
@@ -259,6 +288,9 @@ impl Settings {
         if !self.deepgram_key.trim().is_empty() {
             return self.deepgram_key.trim().to_string();
         }
+        if !trusted_deepgram_host(&self.deepgram_base) {
+            return String::new();
+        }
         std::env::var("DEEPGRAM_API_KEY")
             .ok()
             .map(|v| v.trim().to_string())
@@ -267,8 +299,46 @@ impl Settings {
     }
 }
 
+fn host_from_url(url: &str) -> Option<String> {
+    let trimmed = url.trim();
+    let (_, rest) = trimmed.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(stripped) = host_port.strip_prefix('[') {
+        stripped.split_once(']')?.0.to_string()
+    } else {
+        host_port.split(':').next().unwrap_or("").to_string()
+    };
+    let host = host.trim().trim_matches(['[', ']']).to_ascii_lowercase();
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
+}
+
+fn trusted_openai_compat_host(base_url: &str) -> bool {
+    if crate::net::is_loopback_base_url(base_url) {
+        return true;
+    }
+    matches!(
+        host_from_url(base_url).as_deref(),
+        Some("openrouter.ai" | "api.groq.com" | "api.openai.com" | "api.aqua.sh")
+    )
+}
+
+fn trusted_deepgram_host(base_url: &str) -> bool {
+    if crate::net::is_loopback_base_url(base_url) {
+        return true;
+    }
+    matches!(
+        host_from_url(base_url).as_deref(),
+        Some("api.deepgram.com" | "api.eu.deepgram.com")
+    )
+}
+
 fn rewrite_key_env_order(base_url: &str) -> [&'static str; 3] {
-    if base_url.to_ascii_lowercase().contains("openrouter.ai") {
+    if host_from_url(base_url).as_deref() == Some("openrouter.ai") {
         ["REWRITE_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"]
     } else {
         ["REWRITE_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
@@ -299,6 +369,10 @@ mod tests {
             ["REWRITE_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"]
         );
         assert_eq!(
+            rewrite_key_env_order("https://openrouter.ai.evil.test/api/v1"),
+            ["REWRITE_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
+        );
+        assert_eq!(
             rewrite_key_env_order("https://api.openai.com/v1"),
             ["REWRITE_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
         );
@@ -310,5 +384,56 @@ mod tests {
         let s: Settings = serde_json::from_str(json).expect("legacy settings parse");
         assert_eq!(s.hotkey, "ControlRight");
         assert!(s.ai_prompt_rules.is_empty());
+    }
+
+    #[test]
+    fn redacted_settings_do_not_expose_saved_keys() {
+        let s = Settings {
+            ai_api_key: "gemini-secret".into(),
+            oai_stt_key: "stt-secret".into(),
+            deepgram_key: "deepgram-secret".into(),
+            rewrite_key: "rewrite-secret".into(),
+            ..Settings::default()
+        };
+        let r = s.redacted_for_renderer();
+        assert!(r.ai_api_key.is_empty());
+        assert!(r.oai_stt_key.is_empty());
+        assert!(r.deepgram_key.is_empty());
+        assert!(r.rewrite_key.is_empty());
+    }
+
+    #[test]
+    fn preserve_empty_secrets_keeps_existing_keys_but_accepts_replacements() {
+        let existing = Settings {
+            ai_api_key: "old-gemini".into(),
+            oai_stt_key: "old-stt".into(),
+            deepgram_key: "old-deepgram".into(),
+            rewrite_key: "old-rewrite".into(),
+            ..Settings::default()
+        };
+        let mut incoming = Settings {
+            rewrite_key: "new-rewrite".into(),
+            ..Settings::default()
+        };
+        incoming.preserve_empty_secrets_from(&existing);
+        assert_eq!(incoming.ai_api_key, "old-gemini");
+        assert_eq!(incoming.oai_stt_key, "old-stt");
+        assert_eq!(incoming.deepgram_key, "old-deepgram");
+        assert_eq!(incoming.rewrite_key, "new-rewrite");
+    }
+
+    #[test]
+    fn env_fallback_only_for_known_or_loopback_hosts() {
+        assert!(trusted_openai_compat_host("https://api.groq.com/openai/v1"));
+        assert!(trusted_openai_compat_host("https://api.openai.com/v1"));
+        assert!(trusted_openai_compat_host("http://localhost:11434/v1"));
+        assert!(!trusted_openai_compat_host(
+            "https://api.groq.com.evil.test/v1"
+        ));
+        assert!(!trusted_openai_compat_host("https://custom.example/v1"));
+
+        assert!(trusted_deepgram_host("https://api.deepgram.com"));
+        assert!(trusted_deepgram_host("https://api.eu.deepgram.com"));
+        assert!(!trusted_deepgram_host("https://api.deepgram.com.evil.test"));
     }
 }

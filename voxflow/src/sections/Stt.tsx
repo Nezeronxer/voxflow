@@ -197,6 +197,12 @@ export default function Stt({
                 ? "Локальный режим выбран: ключ и проверка соединения не нужны."
                 : "Пресет не выбран: можно вручную указать провайдера, URL и модель ниже.")}
           </div>
+          <div className="cloud-preset-note">
+            Если диктовка распознаётся неверно, сначала смените язык или модель
+            во вкладке «Модель». Cloud STT можно включить для сложных голосов,
+            микрофонов и языков, но онлайн-провайдеры зависят от сети, лимитов
+            API и доступности сервиса.
+          </div>
         </div>
 
         <Field
@@ -360,7 +366,7 @@ export default function Stt({
           <input
             type="text"
             className="input-mono"
-            placeholder="http://user:pass@host:port"
+            placeholder="http://127.0.0.1:10808"
             value={settings.proxy_url}
             onChange={(e) => update({ proxy_url: e.currentTarget.value })}
             style={{ width: 320 }}

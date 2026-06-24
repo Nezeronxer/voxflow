@@ -30,8 +30,14 @@ Then build the installer from the repository root:
 & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ".\installer\VoxFlow.iss"
 ```
 
+## Release Artifact
+
+- `VoxFlow-Setup-1.0.0.exe`
+- SHA256: `BF585D85BE46F0A8ADD39E097EB6892831C21E7D1094F973F659AB0C3ECB993A`
+
 ## Known Limits
 
 - Some ASR e2e tests are opt-in and ignored by default because they require local models, private WAV fixtures or network/proxy access.
+- Recognition quality depends on the selected language, model, microphone and provider. If dictation is wrong, change the language/model first; if local STT is unstable for a user, they can enable BYOK cloud STT, but online/API providers may be affected by network, rate limits and service availability.
 - The Windows installer is unsigned unless a signing certificate is added to the release pipeline.
 - GitHub release builds require bundled runtime resources to be available in the repository or supplied by a future download step.

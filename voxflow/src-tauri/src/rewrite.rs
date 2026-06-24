@@ -12,9 +12,10 @@
 //! attribution-заголовок `X-OpenRouter-Title`.
 //!
 //! Используется СИСТЕМНЫЙ `curl` (без reqwest — на машине нет cmake). Прокси —
-//! через [`crate::net::apply_proxy`] с `s.proxy_url` (облако из РФ ходит через
-//! настроенный прокси). Тело пишем во временный файл и шлём `--data-binary @file`,
-//! как в [`crate::gemini`]/[`crate::ollama`], чтобы не упираться в длину argv.
+//! через [`crate::net::curl_secret_with_proxy`] с `s.proxy_url`, чтобы облако
+//! работало через настроенный прокси без утечки учетных данных в argv. Тело
+//! пишем во временный файл и шлём `--data-binary @file`, как в
+//! [`crate::gemini`]/[`crate::ollama`], чтобы не упираться в длину argv.
 //!
 //! ВАЖНО: ключ (`Authorization: Bearer …`) НИКОГДА не пишется в лог.
 
@@ -175,8 +176,8 @@ fn openrouter_get_json(
     key: &str,
     timeout_s: u64,
 ) -> Result<serde_json::Value> {
+    net::ensure_https_or_loopback_base(endpoint, "OpenRouter endpoint")?;
     let mut cmd = net::curl();
-    net::apply_proxy(&mut cmd, &s.proxy_url);
     cmd.arg("-s")
         .arg("-m")
         .arg(timeout_s.to_string())
@@ -190,7 +191,7 @@ fn openrouter_get_json(
         format!("Authorization: Bearer {key}"),
         "X-OpenRouter-Title: VoxFlow".to_string(),
     ];
-    let out = net::curl_secret(cmd, &secret_headers)
+    let out = net::curl_secret_with_proxy(cmd, &secret_headers, &s.proxy_url)
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
     if !out.status.success() && out.stdout.is_empty() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -274,6 +275,7 @@ fn chat_completion(
     }
 
     let base_url = base(&s.rewrite_base_url);
+    net::ensure_https_or_loopback_base(&base_url, "Rewrite Base URL")?;
     let endpoint = format!("{base_url}/chat/completions");
 
     let mut body = serde_json::json!({
@@ -290,12 +292,9 @@ fn chat_completion(
     }
 
     // Тело запроса — во временный файл (как в gemini.rs/ollama.rs): не упираемся в argv.
-    let req_path = crate::paths::tmp_dir().join("rewrite_req.json");
     let payload = serde_json::to_vec(&body).map_err(|e| anyhow!("сериализация тела: {e}"))?;
-    std::fs::write(&req_path, &payload)
-        .map_err(|e| anyhow!("не удалось записать {}: {e}", req_path.display()))?;
-
-    let data_arg = format!("@{}", req_path.display());
+    let req = net::TempPayload::write_json("rewrite_req", &payload)?;
+    let data_arg = req.curl_data_arg();
     let mut secret_headers = vec![format!("Authorization: Bearer {key}")];
     if is_openrouter_base(&base_url) {
         secret_headers.push("X-OpenRouter-Title: VoxFlow".to_string());
@@ -305,7 +304,6 @@ fn chat_completion(
     // Облако из РФ: прокси берём из настроек (s.proxy_url); пустой → net::apply_proxy
     // не добавляет -x, и curl сам читает HTTPS_PROXY/HTTP_PROXY из окружения.
     let mut cmd = net::curl();
-    net::apply_proxy(&mut cmd, &s.proxy_url);
     cmd.arg("-s")
         .arg("-m")
         // Рефайн — СИНХРОННЫЙ шаг перед вставкой текста: дольше ~10с он
@@ -323,7 +321,7 @@ fn chat_completion(
 
     // Ключ (Bearer) — через stdin-конфиг curl (-K -), НЕ в argv:
     // командная строка процесса видна другим процессам пользователя.
-    let out = net::curl_secret(cmd, &secret_headers)
+    let out = net::curl_secret_with_proxy(cmd, &secret_headers, &s.proxy_url)
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
 
     if !out.status.success() && out.stdout.is_empty() {

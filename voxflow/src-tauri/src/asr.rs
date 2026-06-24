@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
-use anyhow::anyhow;
+use anyhow::{anyhow, Context};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -126,6 +126,17 @@ pub fn transcribe_cli(p: &AsrParams) -> anyhow::Result<String> {
 pub struct Server {
     pub child: Child,
     pub model: PathBuf,
+    pub port: u16,
+}
+
+pub fn reserve_loopback_port() -> anyhow::Result<u16> {
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .context("не удалось подобрать свободный loopback-порт")?;
+    let port = listener
+        .local_addr()
+        .context("не удалось прочитать loopback-порт")?
+        .port();
+    Ok(port)
 }
 
 /// Поднять whisper-server и дождаться готовности (большая модель грузится несколько секунд).
@@ -191,6 +202,7 @@ fn try_start_server(
     let mut srv = Server {
         child,
         model: model.to_path_buf(),
+        port,
     };
 
     for _ in 0..120 {
@@ -523,5 +535,14 @@ mod tests {
         assert!(language_mismatch("ru", "english", 0.95));
         assert!(language_mismatch("en", "russian", 0.95));
         assert!(!language_mismatch("ru", "english", 0.40));
+    }
+
+    #[test]
+    fn reserve_loopback_port_returns_reusable_port() {
+        let port = reserve_loopback_port().expect("reserve loopback port");
+        assert_ne!(port, 0);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("reserved port should be reusable after listener drop");
+        drop(listener);
     }
 }

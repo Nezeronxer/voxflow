@@ -5,7 +5,10 @@
 //! (юзернейм ASCII). Сами exe/DLL грузятся ОС по wide-пути — им кириллица ок.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Manager};
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// %LOCALAPPDATA%\VoxFlow (ASCII), создаётся при первом обращении.
 pub fn data_dir() -> PathBuf {
@@ -25,6 +28,49 @@ pub fn tmp_dir() -> PathBuf {
     let d = data_dir().join("tmp");
     let _ = std::fs::create_dir_all(&d);
     d
+}
+
+pub fn unique_tmp_path(prefix: &str, ext: &str) -> PathBuf {
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let clean_prefix: String = prefix
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let clean_ext = ext.trim_start_matches('.');
+    tmp_dir().join(format!(
+        "{clean_prefix}-{}-{nanos}-{seq}.{clean_ext}",
+        std::process::id()
+    ))
+}
+
+pub struct TempFileGuard {
+    path: PathBuf,
+}
+
+impl TempFileGuard {
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+impl Drop for TempFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Каталог датасета персонализации (аудио-сэмплы пользователя).
