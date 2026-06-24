@@ -1663,6 +1663,10 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     restore_auto_mute(ctx);
     // Поколение ЭТОЙ диктовки — финал-поток сверит его перед вставкой (C4).
     let my_gen = ctx.gen.load(Ordering::SeqCst);
+    // UX: как только пользователь завершил запись, оверлей должен сразу уйти из
+    // текстовой плашки в AquaVoice-style spinner, пока мы останавливаем partial-loop
+    // и готовим финальный ASR.
+    set_status(&ctx.app, "transcribing");
 
     // Останавливаем петлю частичных результатов. Ждём её НЕ дольше ~150 мс
     // (P2-5): ASR-тик может длиться до ~1 c (whisper), и безусловный join
@@ -1698,7 +1702,6 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         if ctx.settings.lock().play_sounds {
             sound::play(false);
         }
-        set_status(&ctx.app, "transcribing");
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
             if let Err(err) = process_utterance(&ctx2, samples, rate, Some(live), my_gen, target_fp)
@@ -1718,8 +1721,6 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     if ctx.settings.lock().play_sounds {
         sound::play(false);
     }
-    set_status(&ctx.app, "transcribing");
-
     // Тяжёлую обработку выносим в отдельный поток, чтобы движок мог принять новую запись.
     let ctx2 = ctx.clone();
     let actx = crate::app_context::detect();
