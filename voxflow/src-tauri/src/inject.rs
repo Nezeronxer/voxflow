@@ -33,9 +33,15 @@ use std::{
 /// Команда воркеру.
 enum Cmd {
     /// Вставка целиком: clipboard-paste с fallback в печать, либо "type".
-    Full { text: String, method: String },
+    Full {
+        text: String,
+        method: String,
+        keep_clipboard: bool,
+    },
     /// Инкрементальное сведение prev → next клавишами (Backspace + допечатка).
     Incr { prev: String, next: String },
+    /// Положить финальный текст в clipboard без нажатий.
+    SetClipboard { text: String },
     /// Скопировать текущее выделение через Ctrl+C, не оставляя свой мусор в clipboard.
     CopySelection,
 }
@@ -146,8 +152,9 @@ fn worker_loop(rx: mpsc::Receiver<Job>, dry: bool) {
         let wait_ms = job.enqueued.elapsed().as_millis();
         let t0 = Instant::now();
         let (len, method) = match &job.cmd {
-            Cmd::Full { text, method } => (text.chars().count(), method.as_str()),
+            Cmd::Full { text, method, .. } => (text.chars().count(), method.as_str()),
             Cmd::Incr { next, .. } => (next.chars().count(), "incr"),
+            Cmd::SetClipboard { text } => (text.chars().count(), "set-clipboard"),
             Cmd::CopySelection => (0, "copy-selection"),
         };
         let (res, restore) = if dry {
@@ -181,6 +188,7 @@ fn run_dry(cmd: &Cmd) -> Result<CmdResult> {
     let entry = match cmd {
         Cmd::Full { text, .. } => text.clone(),
         Cmd::Incr { prev, next } => format!("incr|{prev}|{next}"),
+        Cmd::SetClipboard { text } => format!("clip|{text}"),
         Cmd::CopySelection => {
             return Ok(CmdResult::Selection(
                 std::env::var("VOXFLOW_INJECT_DRY_SELECTION").ok(),
@@ -195,11 +203,24 @@ fn run_dry(cmd: &Cmd) -> Result<CmdResult> {
 /// прежнего буфера обмена, который надо восстановить ПОСЛЕ ack (см. worker_loop).
 fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<ClipSnapshot>) {
     match cmd {
-        Cmd::Full { text, method } => match method.as_str() {
-            "type" => (try_type(enigo, text).map(|_| CmdResult::Done), None),
+        Cmd::Full {
+            text,
+            method,
+            keep_clipboard,
+        } => match method.as_str() {
+            "type" => {
+                if *keep_clipboard {
+                    match clipboard_set_retry(text).and_then(|_| try_type(enigo, text)) {
+                        Ok(()) => (Ok(CmdResult::Done), None),
+                        Err(e) => (Err(e), None),
+                    }
+                } else {
+                    (try_type(enigo, text).map(|_| CmdResult::Done), None)
+                }
+            }
             _ => {
                 let mut restore = None;
-                match paste_text(enigo, text, &mut restore) {
+                match paste_text(enigo, text, &mut restore, !keep_clipboard) {
                     Ok(()) => (Ok(CmdResult::Done), restore),
                     // paste не сработал, а текст содержит переводы строк —
                     // печать ЗАПРЕЩЕНА: посимвольные Enter'ы в активном окне
@@ -223,6 +244,7 @@ fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<
                 .map(|_| CmdResult::Done),
             None,
         ),
+        Cmd::SetClipboard { text } => (clipboard_set_retry(text).map(|_| CmdResult::Done), None),
         Cmd::CopySelection => run_copy_selection(enigo),
     }
 }
@@ -264,6 +286,7 @@ fn effective_method<'a>(text: &str, method: &'a str) -> &'a str {
 /// Вставка текста целиком. method: "clipboard" (дефолт, с fallback в печать) | "type".
 /// Блокируется до фактического исполнения воркером — как и раньше, но теперь
 /// нажатия идут из одного потока в порядке очереди.
+#[allow(dead_code)] // старый публичный путь оставлен для совместимости; диктовка держит clipboard через inject_keep_clipboard.
 pub fn inject(text: &str, method: &str) -> Result<()> {
     // Пропускаем БЕЗ вставки только ПОЛНОСТЬЮ пустой текст. Именно is_empty(),
     // а не trim().is_empty(): "\n" — результат одиночной команды «с новой
@@ -275,6 +298,34 @@ pub fn inject(text: &str, method: &str) -> Result<()> {
     wait_done(enqueue(Cmd::Full {
         text: text.to_string(),
         method: method.to_string(),
+        keep_clipboard: false,
+    }))
+}
+
+/// Вставить текст целиком и оставить именно его в системном clipboard.
+///
+/// Это финальный пользовательский путь диктовки: если активное окно не приняло
+/// Ctrl+V или прочитало буфер слишком поздно, пользователь всё равно может
+/// вручную нажать Ctrl+V и получить последний надиктованный текст.
+pub fn inject_keep_clipboard(text: &str, method: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let method = effective_method(text, method);
+    wait_done(enqueue(Cmd::Full {
+        text: text.to_string(),
+        method: method.to_string(),
+        keep_clipboard: true,
+    }))
+}
+
+/// Сохранить финальный пользовательский текст в clipboard без нажатий.
+pub fn set_clipboard_text(text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    wait_done(enqueue(Cmd::SetClipboard {
+        text: text.to_string(),
     }))
 }
 
@@ -437,6 +488,7 @@ fn paste_text(
     enigo_slot: &mut Option<Enigo>,
     text: &str,
     restore_out: &mut Option<ClipSnapshot>,
+    restore_previous: bool,
 ) -> Result<()> {
     // Снимок текущего буфера: текст ИЛИ картинка (best-effort: пустой/нечитаемый
     // формат — нечего восстанавливать, см. ClipSnapshot).
@@ -480,7 +532,9 @@ fn paste_text(
     // тяжёлые Electron/Chromium-приёмники читают буфер асинхронно и при 90мс
     // изредка вставляли СТАРЫЙ буфер), но вызывающий больше эти 130мс не ждёт.
     thread::sleep(Duration::from_millis(15));
-    *restore_out = prev;
+    if restore_previous {
+        *restore_out = prev;
+    }
     Ok(())
 }
 
@@ -569,6 +623,7 @@ mod tests {
                         let rx = enqueue(Cmd::Full {
                             text: text.clone(),
                             method: "clipboard".into(),
+                            keep_clipboard: false,
                         });
                         expected.lock().push(text);
                         rx
@@ -671,6 +726,24 @@ mod tests {
         // Однострочный текст — без изменений.
         assert_eq!(effective_method("привет", "type"), "type");
         assert_eq!(effective_method("привет", "clipboard"), "clipboard");
+    }
+
+    #[test]
+    fn final_clipboard_helpers_enqueue_text() {
+        let _serial = SERIAL.lock();
+        std::env::set_var("VOXFLOW_INJECT_DRY", "1");
+        DRY_LOG.lock().clear();
+
+        inject_keep_clipboard("готовый текст", "clipboard").expect("final paste");
+        set_clipboard_text("готовый текст").expect("remember clipboard");
+
+        assert_eq!(
+            dry_log(),
+            vec![
+                "готовый текст".to_string(),
+                "clip|готовый текст".to_string()
+            ]
+        );
     }
 
     /// Тест №3 (регрессия P1-2): в буфере КАРТИНКА (скриншот) — снимок обязан

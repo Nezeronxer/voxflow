@@ -128,7 +128,8 @@ export interface ModelInfo {
   size_mb: number;
   installed: boolean;
   // "gigaam" — русская ONNX-модель (набор файлов в models/gigaam/),
-  // "whisper" — одиночный ggml-*.bin. Отсутствует у старых бэкендов → whisper.
+  // "parakeet" — EN/auto ONNX-модель, "whisper" — одиночный ggml-*.bin.
+  // Отсутствует у старых бэкендов → whisper.
   kind?: string;
 }
 
@@ -240,7 +241,7 @@ export interface ModelErrorEvent {
 }
 
 // Какой STT реально отработал последнюю диктовку. offline=true → облако было
-// недоступно и сработал авто-fallback на локальный whisper (ненавязчивая
+// недоступно и сработал авто-fallback на локальное распознавание (ненавязчивая
 // индикация «оффлайн-режим» в плашке/дашборде).
 export interface SttModeEvent {
   engine: string; // "local" | "openai_compat" | "deepgram"

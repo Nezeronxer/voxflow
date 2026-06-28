@@ -265,8 +265,7 @@ export default function Models({
           <div className="toast" role="status">
             <span className="toast-msg">
               Для английского и автоопределения языка скачайте модель Parakeet
-              TDT v3 ниже — без неё английская речь распознаётся запасным
-              Whisper.
+              TDT v3 ниже — без неё auto/EN распознаются запасным Whisper.
             </span>
           </div>
         )}
@@ -300,7 +299,7 @@ export default function Models({
             Whisper (все языки)
           </div>
           <div className="sub">
-            Универсальная локальная модель для auto и языков вне быстрых RU/EN маршрутов
+            Универсальная локальная модель для языков вне быстрых RU/EN/auto маршрутов
           </div>
         </div>
 
@@ -383,7 +382,7 @@ export default function Models({
         <div className="card-head">
           <div className="card-title">Параметры распознавания</div>
         </div>
-        <Field label="Язык" hint="Все языки — универсальный whisper auto. Для максимальной скорости можно явно выбрать RU или EN: тогда включатся быстрые локальные модели, если они установлены.">
+        <Field label="Язык" hint="Все языки — Parakeet auto, если модель установлена; иначе запасной Whisper. Для максимальной скорости можно явно выбрать RU или EN.">
           <Select
             value={settings.language}
             onChange={(v) => update({ language: v })}
@@ -409,13 +408,13 @@ export default function Models({
         </Field>
         <Field
           label="Движок"
-          hint="GigaAM/Parakeet — быстрые локальные модели для явного RU/EN. Whisper Server держит универсальную модель в памяти для всех языков. Whisper CLI грузит модель каждый раз."
+          hint="GigaAM/Parakeet — быстрые локальные модели для RU/EN/auto. Whisper Server держит универсальную модель в памяти для остальных языков. Whisper CLI грузит модель каждый раз."
         >
           <Select
             value={settings.engine}
             onChange={(v) => update({ engine: v })}
             options={[
-              { value: "gigaam", label: "GigaAM RU / Parakeet EN" },
+              { value: "gigaam", label: "GigaAM RU / Parakeet EN+auto" },
               { value: "whisper_server", label: "Whisper Server (все языки)" },
               { value: "whisper_cli", label: "Whisper CLI (медленнее)" },
             ]}

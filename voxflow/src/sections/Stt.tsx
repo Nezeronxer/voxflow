@@ -3,9 +3,9 @@ import { saveSettings, sttTest } from "../api";
 import { PageHead, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
 
-// Облачный STT (D-022). Локальный whisper остаётся дефолтом и приватен — аудио не
-// покидает устройство. Облачные провайдеры подключаются здесь как альтернатива с
-// авто-fallback на локальный whisper при недоступности сети.
+// Облачный STT (D-022). Локальный роутер GigaAM/Parakeet/Whisper остаётся
+// дефолтом и приватен — аудио не покидает устройство. Облачные провайдеры
+// подключаются здесь как альтернатива с авто-fallback на локальное распознавание.
 //
 // Стиль секции — как Ai.tsx: PageHead + карточки с Field/Select/Switch, кнопка
 // «Проверить». Все поля живут в Settings (types.ts) и сохраняются тем же update(),
@@ -78,7 +78,7 @@ const STT_PRESETS: SttPreset[] = [
   },
   {
     id: "local",
-    label: "Локальный whisper",
+    label: "Локально",
     badge: "офлайн",
     patch: { stt_provider: "local" },
   },
@@ -108,12 +108,12 @@ export default function Stt({
       ? "Deepgram"
       : provider === "openai_compat"
         ? "OpenAI-compatible"
-        : "Локальный whisper";
+        : "Локально";
   const providerMode = isLocal ? "Офлайн и приватно" : "Облако с фолбэком";
   const providerHint = isLocal
     ? "Аудио остаётся на устройстве"
     : settings.stt_fallback_local
-      ? "При ошибке вернётся на локальный whisper"
+      ? "При ошибке вернётся на локальное распознавание"
       : "Нужны сеть и API-ключ";
 
   async function onTest() {
@@ -135,7 +135,7 @@ export default function Stt({
     <div className="content-inner">
       <PageHead
         title="Облако"
-        desc="Облачный движок распознавания речи. Локальный whisper остаётся по умолчанию и приватен — аудио не покидает устройство."
+        desc="Облачный движок распознавания речи. Локальный GigaAM/Parakeet/Whisper остаётся по умолчанию и приватен — аудио не покидает устройство."
       />
 
       <div className="card cloud-card">
@@ -144,7 +144,7 @@ export default function Stt({
             <div className="card-title">Провайдер STT</div>
             <p className="cloud-provider-copy">
               Какой движок распознаёт речь. Облако подключается как BYOK-режим,
-              локальный whisper остаётся приватным запасным вариантом.
+              локальное распознавание остаётся приватным запасным вариантом.
             </p>
           </div>
           <div className="cloud-provider-status" aria-live="polite">
@@ -207,7 +207,7 @@ export default function Stt({
 
         <Field
           label="Движок распознавания"
-          hint="Локальный whisper работает офлайн и приватно. Облачные провайдеры — быстрее на слабом железе, но требуют сети и ключа."
+          hint="Локальные GigaAM/Parakeet/Whisper работают офлайн и приватно. Облачные провайдеры — быстрее на слабом железе, но требуют сети и ключа."
         >
           <Select
             value={settings.stt_provider}
@@ -216,7 +216,7 @@ export default function Stt({
               update({ stt_provider: v });
             }}
             options={[
-              { value: "local", label: "Локальный whisper" },
+              { value: "local", label: "Локально" },
               {
                 value: "openai_compat",
                 label: "OpenAI-совместимый (Avalon/OpenAI/Groq)",
@@ -231,7 +231,7 @@ export default function Stt({
             className="field-hint"
             style={{ marginTop: -6, marginBottom: 14, maxWidth: "none" }}
           >
-            Без ключа VoxFlow мгновенно работает на локальном whisper (умный
+            Без ключа VoxFlow мгновенно работает локально (умный
             фолбэк) — облако подключится, как только укажете ключ.
           </div>
         )}
@@ -348,7 +348,7 @@ export default function Stt({
           )}
           {isLocal && !result && (
             <span className="stt-test-local">
-              Локальный whisper не требует проверки соединения
+              Локальное распознавание не требует проверки соединения
             </span>
           )}
         </div>
@@ -374,7 +374,7 @@ export default function Stt({
         </Field>
 
         <Field
-          label="Откат на локальный whisper"
+          label="Откат на локальное распознавание"
           hint="Если облако недоступно (нет сети, ошибка или таймаут) — автоматически распознать локально. В плашке появится метка «офлайн»."
         >
           <Switch
