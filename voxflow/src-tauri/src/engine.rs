@@ -16,7 +16,7 @@ use crate::audio::{self, Capture};
 use crate::settings::Settings;
 use crate::system_audio::AutoMuteGuard;
 use crate::{db, inject, paths, postprocess};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 /// Звуки старт/стоп (Windows: MessageBeep, без зависимостей; неблокирующий).
 #[cfg(windows)]
@@ -74,6 +74,10 @@ pub enum EngineCmd {
 }
 
 const PARAGRAPH_GAP_SAMPLES: usize = 8 * 16000;
+const DICTATION_CONTEXT_RECENT_LIMIT: usize = 6;
+const DICTATION_CONTEXT_RECENT_CHARS: usize = 1200;
+const DICTATION_CONTEXT_SUMMARY_CHARS: usize = 700;
+const DICTATION_CONTEXT_ITEM_CHARS: usize = 360;
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -111,6 +115,13 @@ struct PartialState {
     start_fp: (String, String),
     /// Режим вставки на момент старта: "never" | "auto" | "always".
     stream_mode: String,
+}
+
+#[derive(Default)]
+struct DictationMemory {
+    target_fp: Option<(String, String)>,
+    summary: String,
+    recent: VecDeque<String>,
 }
 
 #[derive(Clone)]
@@ -161,6 +172,9 @@ struct EngineCtx {
     vad_final: Arc<Mutex<Option<crate::vad::SileroVad>>>,
     /// Не даёт запускать несколько улучшений выделенного текста одновременно.
     improve_busy: Arc<AtomicBool>,
+    /// Короткая память последних финальных вставок для того же окна: помогает
+    /// LLM-рерайту продолжать предложение и ставить пунктуацию по контексту.
+    dictation_memory: Arc<Mutex<DictationMemory>>,
     /// Guard системного mute на время активной диктовки.
     auto_mute: Arc<Mutex<Option<AutoMuteGuard>>>,
 }
@@ -191,6 +205,7 @@ pub fn spawn(
         vad: Arc::new(Mutex::new(None)),
         vad_final: Arc::new(Mutex::new(None)),
         improve_busy: Arc::new(AtomicBool::new(false)),
+        dictation_memory: Arc::new(Mutex::new(DictationMemory::default())),
         auto_mute: auto_mute.clone(),
     };
     // Прогрев whisper-server в фоне (CUDA JIT один раз → первая диктовка тоже быстрая).
@@ -245,17 +260,22 @@ impl LocalStt for crate::parakeet::Parakeet {
 enum LocalRoute {
     /// ru + движок gigaam — как раньше.
     GigaAm,
-    /// en при установленном Parakeet.
+    /// en/auto при установленном Parakeet.
     Parakeet,
     /// Всё остальное (auto/прочие языки/whisper-движки).
     Whisper,
 }
 
 fn local_route(s: &Settings) -> LocalRoute {
-    let parakeet_ready = || crate::parakeet::dir_ready(&paths::parakeet_dir());
+    let parakeet_ready = crate::parakeet::dir_ready(&paths::parakeet_dir());
+    local_route_with_parakeet(s, parakeet_ready)
+}
+
+fn local_route_with_parakeet(s: &Settings, parakeet_ready: bool) -> LocalRoute {
     match s.language.as_str() {
         "ru" if s.engine == "gigaam" => LocalRoute::GigaAm,
-        "en" if s.engine == "gigaam" && parakeet_ready() => LocalRoute::Parakeet,
+        "en" if s.engine == "gigaam" && parakeet_ready => LocalRoute::Parakeet,
+        "auto" if s.engine == "gigaam" && parakeet_ready => LocalRoute::Parakeet,
         _ => LocalRoute::Whisper,
     }
 }
@@ -469,14 +489,14 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         let s = ctx.settings.lock();
         (s.input_device.clone(), s.play_sounds, s.auto_mute)
     };
-    // B3: для локального whisper модель обязательна — без неё НЕ начинаем «запись в
+    // B3: для локального распознавания модель обязательна — без неё НЕ начинаем «запись в
     // никуда», а сразу показываем предупреждение «Выберите модель». Облачный ASR
     // (Gemini-транскрипция ИЛИ облачный STT-провайдер) модель не требует, поэтому
     // проверяем только для чисто локального пути.
     {
         let s = ctx.settings.lock();
         // Облако «активно» только при наличии ключа — иначе провайдер openai_compat/deepgram
-        // de-facto уходит в локальный whisper (умный фолбэк). Та же проверка, что и в
+        // de-facto уходит в локальное распознавание (умный фолбэк). Та же проверка, что и в
         // process_utterance (общий хелпер cloud_stt_active): без ключа провайдер облачный,
         // но модель нам ВСЁ РАВНО нужна, иначе гард «выберите модель» пропустили бы и юзер
         // записал бы «в никуда» (баг старта).
@@ -544,16 +564,16 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
     let s = ctx.settings.lock().clone();
     // ГИБРИД (бриф: «локальный мгновенный черновик → точный облачный финал»):
     // если выбран облачный STT и ключ ЕСТЬ (cloud_active), пилюлю НЕ глушим — наоборот,
-    // крутим локальный whisper-server, чтобы показать МГНОВЕННЫЙ серый ЧЕРНОВИК в пилюле;
+    // крутим локальный сервер живого черновика, чтобы показать МГНОВЕННЫЙ серый ЧЕРНОВИК в пилюле;
     // в поле при этом ничего не печатаем (effective_mode → "never" ниже), потому что точный
     // финал придёт из облака и вставится один раз. Если ключа нет — мы de-facto работаем
     // локально, поведение как у "local" (умный фолбэк, решение пользователя).
     let cloud_active = s.cloud_stt_active();
-    // ОБЛАЧНЫЙ живой черновик: если STT — облако с ключом, локальный whisper/GPU/модель
+    // ОБЛАЧНЫЙ живой черновик: если STT — облако с ключом, локальный GPU/модель
     // НЕ нужны. Шлём растущий буфер прямо в облако (Groq/Avalon/Deepgram) каждые ~1.4с →
     // серый текст в пилюле, «как у офлайн-моделей», но через API-ключ. В поле НЕ печатаем
     // (точный финал вставится один раз). Это и УБИРАЕТ ложный наг «выберите модель»:
-    // раньше гибрид пытался поднять локальный whisper ради черновика и при отсутствии
+    // раньше гибрид пытался поднять локальный сервер ради черновика и при отсутствии
     // модели слал no_model, хотя облако для распознавания полностью рабочее.
     if cloud_active {
         if s.cloud_live_draft {
@@ -1862,6 +1882,7 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
     }
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
+    let context_hint = rewrite_context_hint(ctx, &actx, Some(&text));
     let rewrite_tone = if ai_prompt_context {
         "ai"
     } else {
@@ -1869,12 +1890,15 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
     };
     let (refined, used_model) = refine_text_with_fallback(
         &s,
-        &actx,
-        &text,
-        rewrite_tone,
-        smart_instruction.as_deref(),
-        &corrections,
-        true,
+        RewriteRequest {
+            actx: &actx,
+            text: &text,
+            tone: rewrite_tone,
+            smart_instruction: smart_instruction.as_deref(),
+            context_hint: context_hint.as_deref(),
+            corrections: &corrections,
+            force: true,
+        },
     );
     if !used_model {
         let message = if cloud_or_remote_rewrite {
@@ -1897,7 +1921,7 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
         emit_improve_status(&ctx.app, "cancelled", "Окно изменилось, вставка отменена");
         return Ok(());
     }
-    inject::inject(&refined, "clipboard")?;
+    inject::inject_keep_clipboard(&refined, "clipboard")?;
     emit_improve_status(&ctx.app, "inserted", "Текст улучшен");
     Ok(())
 }
@@ -2168,7 +2192,7 @@ fn process_utterance(
         (load_dict(&conn), load_snippets(&conn))
     };
 
-    // ── ASR: приоритет облачного STT-провайдера, иначе Gemini, иначе локальный whisper ──
+    // ── ASR: приоритет облачного STT-провайдера, иначе Gemini, иначе локальный ASR-пайплайн ──
     // Финальный whisper-проход сериализуем тем же asr_lock, что и тики partial,
     // чтобы он никогда не пересёкся с частичным запросом (петля к этому моменту
     // уже остановлена и приджойнена — это пояс поверх подтяжек).
@@ -2177,7 +2201,7 @@ fn process_utterance(
     // verbose_json локального whisper). Пустой ответ облака трактуем как norecog
     // ниже — общим путём (как и при отклонении гейта локальным проходом).
     // Avalon — основной STT по умолчанию, НО без ключа НЕ делаем бессмысленных сетевых
-    // попыток (лишний RTT/таймаут): мгновенно работаем на локальном whisper. «Умный
+    // попыток (лишний RTT/таймаут): мгновенно работаем локально. «Умный
     // фолбэк» из решения пользователя: облако активно, только когда ключ реально есть
     // (общий хелпер cloud_stt_active — та же проверка, что в гарде старта и петле).
     let use_cloud_stt = s.cloud_stt_active();
@@ -2203,7 +2227,7 @@ fn process_utterance(
                     Ok(_) => log::warn!("облачный STT ({}) вернул пусто", s.stt_provider),
                 }
                 if s.stt_fallback_local {
-                    log::warn!("облачный STT недоступен — откат на локальный whisper");
+                    log::warn!("облачный STT недоступен — откат на локальное распознавание");
                     emit_stt_mode(&ctx.app, "local", true);
                     let _g = ctx.asr_lock.lock();
                     local_transcribe(ctx, &s, &dict, &wav)?
@@ -2222,7 +2246,7 @@ fn process_utterance(
         match crate::gemini::transcribe(&s.ai_api_key, &s.ai_model, &wav, &s.language) {
             Ok(t) => postprocess::dedup_repeated_ngrams(&t),
             Err(e) => {
-                log::warn!("облачный ASR (Gemini) ошибка: {e}; откат на локальный whisper");
+                log::warn!("облачный ASR (Gemini) ошибка: {e}; откат на локальное распознавание");
                 let _g = ctx.asr_lock.lock();
                 local_transcribe(ctx, &s, &dict, &wav)?
             }
@@ -2326,6 +2350,7 @@ fn process_utterance(
     // быстрый deterministic fallback после правил.
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
+    let context_hint = rewrite_context_hint(ctx, &actx, None);
     let rewrite_tone = if ai_prompt_context {
         "ai"
     } else {
@@ -2343,12 +2368,15 @@ fn process_utterance(
     if llm_eligible {
         text = refine_text_with_fallback(
             &s,
-            &actx,
-            &text,
-            rewrite_tone,
-            smart_instruction.as_deref(),
-            &corrections,
-            false,
+            RewriteRequest {
+                actx: &actx,
+                text: &text,
+                tone: rewrite_tone,
+                smart_instruction: smart_instruction.as_deref(),
+                context_hint: context_hint.as_deref(),
+                corrections: &corrections,
+                force: false,
+            },
         )
         .0;
     }
@@ -2427,9 +2455,11 @@ fn process_utterance(
                     // Абзацы должны быть автоматическими, но Enter в чатах опасен.
                     // Поэтому живой черновик стираем клавишами, а финальный
                     // многострочный текст вставляем одним безопасным clipboard-paste.
+                    let _ = inject::set_clipboard_text(&text)
+                        .map_err(|e| log::warn!("clipboard final text: {e}"));
                     if let Err(e) = inject::inject_incremental(&prev, "") {
                         log::warn!("финальная очистка live-черновика: {e}");
-                    } else if let Err(e) = inject::inject(&text, "clipboard") {
+                    } else if let Err(e) = inject::inject_keep_clipboard(&text, "clipboard") {
                         log::warn!("финальная clipboard-вставка с абзацами: {e}");
                     } else if l.stream_mode == "always" {
                         *l.injected.lock() = text.clone();
@@ -2440,6 +2470,8 @@ fn process_utterance(
                     }
                 } else {
                     let flat = flatten_breaks(&text);
+                    let _ = inject::set_clipboard_text(&flat)
+                        .map_err(|e| log::warn!("clipboard final text: {e}"));
                     if let Err(e) = inject::inject_incremental(&prev, &flat) {
                         log::warn!("финальная реконсиляция: {e}");
                     } else if l.stream_mode == "always" {
@@ -2461,7 +2493,7 @@ fn process_utterance(
                 return Ok(());
             }
             // Ошибку пробрасываем ПОСЛЕ уборки временного WAV (иначе утечка в tmp).
-            if let Err(e) = inject::inject(&text, &s.paste_method) {
+            if let Err(e) = inject::inject_keep_clipboard(&text, &s.paste_method) {
                 drop(inject_guard);
                 let _ = std::fs::remove_file(&wav);
                 return Err(e);
@@ -2471,6 +2503,7 @@ fn process_utterance(
     }
     drop(inject_guard); // освобождаем замок клавиш сразу после вставки
     if final_inserted {
+        remember_dictation_context(ctx, &actx, &text);
         emit_final_preview(&ctx.app, &text, my_gen, lang_badge);
     }
     let inject_ms = t_inj.elapsed().as_millis() as u64;
@@ -2881,7 +2914,7 @@ fn emit_no_model(app: &AppHandle) {
 }
 
 /// Локальный ASR с роутингом по языку (PLAN §2): ru → GigaAM (как раньше),
-/// en → Parakeet, auto/прочие языки → whisper. Общий VAD-гейт тишины для
+/// en/auto → Parakeet при установленной модели, прочие языки → whisper. Общий VAD-гейт тишины для
 /// резидентных движков. Возвращает (текст, язык для бейджа overlay).
 fn local_asr(
     ctx: &EngineCtx,
@@ -2948,12 +2981,49 @@ fn local_asr(
                         }) {
                             Ok(t) => {
                                 let st = p.last_stats;
-                                emit_stt_mode(&ctx.app, "parakeet", false);
                                 dbg_log(&format!(
                                     "[lat] vad={vad_ms}мс parakeet: audio={}мс frontend={}мс encoder={}мс decoder={}мс asr={}мс",
                                     st.audio_ms, st.frontend_ms, st.encoder_ms, st.decoder_ms, st.total_ms
                                 ));
                                 let lang = detect_lang_label(&t);
+                                if s.language == "auto"
+                                    && lang == Some("ru")
+                                    && crate::gigaam::dir_ready(&paths::gigaam_dir())
+                                {
+                                    match ensure_gigaam(ctx, s) {
+                                        Ok(()) => {
+                                            let mut g_guard = ctx.gigaam.lock();
+                                            if let Some(g) = g_guard.as_mut() {
+                                                match local_transcribe_long(
+                                                    &ctx.vad_final,
+                                                    samples_16k,
+                                                    &mut |seg| g.transcribe(seg),
+                                                ) {
+                                                    Ok(g_text) if prefer_gigaam_for_auto(&t, &g_text) => {
+                                                        emit_stt_mode(&ctx.app, "gigaam", false);
+                                                        dbg_log(&format!(
+                                                            "auto: выбран GigaAM вместо Parakeet (parakeet_len={}, gigaam_len={})",
+                                                            t.chars().count(),
+                                                            g_text.chars().count()
+                                                        ));
+                                                        return Ok((
+                                                            postprocess::dedup_repeated_ngrams(&g_text),
+                                                            Some("ru"),
+                                                        ));
+                                                    }
+                                                    Ok(_) => {}
+                                                    Err(e) => log::warn!(
+                                                        "auto: GigaAM после Parakeet недоступен: {e:#}"
+                                                    ),
+                                                }
+                                            }
+                                        }
+                                        Err(e) => log::warn!(
+                                            "auto: GigaAM после Parakeet недоступен ({e})"
+                                        ),
+                                    }
+                                }
+                                emit_stt_mode(&ctx.app, "parakeet", false);
                                 return Ok((postprocess::dedup_repeated_ngrams(&t), lang));
                             }
                             Err(e) => log::warn!("parakeet ошибка: {e:#}; откат на whisper"),
@@ -2965,10 +3035,12 @@ fn local_asr(
             LocalRoute::Whisper => unreachable!(),
         }
     }
-    // en без Parakeet — текущее поведение (whisper) + разовая дружелюбная
-    // подсказка, что с Parakeet будет лучше. Для auto подсказку не показываем:
-    // это штатный мультиязычный whisper-маршрут.
-    if route == LocalRoute::Whisper && s.engine == "gigaam" && s.language == "en" {
+    // en/auto без Parakeet — текущее поведение (whisper) + разовая дружелюбная
+    // подсказка, что с Parakeet будет лучше.
+    if route == LocalRoute::Whisper
+        && s.engine == "gigaam"
+        && (s.language == "en" || s.language == "auto")
+    {
         hint_parakeet_once(&ctx.app);
     }
     let whisper_text = {
@@ -3249,26 +3321,27 @@ mod seg_tests {
             language: "auto".to_string(),
             ..Settings::default()
         };
-        assert_eq!(local_route(&s), LocalRoute::Whisper);
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Whisper);
 
         s.language = "en".to_string();
-        assert_eq!(local_route(&s), LocalRoute::Whisper);
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Whisper);
 
         s.language = "ru".to_string();
-        assert_eq!(local_route(&s), LocalRoute::Whisper);
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Whisper);
 
         s.engine = "gigaam".to_string();
-        assert_eq!(local_route(&s), LocalRoute::GigaAm);
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::GigaAm);
     }
 
     #[test]
-    fn auto_language_uses_whisper_for_final_multilingual_route() {
+    fn auto_language_uses_parakeet_when_installed_otherwise_whisper() {
         let s = Settings {
             engine: "gigaam".to_string(),
             language: "auto".to_string(),
             ..Settings::default()
         };
-        assert_eq!(local_route(&s), LocalRoute::Whisper);
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
+        assert_eq!(local_route_with_parakeet(&s, false), LocalRoute::Whisper);
     }
 }
 
@@ -3348,6 +3421,115 @@ fn clamp_chars(value: &str, max_chars: usize) -> String {
 
 fn one_line_instruction(value: &str) -> String {
     clamp_chars(&compact_instruction_source(value), 1800)
+}
+
+fn target_matches_memory(memory: &DictationMemory, actx: &crate::app_context::AppContext) -> bool {
+    memory
+        .target_fp
+        .as_ref()
+        .map(|(exe, title)| exe == &actx.exe && title == &actx.title)
+        .unwrap_or(false)
+}
+
+fn compact_context_tail(value: &str, max_chars: usize) -> String {
+    let compact = compact_instruction_source(value);
+    let len = compact.chars().count();
+    if len <= max_chars {
+        return compact;
+    }
+    let mut tail: String = compact
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    tail = tail
+        .trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, ',' | ';' | ':' | '-' | '—' | '–')
+        })
+        .to_string();
+    format!("...{tail}")
+}
+
+fn merge_context_summary(current: &str, old: &str) -> String {
+    let merged = if current.trim().is_empty() {
+        old.to_string()
+    } else {
+        format!("{current} {old}")
+    };
+    compact_context_tail(&merged, DICTATION_CONTEXT_SUMMARY_CHARS)
+}
+
+fn recent_context_len(recent: &VecDeque<String>) -> usize {
+    recent.iter().map(|v| v.chars().count()).sum()
+}
+
+fn remember_dictation_context(ctx: &EngineCtx, actx: &crate::app_context::AppContext, text: &str) {
+    let compact = compact_context_tail(text, DICTATION_CONTEXT_ITEM_CHARS);
+    if compact.trim().is_empty() {
+        return;
+    }
+
+    let mut memory = ctx.dictation_memory.lock();
+    let target_fp = (actx.exe.clone(), actx.title.clone());
+    if memory.target_fp.as_ref() != Some(&target_fp) {
+        memory.target_fp = Some(target_fp);
+        memory.summary.clear();
+        memory.recent.clear();
+    }
+
+    memory.recent.push_back(compact);
+    while memory.recent.len() > DICTATION_CONTEXT_RECENT_LIMIT
+        || recent_context_len(&memory.recent) > DICTATION_CONTEXT_RECENT_CHARS
+    {
+        let Some(old) = memory.recent.pop_front() else {
+            break;
+        };
+        memory.summary = merge_context_summary(&memory.summary, &old);
+    }
+}
+
+fn rewrite_context_hint(
+    ctx: &EngineCtx,
+    actx: &crate::app_context::AppContext,
+    current_document: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(doc) = current_document.map(str::trim).filter(|v| !v.is_empty()) {
+        parts.push(format!(
+            "Готовый/выделенный текст для правки: {}",
+            compact_context_tail(doc, 1200)
+        ));
+    }
+
+    let memory = ctx.dictation_memory.lock();
+    if target_matches_memory(&memory, actx) {
+        if !memory.summary.trim().is_empty() {
+            parts.push(format!(
+                "Краткая выжимка более ранней диктовки: {}",
+                memory.summary
+            ));
+        }
+        if !memory.recent.is_empty() {
+            parts.push(format!(
+                "Последние вставленные фрагменты: {}",
+                memory
+                    .recent
+                    .iter()
+                    .map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" / ")
+            ));
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(clamp_chars(&parts.join("\n"), 1800))
+    }
 }
 
 fn app_label_for_payload(actx: &crate::app_context::AppContext) -> String {
@@ -3464,14 +3646,15 @@ fn effective_smart_instruction_for_app(
 }
 
 /// Пользовательский payload для системного промпта Ollama/OpenAI-compatible.
-/// [ОКРУЖЕНИЕ] не отправляем — оно пустое. Для ручного/авто-профиля подставляем
-/// понятный маркер приложения, чтобы системный промпт выбрал нужный workflow
-/// даже если фактический активный app не похож на Gmail/Slack/ChatGPT.
+/// Для ручного/авто-профиля подставляем понятный маркер приложения, чтобы
+/// системный промпт выбрал нужный workflow даже если фактический активный app
+/// не похож на Gmail/Slack/ChatGPT.
 fn build_voiceflow_payload(
     actx: &crate::app_context::AppContext,
     text: &str,
     tone: &str,
     smart_instruction: Option<&str>,
+    context_hint: Option<&str>,
 ) -> String {
     let actual = app_label_for_payload(actx);
     let app = match tone {
@@ -3492,20 +3675,42 @@ fn build_voiceflow_payload(
         payload.push_str(&one_line_instruction(instruction));
         payload.push('\n');
     }
+    if let Some(context) = context_hint.map(str::trim).filter(|v| !v.is_empty()) {
+        payload.push_str("[ОКРУЖЕНИЕ]: ");
+        payload.push_str(&one_line_instruction(context));
+        payload.push('\n');
+        payload.push_str("[КАК ИСПОЛЬЗОВАТЬ ОКРУЖЕНИЕ]: ");
+        payload.push_str(
+            "используй его только для пунктуации, продолжения предложения, местоимений и стиля; не добавляй факты, которых нет в диктовке.",
+        );
+        payload.push('\n');
+    }
     payload.push_str("[ДИКТОВКА]: ");
     payload.push_str(text);
     payload
 }
 
-fn refine_text_with_fallback(
-    s: &Settings,
-    actx: &crate::app_context::AppContext,
-    text: &str,
-    tone: &str,
-    smart_instruction: Option<&str>,
-    corrections: &[postprocess::Correction],
+struct RewriteRequest<'a> {
+    actx: &'a crate::app_context::AppContext,
+    text: &'a str,
+    tone: &'a str,
+    smart_instruction: Option<&'a str>,
+    context_hint: Option<&'a str>,
+    corrections: &'a [postprocess::Correction],
     force: bool,
-) -> (String, bool) {
+}
+
+fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (String, bool) {
+    let RewriteRequest {
+        actx,
+        text,
+        tone,
+        smart_instruction,
+        context_hint,
+        corrections,
+        force,
+    } = request;
+
     if text.trim().is_empty() {
         return (String::new(), false);
     }
@@ -3533,7 +3738,8 @@ fn refine_text_with_fallback(
     if s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key) {
         let key = s.ai_api_key.clone();
         let model = s.ai_model.clone();
-        let instruction = build_tone_instruction(target_tone, smart_instruction, corrections);
+        let instruction =
+            build_tone_instruction(target_tone, smart_instruction, context_hint, corrections);
         let input = text.to_string();
         attempts.push(Box::new(move || {
             crate::gemini::refine(&key, &model, &instruction, &input)
@@ -3541,7 +3747,8 @@ fn refine_text_with_fallback(
     }
     if s.ai_backend == "openai_compat" && crate::rewrite::configured(s) {
         let settings = s.clone();
-        let user = build_voiceflow_payload(actx, text, target_tone, smart_instruction);
+        let user =
+            build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
         attempts.push(Box::new(move || {
             crate::rewrite::refine(&settings, crate::ollama::SYSTEM_PROMPT, &user)
         }));
@@ -3549,7 +3756,8 @@ fn refine_text_with_fallback(
     if s.ai_backend != "off" && crate::ollama::configured(&s.ollama_url) {
         let url = s.ollama_url.clone();
         let model = s.ollama_model.clone();
-        let user = build_voiceflow_payload(actx, text, target_tone, smart_instruction);
+        let user =
+            build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
         attempts.push(Box::new(move || {
             crate::ollama::refine(&url, &model, crate::ollama::SYSTEM_PROMPT, &user)
         }));
@@ -3571,6 +3779,7 @@ fn refine_text_with_fallback(
 fn build_tone_instruction(
     tone: &str,
     smart_instruction: Option<&str>,
+    context_hint: Option<&str>,
     corrections: &[postprocess::Correction],
 ) -> String {
     let style = match tone {
@@ -3590,6 +3799,7 @@ fn build_tone_instruction(
          Сохраняй контекст соседних фраз: если следующая фраза продолжает мысль, объединяй её с предыдущей и продолжай предложение. \
          Новый абзац делай только при явной смене темы, перечислении, новом смысловом блоке, явной команде абзаца или действительно длинной паузе. \
          Не разбивай каждую фразу или каждое предложение в отдельный абзац. \
+         Если дан контекст предыдущего или выделенного текста, используй его только для пунктуации, местоимений, продолжения предложения и стиля; не добавляй новые факты из контекста. \
          НЕ добавляй ничего от себя, не отвечай на текст и не комментируй — верни ТОЛЬКО переписанный текст."
     );
     if let Some(instruction) = smart_instruction
@@ -3599,6 +3809,12 @@ fn build_tone_instruction(
         s.push_str(&format!(
             " Пользовательская инструкция стиля: {}. Она важнее стандартного профиля, но не должна менять факты, язык и смысл диктовки.",
             one_line_instruction(instruction)
+        ));
+    }
+    if let Some(context) = context_hint.map(str::trim).filter(|v| !v.is_empty()) {
+        s.push_str(&format!(
+            " Контекст для понимания соседнего текста: {}.",
+            one_line_instruction(context)
         ));
     }
     if !corrections.is_empty() {
@@ -3652,6 +3868,7 @@ mod smart_prompt_tests {
             "я объясни мне по поводу архитектуры проекта а ещё используй компьютер юз",
             "ai",
             Some(prompt),
+            None,
         );
 
         assert!(payload.contains("[ПРИЛОЖЕНИЕ]: AI prompt (chrome.exe)"));
@@ -3666,12 +3883,52 @@ mod smart_prompt_tests {
         let instruction = build_tone_instruction(
             "ai",
             Some("Преобразуй фразу в структурный промпт для нейросети"),
+            None,
             &[],
         );
 
         assert!(instruction.contains("Пользовательская инструкция стиля"));
         assert!(instruction.contains("структурный промпт"));
         assert!(instruction.contains("Она важнее стандартного профиля"));
+    }
+
+    #[test]
+    fn voiceflow_payload_includes_context_as_environment_not_dictation() {
+        let payload = build_voiceflow_payload(
+            &app("Telegram"),
+            "наверное задержусь на работе",
+            "casual",
+            None,
+            Some("Последние вставленные фрагменты: Я сегодня"),
+        );
+
+        assert!(payload.contains("[ОКРУЖЕНИЕ]:"));
+        assert!(payload.contains("Последние вставленные фрагменты"));
+        assert!(payload.contains("[КАК ИСПОЛЬЗОВАТЬ ОКРУЖЕНИЕ]:"));
+        assert!(payload.contains("[ДИКТОВКА]: наверное задержусь"));
+    }
+
+    #[test]
+    fn gemini_instruction_includes_context_guardrail() {
+        let instruction = build_tone_instruction(
+            "doc",
+            None,
+            Some("Краткая выжимка более ранней диктовки: обсуждали релиз"),
+            &[],
+        );
+
+        assert!(instruction.contains("Контекст для понимания соседнего текста"));
+        assert!(instruction.contains("не добавляй новые факты из контекста"));
+    }
+
+    #[test]
+    fn context_tail_is_clamped_from_the_end() {
+        let value = "раз два три четыре пять шесть";
+        let clipped = compact_context_tail(value, 12);
+
+        assert!(clipped.starts_with("..."));
+        assert!(clipped.contains("пять шесть"));
+        assert!(clipped.chars().count() <= 15);
     }
 
     #[test]

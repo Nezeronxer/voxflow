@@ -90,7 +90,7 @@ export default function Overlay() {
   const [latchNotice, setLatchNotice] = useState<HotkeyLatchEvent | null>(null);
   const latchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // D: метка «оффлайн» — облако было недоступно, сработал авто-fallback на
-  // локальный whisper ("stt_mode" offline=true). Сбрасывается на новой записи.
+  // локальное распознавание ("stt_mode" offline=true). Сбрасывается на новой записи.
   const [offline, setOffline] = useState(false);
   // Язык текущей диктовки от бэкенда (lang в "partial"/"status"). null =
   // не определён / старый бэкенд без поля → бейдж скрыт. Сброс на новой записи.
@@ -497,7 +497,7 @@ export default function Overlay() {
     });
 
     // D: какой STT реально отработал диктовку. offline=true → облако было недоступно
-    // и сработал авто-fallback на локальный whisper. Показываем ненавязчивую метку
+    // и сработал авто-fallback на локальное распознавание. Показываем ненавязчивую метку
     // «оффлайн»; сбрасывается при старте следующей записи (см. status).
     const offSttMode = subscribe<SttModeEvent>("stt_mode", (e) => {
       setOffline(e.payload?.offline === true);
@@ -613,7 +613,7 @@ export default function Overlay() {
         data-tauri-drag-region
         title={
           offline && mode === "trans"
-            ? "Облако недоступно — локальный whisper"
+            ? "Облако недоступно — локальное распознавание"
             : undefined
         }
       >
@@ -699,7 +699,7 @@ export default function Overlay() {
                     {offline && (
                       <span
                         className="aq-offline"
-                        title="Облако недоступно — локальный whisper"
+                        title="Облако недоступно — локальное распознавание"
                       >
                         офлайн
                       </span>
