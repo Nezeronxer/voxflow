@@ -24,15 +24,51 @@
 /// * `exe` — имя исполняемого файла переднего окна в нижнем регистре
 ///   (например, `"chrome.exe"`); пустая строка, если определить не удалось.
 /// * `title` — заголовок переднего окна; пустая строка при неудаче.
+/// * `window_id` — стабильный идентификатор окна в рамках текущей сессии ОС
+///   (на Windows это HWND); пустая строка, если платформа его не даёт.
 /// * `category` — стилевая категория: `"verbatim" | "ai" | "formal" | "work"
 ///   | "casual" | "doc" | "neutral"`.
+#[derive(Clone, Debug)]
 pub struct AppContext {
     /// Имя exe-файла в нижнем регистре (только имя файла, без пути).
     pub exe: String,
     /// Заголовок переднего окна.
     pub title: String,
+    /// Стабильный id foreground-окна, если платформа умеет его дать.
+    pub window_id: String,
     /// Стилевая категория приложения.
     pub category: String,
+}
+
+/// Отпечаток целевого окна для безопасной отложенной вставки.
+///
+/// Когда доступен `window_id`, он надёжнее заголовка: браузеры и Electron-приложения
+/// часто меняют title между окончанием записи и финальной вставкой, из-за чего
+/// строгая проверка `(exe,title)` ложно отменяла вставку.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetFingerprint {
+    exe: String,
+    title: String,
+    window_id: String,
+}
+
+impl AppContext {
+    pub fn target_fingerprint(&self) -> TargetFingerprint {
+        TargetFingerprint {
+            exe: self.exe.clone(),
+            title: self.title.clone(),
+            window_id: self.window_id.clone(),
+        }
+    }
+}
+
+impl TargetFingerprint {
+    pub fn matches(&self, current: &AppContext) -> bool {
+        if !self.window_id.is_empty() && !current.window_id.is_empty() {
+            return self.exe == current.exe && self.window_id == current.window_id;
+        }
+        self.exe == current.exe && self.title == current.title
+    }
 }
 
 /// Классифицирует приложение по имени exe и заголовку окна.
@@ -316,6 +352,32 @@ mod tests {
         assert_eq!(super::classify("codex.exe", "New prompt"), "ai");
         assert_eq!(super::classify("chrome.exe", "codex - openai"), "ai");
     }
+
+    fn ctx(exe: &str, title: &str, window_id: &str) -> super::AppContext {
+        super::AppContext {
+            exe: exe.to_string(),
+            title: title.to_string(),
+            window_id: window_id.to_string(),
+            category: super::classify(exe, &title.to_lowercase()),
+        }
+    }
+
+    #[test]
+    fn target_fingerprint_uses_window_id_when_available() {
+        let start = ctx("chrome.exe", "ChatGPT", "123").target_fingerprint();
+
+        assert!(start.matches(&ctx("chrome.exe", "ChatGPT - updated", "123")));
+        assert!(!start.matches(&ctx("chrome.exe", "ChatGPT", "456")));
+        assert!(!start.matches(&ctx("msedge.exe", "ChatGPT", "123")));
+    }
+
+    #[test]
+    fn target_fingerprint_falls_back_to_title_without_window_id() {
+        let start = ctx("chrome.exe", "ChatGPT", "").target_fingerprint();
+
+        assert!(start.matches(&ctx("chrome.exe", "ChatGPT", "")));
+        assert!(!start.matches(&ctx("chrome.exe", "ChatGPT - updated", "")));
+    }
 }
 
 // ===========================================================================
@@ -387,9 +449,11 @@ mod platform {
                 return AppContext {
                     exe: String::new(),
                     title: String::new(),
+                    window_id: String::new(),
                     category: "neutral".to_string(),
                 };
             }
+            let window_id = hwnd.to_string();
 
             // --- Заголовок окна -------------------------------------------
             let mut title_buf: [u16; 512] = [0u16; 512];
@@ -408,6 +472,7 @@ mod platform {
                 return AppContext {
                     exe: String::new(),
                     title,
+                    window_id,
                     category,
                 };
             }
@@ -440,6 +505,7 @@ mod platform {
             AppContext {
                 exe,
                 title,
+                window_id,
                 category,
             }
         }
@@ -497,6 +563,7 @@ pub fn detect() -> AppContext {
     AppContext {
         exe,
         title,
+        window_id: String::new(),
         category,
     }
 }
@@ -532,6 +599,7 @@ pub fn detect() -> AppContext {
     AppContext {
         exe: String::new(),
         title: String::new(),
+        window_id: String::new(),
         category: "neutral".into(),
     }
 }
