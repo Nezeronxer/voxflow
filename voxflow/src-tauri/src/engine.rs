@@ -125,6 +125,12 @@ struct DictationMemory {
 }
 
 #[derive(Clone)]
+struct LastInject {
+    text: String,
+    at: Instant,
+}
+
+#[derive(Clone)]
 struct EngineCtx {
     app: AppHandle,
     db: Arc<Mutex<Connection>>,
@@ -133,7 +139,7 @@ struct EngineCtx {
     /// Постоянный whisper-server (если используется движок whisper_server).
     server: Arc<Mutex<Option<asr::Server>>>,
     /// Последний вставленный текст — для авто-захвата исправлений из буфера обмена.
-    last_inject: Arc<Mutex<Option<String>>>,
+    last_inject: Arc<Mutex<Option<LastInject>>>,
     /// Сериализация ВСЕХ обращений к /inference whisper-server (тики partial + финал).
     /// Один на движок, переиспользуется каждую диктовку.
     asr_lock: Arc<Mutex<()>>,
@@ -937,6 +943,104 @@ fn render_segments(segs: &[(bool, String)]) -> String {
     out
 }
 
+fn push_dictation_segment(segs: &mut Vec<(bool, String)>, para: bool, text: String) {
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        return;
+    }
+    if let Some(last) = segs.last_mut() {
+        if is_restatement(&last.1, &text) {
+            last.1 = text;
+            return;
+        }
+        if !para && soft_join_continuation_segment(&mut last.1, &text) {
+            return;
+        }
+    }
+    segs.push((para, text));
+}
+
+fn soft_join_continuation_segment(prev: &mut String, next: &str) -> bool {
+    let Some(next_clean) = lower_if_continuation_start(next) else {
+        return false;
+    };
+    let trimmed = prev.trim_end();
+    if !trimmed.ends_with('.') && !trimmed.ends_with('…') {
+        return false;
+    }
+    while prev.ends_with(char::is_whitespace) {
+        prev.pop();
+    }
+    while prev.ends_with('.') {
+        prev.pop();
+    }
+    if prev.ends_with('…') {
+        prev.pop();
+    }
+    while prev.ends_with(char::is_whitespace) {
+        prev.pop();
+    }
+    prev.push_str(", ");
+    prev.push_str(&next_clean);
+    true
+}
+
+fn lower_if_continuation_start(text: &str) -> Option<String> {
+    let trimmed = text.trim_start();
+    if !starts_with_continuation_cue(trimmed) {
+        return None;
+    }
+    Some(lower_first_alphabetic(trimmed))
+}
+
+fn starts_with_continuation_cue(text: &str) -> bool {
+    const CUES: &[&str] = &[
+        "то есть",
+        "потому что",
+        "а",
+        "и",
+        "но",
+        "чтобы",
+        "если",
+        "когда",
+        "который",
+        "которая",
+        "которое",
+        "которые",
+        "поэтому",
+        "наверное",
+        "просто",
+        "ещё",
+        "видишь",
+        "допустим",
+    ];
+    let lower = text.to_lowercase();
+    CUES.iter().any(|cue| {
+        if !lower.starts_with(cue) {
+            return false;
+        }
+        lower[cue.len()..]
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true)
+    })
+}
+
+fn lower_first_alphabetic(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut lowered = false;
+    for ch in text.chars() {
+        if !lowered && ch.is_alphabetic() {
+            out.extend(ch.to_lowercase());
+            lowered = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn load_live_postprocess_data(
     ctx: &EngineCtx,
 ) -> (
@@ -1300,10 +1404,7 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                     .unwrap_or(prev_seg_end)
                     .saturating_sub(prev_seg_end);
                 let para = gap_starts_paragraph(!committed_segs.is_empty(), gap);
-                match committed_segs.last_mut() {
-                    Some(last) if is_restatement(&last.1, &t) => last.1 = t,
-                    _ => committed_segs.push((para, t)),
-                }
+                push_dictation_segment(&mut committed_segs, para, t);
             }
             prev_seg_end = last_speech_end;
             seg_start = bound;
@@ -2268,6 +2369,7 @@ fn process_utterance(
             );
         }
     }
+    let raw = postprocess::dedup_repeated_ngrams(&raw);
 
     if raw.trim().is_empty() {
         // Гейт уверенности/VAD отклонил (невнятно / тишина / чужой язык).
@@ -2289,6 +2391,25 @@ fn process_utterance(
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
+
+    // Контекст окна нужен и для тона, и для payload Ollama, и для rule-based
+    // продолжения фразы. Детектим один раз после ASR и до постобработки.
+    let actx = crate::app_context::detect();
+    if (actx.exe.clone(), actx.title.clone()) != target_fp {
+        dbg_log("финал: окно изменилось до постобработки — вставка отменена");
+        erase_live_draft(ctx, live.as_ref(), my_gen);
+        return Ok(());
+    }
+    dbg_log(&format!(
+        "app: exe={} title_len={} → {}",
+        actx.exe,
+        actx.title.chars().count(),
+        actx.category
+    ));
+    // Тон по приложению считаем через category_for — он учитывает пользовательские
+    // app_profile_overrides (ветка B) ПЕРЕД встроенной таблицей классификации.
+    let tone = crate::app_context::category_for(&actx.exe, &actx.title, &s.app_profile_overrides);
+    let previous_context_tail = last_dictation_context(ctx, &actx);
 
     // Постобработка (правила) + выученные исправления.
     let t_post = Instant::now();
@@ -2327,23 +2448,6 @@ fn process_utterance(
     text = reconcile_final_with_live_preview(live.as_ref(), &text);
 
     // ── «Умный» рерайт под стиль активного приложения (Gemini/Ollama/OpenAI-compatible) ──
-    // Контекст окна нужен и для тона, и для payload Ollama — детектим один раз.
-    // Тон = категория приложения (Gmail→formal, мессенджеры→casual, промпты→work).
-    let actx = crate::app_context::detect();
-    if (actx.exe.clone(), actx.title.clone()) != target_fp {
-        dbg_log("финал: окно изменилось до рерайта — вставка отменена");
-        erase_live_draft(ctx, live.as_ref(), my_gen);
-        return Ok(());
-    }
-    dbg_log(&format!(
-        "app: exe={} title_len={} → {}",
-        actx.exe,
-        actx.title.chars().count(),
-        actx.category
-    ));
-    // Тон по приложению считаем через category_for — он учитывает пользовательские
-    // app_profile_overrides (ветка B) ПЕРЕД встроенной таблицей классификации.
-    let tone = crate::app_context::category_for(&actx.exe, &actx.title, &s.app_profile_overrides);
     // verbatim и нейтральный/пустой профиль LLM не зовут (правила уже отработали).
     // "ai" теперь eligible: пользователь ожидает Wispr Flow-поведение — из одной
     // сбивчивой диктовки получить готовый промпт. Если LLM недоступна, остаётся
@@ -2386,6 +2490,11 @@ fn process_utterance(
     // (replace_ci — сырая подстрочная замена; LLM иногда добавляет лишние пробелы).
     // normalize_spaces внутри postprocess::process отрабатывает РАНЬШЕ этих шагов,
     // поэтому нормализуем ещё раз — финально, перед вставкой.
+    text = postprocess::normalize_spaces(&text);
+    if conversational_continuation_enabled(&tone) {
+        text = postprocess::soften_false_sentence_breaks(&text);
+    }
+    text = continue_from_previous_context(&text, previous_context_tail.as_deref(), &tone);
     text = postprocess::normalize_spaces(&text);
     if text.trim().is_empty() {
         let _ = std::fs::remove_file(&wav);
@@ -2513,7 +2622,10 @@ fn process_utterance(
         t_all.elapsed().as_millis()
     ));
     // Запомнить вставленное — для авто-захвата исправлений из буфера (во всех путях).
-    *ctx.last_inject.lock() = Some(text.clone());
+    *ctx.last_inject.lock() = Some(LastInject {
+        text: text.clone(),
+        at: Instant::now(),
+    });
 
     let words = text.split_whitespace().count() as u32;
     if words == 0 {
@@ -3222,10 +3334,7 @@ where
             continue;
         }
         let para = gap_starts_paragraph(!segs.is_empty(), u.gap_before);
-        match segs.last_mut() {
-            Some(last) if is_restatement(&last.1, &t) => last.1 = t,
-            _ => segs.push((para, t)),
-        }
+        push_dictation_segment(&mut segs, para, t);
     }
     Ok(render_segments(&segs))
 }
@@ -3258,6 +3367,68 @@ mod seg_tests {
         assert_eq!(
             render_segments(&segs),
             "Первая фраза. Вторая рядом.\n\nНовый абзац."
+        );
+    }
+
+    #[test]
+    fn short_pause_continuation_soft_joins_segments() {
+        let mut segs = Vec::new();
+        push_dictation_segment(&mut segs, false, "Я немного остановился.".to_string());
+        push_dictation_segment(
+            &mut segs,
+            false,
+            "А он начал новое предложение.".to_string(),
+        );
+
+        assert_eq!(
+            render_segments(&segs),
+            "Я немного остановился, а он начал новое предложение."
+        );
+    }
+
+    #[test]
+    fn real_sentence_boundary_survives_segment_join() {
+        let mut segs = Vec::new();
+        push_dictation_segment(&mut segs, false, "Готово.".to_string());
+        push_dictation_segment(&mut segs, false, "Следующая тема.".to_string());
+
+        assert_eq!(render_segments(&segs), "Готово. Следующая тема.");
+    }
+
+    #[test]
+    fn paragraph_boundary_survives_segment_join() {
+        let mut segs = Vec::new();
+        push_dictation_segment(&mut segs, false, "Первый блок.".to_string());
+        push_dictation_segment(&mut segs, true, "А это новый абзац.".to_string());
+
+        assert_eq!(render_segments(&segs), "Первый блок.\n\nА это новый абзац.");
+    }
+
+    #[test]
+    fn previous_open_context_lowers_only_clear_continuations() {
+        assert_eq!(
+            continue_from_previous_context(
+                "А он начал новое предложение",
+                Some("я немного остановился"),
+                "casual",
+            ),
+            " а он начал новое предложение"
+        );
+        assert_eq!(
+            continue_from_previous_context(
+                "Следующая тема",
+                Some("я немного остановился"),
+                "casual",
+            ),
+            "Следующая тема"
+        );
+        assert_eq!(
+            continue_from_previous_context("А новый абзац", Some("Готово."), "casual"),
+            "А новый абзац"
+        );
+        assert_eq!(
+            continue_from_previous_context("А новый абзац", Some("Текст"), "formal"),
+            "А новый абзац"
         );
     }
 
@@ -3428,6 +3599,55 @@ fn target_matches_memory(memory: &DictationMemory, actx: &crate::app_context::Ap
         .target_fp
         .as_ref()
         .map(|(exe, title)| exe == &actx.exe && title == &actx.title)
+        .unwrap_or(false)
+}
+
+fn last_dictation_context(
+    ctx: &EngineCtx,
+    actx: &crate::app_context::AppContext,
+) -> Option<String> {
+    let memory = ctx.dictation_memory.lock();
+    if !target_matches_memory(&memory, actx) {
+        return None;
+    }
+    memory.recent.back().cloned()
+}
+
+fn conversational_continuation_enabled(tone: &str) -> bool {
+    matches!(tone, "" | "neutral" | "casual" | "very_casual" | "work")
+}
+
+fn continue_from_previous_context(text: &str, previous: Option<&str>, tone: &str) -> String {
+    if !conversational_continuation_enabled(tone) {
+        return text.to_string();
+    }
+    let Some(prev) = previous.map(str::trim).filter(|v| !v.is_empty()) else {
+        return text.to_string();
+    };
+    if previous_context_is_closed(prev) {
+        return text.to_string();
+    }
+    let Some(next) = lower_if_continuation_start(text) else {
+        return text.to_string();
+    };
+    if next
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_punctuation() || c.is_whitespace())
+        .unwrap_or(false)
+    {
+        next
+    } else {
+        format!(" {next}")
+    }
+}
+
+fn previous_context_is_closed(text: &str) -> bool {
+    text.trim_end()
+        .chars()
+        .rev()
+        .find(|c| !matches!(c, '"' | '\'' | ')' | ']' | '}' | '»' | '”'))
+        .map(|c| ".!?…\n".contains(c))
         .unwrap_or(false)
 }
 
@@ -4009,7 +4229,7 @@ fn clipboard_monitor(ctx: EngineCtx) {
         }
         let injected = ctx.last_inject.lock().clone();
         if let Some(inj) = injected {
-            if cur.trim() == inj.trim() {
+            if cur.trim() == inj.text.trim() {
                 continue; // это наш же текст — не учим
             }
             try_learn(&ctx, &inj, &cur);
@@ -4018,40 +4238,302 @@ fn clipboard_monitor(ctx: EngineCtx) {
 }
 
 /// Выучить исправления из пары (вставлено → отредактировано пользователем).
-fn try_learn(ctx: &EngineCtx, injected: &str, edited: &str) {
-    let wt: Vec<&str> = injected.split_whitespace().collect();
-    let wv: Vec<&str> = edited.split_whitespace().collect();
-    if wt.is_empty() || wv.is_empty() {
+fn try_learn(ctx: &EngineCtx, injected: &LastInject, edited: &str) {
+    if injected.at.elapsed() > Duration::from_secs(10 * 60) {
         return;
     }
-    // Похожесть (Jaccard по словам, нижний регистр): правка, а не другой текст.
-    let st: HashSet<String> = wt.iter().map(|w| w.to_lowercase()).collect();
-    let sv: HashSet<String> = wv.iter().map(|w| w.to_lowercase()).collect();
-    let common = st.intersection(&sv).count();
-    let denom = st.len().max(sv.len()).max(1);
-    let sim = common as f64 / denom as f64;
-    if !(0.5..1.0).contains(&sim) {
+    let pairs = learned_correction_pairs(&injected.text, edited, injected.at.elapsed());
+    if pairs.is_empty() {
         return; // не похоже на правку (или идентично)
     }
-    // Пословные замены при равной длине.
-    if wt.len() == wv.len() {
-        let conn = ctx.db.lock();
-        let mut learned = 0u32;
-        for (a, b) in wt.iter().zip(wv.iter()) {
-            let ca = a.trim_matches(|c: char| !c.is_alphanumeric());
-            let cb = b.trim_matches(|c: char| !c.is_alphanumeric());
-            if ca.is_empty() || cb.is_empty() || ca.to_lowercase() == cb.to_lowercase() {
-                continue;
+    let conn = ctx.db.lock();
+    let mut learned = 0u32;
+    for (wrong, right) in pairs {
+        if db::add_correction(&conn, &wrong, &right).is_ok() {
+            learned += 1;
+        }
+    }
+    if learned > 0 {
+        dbg_log(&format!("выучено исправлений: {learned}"));
+        let _ = ctx
+            .app
+            .emit("learned", serde_json::json!({ "count": learned }));
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LearnToken {
+    raw: String,
+    norm: String,
+}
+
+fn learned_correction_pairs(injected: &str, edited: &str, age: Duration) -> Vec<(String, String)> {
+    let wrong = learning_tokens(injected);
+    let right = learning_tokens(edited);
+    if wrong.is_empty() || right.is_empty() || token_norms_equal(&wrong, &right) {
+        return Vec::new();
+    }
+    if wrong.len() > 80 || right.len() > 80 {
+        return Vec::new();
+    }
+
+    let anchors = lcs_token_anchors(&wrong, &right);
+    let mut out = Vec::new();
+    if anchors.is_empty() {
+        push_learned_span(&mut out, &wrong, &right, false, age);
+        return dedup_learned_pairs(out);
+    }
+
+    let mut prev_w = 0usize;
+    let mut prev_r = 0usize;
+    for (wi, ri) in anchors
+        .into_iter()
+        .chain(std::iter::once((wrong.len(), right.len())))
+    {
+        push_learned_span(&mut out, &wrong[prev_w..wi], &right[prev_r..ri], true, age);
+        prev_w = wi.saturating_add(1);
+        prev_r = ri.saturating_add(1);
+    }
+    dedup_learned_pairs(out)
+}
+
+fn learning_tokens(text: &str) -> Vec<LearnToken> {
+    text.split_whitespace()
+        .filter_map(|raw| {
+            let clean = raw
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .trim_matches(|c: char| !c.is_alphanumeric());
+            if clean.is_empty() {
+                return None;
             }
-            if db::add_correction(&conn, ca, cb).is_ok() {
-                learned += 1;
+            Some(LearnToken {
+                raw: clean.to_string(),
+                norm: clean.to_lowercase(),
+            })
+        })
+        .collect()
+}
+
+fn token_norms_equal(a: &[LearnToken], b: &[LearnToken]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.norm == y.norm)
+}
+
+fn lcs_token_anchors(a: &[LearnToken], b: &[LearnToken]) -> Vec<(usize, usize)> {
+    let m = a.len();
+    let n = b.len();
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i][j] = if a[i].norm == b[j].norm {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let mut anchors = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < m && j < n {
+        if a[i].norm == b[j].norm {
+            anchors.push((i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    anchors
+}
+
+fn push_learned_span(
+    out: &mut Vec<(String, String)>,
+    wrong: &[LearnToken],
+    right: &[LearnToken],
+    anchored: bool,
+    age: Duration,
+) {
+    if wrong.is_empty() || right.is_empty() {
+        return;
+    }
+    if span_pair_valid(wrong, right, anchored, age) {
+        out.push((join_learn_tokens(wrong), join_learn_tokens(right)));
+    }
+    if wrong.len() == right.len() {
+        for (w, r) in wrong.iter().zip(right) {
+            if span_pair_valid(
+                std::slice::from_ref(w),
+                std::slice::from_ref(r),
+                anchored,
+                age,
+            ) {
+                out.push((w.raw.clone(), r.raw.clone()));
             }
         }
-        if learned > 0 {
-            dbg_log(&format!("выучено исправлений: {learned}"));
-            let _ = ctx
-                .app
-                .emit("learned", serde_json::json!({ "count": learned }));
+    }
+}
+
+fn span_pair_valid(
+    wrong: &[LearnToken],
+    right: &[LearnToken],
+    anchored: bool,
+    age: Duration,
+) -> bool {
+    if wrong.len() > 6 || right.len() > 6 {
+        return false;
+    }
+    let w = join_learn_tokens(wrong);
+    let r = join_learn_tokens(right);
+    let wc = w.chars().count();
+    let rc = r.chars().count();
+    if wc < 2 || rc < 2 || wc > 80 || rc > 80 || w.eq_ignore_ascii_case(&r) {
+        return false;
+    }
+    if anchored {
+        return true;
+    }
+    if age > Duration::from_secs(3 * 60) {
+        return false;
+    }
+    correction_similarity(&w, &r) >= 0.30
+}
+
+fn correction_similarity(wrong: &str, right: &str) -> f32 {
+    let a = rough_latin_key(wrong);
+    let b = rough_latin_key(right);
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    let dist = levenshtein_chars(&a, &b);
+    1.0 - (dist as f32 / a.chars().count().max(b.chars().count()) as f32)
+}
+
+fn rough_latin_key(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            continue;
         }
+        let mapped = match ch {
+            'а' => "a",
+            'б' => "b",
+            'в' => "v",
+            'г' => "g",
+            'д' => "d",
+            'е' | 'э' => "e",
+            'ё' => "yo",
+            'ж' => "zh",
+            'з' => "z",
+            'и' => "i",
+            'й' => "y",
+            'к' => "k",
+            'л' => "l",
+            'м' => "m",
+            'н' => "n",
+            'о' => "o",
+            'п' => "p",
+            'р' => "r",
+            'с' => "s",
+            'т' => "t",
+            'у' => "u",
+            'ф' => "f",
+            'х' => "h",
+            'ц' => "ts",
+            'ч' => "ch",
+            'ш' => "sh",
+            'щ' => "shch",
+            'ы' => "y",
+            'ю' => "yu",
+            'я' => "ya",
+            'ъ' | 'ь' => "",
+            _ => "",
+        };
+        out.push_str(mapped);
+    }
+    out
+}
+
+fn levenshtein_chars(a: &str, b: &str) -> usize {
+    let b_chars: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b_chars.len()).collect();
+    let mut cur = vec![0usize; b_chars.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b_chars.iter().enumerate() {
+            let cost = usize::from(ca != *cb);
+            cur[j + 1] = (prev[j + 1] + 1).min(cur[j] + 1).min(prev[j] + cost);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b_chars.len()]
+}
+
+fn join_learn_tokens(tokens: &[LearnToken]) -> String {
+    tokens
+        .iter()
+        .map(|t| t.raw.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn dedup_learned_pairs(pairs: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for (wrong, right) in pairs {
+        let key = (wrong.to_lowercase(), right.to_lowercase());
+        if seen.insert(key) {
+            out.push((wrong, right));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod correction_learning_tests {
+    use super::*;
+
+    fn has_pair(pairs: &[(String, String)], wrong: &str, right: &str) -> bool {
+        pairs.iter().any(|(w, r)| w == wrong && r == right)
+    }
+
+    #[test]
+    fn learns_whole_brand_phrase_without_shared_tokens() {
+        let pairs = learned_correction_pairs("Виспа Фолл", "Wispr Flow", Duration::from_secs(30));
+
+        assert!(has_pair(&pairs, "Виспа Фолл", "Wispr Flow"));
+    }
+
+    #[test]
+    fn learns_changed_phrase_between_stable_anchors() {
+        let pairs = learned_correction_pairs(
+            "открой Виспа Фолл пожалуйста",
+            "открой Wispr Flow пожалуйста",
+            Duration::from_secs(90),
+        );
+
+        assert!(has_pair(&pairs, "Виспа Фолл", "Wispr Flow"));
+    }
+
+    #[test]
+    fn learns_short_phonetic_single_word_correction() {
+        let pairs = learned_correction_pairs("фу", "foo", Duration::from_secs(15));
+
+        assert!(has_pair(&pairs, "фу", "foo"));
+    }
+
+    #[test]
+    fn rejects_unrelated_copied_text() {
+        let pairs = learned_correction_pairs("привет", "password", Duration::from_secs(15));
+
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn rejects_stale_direct_clipboard_change_without_anchors() {
+        let pairs = learned_correction_pairs("Виспа Фолл", "Wispr Flow", Duration::from_secs(240));
+
+        assert!(pairs.is_empty());
     }
 }

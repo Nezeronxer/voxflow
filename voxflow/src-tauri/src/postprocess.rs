@@ -26,7 +26,14 @@ pub struct Correction {
 /// Применить выученные исправления (регистронезависимая замена подстрок).
 pub fn apply_corrections(text: &str, corrections: &[Correction]) -> String {
     let mut t = text.to_string();
-    for c in corrections {
+    let mut ordered: Vec<&Correction> = corrections.iter().collect();
+    ordered.sort_by(|a, b| {
+        let aw = a.wrong.split_whitespace().count();
+        let bw = b.wrong.split_whitespace().count();
+        bw.cmp(&aw)
+            .then_with(|| b.wrong.chars().count().cmp(&a.wrong.chars().count()))
+    });
+    for c in ordered {
         let from = c.wrong.trim();
         if from.is_empty() {
             continue;
@@ -326,7 +333,7 @@ fn collapse_stuttered_words_line(line: &str) -> String {
         while j < toks.len() && norm(toks[j]) == cur {
             j += 1;
         }
-        if j - i >= 3 {
+        if j - i >= 3 || (j - i == 2 && collapse_double_starter_repeat(&cur)) {
             out.push(toks[i]);
         } else {
             out.extend_from_slice(&toks[i..j]);
@@ -334,6 +341,34 @@ fn collapse_stuttered_words_line(line: &str) -> String {
         i = j;
     }
     out.join(" ")
+}
+
+fn collapse_double_starter_repeat(word: &str) -> bool {
+    matches!(
+        word,
+        "я" | "мы"
+            | "ты"
+            | "вы"
+            | "он"
+            | "она"
+            | "они"
+            | "оно"
+            | "это"
+            | "этот"
+            | "эта"
+            | "эти"
+            | "то"
+            | "что"
+            | "как"
+            | "и"
+            | "а"
+            | "но"
+            | "вот"
+            | "там"
+            | "тут"
+            | "здесь"
+            | "просто"
+    )
 }
 
 fn collapse_inline_self_corrections(text: &str) -> String {
@@ -600,6 +635,67 @@ fn capitalize_sentences(text: &str) -> String {
         }
     }
     out
+}
+
+/// Смягчить типичный артефакт диктовки: ASR ставит точку после короткой паузы,
+/// а следующий дискурсивный маркер начинает с заглавной ("... . То есть ...").
+/// Формальные профили решают это выше по контексту; функция публична, чтобы движок
+/// включал её только для разговорных/нейтральных целей.
+pub fn soften_false_sentence_breaks(text: &str) -> String {
+    const STARTERS: &[&str] = &[
+        "то есть",
+        "потому что",
+        "а",
+        "и",
+        "но",
+        "чтобы",
+        "если",
+        "когда",
+        "поэтому",
+        "видишь",
+        "допустим",
+        "наверное",
+        "просто",
+        "ещё",
+    ];
+
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while let Some(rel) = text[i..].find(". ") {
+        let dot = i + rel;
+        let after = dot + 2;
+        out.push_str(&text[i..dot]);
+        if let Some((matched_len, replacement)) = false_break_starter(&text[after..], STARTERS) {
+            out.push_str(", ");
+            out.push_str(replacement);
+            i = after + matched_len;
+        } else {
+            out.push_str(". ");
+            i = after;
+        }
+    }
+    out.push_str(&text[i..]);
+    out
+}
+
+fn false_break_starter<'a>(rest: &str, starters: &'a [&'a str]) -> Option<(usize, &'a str)> {
+    for starter in starters {
+        let chars = starter.chars().count();
+        let candidate: String = rest.chars().take(chars).collect();
+        if candidate.chars().count() != chars || candidate.to_lowercase() != *starter {
+            continue;
+        }
+        let matched_len = candidate.len();
+        let boundary_ok = rest[matched_len..]
+            .chars()
+            .next()
+            .map(|c| !c.is_alphanumeric())
+            .unwrap_or(true);
+        if boundary_ok {
+            return Some((matched_len, *starter));
+        }
+    }
+    None
 }
 
 /// Схлопнуть пробелы и убрать пробел перед пунктуацией. Публична, т.к. движок
@@ -895,7 +991,8 @@ mod filler_tests {
             process("я я я думаю это сработает", &s, &[], &[]),
             "Я думаю это сработает"
         );
-        assert_eq!(process("это это важно", &s, &[], &[]), "Это это важно");
+        assert_eq!(process("это это важно", &s, &[], &[]), "Это важно");
+        assert_eq!(process("очень очень рад", &s, &[], &[]), "Очень очень рад");
     }
 
     #[test]
@@ -941,6 +1038,22 @@ mod filler_tests {
     }
 
     #[test]
+    fn false_sentence_breaks_after_short_pause_are_softened() {
+        assert_eq!(
+            soften_false_sentence_breaks("Я остановился. То есть продолжил мысль."),
+            "Я остановился, то есть продолжил мысль."
+        );
+        assert_eq!(
+            soften_false_sentence_breaks("Пауза была короткой. А текст пошёл дальше."),
+            "Пауза была короткой, а текст пошёл дальше."
+        );
+        assert_eq!(
+            soften_false_sentence_breaks("Готово. Следующая тема."),
+            "Готово. Следующая тема."
+        );
+    }
+
+    #[test]
     fn learned_corrections_respect_word_boundaries() {
         assert_eq!(
             apply_corrections(
@@ -951,6 +1064,25 @@ mod filler_tests {
                 }]
             ),
             "пёс и котик"
+        );
+    }
+
+    #[test]
+    fn learned_phrase_corrections_win_before_single_words() {
+        let corrections = vec![
+            Correction {
+                wrong: "Виспа".into(),
+                right: "Wispr".into(),
+            },
+            Correction {
+                wrong: "Виспа Фолл".into(),
+                right: "Wispr Flow".into(),
+            },
+        ];
+
+        assert_eq!(
+            apply_corrections("открой виспа фолл", &corrections),
+            "открой Wispr Flow"
         );
     }
 }
