@@ -11,6 +11,7 @@ use parking_lot::Mutex;
 use rusqlite::Connection;
 use tauri::{AppHandle, Emitter};
 
+use crate::app_context::TargetFingerprint;
 use crate::asr::{self, AsrParams};
 use crate::audio::{self, Capture};
 use crate::settings::Settings;
@@ -111,8 +112,8 @@ struct PartialState {
     committed: Arc<Mutex<String>>,
     /// Сработал ли запрет живой вставки (сменилось окно/поле) — остаётся true до конца диктовки.
     abort: Arc<AtomicBool>,
-    /// (exe,title) активного окна на старте — отпечаток целевого поля.
-    start_fp: (String, String),
+    /// Активное окно на старте — отпечаток целевого поля.
+    start_fp: TargetFingerprint,
     /// Режим вставки на момент старта: "never" | "auto" | "always".
     stream_mode: String,
 }
@@ -712,7 +713,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
 
     // Отпечаток целевого окна на старте — для защиты от смены приложения.
     let actx = crate::app_context::detect();
-    let start_fp = (actx.exe, actx.title);
+    let start_fp = actx.target_fingerprint();
     // Поколение этой диктовки — суффикс seq для событий partial (фронт отбрасывает
     // устаревшие партиалы прошлой диктовки при гонке доставки/StrictMode-листенерах).
     let my_seq = ctx.gen.load(Ordering::SeqCst);
@@ -794,7 +795,7 @@ const CLOUD_DRAFT_CAP: u32 = 4;
 /// WAV (имя по seq, без гонки с соседней диктовкой) и сама за собой убирает.
 fn start_cloud_partial_loop(capture: &Capture, ctx: &EngineCtx, s: &Settings) {
     let actx = crate::app_context::detect();
-    let start_fp = (actx.exe, actx.title);
+    let start_fp = actx.target_fingerprint();
     let my_seq = ctx.gen.load(Ordering::SeqCst);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1219,7 +1220,7 @@ struct LocalLoopArgs<T: LocalStt> {
     abort: Arc<AtomicBool>,
     injected: Arc<Mutex<String>>,
     committed_field: Arc<Mutex<String>>,
-    start_fp: (String, String),
+    start_fp: TargetFingerprint,
     stream_mode: String,
     seq: u64,
     tuning: LocalLoopTuning,
@@ -1239,7 +1240,7 @@ fn start_local_partial_loop<T: LocalStt + Send + 'static>(
     tuning: LocalLoopTuning,
 ) {
     let actx = crate::app_context::detect();
-    let start_fp = (actx.exe, actx.title);
+    let start_fp = actx.target_fingerprint();
     let my_seq = ctx.gen.load(Ordering::SeqCst);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1514,7 +1515,7 @@ struct PartialLoopArgs {
     abort: Arc<AtomicBool>,
     injected: Arc<Mutex<String>>,
     committed: Arc<Mutex<String>>,
-    start_fp: (String, String),
+    start_fp: TargetFingerprint,
     stream_mode: String,
     /// Поколение (seq) диктовки — кладётся в событие "partial" для отбрасывания
     /// устаревших партиалов на фронте.
@@ -1632,12 +1633,12 @@ fn partial_loop(a: PartialLoopArgs) {
 /// Проверка отпечатка окна перед живой вставкой: при смене окна/поля — навсегда
 /// (на эту диктовку) выставляем abort и больше не вставляем. Возвращает true,
 /// если вставлять МОЖНО (окно то же и abort не выставлен).
-fn live_target_ok(start_fp: &(String, String), abort: &Arc<AtomicBool>) -> bool {
+fn live_target_ok(start_fp: &TargetFingerprint, abort: &Arc<AtomicBool>) -> bool {
     if abort.load(Ordering::Acquire) {
         return false;
     }
     let cur = crate::app_context::detect();
-    if (cur.exe, cur.title) != *start_fp {
+    if !start_fp.matches(&cur) {
         // Окно не наше — СЕЙЧАС не вставляем, но НЕ латчим abort навсегда: если фокус
         // вернётся на исходное поле, продолжим (в чужое окно мы ничего не печатали, поэтому
         // injected/committed всё ещё соответствуют целевому полю). Это чинит «permanent
@@ -1845,7 +1846,7 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     // Тяжёлую обработку выносим в отдельный поток, чтобы движок мог принять новую запись.
     let ctx2 = ctx.clone();
     let actx = crate::app_context::detect();
-    let target_fp = (actx.exe, actx.title);
+    let target_fp = actx.target_fingerprint();
     std::thread::spawn(move || {
         if let Err(err) = process_utterance(&ctx2, samples, rate, None, my_gen, target_fp) {
             log::error!("process_utterance: {err:#}");
@@ -2017,8 +2018,9 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
     if ctx.gen.load(Ordering::SeqCst) != my_gen {
         return Ok(());
     }
+    let target_fp = actx.target_fingerprint();
     let cur = crate::app_context::detect();
-    if (cur.exe, cur.title) != (actx.exe.clone(), actx.title.clone()) {
+    if !target_fp.matches(&cur) {
         emit_improve_status(&ctx.app, "cancelled", "Окно изменилось, вставка отменена");
         return Ok(());
     }
@@ -2050,7 +2052,7 @@ struct LiveState {
     injected: Arc<Mutex<String>>,
     committed: Arc<Mutex<String>>,
     abort: Arc<AtomicBool>,
-    start_fp: (String, String),
+    start_fp: TargetFingerprint,
 }
 
 impl LiveState {
@@ -2235,7 +2237,7 @@ fn erase_live_draft(ctx: &EngineCtx, live: Option<&LiveState>, my_gen: u64) {
         return;
     }
     let cur = crate::app_context::detect();
-    if (cur.exe, cur.title) != l.start_fp {
+    if !l.start_fp.matches(&cur) {
         dbg_log("отмена: окно сменилось — чужое поле не трогаем");
         return;
     }
@@ -2261,7 +2263,7 @@ fn process_utterance(
     rate: u32,
     live: Option<LiveState>,
     my_gen: u64,
-    target_fp: (String, String),
+    target_fp: TargetFingerprint,
 ) -> anyhow::Result<()> {
     if samples.is_empty() {
         return Ok(());
@@ -2395,7 +2397,7 @@ fn process_utterance(
     // Контекст окна нужен и для тона, и для payload Ollama, и для rule-based
     // продолжения фразы. Детектим один раз после ASR и до постобработки.
     let actx = crate::app_context::detect();
-    if (actx.exe.clone(), actx.title.clone()) != target_fp {
+    if !target_fp.matches(&actx) {
         dbg_log("финал: окно изменилось до постобработки — вставка отменена");
         erase_live_draft(ctx, live.as_ref(), my_gen);
         return Ok(());
@@ -2550,7 +2552,7 @@ fn process_utterance(
             let cur = crate::app_context::detect();
             if l.abort.load(Ordering::Acquire) {
                 dbg_log("финал: окно сменилось — реконсиляцию пропускаем");
-            } else if (cur.exe, cur.title) != l.start_fp {
+            } else if !l.start_fp.matches(&cur) {
                 l.abort.store(true, Ordering::Release);
                 dbg_log("финал: целевое окно изменилось — реконсиляцию пропускаем");
             } else {
@@ -2596,7 +2598,7 @@ fn process_utterance(
         _ => {
             // never-режим или петли не было — поведение как раньше (вставка целиком).
             let cur = crate::app_context::detect();
-            if (cur.exe, cur.title) != target_fp {
+            if !target_fp.matches(&cur) {
                 dbg_log("финал: целевое окно изменилось — вставка отменена");
                 drop(inject_guard);
                 return Ok(());
@@ -4059,6 +4061,7 @@ mod smart_prompt_tests {
         crate::app_context::AppContext {
             exe: "chrome.exe".to_string(),
             title: title.to_string(),
+            window_id: "test-window".to_string(),
             category: "ai".to_string(),
         }
     }
@@ -4182,6 +4185,7 @@ mod smart_prompt_tests {
         let actx = crate::app_context::AppContext {
             exe: "codex.exe".to_string(),
             title: "Codex".to_string(),
+            window_id: "test-window".to_string(),
             category: "ai".to_string(),
         };
 
