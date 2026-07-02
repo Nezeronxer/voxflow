@@ -222,15 +222,14 @@ fn try_start_server(
 /// Готов ли сервер (curl к корню отвечает).
 pub fn server_ready(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{port}/");
-    let mut cmd = Command::new("curl");
+    let mut cmd = crate::net::curl();
+    crate::net::apply_no_proxy(&mut cmd);
     cmd.arg("-s")
         .arg("-o")
         .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
         .arg("-m")
         .arg("2")
         .arg(&url);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
     cmd.status().map(|s| s.success()).unwrap_or(false)
 }
 
@@ -243,25 +242,23 @@ pub fn transcribe_server(
 ) -> anyhow::Result<String> {
     let url = format!("http://127.0.0.1:{port}/inference");
     let file_arg = format!("file=@{}", wav.display());
-    let lang_arg = format!("language={language}");
-    let mut cmd = Command::new("curl");
+    let mut cmd = crate::net::curl();
+    crate::net::apply_no_proxy(&mut cmd);
     cmd.arg("-s")
         .arg("-m")
         .arg("120")
         .arg("-F")
         .arg(&file_arg)
-        .arg("-F")
+        .arg("--form-string")
         .arg("response_format=verbose_json")
-        .arg("-F")
-        .arg(&lang_arg)
-        .arg("-F")
+        .arg("--form-string")
+        .arg(format!("language={language}"))
+        .arg("--form-string")
         .arg("temperature=0.0");
     if let Some(p) = prompt {
-        cmd.arg("-F").arg(format!("prompt={p}"));
+        cmd.arg("--form-string").arg(format!("prompt={p}"));
     }
     cmd.arg(&url);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
 
     let out = cmd.output().map_err(|e| anyhow!("curl /inference: {e}"))?;
     if !out.status.success() {
@@ -280,22 +277,20 @@ pub fn transcribe_server(
 pub fn transcribe_server_partial(port: u16, wav: &Path, language: &str) -> anyhow::Result<String> {
     let url = format!("http://127.0.0.1:{port}/inference");
     let file_arg = format!("file=@{}", wav.display());
-    let lang_arg = format!("language={language}");
-    let mut cmd = Command::new("curl");
+    let mut cmd = crate::net::curl();
+    crate::net::apply_no_proxy(&mut cmd);
     cmd.arg("-s")
         .arg("-m")
         .arg("10")
         .arg("-F")
         .arg(&file_arg)
-        .arg("-F")
+        .arg("--form-string")
         .arg("response_format=verbose_json")
-        .arg("-F")
-        .arg(&lang_arg)
-        .arg("-F")
+        .arg("--form-string")
+        .arg(format!("language={language}"))
+        .arg("--form-string")
         .arg("temperature=0.0")
         .arg(&url);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
 
     let out = cmd
         .output()

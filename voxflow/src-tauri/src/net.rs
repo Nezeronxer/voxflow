@@ -6,16 +6,35 @@
 
 use anyhow::{anyhow, Result};
 use std::io::Write;
-use std::path::Path;
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 /// Windows: не показывать консольное окно у дочернего curl.
 #[cfg(windows)]
 pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+fn curl_program() -> PathBuf {
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let system_curl = root.join("System32").join("curl.exe");
+        if system_curl.exists() {
+            return system_curl;
+        }
+        return PathBuf::from("curl.exe");
+    }
+    #[cfg(not(windows))]
+    {
+        PathBuf::from("curl")
+    }
+}
+
 /// Создать `curl`-команду с подавленным окном (Windows) — единая точка входа.
 pub fn curl() -> Command {
-    let mut c = Command::new("curl");
+    let mut c = Command::new(curl_program());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -24,21 +43,9 @@ pub fn curl() -> Command {
     c
 }
 
-/// Добавить `-x <proxy>` к curl-команде, если `proxy` непустой.
-///
-/// Если пусто — НИЧЕГО не добавляем: curl сам читает `HTTPS_PROXY`/`HTTP_PROXY`
-/// (и lowercase-варианты) из окружения. Явная настройка приложения имеет приоритет
-/// над окружением (флаг `-x` перебивает env). Это критично для плавности из РФ:
-/// без рабочего прокси облачный STT/LLM просто не достучатся.
-///
-/// Не используйте для прокси с `user:pass@host`, если процесс шлёт приватный
-/// текст, аудио или ключи. Для таких путей используйте [`curl_secret_with_proxy`],
-/// чтобы proxy URL тоже ушёл через stdin-config, а не argv.
-pub fn apply_proxy(cmd: &mut Command, proxy: &str) {
-    let p = proxy.trim();
-    if !p.is_empty() {
-        cmd.arg("-x").arg(p);
-    }
+/// Запретить curl использовать env/app proxy для локальных loopback-запросов.
+pub fn apply_no_proxy(cmd: &mut Command) {
+    cmd.arg("--noproxy").arg("*");
 }
 
 fn curl_config_line(option: &str, value: &str) -> String {
@@ -99,7 +106,11 @@ fn parse_base_url(raw: &str) -> Option<ParsedBaseUrl> {
 }
 
 fn is_loopback_host(host: &str) -> bool {
-    host == "localhost" || host == "::1" || host.starts_with("127.")
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
 }
 
 pub fn is_loopback_base_url(raw: &str) -> bool {
@@ -127,6 +138,81 @@ pub fn ensure_https_or_loopback_base(raw: &str, label: &str) -> Result<()> {
         )),
         _ => Err(anyhow!("{label}: поддерживаются только http или https URL")),
     }
+}
+
+pub fn ensure_loopback_base(raw: &str, label: &str) -> Result<()> {
+    let parsed = parse_base_url(raw).ok_or_else(|| {
+        anyhow!("{label}: укажите полный http(s) URL с хостом, например http://localhost:11434")
+    })?;
+    if parsed.has_userinfo {
+        return Err(anyhow!("{label}: логин/пароль в URL не поддерживаются"));
+    }
+    if matches!(parsed.scheme.as_str(), "http" | "https") && is_loopback_host(&parsed.host) {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{label}: разрешён только loopback URL (localhost/127.0.0.1/[::1])"
+        ))
+    }
+}
+
+fn trailing_url_part(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim();
+    let (_, rest) = trimmed.split_once("://")?;
+    match rest.find(['/', '?', '#']) {
+        Some(i) => Some(&rest[i..]),
+        None => Some(""),
+    }
+}
+
+fn is_origin_only_base(raw: &str) -> bool {
+    match trailing_url_part(raw) {
+        Some("") => true,
+        Some(part) if part.starts_with('/') => part.chars().all(|c| c == '/'),
+        _ => false,
+    }
+}
+
+/// Provider bases used to build query strings must be scheme+authority only.
+pub fn ensure_https_origin_base(raw: &str, label: &str) -> Result<()> {
+    ensure_https_or_loopback_base(raw, label)?;
+    if !is_origin_only_base(raw) {
+        return Err(anyhow!(
+            "{label}: укажите только origin без пути, query и fragment, например https://api.deepgram.com"
+        ));
+    }
+    Ok(())
+}
+
+pub fn percent_encode_query_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.as_bytes() {
+        match *b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*b as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+pub fn strip_url_userinfo(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Some((scheme, rest)) = trimmed.split_once("://") {
+        let (authority, suffix) = match rest.find(['/', '?', '#']) {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        if let Some((_, host_port)) = authority.rsplit_once('@') {
+            return format!("{scheme}://{host_port}{suffix}");
+        }
+        return trimmed.to_string();
+    }
+    if let Some((_, host_port)) = trimmed.rsplit_once('@') {
+        return host_port.to_string();
+    }
+    trimmed.to_string()
 }
 
 pub struct TempPayload {
@@ -277,15 +363,52 @@ mod tests {
         assert!(ensure_https_or_loopback_base("https://api.groq.com/openai/v1", "x").is_ok());
         assert!(ensure_https_or_loopback_base("http://localhost:11434", "x").is_ok());
         assert!(ensure_https_or_loopback_base("http://127.0.0.1:11434", "x").is_ok());
+        assert!(ensure_https_or_loopback_base("http://127.1.2.3:11434", "x").is_ok());
         assert!(ensure_https_or_loopback_base("http://[::1]:11434", "x").is_ok());
         assert!(ensure_https_or_loopback_base("http://api.example.test/v1", "x").is_err());
+        assert!(ensure_https_or_loopback_base("http://127.0.0.1.evil.test/v1", "x").is_err());
+        assert!(ensure_https_or_loopback_base("http://127.evil.test/v1", "x").is_err());
         assert!(ensure_https_or_loopback_base("ftp://api.example.test/v1", "x").is_err());
         assert!(
             ensure_https_or_loopback_base("https://user:pass@api.example.test/v1", "x").is_err()
         );
         assert!(is_loopback_base_url("http://localhost:11434"));
         assert!(is_loopback_base_url("http://127.0.0.1:11434"));
+        assert!(is_loopback_base_url("http://[::1]:11434"));
+        assert!(!is_loopback_base_url("http://127.0.0.1.evil.test:11434"));
         assert!(!is_loopback_base_url("https://api.example.test/v1"));
+    }
+
+    #[test]
+    fn origin_base_rejects_query_and_path_injection() {
+        assert!(ensure_https_origin_base("https://api.deepgram.com", "x").is_ok());
+        assert!(ensure_https_origin_base("https://api.deepgram.com/", "x").is_ok());
+        assert!(ensure_https_origin_base("https://api.deepgram.com/v1", "x").is_err());
+        assert!(
+            ensure_https_origin_base("https://api.deepgram.com?callback=https://evil", "x")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn query_values_are_percent_encoded() {
+        assert_eq!(percent_encode_query_value("nova-3"), "nova-3");
+        assert_eq!(
+            percent_encode_query_value("nova-3&callback=https://evil.test/a b"),
+            "nova-3%26callback%3Dhttps%3A%2F%2Fevil.test%2Fa%20b"
+        );
+    }
+
+    #[test]
+    fn strip_url_userinfo_removes_proxy_credentials() {
+        assert_eq!(
+            strip_url_userinfo("http://user:pass@127.0.0.1:1080"),
+            "http://127.0.0.1:1080"
+        );
+        assert_eq!(
+            strip_url_userinfo("https://u:p@example.test/path?q=1"),
+            "https://example.test/path?q=1"
+        );
     }
 
     #[test]

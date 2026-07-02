@@ -4,7 +4,7 @@
 //! МОДЕЛИ и временным WAV должны быть ASCII. Их кладём в %LOCALAPPDATA%\VoxFlow
 //! (юзернейм ASCII). Сами exe/DLL грузятся ОС по wide-пути — им кириллица ок.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tauri::{AppHandle, Manager};
 
@@ -84,8 +84,21 @@ pub fn db_path() -> PathBuf {
     data_dir().join("voxflow.db")
 }
 
+pub fn is_safe_model_name(name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed != name || trimmed.contains(['/', '\\']) {
+        return false;
+    }
+    let mut components = Path::new(trimmed).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
+}
+
+pub fn safe_model_path(name: &str) -> Option<PathBuf> {
+    is_safe_model_name(name).then(|| models_dir().join(name))
+}
+
 pub fn model_path(name: &str) -> PathBuf {
-    models_dir().join(name)
+    safe_model_path(name).unwrap_or_else(|| models_dir().join("__invalid_model_name__"))
 }
 
 /// Каталог моделей GigaAM (models/gigaam, ASCII-путь — ort открывает по wide,
@@ -145,6 +158,22 @@ pub fn has_nvidia() -> bool {
         .join("System32")
         .join("nvcuda.dll")
         .exists()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_model_name_accepts_catalog_filenames_only() {
+        assert!(is_safe_model_name("ggml-large-v3-turbo-q5_0.bin"));
+        assert!(!is_safe_model_name("../secret.bin"));
+        assert!(!is_safe_model_name("..\\secret.bin"));
+        assert!(!is_safe_model_name("C:\\Windows\\win.ini"));
+        assert!(!is_safe_model_name("/tmp/model.bin"));
+        assert!(!is_safe_model_name(" model.bin"));
+        assert!(!is_safe_model_name(""));
+    }
 }
 
 /// Каталог с whisper-cli.exe / whisper-server.exe + DLL.

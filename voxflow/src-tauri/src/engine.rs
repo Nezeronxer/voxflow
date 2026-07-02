@@ -2420,7 +2420,8 @@ fn process_utterance(
             }
         }
     } else if use_cloud_gemini {
-        match crate::gemini::transcribe(&s.ai_api_key, &s.ai_model, &wav, &s.language) {
+        match crate::gemini::transcribe(&s.ai_api_key, &s.ai_model, &wav, &s.language, &s.proxy_url)
+        {
             Ok(t) => postprocess::dedup_repeated_ngrams(&t),
             Err(e) => {
                 log::warn!("облачный ASR (Gemini) ошибка: {e}; откат на локальное распознавание");
@@ -2890,7 +2891,10 @@ impl std::fmt::Display for ModelMissing {
 impl std::error::Error for ModelMissing {}
 
 fn whisper_model_installed(s: &Settings) -> bool {
-    if paths::model_path(&s.model).exists() {
+    if paths::safe_model_path(&s.model)
+        .map(|p| p.exists())
+        .unwrap_or(false)
+    {
         return true;
     }
     if let Ok(rd) = std::fs::read_dir(paths::models_dir()) {
@@ -2926,9 +2930,12 @@ fn no_model_installed(s: &Settings) -> bool {
 /// Выбрать модель: из настроек, иначе — самая БОЛЬШАЯ установленная *.bin
 /// (эвристика «самая мощная»), иначе типизированная ошибка `ModelMissing`.
 fn resolve_model(s: &Settings) -> anyhow::Result<std::path::PathBuf> {
-    let p = paths::model_path(&s.model);
-    if p.exists() {
-        return Ok(p);
+    if let Some(p) = paths::safe_model_path(&s.model) {
+        if p.exists() {
+            return Ok(p);
+        }
+    } else {
+        log::warn!("модель {:?} отклонена: имя файла небезопасно", s.model);
     }
     let mut best: Option<(u64, std::path::PathBuf)> = None;
     if let Ok(rd) = std::fs::read_dir(paths::models_dir()) {
@@ -4218,11 +4225,12 @@ fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (Stri
     if s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key) {
         let key = s.ai_api_key.clone();
         let model = s.ai_model.clone();
+        let proxy_url = s.proxy_url.clone();
         let instruction =
             build_tone_instruction(target_tone, smart_instruction, context_hint, corrections);
         let input = text.to_string();
         attempts.push(Box::new(move || {
-            crate::gemini::refine(&key, &model, &instruction, &input)
+            crate::gemini::refine(&key, &model, &instruction, &input, &proxy_url)
         }));
     }
     if s.ai_backend == "openai_compat" && crate::rewrite::configured(s) {

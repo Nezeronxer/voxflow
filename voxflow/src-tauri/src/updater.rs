@@ -49,11 +49,9 @@ pub fn check(proxy_url: &str) -> Result<UpdateInfo> {
         .arg("X-GitHub-Api-Version: 2022-11-28")
         .arg("-A")
         .arg(USER_AGENT);
-    crate::net::apply_proxy(&mut cmd, proxy_url);
     cmd.arg(LATEST_RELEASE_URL);
 
-    let out = cmd
-        .output()
+    let out = crate::net::curl_secret_with_proxy(cmd, &[], proxy_url)
         .map_err(|e| anyhow!("не удалось запустить curl для GitHub Releases: {e}"))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -89,11 +87,9 @@ pub fn download_and_launch(
         .arg(USER_AGENT)
         .arg("-o")
         .arg(&dest);
-    crate::net::apply_proxy(&mut cmd, proxy_url);
     cmd.arg(asset_url);
 
-    let out = cmd
-        .output()
+    let out = crate::net::curl_secret_with_proxy(cmd, &[], proxy_url)
         .map_err(|e| anyhow!("не удалось скачать установщик обновления: {e}"))?;
     if !out.status.success() {
         let _ = std::fs::remove_file(&dest);

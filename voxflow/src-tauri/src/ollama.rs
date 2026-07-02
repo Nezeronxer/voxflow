@@ -35,14 +35,12 @@ fn base(url: &str) -> String {
 /// `models[*].name`. Если curl упал или ответ — не JSON, отдаёт понятную ошибку.
 pub fn list_models(url: &str) -> Result<Vec<String>> {
     let base_url = base(url);
-    net::ensure_https_or_loopback_base(&base_url, "Ollama URL")?;
+    net::ensure_loopback_base(&base_url, "Ollama URL")?;
     let endpoint = format!("{base_url}/api/tags");
 
-    // Прокси-aware curl из общего модуля net (CREATE_NO_WINDOW уже внутри).
-    // Ollama по умолчанию локальна (localhost), но через net::curl() env-прокси
-    // (HTTPS_PROXY/HTTP_PROXY) подхватится автоматически для нелокальных адресов.
+    // Ollama — локальный/offline backend, поэтому даже env-прокси отключаем явно.
     let mut cmd = net::curl();
-    net::apply_proxy(&mut cmd, "");
+    net::apply_no_proxy(&mut cmd);
     cmd.arg("-s").arg("-m").arg("15").arg(&endpoint);
 
     let out = cmd
@@ -82,7 +80,7 @@ pub fn list_models(url: &str) -> Result<Vec<String>> {
 /// `/no_think` + `"think": false`, остаток `<think>…</think>` срезаем из ответа.
 pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String> {
     let base_url = base(url);
-    net::ensure_https_or_loopback_base(&base_url, "Ollama URL")?;
+    net::ensure_loopback_base(&base_url, "Ollama URL")?;
     let endpoint = format!("{base_url}/api/chat");
 
     // ВАЖНО: директиву /no_think в системном сообщении НЕ добавляем — у qwen3:4b она
@@ -113,12 +111,10 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
     let req = net::TempPayload::write_json("ollama_req", &payload)?;
     let data_arg = req.curl_data_arg();
 
-    // Прокси-aware curl из общего модуля net (CREATE_NO_WINDOW уже внутри).
-    // Локальный Ollama обычно прямой; пустой proxy → net::apply_proxy не добавляет -x,
-    // curl сам читает env-прокси. Тройное глушение reasoning (см. тело body выше) и
-    // strip_think в обработке ответа сохранены без изменений.
+    // Локальный Ollama всегда идёт напрямую; env-прокси здесь был бы утечкой
+    // приватного текста за пределы loopback.
     let mut cmd = net::curl();
-    net::apply_proxy(&mut cmd, "");
+    net::apply_no_proxy(&mut cmd);
     cmd.arg("-s")
         .arg("-m")
         // Рефайн — СИНХРОННЫЙ шаг перед вставкой текста: дольше ~10с он
