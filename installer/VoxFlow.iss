@@ -38,6 +38,7 @@ DefaultDirName={localappdata}\VoxFlow
 DefaultGroupName=VoxFlow
 DisableProgramGroupPage=yes
 DisableWelcomePage=no
+ShowLanguageDialog=no
 
 ; --- Uninstall presentation ---
 UninstallDisplayIcon={app}\voxflow.exe
@@ -54,8 +55,8 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 
 ; --- Branding / wizard look ---
-; Иконка setup.exe = фирменная ЦВЕТНАЯ иконка приложения (зелёный пузырь):
-; тёмная неоновая сливалась со светлым фоном проводника — читалась как «без иконки».
+; Иконка setup.exe = отдельная яркая installer-иконка:
+; installer\assets\build_setup_icon.py -> assets\voxflow-setup.ico.
 SetupIconFile=assets\voxflow-setup.ico
 WizardStyle=modern
 WizardImageFile=assets\wizard-banner-164.bmp,assets\wizard-banner-246.bmp,assets\wizard-banner-328.bmp,assets\wizard-banner-459.bmp
