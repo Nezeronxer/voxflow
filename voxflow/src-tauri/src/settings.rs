@@ -80,8 +80,8 @@ pub struct Settings {
     /// ЦЕНА: каждый тик заново транскрибирует растущий буфер (аудио-секунды копятся);
     /// движок ограничивает ≤CLOUD_DRAFT_CAP превью на диктовку (каденс ~2с, idle-стоп),
     /// но на бесплатных тирах (Groq) при активной диктовке квоту можно исчерпать —
-    /// тогда упрётся и сам финал. По умолчанию включено (пользователь просил живой ввод);
-    /// при экономии квоты — выключить тоггл (распознавание останется, без серого превью).
+    /// тогда упрётся и сам финал. По умолчанию выключено: включение означает
+    /// явное согласие на дополнительные preview-upload'ы сверх финального запроса.
     pub cloud_live_draft: bool,
     /// OpenAI-совместимый STT — базовый URL
     /// (Avalon=https://api.aqua.sh/v1, OpenAI=https://api.openai.com/v1, Groq=https://api.groq.com/openai/v1).
@@ -168,7 +168,7 @@ impl Default for Settings {
             auto_mute: true,
             autostart: false,
             auto_update_check: true,
-            personalize: true,
+            personalize: false,
             ai_backend: "ollama".into(),
             ai_api_key: String::new(),
             ai_model: "gemini-2.5-flash".into(),
@@ -183,7 +183,7 @@ impl Default for Settings {
             // (Groq/Avalon/OpenAI/Deepgram) остаются выбираемыми в UI.
             stt_provider: "local".into(),
             stt_fallback_local: true,
-            cloud_live_draft: true,
+            cloud_live_draft: false,
             oai_stt_base_url: "https://api.groq.com/openai/v1".into(),
             oai_stt_model: "whisper-large-v3".into(),
             oai_stt_key: String::new(),
@@ -206,6 +206,7 @@ impl Settings {
         self.oai_stt_key.clear();
         self.deepgram_key.clear();
         self.rewrite_key.clear();
+        self.proxy_url = crate::net::strip_url_userinfo(&self.proxy_url);
         self
     }
 
@@ -213,15 +214,22 @@ impl Settings {
         if self.ai_api_key.trim().is_empty() {
             self.ai_api_key = existing.ai_api_key.clone();
         }
-        if self.oai_stt_key.trim().is_empty() {
+        if self.oai_stt_key.trim().is_empty()
+            && same_endpoint(&self.oai_stt_base_url, &existing.oai_stt_base_url)
+        {
             self.oai_stt_key = existing.oai_stt_key.clone();
         }
-        if self.deepgram_key.trim().is_empty() {
+        if self.deepgram_key.trim().is_empty()
+            && same_endpoint(&self.deepgram_base, &existing.deepgram_base)
+        {
             self.deepgram_key = existing.deepgram_key.clone();
         }
-        if self.rewrite_key.trim().is_empty() {
+        if self.rewrite_key.trim().is_empty()
+            && same_endpoint(&self.rewrite_base_url, &existing.rewrite_base_url)
+        {
             self.rewrite_key = existing.rewrite_key.clone();
         }
+        preserve_redacted_proxy_url(&mut self.proxy_url, &existing.proxy_url);
     }
 
     /// Число потоков для whisper (0 → половина логических ядер, минимум 2).
@@ -299,6 +307,20 @@ impl Settings {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .unwrap_or_default()
+    }
+}
+
+fn same_endpoint(a: &str, b: &str) -> bool {
+    a.trim().trim_end_matches('/') == b.trim().trim_end_matches('/')
+}
+
+fn preserve_redacted_proxy_url(incoming: &mut String, existing: &str) {
+    let stripped_existing = crate::net::strip_url_userinfo(existing);
+    if !incoming.trim().is_empty()
+        && incoming.trim() == stripped_existing
+        && existing.trim() != stripped_existing
+    {
+        *incoming = existing.to_string();
     }
 }
 
@@ -397,6 +419,7 @@ mod tests {
             oai_stt_key: "stt-secret".into(),
             deepgram_key: "deepgram-secret".into(),
             rewrite_key: "rewrite-secret".into(),
+            proxy_url: "http://proxy-user:proxy-pass@127.0.0.1:1080".into(),
             ..Settings::default()
         };
         let r = s.redacted_for_renderer();
@@ -404,19 +427,22 @@ mod tests {
         assert!(r.oai_stt_key.is_empty());
         assert!(r.deepgram_key.is_empty());
         assert!(r.rewrite_key.is_empty());
+        assert_eq!(r.proxy_url, "http://127.0.0.1:1080");
     }
 
     #[test]
-    fn preserve_empty_secrets_keeps_existing_keys_but_accepts_replacements() {
+    fn preserve_empty_secrets_keeps_existing_keys_for_same_endpoints_but_accepts_replacements() {
         let existing = Settings {
             ai_api_key: "old-gemini".into(),
             oai_stt_key: "old-stt".into(),
             deepgram_key: "old-deepgram".into(),
             rewrite_key: "old-rewrite".into(),
+            proxy_url: "http://proxy-user:proxy-pass@127.0.0.1:1080".into(),
             ..Settings::default()
         };
         let mut incoming = Settings {
             rewrite_key: "new-rewrite".into(),
+            proxy_url: "http://127.0.0.1:1080".into(),
             ..Settings::default()
         };
         incoming.preserve_empty_secrets_from(&existing);
@@ -424,6 +450,38 @@ mod tests {
         assert_eq!(incoming.oai_stt_key, "old-stt");
         assert_eq!(incoming.deepgram_key, "old-deepgram");
         assert_eq!(incoming.rewrite_key, "new-rewrite");
+        assert_eq!(
+            incoming.proxy_url,
+            "http://proxy-user:proxy-pass@127.0.0.1:1080"
+        );
+    }
+
+    #[test]
+    fn preserve_empty_secrets_does_not_retarget_endpoint_bound_keys() {
+        let existing = Settings {
+            oai_stt_key: "old-stt".into(),
+            deepgram_key: "old-deepgram".into(),
+            rewrite_key: "old-rewrite".into(),
+            rewrite_base_url: "https://api.groq.com/openai/v1".into(),
+            ..Settings::default()
+        };
+        let mut incoming = Settings {
+            oai_stt_base_url: "https://evil.example/openai/v1".into(),
+            deepgram_base: "https://evil.example".into(),
+            rewrite_base_url: "https://evil.example/openai/v1".into(),
+            ..Settings::default()
+        };
+        incoming.preserve_empty_secrets_from(&existing);
+        assert!(incoming.oai_stt_key.is_empty());
+        assert!(incoming.deepgram_key.is_empty());
+        assert!(incoming.rewrite_key.is_empty());
+    }
+
+    #[test]
+    fn privacy_sensitive_defaults_are_opt_in() {
+        let s = Settings::default();
+        assert!(!s.personalize);
+        assert!(!s.cloud_live_draft);
     }
 
     #[test]

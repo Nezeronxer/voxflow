@@ -7,15 +7,9 @@
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-const NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Serialize, Clone)]
 pub struct ModelInfo {
@@ -296,7 +290,7 @@ fn run_download_dir(app: &AppHandle, m: &DirModel) -> Result<()> {
         let _ = std::fs::remove_file(&part);
         let url = format!("{}{fname}", m.base_url);
 
-        let mut cmd = Command::new("curl");
+        let mut cmd = crate::net::curl();
         cmd.arg("-L")
             .arg("--fail")
             .arg("--silent")
@@ -304,8 +298,6 @@ fn run_download_dir(app: &AppHandle, m: &DirModel) -> Result<()> {
             .arg("-o")
             .arg(&part)
             .arg(&url);
-        #[cfg(windows)]
-        cmd.creation_flags(NO_WINDOW);
 
         let mut child = cmd
             .spawn()
@@ -346,7 +338,7 @@ fn run_download(app: &AppHandle, name: &str) -> Result<()> {
     let url = url_for(name);
     let total = content_length(&url).unwrap_or_else(|| catalog_size(name));
 
-    let mut cmd = Command::new("curl");
+    let mut cmd = crate::net::curl();
     cmd.arg("-L")
         .arg("--fail")
         .arg("--silent")
@@ -354,8 +346,6 @@ fn run_download(app: &AppHandle, name: &str) -> Result<()> {
         .arg("-o")
         .arg(&part)
         .arg(&url);
-    #[cfg(windows)]
-    cmd.creation_flags(NO_WINDOW);
 
     let mut child = cmd
         .spawn()
@@ -387,10 +377,8 @@ fn run_download(app: &AppHandle, name: &str) -> Result<()> {
 
 /// Узнать размер файла через HEAD (для точного прогресс-бара). Best-effort.
 fn content_length(url: &str) -> Option<u64> {
-    let mut cmd = Command::new("curl");
+    let mut cmd = crate::net::curl();
     cmd.arg("-sIL").arg(url);
-    #[cfg(windows)]
-    cmd.creation_flags(NO_WINDOW);
     let out = cmd.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     let mut last = None;

@@ -61,7 +61,6 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path, prompt: Option<&str>) 
 
     let auth = format!("Authorization: Bearer {key}");
     let file_arg = format!("file=@{}", wav.display());
-    let model_arg = format!("model={}", s.oai_stt_model);
 
     let mut cmd = net::curl();
     cmd.arg("-s")
@@ -69,13 +68,13 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path, prompt: Option<&str>) 
         .arg(TIMEOUT_SECS)
         .arg("-F")
         .arg(&file_arg)
-        .arg("-F")
-        .arg(&model_arg);
+        .arg("--form-string")
+        .arg(format!("model={}", s.oai_stt_model));
 
     // language — только если язык задан явно. auto/all/any/multi = автоопределение:
     // параметр не шлём, чтобы модель могла свободно выбрать язык и не резать mixed speech.
     if let Some(language) = normalized_cloud_language(&s.language) {
-        cmd.arg("-F").arg(format!("language={language}"));
+        cmd.arg("--form-string").arg(format!("language={language}"));
     }
 
     // Важное отличие от rewrite prompt: это короткая подсказка ASR для терминов и
@@ -85,12 +84,18 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path, prompt: Option<&str>) 
         cmd.arg("--form-string").arg(format!("prompt={prompt}"));
     }
 
-    cmd.arg("-F").arg("response_format=json");
+    cmd.arg("--form-string").arg("response_format=json");
     cmd.arg(&url);
+    let proxy_url = if net::is_loopback_base_url(base) {
+        net::apply_no_proxy(&mut cmd);
+        ""
+    } else {
+        &s.proxy_url
+    };
 
     // Ключ — через stdin-конфиг curl (-K -), НЕ в argv: командная строка
     // процесса видна другим процессам пользователя.
-    let out = net::curl_secret_with_proxy(cmd, &[auth], &s.proxy_url)
+    let out = net::curl_secret_with_proxy(cmd, &[auth], proxy_url)
         .map_err(|e| anyhow!("curl /audio/transcriptions: {e}"))?;
     if !out.status.success() {
         // НЕ логируем тело (могут быть заголовки/эхо); только код процесса curl.
@@ -127,14 +132,7 @@ pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
     }
 
     let base = s.deepgram_base.trim().trim_end_matches('/');
-    net::ensure_https_or_loopback_base(base, "Deepgram Base URL")?;
-    // language=multi при auto/all/any/multi (Deepgram-специфика мультиязычного
-    // распознавания), иначе конкретный язык. model/smart_format/punctuate всегда.
-    let lang = deepgram_language_param(&s.language);
-    let url = format!(
-        "{base}/v1/listen?model={}&smart_format=true&punctuate=true&language={}",
-        s.deepgram_model, lang
-    );
+    let url = deepgram_listen_url(base, &s.deepgram_model, &s.language)?;
 
     let auth = format!("Authorization: Token {key}");
     let data_arg = format!("@{}", wav.display());
@@ -149,9 +147,15 @@ pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
         .arg("--data-binary")
         .arg(&data_arg);
     cmd.arg(&url);
+    let proxy_url = if net::is_loopback_base_url(base) {
+        net::apply_no_proxy(&mut cmd);
+        ""
+    } else {
+        &s.proxy_url
+    };
 
     // Ключ — через stdin-конфиг curl (-K -), НЕ в argv (виден в Task Manager/WMI).
-    let out = net::curl_secret_with_proxy(cmd, &[auth], &s.proxy_url)
+    let out = net::curl_secret_with_proxy(cmd, &[auth], proxy_url)
         .map_err(|e| anyhow!("curl /v1/listen: {e}"))?;
     if !out.status.success() {
         log::warn!("deepgram STT: curl завершился с кодом {}", out.status);
@@ -201,6 +205,18 @@ fn deepgram_language_param(language: &str) -> String {
         .to_string()
 }
 
+fn deepgram_listen_url(base: &str, model: &str, language: &str) -> Result<String> {
+    let base = base.trim().trim_end_matches('/');
+    net::ensure_https_origin_base(base, "Deepgram Base URL")?;
+    // language=multi при auto/all/any/multi (Deepgram-специфика мультиязычного
+    // распознавания), иначе конкретный язык. model/smart_format/punctuate всегда.
+    let model = net::percent_encode_query_value(model.trim());
+    let lang = net::percent_encode_query_value(&deepgram_language_param(language));
+    Ok(format!(
+        "{base}/v1/listen?model={model}&smart_format=true&punctuate=true&language={lang}"
+    ))
+}
+
 fn sanitized_stt_prompt(prompt: Option<&str>) -> Option<String> {
     let prompt = prompt?;
     let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -229,6 +245,24 @@ mod tests {
         assert_eq!(deepgram_language_param("auto"), "multi");
         assert_eq!(deepgram_language_param("all"), "multi");
         assert_eq!(deepgram_language_param("de"), "de");
+    }
+
+    #[test]
+    fn deepgram_url_encodes_query_values_and_rejects_base_query() {
+        let url = deepgram_listen_url(
+            "https://api.deepgram.com",
+            "nova-3&callback=https://evil.test/hook",
+            "ru&callback=https://evil.test/hook",
+        )
+        .unwrap();
+        assert!(url.contains("model=nova-3%26callback%3Dhttps%3A%2F%2Fevil.test%2Fhook"));
+        assert!(url.contains("language=ru%26callback%3Dhttps%3A%2F%2Fevil.test%2Fhook"));
+        assert!(deepgram_listen_url(
+            "https://api.deepgram.com?callback=https://evil.test",
+            "nova-3",
+            "ru"
+        )
+        .is_err());
     }
 
     #[test]

@@ -444,8 +444,13 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
             if key.trim().is_empty() {
                 return ai_test_plain(false, "Введите API-ключ");
             }
-            match crate::gemini::refine(&key, &model, "Ответь ровно одним словом.", "Напиши: ОК")
-            {
+            match crate::gemini::refine(
+                &key,
+                &model,
+                "Ответь ровно одним словом.",
+                "Напиши: ОК",
+                &settings.proxy_url,
+            ) {
                 Ok(t) => ai_test_plain(true, format!("Gemini отвечает: {}", t.trim())),
                 Err(e) => ai_test_plain(false, format!("Ошибка: {e}")),
             }
@@ -574,7 +579,7 @@ pub fn rewrite_prompt_with_instruction(
     }
 
     let result = if s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key) {
-        crate::gemini::refine(&s.ai_api_key, &s.ai_model, system, &user)
+        crate::gemini::refine(&s.ai_api_key, &s.ai_model, system, &user, &s.proxy_url)
     } else if s.ai_backend == "openai_compat" && crate::rewrite::configured(&s) {
         crate::rewrite::refine(&s, system, &user)
     } else if s.ai_backend == "ollama" && crate::ollama::configured(&s.ollama_url) {
@@ -641,6 +646,7 @@ pub fn transform_text(state: State<AppState>, text: String, transform: String) -
             &s.ai_model,
             "Верни только готовый преобразованный текст, без комментариев.",
             &user,
+            &s.proxy_url,
         )
     } else if s.ai_backend == "openai_compat" && crate::rewrite::configured(&s) {
         crate::rewrite::refine(&s, crate::ollama::SYSTEM_PROMPT, &user)

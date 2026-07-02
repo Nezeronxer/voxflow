@@ -301,8 +301,7 @@ fn chat_completion(
     }
 
     // Прокси-aware curl из общего модуля net (CREATE_NO_WINDOW уже внутри).
-    // Облако из РФ: прокси берём из настроек (s.proxy_url); пустой → net::apply_proxy
-    // не добавляет -x, и curl сам читает HTTPS_PROXY/HTTP_PROXY из окружения.
+    // Явный proxy_url уходит через stdin-config, чтобы user:pass@proxy не был виден в argv.
     let mut cmd = net::curl();
     cmd.arg("-s")
         .arg("-m")

@@ -29,7 +29,13 @@ pub fn available(api_key: &str) -> bool {
 /// Распознать WAV-файл через Gemini (cloud ASR). Возвращает только текст.
 ///
 /// `language` — код/название языка для подсказки модели; "auto" = определить язык.
-pub fn transcribe(api_key: &str, model: &str, wav: &Path, language: &str) -> Result<String> {
+pub fn transcribe(
+    api_key: &str,
+    model: &str,
+    wav: &Path,
+    language: &str,
+    proxy_url: &str,
+) -> Result<String> {
     // Читаем WAV и кодируем в base64.
     let bytes = std::fs::read(wav)
         .map_err(|e| anyhow!("не удалось прочитать WAV {}: {e}", wav.display()))?;
@@ -41,7 +47,7 @@ pub fn transcribe(api_key: &str, model: &str, wav: &Path, language: &str) -> Res
         }
         "ru" | "russian" => "Язык речи: русский.",
         "en" | "english" => "Язык речи: English.",
-        other => return transcribe_with_language_hint(api_key, model, wav, &b64, other),
+        other => return transcribe_with_language_hint(api_key, model, wav, &b64, other, proxy_url),
     };
     let prompt = format!(
         "Транскрибируй это аудио ДОСЛОВНО. {lang_hint} \
@@ -58,7 +64,7 @@ pub fn transcribe(api_key: &str, model: &str, wav: &Path, language: &str) -> Res
         "generationConfig": { "temperature": 0 }
     });
 
-    call(api_key, model, &body)
+    call(api_key, model, &body, proxy_url)
 }
 
 fn transcribe_with_language_hint(
@@ -67,6 +73,7 @@ fn transcribe_with_language_hint(
     _wav: &Path,
     b64: &str,
     language: &str,
+    proxy_url: &str,
 ) -> Result<String> {
     let prompt = format!(
         "Транскрибируй это аудио ДОСЛОВНО. Язык речи: {language}. \
@@ -81,12 +88,18 @@ fn transcribe_with_language_hint(
         }],
         "generationConfig": { "temperature": 0 }
     });
-    call(api_key, model, &body)
+    call(api_key, model, &body, proxy_url)
 }
 
 /// Отрефайнить текст: `system` (инструкция) + `user` (исходный текст)
 /// склеиваются в один text-part через двойной перевод строки.
-pub fn refine(api_key: &str, model: &str, system: &str, user: &str) -> Result<String> {
+pub fn refine(
+    api_key: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    proxy_url: &str,
+) -> Result<String> {
     let combined = format!("{system}\n\n{user}");
 
     let body = serde_json::json!({
@@ -96,12 +109,12 @@ pub fn refine(api_key: &str, model: &str, system: &str, user: &str) -> Result<St
         "generationConfig": { "temperature": 0.3 }
     });
 
-    call(api_key, model, &body)
+    call(api_key, model, &body, proxy_url)
 }
 
 /// Общий вызов generateContent: пишет тело в temp-файл, дёргает curl,
 /// парсит ответ и достаёт текст. Ключ передаётся ТОЛЬКО заголовком.
-fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> {
+fn call(api_key: &str, model: &str, body: &serde_json::Value, proxy_url: &str) -> Result<String> {
     let url = format!("{BASE_URL}/{model}:generateContent");
 
     // Тело запроса — во временный файл (большой base64 не влезает в argv).
@@ -111,12 +124,9 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
     let auth_header = format!("x-goog-api-key: {api_key}");
 
     // Прокси-aware curl из общего модуля net (CREATE_NO_WINDOW уже внутри).
-    // У публичных сигнатур transcribe/refine (их зовёт engine.rs) НЕТ proxy_url,
-    // поэтому пробрасываем пустую строку: net::apply_proxy в этом случае НЕ добавляет
-    // -x, и curl сам берёт HTTPS_PROXY/HTTP_PROXY из окружения. Так облачный путь из РФ
-    // ходит через системный/env-прокси без смены чужого контракта engine.rs.
+    // Явный proxy_url передаём через stdin-config вместе с секретным заголовком,
+    // чтобы user:pass@proxy не появлялся в argv.
     let mut cmd = net::curl();
-    net::apply_proxy(&mut cmd, "");
     cmd.arg("-s")
         .arg("-m")
         // Рефайн — СИНХРОННЫЙ шаг перед вставкой текста: дольше ~10с он
@@ -134,7 +144,7 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
 
     // Ключ (x-goog-api-key) — через stdin-конфиг curl (-K -), НЕ в argv:
     // командная строка процесса видна другим процессам пользователя.
-    let out = net::curl_secret(cmd, &[auth_header])
+    let out = net::curl_secret_with_proxy(cmd, &[auth_header], proxy_url)
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
 
     if !out.status.success() && out.stdout.is_empty() {
