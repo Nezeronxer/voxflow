@@ -79,6 +79,25 @@ const DICTATION_CONTEXT_RECENT_LIMIT: usize = 6;
 const DICTATION_CONTEXT_RECENT_CHARS: usize = 1200;
 const DICTATION_CONTEXT_SUMMARY_CHARS: usize = 700;
 const DICTATION_CONTEXT_ITEM_CHARS: usize = 360;
+const ASR_PROMPT_MAX_CHARS: usize = 1100;
+const ASR_PROMPT_PREVIOUS_CHARS: usize = 280;
+const ASR_PROMPT_TERM_LIMIT: usize = 36;
+const ASR_PROMPT_SNIPPET_LIMIT: usize = 12;
+const ASR_PROMPT_CORRECTION_LIMIT: usize = 16;
+const BUILTIN_ASR_TERMS: &[&str] = &[
+    "VoxFlow",
+    "Wispr Flow",
+    "Aqua Voice",
+    "Tauri",
+    "Rust",
+    "whisper.cpp",
+    "Codex",
+    "OpenAI",
+    "Deepgram",
+    "Gemini",
+    "GigaAM",
+    "Parakeet",
+];
 
 #[derive(Clone)]
 pub struct EngineHandle {
@@ -2289,10 +2308,14 @@ fn process_utterance(
     let _wav_guard = paths::TempFileGuard::new(wav.clone());
     audio::write_wav_16k_mono(&wav, &speech_trimmed)?;
 
-    // Словарь и сниппеты из БД (под локом).
-    let (dict, snippets) = {
+    // Словарь, сниппеты и выученные исправления из БД (под локом).
+    let (dict, snippets, corrections) = {
         let conn = ctx.db.lock();
-        (load_dict(&conn), load_snippets(&conn))
+        (
+            load_dict(&conn),
+            load_snippets(&conn),
+            load_corrections(&conn),
+        )
     };
 
     // ── ASR: приоритет облачного STT-провайдера, иначе Gemini, иначе локальный ASR-пайплайн ──
@@ -2310,6 +2333,28 @@ fn process_utterance(
     let use_cloud_stt = s.cloud_stt_active();
     let use_cloud_gemini =
         s.cloud_asr && s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key);
+    let asr_actx = crate::app_context::detect();
+    if !target_fp.matches(&asr_actx) {
+        dbg_log("финал: окно изменилось до ASR — распознавание отменено");
+        erase_live_draft(ctx, live.as_ref(), my_gen);
+        let _ = std::fs::remove_file(&wav);
+        return Ok(());
+    }
+    let asr_tone =
+        crate::app_context::category_for(&asr_actx.exe, &asr_actx.title, &s.app_profile_overrides);
+    let asr_prompt = if use_cloud_stt {
+        let asr_previous_context_tail = last_dictation_context(ctx, &asr_actx);
+        build_asr_prompt(
+            &asr_actx,
+            &asr_tone,
+            asr_previous_context_tail.as_deref(),
+            &dict,
+            &snippets,
+            &corrections,
+        )
+    } else {
+        None
+    };
     let t0 = Instant::now();
     // Язык диктовки для бейджа overlay: Some("ru"/"en") у локальных резидентных
     // маршрутов, None (бейдж скрыт) у облака/whisper.
@@ -2317,7 +2362,7 @@ fn process_utterance(
     let raw = if use_cloud_stt {
         // Облачный провайдер — основной путь. Сетевой вызов БЕЗ asr_lock
         // (asr_lock сериализует только whisper-server; облако к нему не обращается).
-        match crate::cloud_stt::transcribe(&s, &wav) {
+        match crate::cloud_stt::transcribe_with_prompt(&s, &wav, asr_prompt.as_deref()) {
             Ok(t) if !t.trim().is_empty() => {
                 emit_stt_mode(&ctx.app, &s.stt_provider, false);
                 // Облако без гейта уверенности — дешёвый анти-повтор обязателен.
@@ -2415,10 +2460,6 @@ fn process_utterance(
 
     // Постобработка (правила) + выученные исправления.
     let t_post = Instant::now();
-    let corrections = {
-        let conn = ctx.db.lock();
-        load_corrections(&conn)
-    };
     let mut text = postprocess::process(&raw, &s, &dict, &snippets);
     text = postprocess::apply_corrections(&text, &corrections);
     let post_ms = t_post.elapsed().as_millis() as u64;
@@ -3754,6 +3795,128 @@ fn rewrite_context_hint(
     }
 }
 
+fn push_unique_prompt_item(
+    items: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    value: &str,
+    max_chars: usize,
+) {
+    let cleaned = compact_instruction_source(value);
+    let cleaned = cleaned
+        .trim_matches(|c: char| matches!(c, ',' | ';' | ':' | '.' | '…'))
+        .trim();
+    if cleaned.is_empty() {
+        return;
+    }
+
+    let item = clamp_chars(cleaned, max_chars);
+    let key = item.to_lowercase();
+    if seen.insert(key) {
+        items.push(item);
+    }
+}
+
+fn build_asr_prompt(
+    actx: &crate::app_context::AppContext,
+    tone: &str,
+    previous_context_tail: Option<&str>,
+    dict: &[postprocess::Dict],
+    snippets: &[postprocess::Snippet],
+    corrections: &[postprocess::Correction],
+) -> Option<String> {
+    let mut parts = vec![
+        "Speech recognition context only: transcribe what was said, preserve Russian/English/other language switches, do not rewrite.".to_string(),
+    ];
+
+    let app = app_label_for_payload(actx);
+    if !app.trim().is_empty() {
+        if tone.trim().is_empty() || tone == "neutral" {
+            parts.push(format!("Active app: {app}."));
+        } else {
+            parts.push(format!("Active app: {app}; style context: {tone}."));
+        }
+    }
+
+    if let Some(previous) = previous_context_tail
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        parts.push(format!(
+            "Previous same-field text tail: {}.",
+            compact_context_tail(previous, ASR_PROMPT_PREVIOUS_CHARS)
+        ));
+    }
+
+    let mut terms = Vec::new();
+    let mut seen_terms = HashSet::new();
+    for term in BUILTIN_ASR_TERMS {
+        push_unique_prompt_item(&mut terms, &mut seen_terms, term, 80);
+    }
+    for d in dict {
+        if terms.len() >= ASR_PROMPT_TERM_LIMIT {
+            break;
+        }
+        push_unique_prompt_item(&mut terms, &mut seen_terms, &d.replacement, 80);
+        if terms.len() >= ASR_PROMPT_TERM_LIMIT {
+            break;
+        }
+        push_unique_prompt_item(&mut terms, &mut seen_terms, &d.term, 80);
+    }
+    if !terms.is_empty() {
+        parts.push(format!(
+            "Likely names and technical terms: {}.",
+            terms.join(", ")
+        ));
+    }
+
+    let mut snippet_triggers = Vec::new();
+    let mut seen_snippets = HashSet::new();
+    for sn in snippets.iter().take(ASR_PROMPT_SNIPPET_LIMIT) {
+        push_unique_prompt_item(&mut snippet_triggers, &mut seen_snippets, &sn.trigger, 80);
+    }
+    if !snippet_triggers.is_empty() {
+        parts.push(format!(
+            "Possible spoken snippet triggers: {}.",
+            snippet_triggers.join(", ")
+        ));
+    }
+
+    let mut correction_pairs = Vec::new();
+    let mut seen_corrections = HashSet::new();
+    for c in corrections.iter().take(ASR_PROMPT_CORRECTION_LIMIT) {
+        let wrong = compact_instruction_source(&c.wrong);
+        let right = compact_instruction_source(&c.right);
+        let wrong = wrong.trim();
+        let right = right.trim();
+        if wrong.is_empty() || right.is_empty() {
+            continue;
+        }
+        if wrong.eq_ignore_ascii_case(right) {
+            push_unique_prompt_item(&mut correction_pairs, &mut seen_corrections, right, 120);
+        } else {
+            push_unique_prompt_item(
+                &mut correction_pairs,
+                &mut seen_corrections,
+                &format!("{} -> {}", wrong, right),
+                140,
+            );
+        }
+    }
+    if !correction_pairs.is_empty() {
+        parts.push(format!(
+            "Known recognition corrections: {}.",
+            correction_pairs.join("; ")
+        ));
+    }
+
+    let prompt = clamp_chars(&parts.join(" "), ASR_PROMPT_MAX_CHARS);
+    if prompt.trim().is_empty() {
+        None
+    } else {
+        Some(prompt)
+    }
+}
+
 fn app_label_for_payload(actx: &crate::app_context::AppContext) -> String {
     if !actx.exe.trim().is_empty() {
         one_line_instruction(&actx.exe)
@@ -4195,6 +4358,42 @@ mod smart_prompt_tests {
         assert!(instruction
             .expect("ai default instruction")
             .contains("готовый промпт"));
+    }
+
+    #[test]
+    fn asr_prompt_includes_bias_sources_without_snippet_body() {
+        let dict = vec![postprocess::Dict {
+            term: "виспр флоу".to_string(),
+            replacement: "Wispr Flow".to_string(),
+        }];
+        let snippets = vec![postprocess::Snippet {
+            trigger: "sig".to_string(),
+            content: "super secret expanded template".to_string(),
+            is_template: true,
+        }];
+        let corrections = vec![postprocess::Correction {
+            wrong: "Виспа Фолл".to_string(),
+            right: "Wispr Flow".to_string(),
+        }];
+
+        let prompt = build_asr_prompt(
+            &app("Codex"),
+            "ai",
+            Some("предыдущий хвост про Tauri и whisper.cpp"),
+            &dict,
+            &snippets,
+            &corrections,
+        )
+        .expect("prompt");
+
+        assert!(prompt.contains("preserve Russian/English"));
+        assert!(prompt.contains("Previous same-field text tail"));
+        assert!(prompt.contains("Wispr Flow"));
+        assert!(prompt.contains("VoxFlow"));
+        assert!(prompt.contains("sig"));
+        assert!(prompt.contains("Виспа Фолл -> Wispr Flow"));
+        assert!(!prompt.contains("super secret expanded template"));
+        assert!(prompt.chars().count() <= ASR_PROMPT_MAX_CHARS);
     }
 }
 
