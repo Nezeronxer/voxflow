@@ -16,6 +16,12 @@ use crate::settings::Settings;
 
 /// Таймаут curl на облачный запрос (секунды).
 const TIMEOUT_SECS: &str = "60";
+/// Максимальный размер ASR-prompt для OpenAI-compatible STT.
+///
+/// Это не rewrite-инструкция, а короткий bias-подсказчик для имён, терминов,
+/// предыдущего хвоста фразы и app-контекста. Большой prompt ухудшает latency и
+/// может начать влиять на текст как rewrite, поэтому ограничиваем заранее.
+const MAX_STT_PROMPT_CHARS: usize = 1200;
 
 /// Распознать WAV через выбранного облачного провайдера.
 ///
@@ -23,8 +29,18 @@ const TIMEOUT_SECS: &str = "60";
 /// Прочие значения (в т.ч. "local") → ошибка (вызывать облачную транскрипцию
 /// при локальном провайдере — логическая ошибка вызывающего кода).
 pub fn transcribe(s: &Settings, wav: &Path) -> Result<String> {
+    transcribe_with_prompt(s, wav, None)
+}
+
+/// Распознать WAV с необязательным ASR-prompt.
+///
+/// Prompt используется только там, где провайдер поддерживает biasing напрямую
+/// через совместимый `/audio/transcriptions` API. Сейчас это OpenAI-compatible
+/// путь. Deepgram оставлен без prompt, потому что у него другой механизм biasing
+/// (keywords/keyterms) и его нельзя слепо подменять текстовой подсказкой.
+pub fn transcribe_with_prompt(s: &Settings, wav: &Path, prompt: Option<&str>) -> Result<String> {
     match s.stt_provider.as_str() {
-        "openai_compat" => transcribe_openai_compat(s, wav),
+        "openai_compat" => transcribe_openai_compat(s, wav, prompt),
         "deepgram" => transcribe_deepgram(s, wav),
         other => Err(anyhow!("неизвестный облачный STT-провайдер: {other}")),
     }
@@ -32,7 +48,7 @@ pub fn transcribe(s: &Settings, wav: &Path) -> Result<String> {
 
 /// OpenAI-совместимый STT (Avalon/OpenAI/Groq): multipart POST на
 /// `{base}/audio/transcriptions`. Ответ — JSON `{"text":"..."}`.
-pub fn transcribe_openai_compat(s: &Settings, wav: &Path) -> Result<String> {
+pub fn transcribe_openai_compat(s: &Settings, wav: &Path, prompt: Option<&str>) -> Result<String> {
     let key = s.resolve_oai_key();
     if key.trim().is_empty() {
         return Err(anyhow!("ключ не задан"));
@@ -55,10 +71,20 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path) -> Result<String> {
         .arg(&file_arg)
         .arg("-F")
         .arg(&model_arg);
-    // language — только если не "auto" (auto = автоопределение, параметр не шлём).
-    if s.language != "auto" {
-        cmd.arg("-F").arg(format!("language={}", s.language));
+
+    // language — только если язык задан явно. auto/all/any/multi = автоопределение:
+    // параметр не шлём, чтобы модель могла свободно выбрать язык и не резать mixed speech.
+    if let Some(language) = normalized_cloud_language(&s.language) {
+        cmd.arg("-F").arg(format!("language={language}"));
     }
+
+    // Важное отличие от rewrite prompt: это короткая подсказка ASR для терминов и
+    // контекста. --form-string защищает от curl-семантики `@file`, если prompt
+    // начинается с @ или содержит спецсимволы.
+    if let Some(prompt) = sanitized_stt_prompt(prompt) {
+        cmd.arg("--form-string").arg(format!("prompt={prompt}"));
+    }
+
     cmd.arg("-F").arg("response_format=json");
     cmd.arg(&url);
 
@@ -102,13 +128,9 @@ pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
 
     let base = s.deepgram_base.trim().trim_end_matches('/');
     net::ensure_https_or_loopback_base(base, "Deepgram Base URL")?;
-    // language=multi при auto (Deepgram-специфика мультиязычного распознавания),
-    // иначе конкретный язык. model/smart_format/punctuate всегда.
-    let lang = if s.language == "auto" {
-        "multi".to_string()
-    } else {
-        s.language.clone()
-    };
+    // language=multi при auto/all/any/multi (Deepgram-специфика мультиязычного
+    // распознавания), иначе конкретный язык. model/smart_format/punctuate всегда.
+    let lang = deepgram_language_param(&s.language);
     let url = format!(
         "{base}/v1/listen?model={}&smart_format=true&punctuate=true&language={}",
         s.deepgram_model, lang
@@ -159,4 +181,63 @@ pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow!("deepgram STT: нет транскрипта в ответе"))?;
     Ok(transcript.trim().to_string())
+}
+
+fn normalized_cloud_language(language: &str) -> Option<&str> {
+    let language = language.trim();
+    if language.is_empty() {
+        return None;
+    }
+    let lower = language.to_ascii_lowercase();
+    match lower.as_str() {
+        "auto" | "all" | "any" | "multi" | "multilingual" | "*" => None,
+        _ => Some(language),
+    }
+}
+
+fn deepgram_language_param(language: &str) -> String {
+    normalized_cloud_language(language)
+        .unwrap_or("multi")
+        .to_string()
+}
+
+fn sanitized_stt_prompt(prompt: Option<&str>) -> Option<String> {
+    let prompt = prompt?;
+    let collapsed = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed = collapsed.trim();
+    if collapsed.is_empty() {
+        return None;
+    }
+    Some(collapsed.chars().take(MAX_STT_PROMPT_CHARS).collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cloud_language_aliases_keep_auto_detection() {
+        for lang in ["", "auto", "all", "any", "multi", "multilingual", "*"] {
+            assert_eq!(normalized_cloud_language(lang), None, "{lang}");
+        }
+        assert_eq!(normalized_cloud_language("ru"), Some("ru"));
+        assert_eq!(normalized_cloud_language(" es "), Some("es"));
+    }
+
+    #[test]
+    fn deepgram_auto_aliases_use_multi() {
+        assert_eq!(deepgram_language_param("auto"), "multi");
+        assert_eq!(deepgram_language_param("all"), "multi");
+        assert_eq!(deepgram_language_param("de"), "de");
+    }
+
+    #[test]
+    fn stt_prompt_is_collapsed_and_capped() {
+        let prompt = sanitized_stt_prompt(Some("  VoxFlow\nWispr\tFlow   Aqua Voice  ")).unwrap();
+        assert_eq!(prompt, "VoxFlow Wispr Flow Aqua Voice");
+
+        let long = "я".repeat(MAX_STT_PROMPT_CHARS + 50);
+        let capped = sanitized_stt_prompt(Some(&long)).unwrap();
+        assert_eq!(capped.chars().count(), MAX_STT_PROMPT_CHARS);
+    }
 }
