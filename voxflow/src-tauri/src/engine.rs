@@ -292,16 +292,26 @@ enum LocalRoute {
     Whisper,
 }
 
+fn is_auto_language_alias(language: &str) -> bool {
+    matches!(
+        language.trim().to_ascii_lowercase().as_str(),
+        "auto" | "all" | "any" | "multi" | "multilingual" | "*"
+    )
+}
+
 fn local_route(s: &Settings) -> LocalRoute {
     let parakeet_ready = crate::parakeet::dir_ready(&paths::parakeet_dir());
     local_route_with_parakeet(s, parakeet_ready)
 }
 
 fn local_route_with_parakeet(s: &Settings, parakeet_ready: bool) -> LocalRoute {
-    match s.language.as_str() {
-        "ru" if s.engine == "gigaam" => LocalRoute::GigaAm,
-        "en" if s.engine == "gigaam" && parakeet_ready => LocalRoute::Parakeet,
-        "auto" if s.engine == "gigaam" && parakeet_ready => LocalRoute::Parakeet,
+    if s.engine != "gigaam" {
+        return LocalRoute::Whisper;
+    }
+    match s.language.trim().to_ascii_lowercase().as_str() {
+        "ru" | "russian" => LocalRoute::GigaAm,
+        "en" | "english" if parakeet_ready => LocalRoute::Parakeet,
+        _ if is_auto_language_alias(&s.language) && parakeet_ready => LocalRoute::Parakeet,
         _ => LocalRoute::Whisper,
     }
 }
@@ -349,6 +359,24 @@ fn prefer_gigaam_for_auto(whisper_text: &str, gigaam_text: &str) -> bool {
     // Типичный сбой whisper auto на русской речи: короткая латинская фраза
     // вроде "After" / "Państwo, unze" вместо полноценной русской диктовки.
     !has_cyrillic(w) && gw >= 3 && (ww <= 2 || gw >= ww.saturating_mul(2))
+}
+
+const DEFAULT_MULTILINGUAL_PROMPT: &str = "Multilingual speech recognition. Preserve Russian, English and other language switches. Use punctuation. Keep technical terms such as VoxFlow, Tauri, whisper.cpp and Codex.";
+
+fn whisper_base_prompt(language: &str) -> Option<&'static str> {
+    match language.trim().to_ascii_lowercase().as_str() {
+        "ru" | "russian" => Some(postprocess::DEFAULT_RU_PROMPT),
+        _ => None,
+    }
+    .or_else(|| is_auto_language_alias(language).then_some(DEFAULT_MULTILINGUAL_PROMPT))
+}
+
+fn whisper_language_arg(language: &str) -> String {
+    if is_auto_language_alias(language) {
+        "auto".into()
+    } else {
+        language.trim().to_string()
+    }
 }
 
 /// Заранее поднять и прогреть резидентные модели (GigaAM/Parakeet/VAD или
@@ -448,7 +476,8 @@ fn warmup(ctx: EngineCtx) {
     match ensure_server(&ctx, &whisper_dir, &model, s.effective_threads()) {
         Ok(port) => {
             dbg_log(&format!("warmup: сервер на {port}, прогрев..."));
-            let r = asr::transcribe_server(port, &wav, &s.language, None);
+            let language = whisper_language_arg(&s.language);
+            let r = asr::transcribe_server(port, &wav, &language, None);
             dbg_log(&format!("warmup: прогрет ok={}", r.is_ok()));
         }
         Err(e) => dbg_log(&format!("warmup: ensure_server ОШИБКА: {e:#}")),
@@ -747,7 +776,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
     let app = ctx.app.clone();
     let asr_lock = Arc::clone(&ctx.asr_lock);
     let inject_lock = Arc::clone(&ctx.inject_lock);
-    let lang = s.language.clone();
+    let lang = whisper_language_arg(&s.language);
     let mode = effective_mode;
     let settings = s.clone();
     let (dict, snippets, corrections) = load_live_postprocess_data(ctx);
@@ -2883,6 +2912,13 @@ fn no_model_installed(s: &Settings) -> bool {
         LocalRoute::Parakeet => {
             !crate::parakeet::dir_ready(&paths::parakeet_dir()) && !whisper_ready()
         }
+        LocalRoute::Whisper
+            if s.engine == "gigaam"
+                && is_auto_language_alias(&s.language)
+                && crate::gigaam::dir_ready(&paths::gigaam_dir()) =>
+        {
+            false
+        }
         LocalRoute::Whisper => !whisper_ready(),
     }
 }
@@ -3194,9 +3230,50 @@ fn local_asr(
     // подсказка, что с Parakeet будет лучше.
     if route == LocalRoute::Whisper
         && s.engine == "gigaam"
-        && (s.language == "en" || s.language == "auto")
+        && (s.language == "en" || is_auto_language_alias(&s.language))
     {
         hint_parakeet_once(&ctx.app);
+    }
+    if route == LocalRoute::Whisper
+        && s.engine == "gigaam"
+        && is_auto_language_alias(&s.language)
+        && !whisper_model_installed(s)
+        && crate::gigaam::dir_ready(&paths::gigaam_dir())
+    {
+        let t_vad = Instant::now();
+        let speech = match ctx.vad_final.lock().as_mut() {
+            Some(v) => v.has_speech(samples_16k, 0.5).unwrap_or(true),
+            None => true,
+        };
+        let vad_ms = t_vad.elapsed().as_millis() as u64;
+        if !speech {
+            dbg_log(&format!(
+                "[lat] vad={vad_ms}мс: речи нет — отклонено без ASR"
+            ));
+            return Ok((String::new(), None));
+        }
+        match ensure_gigaam(ctx, s) {
+            Ok(()) => {
+                let mut guard = ctx.gigaam.lock();
+                if let Some(g) = guard.as_mut() {
+                    match local_transcribe_long(&ctx.vad_final, samples_16k, &mut |seg| {
+                        g.transcribe(seg)
+                    }) {
+                        Ok(t) => {
+                            let st = g.last_stats;
+                            emit_stt_mode(&ctx.app, "gigaam", false);
+                            dbg_log(&format!(
+                                "[lat] vad={vad_ms}мс auto-fallback gigaam: audio={}мс frontend={}мс encoder={}мс decoder={}мс asr={}мс",
+                                st.audio_ms, st.frontend_ms, st.encoder_ms, st.decoder_ms, st.total_ms
+                            ));
+                            return Ok((postprocess::dedup_repeated_ngrams(&t), Some("ru")));
+                        }
+                        Err(e) => log::warn!("auto-fallback GigaAM ошибка: {e:#}"),
+                    }
+                }
+            }
+            Err(e) => log::warn!("auto-fallback GigaAM недоступен ({e})"),
+        }
     }
     let whisper_text = {
         let _g = ctx.asr_lock.lock();
@@ -3549,13 +3626,34 @@ mod seg_tests {
 
     #[test]
     fn auto_language_uses_parakeet_when_installed_otherwise_whisper() {
-        let s = Settings {
+        let mut s = Settings {
             engine: "gigaam".to_string(),
             language: "auto".to_string(),
             ..Settings::default()
         };
         assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
         assert_eq!(local_route_with_parakeet(&s, false), LocalRoute::Whisper);
+
+        s.language = "multi".to_string();
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
+
+        s.language = "*".to_string();
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
+    }
+
+    #[test]
+    fn whisper_base_prompt_covers_auto_aliases() {
+        assert_eq!(
+            whisper_base_prompt("ru"),
+            Some(postprocess::DEFAULT_RU_PROMPT)
+        );
+        for lang in ["auto", "all", "any", "multi", "multilingual", "*"] {
+            let prompt = whisper_base_prompt(lang).expect("multilingual prompt");
+            assert!(prompt.contains("language switches"));
+            assert_eq!(whisper_language_arg(lang), "auto");
+        }
+        assert!(whisper_base_prompt("en").is_none());
+        assert_eq!(whisper_language_arg("en"), "en");
     }
 }
 
@@ -3568,19 +3666,16 @@ fn local_transcribe(
 ) -> anyhow::Result<String> {
     let whisper_dir = paths::whisper_dir(&ctx.app);
     let model = resolve_model(s)?;
-    // Для русского даём короткую языковую затравку даже при пустом словаре —
-    // это удерживает декодер в русском и улучшает выбор слов. Для en/auto затравки нет.
-    let base_prompt = if s.language == "ru" {
-        Some(postprocess::DEFAULT_RU_PROMPT)
-    } else {
-        None
-    };
+    let language = whisper_language_arg(&s.language);
+    // Короткая языковая затравка удерживает whisper в нужном режиме даже при
+    // пустом словаре: ru — русский, auto/multi aliases — смешанная речь.
+    let base_prompt = whisper_base_prompt(&s.language);
     let prompt = postprocess::dict_bias_prompt(dict, base_prompt);
     let params = AsrParams {
         whisper_dir: &whisper_dir,
         model_path: &model,
         wav_path: wav,
-        language: &s.language,
+        language: &language,
         threads: s.effective_threads(),
         initial_prompt: prompt.as_deref(),
     };
@@ -3588,7 +3683,7 @@ fn local_transcribe(
         asr::transcribe_cli(&params)
     } else {
         match ensure_server(ctx, &whisper_dir, &model, s.effective_threads())
-            .and_then(|port| asr::transcribe_server(port, wav, &s.language, prompt.as_deref()))
+            .and_then(|port| asr::transcribe_server(port, wav, &language, prompt.as_deref()))
         {
             Ok(t) => Ok(t),
             Err(e) => {

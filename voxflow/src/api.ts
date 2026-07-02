@@ -15,6 +15,8 @@ import type {
   ActiveAppContext,
   ProfileOverride,
   TransformResult,
+  UpdateInfo,
+  UpdateInstallResult,
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 
@@ -246,6 +248,27 @@ export function aiTest(): Promise<AiTestResult> {
 // на бэкенде — сюда приходит только итог (без секретов).
 export function sttTest(): Promise<string> {
   return safe<string>(() => invoke<string>("stt_test"), "—");
+}
+
+export function checkForUpdate(): Promise<UpdateInfo | null> {
+  return safe<UpdateInfo | null>(
+    () => invoke<UpdateInfo>("check_for_update"),
+    null,
+  );
+}
+
+export function installUpdate(
+  assetUrl: string,
+  assetName: string,
+): Promise<UpdateInstallResult | null> {
+  return safe<UpdateInstallResult | null>(
+    () =>
+      invoke<UpdateInstallResult>("install_update", {
+        assetUrl,
+        assetName,
+      }),
+    null,
+  );
 }
 
 export function correctionsList(): Promise<CorrectionEntry[]> {

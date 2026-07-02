@@ -20,6 +20,7 @@ mod postprocess;
 mod rewrite;
 mod settings;
 mod system_audio;
+mod updater;
 mod vad;
 mod voice_cmds;
 
@@ -104,7 +105,7 @@ pub fn run() {
             let overlay_hit = Arc::new(Mutex::new(None));
             app.manage(AppState {
                 db: db_arc,
-                settings: settings_arc,
+                settings: settings_arc.clone(),
                 engine,
                 engine_tx: Mutex::new(tx),
                 recording,
@@ -116,9 +117,11 @@ pub fn run() {
             setup_overlay(&handle);
             spawn_overlay_hover_poller(&handle, overlay_hit);
 
-            // Первый запуск: если русская модель (GigaAM) не установлена —
-            // скачать автоматически с прогрессом в UI (задача №5 брифа).
-            models::ensure_default_models(handle.clone());
+            // Первый запуск/legacy-default: подготовить модель под текущий
+            // локальный маршрут. Свежий default — multilingual Whisper auto;
+            // явный русский GigaAM продолжает автоподготовку GigaAM.
+            let startup_settings = settings_arc.lock().clone();
+            models::ensure_default_models(handle.clone(), &startup_settings);
 
             // Применить автозапуск согласно сохранённым настройкам (reconcile с ОС).
             {
@@ -198,6 +201,8 @@ pub fn run() {
             commands::transform_text,
             commands::default_app_profile_presets,
             commands::stt_test,
+            commands::check_for_update,
+            commands::install_update,
             commands::corrections_list,
             commands::corrections_upsert,
             commands::corrections_delete,
