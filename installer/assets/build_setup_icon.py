@@ -54,9 +54,14 @@ def make_icon(size: int) -> Image.Image:
     dark2 = (12, 18, 28, 255)
     white = (255, 255, 255, 255)
 
-    x0, y0 = int(size * 0.20), int(size * 0.20)
-    x1, y1 = int(size * 0.74), int(size * 0.61)
-    stroke = max(2, int(size * 0.055))
+    if size < 24:
+        x0, y0 = int(size * 0.14), int(size * 0.18)
+        x1, y1 = int(size * 0.82), int(size * 0.64)
+        stroke = 1
+    else:
+        x0, y0 = int(size * 0.20), int(size * 0.20)
+        x1, y1 = int(size * 0.74), int(size * 0.61)
+        stroke = max(2, int(size * 0.055))
     radius = max(5, int(size * 0.10))
     draw.rounded_rectangle(
         [x0, y0, x1, y1],
@@ -72,7 +77,13 @@ def make_icon(size: int) -> Image.Image:
     ]
     draw.polygon(tail, fill=(255, 255, 255, 236), outline=dark)
 
-    if size >= 32:
+    if size < 24:
+        line_h = 1
+        line_x = int(size * 0.30)
+        for i, frac in enumerate([0.38, 0.28]):
+            y = int(size * (0.34 + i * 0.13))
+            draw.line([line_x, y, line_x + int(size * frac), y], fill=dark2, width=1)
+    elif size >= 32:
         line_h = max(2, int(size * 0.028))
         line_x = int(size * 0.32)
         for i, frac in enumerate([0.34, 0.26, 0.20]):
@@ -101,9 +112,6 @@ def make_icon(size: int) -> Image.Image:
             [(cx - arrow_w, bot_y - arrow_w), (cx + arrow_w, bot_y - arrow_w), (cx, bot_y + arrow_w)],
             fill=white,
         )
-    else:
-        radius = max(2, int(size * 0.14))
-        draw.ellipse([size - radius * 2 - 1, size - radius * 2 - 1, size - 2, size - 2], fill=dark)
 
     return icon
 
