@@ -44,6 +44,8 @@ pub struct Settings {
     pub auto_mute: bool,
     /// Автозапуск с системой.
     pub autostart: bool,
+    /// Автоматически проверять GitHub Releases на обновления при запуске UI.
+    pub auto_update_check: bool,
     /// Учиться на речи пользователя: сбор датасета (аудио↔текст) + адаптивный biasing.
     pub personalize: bool,
     /// ИИ-движок рефайна: "off" | "gemini" | "ollama" | "openai_compat".
@@ -149,10 +151,10 @@ impl Default for Settings {
             input_device: String::new(),
             language: "auto".into(),
             model: "ggml-large-v3-turbo-q5_0.bin".into(),
-            // Основной локальный движок — GigaAM-v3 e2e RNNT (русский SOTA, реальное
-            // время на CPU, пунктуация из коробки). whisper остаётся для en/auto
-            // и как fallback-модель в поле `model`.
-            engine: "gigaam".into(),
+            // Свежая установка сразу работает в multilingual-режиме: Whisper
+            // large-v3-turbo + language=auto. GigaAM/Parakeet остаются быстрыми
+            // локальными спец-маршрутами, если пользователь выберет их в UI.
+            engine: "whisper_server".into(),
             theme: "system".into(),
             verbatim: false,
             remove_fillers: true,
@@ -165,6 +167,7 @@ impl Default for Settings {
             play_sounds: true,
             auto_mute: true,
             autostart: false,
+            auto_update_check: true,
             personalize: true,
             ai_backend: "ollama".into(),
             ai_api_key: String::new(),
@@ -175,9 +178,9 @@ impl Default for Settings {
             tone_by_app: true,
             threads: 0,
             stream_mode: "never".into(),
-            // Основной STT — локальный GigaAM (см. engine): ≤0.5с на CPU без сети
-            // и без ключей. Облачные пресеты (Groq/Avalon/OpenAI/Deepgram) остаются
-            // выбираемыми в UI (см. Stt.tsx) для en/спец-сценариев.
+            // Основной STT — локальный маршрут из `engine`: свежий default это
+            // multilingual Whisper auto без ключей. Облачные пресеты
+            // (Groq/Avalon/OpenAI/Deepgram) остаются выбираемыми в UI.
             stt_provider: "local".into(),
             stt_fallback_local: true,
             cloud_live_draft: true,
@@ -383,6 +386,7 @@ mod tests {
         let json = r#"{"hotkey":"ControlRight","ai_backend":"off"}"#;
         let s: Settings = serde_json::from_str(json).expect("legacy settings parse");
         assert_eq!(s.hotkey, "ControlRight");
+        assert!(s.auto_update_check);
         assert!(s.ai_prompt_rules.is_empty());
     }
 

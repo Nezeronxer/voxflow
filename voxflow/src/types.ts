@@ -21,6 +21,7 @@ export interface Settings {
   play_sounds: boolean;
   auto_mute: boolean;
   autostart: boolean;
+  auto_update_check: boolean;
   personalize: boolean;
   threads: number;
   ai_backend: string; // "off" | "ollama" | "gemini" | "openai_compat"
@@ -73,6 +74,25 @@ export interface TransformResult {
   message: string;
 }
 
+export interface UpdateInfo {
+  available: boolean;
+  current_version: string;
+  latest_version: string;
+  release_name: string;
+  release_url: string;
+  asset_name: string;
+  asset_url: string;
+  asset_size: number;
+  published_at: string;
+  notes: string;
+}
+
+export interface UpdateInstallResult {
+  launched: boolean;
+  path: string;
+  message: string;
+}
+
 export const DEFAULT_SETTINGS: Settings = {
   hotkey: "ControlRight",
   improve_hotkey: "F8",
@@ -82,7 +102,7 @@ export const DEFAULT_SETTINGS: Settings = {
   // Зеркало Rust-дефолтов (settings.rs). Расхождение раньше позволяло UI
   // застампить в БД engine=whisper_cli и навсегда выключить живой ввод (B2).
   model: "ggml-large-v3-turbo-q5_0.bin",
-  engine: "gigaam",
+  engine: "whisper_server",
   theme: "system",
   verbatim: false,
   remove_fillers: true,
@@ -95,6 +115,7 @@ export const DEFAULT_SETTINGS: Settings = {
   play_sounds: true,
   auto_mute: true,
   autostart: false,
+  auto_update_check: true,
   personalize: true,
   threads: 0,
   ai_backend: "ollama",

@@ -800,6 +800,37 @@ pub async fn stt_test(state: State<'_, AppState>) -> Result<String, String> {
     }
 }
 
+// ─────────────────────────── Обновления ───────────────────────────
+
+#[tauri::command]
+pub fn check_for_update(state: State<AppState>) -> R<crate::updater::UpdateInfo> {
+    let proxy = state.settings.lock().proxy_url.clone();
+    crate::updater::check(&proxy).map_err(err)
+}
+
+#[tauri::command]
+pub fn install_update(
+    app: AppHandle,
+    state: State<AppState>,
+    asset_url: String,
+    asset_name: String,
+) -> R<crate::updater::UpdateInstallResult> {
+    let proxy = state.settings.lock().proxy_url.clone();
+    let result =
+        crate::updater::download_and_launch(&asset_url, &asset_name, &proxy).map_err(err)?;
+
+    state.engine.restore_auto_mute();
+    let _ = state.engine_tx.lock().send(EngineCmd::Shutdown);
+
+    // Даём IPC-ответу уйти во фронт и закрываемся, чтобы Inno мог заменить exe.
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        app.exit(0);
+    });
+
+    Ok(result)
+}
+
 #[cfg(test)]
 mod prompt_rewrite_tests {
     use super::build_prompt_rewrite_request;

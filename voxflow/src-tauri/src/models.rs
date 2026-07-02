@@ -39,6 +39,7 @@ pub const PARAKEET_NAME: &str = "parakeet-v3";
 /// whisper-моделей такой гонки нет (качаются только по клику).
 static GIGAAM_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 static PARAKEET_DOWNLOADING: AtomicBool = AtomicBool::new(false);
+static WHISPER_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
 /// Многофайловая ONNX-модель: каталог в models/<dir> вместо одиночного .bin.
 /// Механизм скачивания/докачки/удаления общий (run_download_dir), записи
@@ -57,10 +58,10 @@ struct DirModel {
 }
 
 const DIR_MODELS: &[DirModel] = &[
-    // GigaAM — ПЕРВОЙ записью: дефолтный движок, фронт ждёт её первой строкой list().
+    // GigaAM — первой ONNX-записью: фронт рисует hero именно по порядку каталога.
     DirModel {
         name: GIGAAM_NAME,
-        label: "GigaAM-v3 — русский (рекомендуется)",
+        label: "GigaAM-v3 — быстрый русский",
         size_mb: 217,
         kind: "gigaam",
         base_url: "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/main/",
@@ -95,7 +96,7 @@ struct Entry {
 const CATALOG: &[Entry] = &[
     Entry {
         name: "ggml-large-v3-turbo-q5_0.bin",
-        label: "Large v3 Turbo Q5 — рекомендуется (сильный русский, 574 МБ)",
+        label: "Large v3 Turbo Q5 — рекомендуется (все языки, 574 МБ)",
         size_mb: 574,
     },
     Entry {
@@ -127,8 +128,7 @@ fn gigaam_dir() -> std::path::PathBuf {
 
 pub fn list() -> Vec<ModelInfo> {
     let mut out = Vec::with_capacity(CATALOG.len() + DIR_MODELS.len());
-    // Каталожные ONNX-модели — первыми строками (GigaAM — самой первой:
-    // дефолтный движок), фронт рисует их hero-карточками.
+    // Каталожные ONNX-модели — первыми строками, фронт рисует их hero-карточками.
     out.extend(DIR_MODELS.iter().map(|m| ModelInfo {
         name: m.name.to_string(),
         label: m.label.to_string(),
@@ -182,16 +182,36 @@ pub fn delete(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Автозагрузка дефолтной модели при первом запуске: GigaAM не на месте и не
-/// качается → стартуем скачивание в фоне. Зовётся интегратором из setup (lib.rs);
-/// прогресс фронт увидит обычными событиями model:progress под именем "gigaam-v3".
-/// Parakeet (~640 МБ) сюда сознательно НЕ входит — качается только по кнопке в UI.
-pub fn ensure_default_models(app: AppHandle) {
-    if crate::gigaam::dir_ready(&gigaam_dir()) {
+/// Автозагрузка дефолтной модели при первом запуске: свежая установка должна
+/// сразу получить multilingual Whisper large-v3-turbo для language=auto.
+/// GigaAM/Parakeet остаются выбираемыми спец-маршрутами, но не являются
+/// стартовым default: пользователь просил out-of-the-box мультиязычность.
+pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Settings) {
+    let language = settings.language.trim().to_ascii_lowercase();
+    let wants_multilingual = matches!(
+        language.as_str(),
+        "auto" | "all" | "any" | "multi" | "multilingual" | "*"
+    ) || settings.engine != "gigaam";
+
+    let name = if wants_multilingual && is_whisper_catalog_name(&settings.model) {
+        settings.model.clone()
+    } else if wants_multilingual {
+        crate::settings::Settings::default().model
+    } else if language == "ru" || language == "russian" {
+        GIGAAM_NAME.to_string()
+    } else {
+        return;
+    };
+
+    let already_ready = if let Some(m) = find_dir_model(&name) {
+        (m.ready)(&(m.dir)())
+    } else {
+        crate::paths::model_path(&name).exists()
+    };
+    if already_ready {
         return;
     }
-    // Дубликат (гонка с кликом «Скачать» в UI) глушится атомиком в start_download.
-    if let Err(e) = start_download(app, GIGAAM_NAME.to_string()) {
+    if let Err(e) = start_download(app, name) {
         log::error!("ensure_default_models: {e:#}");
     }
 }
@@ -224,6 +244,12 @@ pub fn start_download(app: AppHandle, name: String) -> Result<()> {
     if !CATALOG.iter().any(|e| e.name == name) {
         return Err(anyhow!("Неизвестная модель: {name}"));
     }
+    if WHISPER_DOWNLOADING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(());
+    }
     std::thread::spawn(move || {
         if let Err(e) = run_download(&app, &name) {
             log::error!("download {name}: {e:#}");
@@ -232,6 +258,7 @@ pub fn start_download(app: AppHandle, name: String) -> Result<()> {
                 serde_json::json!({ "name": name, "error": e.to_string(), "message": e.to_string() }),
             );
         }
+        WHISPER_DOWNLOADING.store(false, Ordering::SeqCst);
     });
     Ok(())
 }

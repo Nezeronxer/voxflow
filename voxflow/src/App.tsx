@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
-import { getSettings, saveSettings, subscribe } from "./api";
+import { checkForUpdate, getSettings, installUpdate, saveSettings, subscribe } from "./api";
 import { Icon, Toast, applyTheme, normalizeTheme } from "./ui";
 import FpsMeter from "./components/FpsMeter";
 import type {
@@ -8,6 +8,7 @@ import type {
   NoModelEvent,
   ErrorEvent as VoxErrorEvent,
   NoRecogEvent,
+  UpdateInfo,
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
 
@@ -74,6 +75,7 @@ type Notice = {
   variant: "warning" | "error";
   actionLabel?: string;
   action?: TabId;
+  onAction?: () => void;
 };
 
 // Детерминированная сериализация настроек для сравнения «локальное == бэкенд».
@@ -114,6 +116,25 @@ export default function App() {
   // отличаем эхо собственного сейва (его не применяем — локальное состояние могло
   // уйти вперёд) от настоящей внешней смены (например, язык из трея).
   const lastSentRef = useRef<string>("");
+
+  async function handleInstallUpdate(info: UpdateInfo) {
+    setNotice({
+      message: `Скачиваю VoxFlow ${info.latest_version}…`,
+      variant: "warning",
+    });
+    const result = await installUpdate(info.asset_url, info.asset_name);
+    if (result?.launched) {
+      setNotice({
+        message: "Установщик обновления запущен. VoxFlow сейчас закроется.",
+        variant: "warning",
+      });
+    } else {
+      setNotice({
+        message: "Не удалось скачать или запустить обновление.",
+        variant: "error",
+      });
+    }
+  }
 
   // Initial load.
   useEffect(() => {
@@ -161,6 +182,27 @@ export default function App() {
     if (!loaded) return;
     applyTheme(normalizeTheme(settings.theme));
   }, [loaded, settings.theme]);
+
+  // Автопроверка GitHub Releases после загрузки настроек. Скачивание/запуск —
+  // только по явному нажатию в тосте: установщик unsigned, поэтому без silent-run.
+  useEffect(() => {
+    if (!loaded || !settings.auto_update_check) return;
+    let alive = true;
+    const t = setTimeout(async () => {
+      const info = await checkForUpdate();
+      if (!alive || !info?.available) return;
+      setNotice({
+        message: `Доступно обновление VoxFlow ${info.latest_version}.`,
+        variant: "warning",
+        actionLabel: "Установить",
+        onAction: () => void handleInstallUpdate(info),
+      });
+    }, 1600);
+    return () => {
+      alive = false;
+      clearTimeout(t);
+    };
+  }, [loaded, settings.auto_update_check]);
 
   // B3: предупреждения от движка. no_model — баннер с кнопкой на вкладку «Модель»;
   // error/norecog раньше никто не слушал (тихие провалы) — теперь показываем тост.
@@ -249,7 +291,11 @@ export default function App() {
             variant={notice.variant}
             actionLabel={notice.actionLabel}
             onAction={
-              notice.action
+              notice.onAction
+                ? () => {
+                    notice.onAction?.();
+                  }
+                : notice.action
                 ? () => {
                     setTab(notice.action!);
                     setNotice(null);

@@ -252,8 +252,8 @@ export default function Models({
       {models.length > 0 && !models.some((m) => m.installed) && (
         <div className="toast toast-warning" role="alert">
           <span className="toast-msg">
-            Скачайте модель, чтобы начать распознавание. Рекомендуем GigaAM-v3 —
-            она скачается автоматически при первом запуске.
+            Скачайте модель, чтобы начать распознавание. На свежей установке
+            VoxFlow автоматически готовит Whisper Large v3 Turbo для всех языков.
           </span>
         </div>
       )}
@@ -408,14 +408,14 @@ export default function Models({
         </Field>
         <Field
           label="Движок"
-          hint="GigaAM/Parakeet — быстрые локальные модели для RU/EN/auto. Whisper Server держит универсальную модель в памяти для остальных языков. Whisper CLI грузит модель каждый раз."
+          hint="Whisper Server держит универсальную модель в памяти. GigaAM/Parakeet — быстрый спец-маршрут для RU/EN/auto. Whisper CLI грузит модель каждый раз."
         >
           <Select
             value={settings.engine}
             onChange={(v) => update({ engine: v })}
             options={[
-              { value: "gigaam", label: "GigaAM RU / Parakeet EN+auto" },
               { value: "whisper_server", label: "Whisper Server (все языки)" },
+              { value: "gigaam", label: "GigaAM RU / Parakeet EN+auto" },
               { value: "whisper_cli", label: "Whisper CLI (медленнее)" },
             ]}
           />

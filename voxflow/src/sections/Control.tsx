@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { listAudioDevices } from "../api";
+import { checkForUpdate, installUpdate, listAudioDevices } from "../api";
 import {
   PageHead,
   Field,
@@ -9,6 +9,7 @@ import {
   normalizeTheme,
 } from "../ui";
 import type { Settings } from "../types";
+import type { UpdateInfo } from "../types";
 
 // Сегменты темы: значения зеркалят Settings.theme ("system"|"light"|"dark").
 // Применение мгновенное (эффект в App.tsx), сохранение — штатным debounce-
@@ -27,6 +28,10 @@ export default function Control({
   update: (patch: Partial<Settings>) => void;
 }) {
   const [devices, setDevices] = useState<string[]>([]);
+  const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
+  const [updateStatus, setUpdateStatus] = useState("");
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -40,6 +45,34 @@ export default function Control({
     { value: "", label: "По умолчанию" },
     ...devices.map((d) => ({ value: d, label: d })),
   ];
+
+  async function onCheckUpdate() {
+    setCheckingUpdate(true);
+    setUpdateStatus("Проверяю…");
+    const info = await checkForUpdate();
+    setCheckingUpdate(false);
+    setUpdateInfo(info);
+    if (!info) {
+      setUpdateStatus("Проверка не удалась");
+    } else if (info.available) {
+      setUpdateStatus(`Доступна версия ${info.latest_version}`);
+    } else {
+      setUpdateStatus(`Актуальная версия ${info.current_version}`);
+    }
+  }
+
+  async function onInstallUpdate() {
+    if (!updateInfo?.available) return;
+    setInstallingUpdate(true);
+    setUpdateStatus("Скачиваю установщик…");
+    const result = await installUpdate(updateInfo.asset_url, updateInfo.asset_name);
+    setInstallingUpdate(false);
+    setUpdateStatus(
+      result?.launched
+        ? "Установщик запущен. VoxFlow закроется."
+        : "Не удалось запустить установщик",
+    );
+  }
 
   return (
     <div className="content-inner">
@@ -153,6 +186,37 @@ export default function Control({
             checked={settings.autostart}
             onChange={(v) => update({ autostart: v })}
           />
+        </Field>
+
+        <Field
+          label="Автообновления"
+          hint="Проверять новые версии в GitHub Releases при запуске"
+        >
+          <Switch
+            checked={settings.auto_update_check}
+            onChange={(v) => update({ auto_update_check: v })}
+          />
+        </Field>
+
+        <Field label="Версия" hint={updateStatus || "GitHub Releases"}>
+          <div className="row-flex">
+            <button
+              className="btn btn-sm"
+              onClick={onCheckUpdate}
+              disabled={checkingUpdate || installingUpdate}
+            >
+              {checkingUpdate ? "Проверяю…" : "Проверить"}
+            </button>
+            {updateInfo?.available && (
+              <button
+                className="btn btn-sm btn-primary"
+                onClick={onInstallUpdate}
+                disabled={checkingUpdate || installingUpdate}
+              >
+                {installingUpdate ? "Скачиваю…" : "Установить"}
+              </button>
+            )}
+          </div>
         </Field>
       </div>
     </div>
