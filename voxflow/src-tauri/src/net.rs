@@ -24,7 +24,7 @@ fn curl_program() -> PathBuf {
         if system_curl.exists() {
             return system_curl;
         }
-        return PathBuf::from("curl.exe");
+        PathBuf::from("curl.exe")
     }
     #[cfg(not(windows))]
     {
@@ -247,17 +247,6 @@ pub fn secret_header_line(header: &str) -> String {
     curl_config_line("header", header)
 }
 
-/// Запустить curl, передав СЕКРЕТНЫЕ заголовки через stdin-конфиг (`-K -`),
-/// а НЕ через argv: командная строка дочернего процесса видна любому процессу
-/// пользователя (Task Manager/WMI/ProcessExplorer), API-ключ туда попадать
-/// не должен — это часть контракта «ключ никогда не логируется».
-///
-/// `cmd` — команда, собранная через [`curl`] (CREATE_NO_WINDOW уже внутри) со
-/// всеми НЕсекретными аргументами: URL, -F/-X/--data-binary, Content-Type.
-pub fn curl_secret(cmd: Command, secret_headers: &[String]) -> std::io::Result<Output> {
-    curl_secret_with_config(cmd, secret_headers, &[])
-}
-
 pub fn curl_secret_with_proxy(
     cmd: Command,
     secret_headers: &[String],
@@ -443,8 +432,9 @@ mod tests {
             .arg("-w")
             .arg("%{http_code}")
             .arg("https://huggingface.co");
-        let out = curl_secret(cmd, &["X-Test: voxflow-secret-transport".to_string()])
-            .expect("spawn curl с -K - не должен падать");
+        let out =
+            curl_secret_with_config(cmd, &["X-Test: voxflow-secret-transport".to_string()], &[])
+                .expect("spawn curl с -K - не должен падать");
         let code = String::from_utf8_lossy(&out.stdout);
         assert!(
             out.status.success(),

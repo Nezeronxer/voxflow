@@ -1,7 +1,7 @@
 {
   "name": "voxflow",
   "private": true,
-  "version": "1.0.3",
+  "version": "1.0.4",
   "license": "UNLICENSED",
   "type": "module",
   "scripts": {
