@@ -160,22 +160,6 @@ pub fn has_nvidia() -> bool {
         .exists()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn safe_model_name_accepts_catalog_filenames_only() {
-        assert!(is_safe_model_name("ggml-large-v3-turbo-q5_0.bin"));
-        assert!(!is_safe_model_name("../secret.bin"));
-        assert!(!is_safe_model_name("..\\secret.bin"));
-        assert!(!is_safe_model_name("C:\\Windows\\win.ini"));
-        assert!(!is_safe_model_name("/tmp/model.bin"));
-        assert!(!is_safe_model_name(" model.bin"));
-        assert!(!is_safe_model_name(""));
-    }
-}
-
 /// Каталог с whisper-cli.exe / whisper-server.exe + DLL.
 /// При наличии NVIDIA приоритет у CUDA-сборки (whisper-cuda), иначе CPU (whisper).
 /// В проде — из resource_dir, в dev — из dev-копий.
@@ -233,5 +217,21 @@ pub fn whisper_server_name() -> &'static str {
         "whisper-server.exe"
     } else {
         "whisper-server"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn safe_model_name_accepts_catalog_filenames_only() {
+        assert!(is_safe_model_name("ggml-large-v3-turbo-q5_0.bin"));
+        assert!(!is_safe_model_name("../secret.bin"));
+        assert!(!is_safe_model_name("..\\secret.bin"));
+        assert!(!is_safe_model_name("C:\\Windows\\win.ini"));
+        assert!(!is_safe_model_name("/tmp/model.bin"));
+        assert!(!is_safe_model_name(" model.bin"));
+        assert!(!is_safe_model_name(""));
     }
 }
