@@ -1,29 +1,29 @@
-# VoxFlow v1.0.5
+# VoxFlow v1.0.6
 
 ## Highlights
 
-- Restored the bright canonical VoxFlow app icon for Windows taskbar, window, tray and shortcuts.
-- Synchronized generated branding assets into `src-tauri/icons` so future Tauri/Inno builds cannot accidentally embed the dark unreadable icon set.
-- Kept the installer `setup.exe` icon separate from the app icon: setup stays installer-branded, while `voxflow.exe` uses the readable green/blue speech-bubble mark.
+- Fixed the custom Inno Setup window/taskbar icon so the installer no longer appears as a generic Windows process on the taskbar.
+- Kept the installed VoxFlow app icon path separate from the setup icon path: this release only changes installer branding/runtime icon handling.
+- Refreshed Inno modern wizard assets with DPI-sized 24-bit BMPs, including square `WizardSmallImageFile` frames for current Windows scaling.
 
 ## Release Artifact
 
-- `VoxFlow-Setup-1.0.5.exe`
-- Size: `288222498` bytes
-- SHA256: `90F1C29E13B5D602E511C04C4C9F952A2DB023571CDDFE378437EDFE4DD22BE4`
-- Built from tag `v1.0.5` in the verified local Windows release environment.
+- `VoxFlow-Setup-1.0.6.exe`
+- Size: `289070173` bytes
+- SHA256: `0154BE0B745B592BA0CC8FE9B2ABB052878516C8D2D767E292204E604A65F6E8`
+- Built from tag `v1.0.6` in the verified local Windows release environment.
 
 ## Verified For This Build
 
-- `voxflow/branding/build_icon.py` regenerated canonical app icon assets and synced them into `voxflow/src-tauri/icons`.
-- Extracted icon from the release `voxflow.exe` resolves to the bright app icon instead of the dark low-contrast icon seen in v1.0.4.
 - `npm run build` — OK.
 - `npm audit --audit-level=high` — OK, 0 vulnerabilities.
-- `cargo fmt` — OK.
-- `TAURI_CONFIG={"bundle":{"resources":[]}} cargo test --lib` — OK, 147 passed, 5 ignored.
-- `cargo clippy --all-targets -- -D warnings` — OK.
-- `npm run tauri -- build --no-bundle` — OK.
-- Inno Setup 6.7.1 compile — OK.
+- `cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check` — OK.
+- `TAURI_CONFIG={"bundle":{"resources":[]}} cargo test --manifest-path src-tauri\Cargo.toml --lib` — OK, 147 passed, 5 ignored.
+- `cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings` — OK.
+- `npm run tauri -- build --no-bundle` — OK, release exe built as `voxflow v1.0.6`.
+- Inno Setup 6.7.1 compile — OK, created `VoxFlow-Setup-1.0.6.exe`.
+- Runtime setup-icon probe — OK: launched setup without installing; `WM_GETICON` returned nonzero small/big icon handles for `VoxFlow-Setup-1.0.6.tmp`.
+- `git diff --check` — OK.
 
 ## Known Limits
 

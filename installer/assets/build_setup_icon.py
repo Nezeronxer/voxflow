@@ -11,11 +11,12 @@ from __future__ import annotations
 import struct
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
 
 HERE = Path(__file__).resolve().parent
 APP_BRANDING = HERE.parent.parent / "voxflow" / "branding"
+MASTER = HERE / "voxflow-avatar-master.png"
 OUT = HERE / "voxflow-setup.ico"
 SIZES = [256, 128, 64, 48, 32, 24, 16]
 APP_SMALL = Image.open(APP_BRANDING / "small_512.png").convert("RGBA")
@@ -37,6 +38,48 @@ def make_icon(size: int) -> Image.Image:
 
     scale = size / 256
     icon = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    if MASTER.exists():
+        avatar = Image.open(MASTER).convert("RGBA")
+        avatar = ImageOps.fit(avatar, (size, size), method=Image.LANCZOS)
+        mask = rounded_rect_mask(size, max(4, int(size * 0.19)))
+        avatar.putalpha(mask)
+
+        shadow = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        shadow_mask = mask.filter(ImageFilter.GaussianBlur(max(1, int(size * 0.035))))
+        shadow.putalpha(shadow_mask.point(lambda value: int(value * 0.34)))
+        icon.alpha_composite(shadow, (0, max(1, int(5 * scale))))
+        icon.alpha_composite(avatar)
+
+        if size >= 24:
+            draw = ImageDraw.Draw(icon)
+            dark = (7, 11, 18, 255)
+            white = (255, 255, 255, 255)
+            cyan = (0, 229, 255, 255)
+
+            bx0, by0 = int(size * 0.58), int(size * 0.58)
+            bx1, by1 = int(size * 0.88), int(size * 0.88)
+            draw.ellipse(
+                [bx0, by0, bx1, by1],
+                fill=dark,
+                outline=cyan,
+                width=max(1, int(size * 0.018)),
+            )
+            cx = (bx0 + bx1) // 2
+            top_y = int(size * 0.65)
+            bot_y = int(size * 0.78)
+            arrow_w = max(3, int(size * 0.045))
+            draw.line([cx, top_y, cx, bot_y], fill=white, width=max(2, int(size * 0.030)))
+            draw.polygon(
+                [
+                    (cx - arrow_w, bot_y - arrow_w),
+                    (cx + arrow_w, bot_y - arrow_w),
+                    (cx, bot_y + arrow_w),
+                ],
+                fill=white,
+            )
+
+        return icon
 
     tile = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     px = tile.load()

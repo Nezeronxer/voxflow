@@ -59,8 +59,10 @@ SolidCompression=yes
 ; installer\assets\build_setup_icon.py -> assets\voxflow-setup.ico.
 SetupIconFile=assets\voxflow-setup.ico
 WizardStyle=modern
-WizardImageFile=assets\wizard-banner-164.bmp,assets\wizard-banner-246.bmp,assets\wizard-banner-328.bmp,assets\wizard-banner-459.bmp
-WizardSmallImageFile=assets\wizard-small-55.bmp,assets\wizard-small-83.bmp,assets\wizard-small-110.bmp,assets\wizard-small-138.bmp
+; Inno 6.6+ modern DPI sizes. The small image area is square, so every
+; avatar bitmap below must also be square.
+WizardImageFile=assets\wizard-banner-202.bmp,assets\wizard-banner-269.bmp,assets\wizard-banner-336.bmp,assets\wizard-banner-403.bmp,assets\wizard-banner-430.bmp,assets\wizard-banner-498.bmp,assets\wizard-banner-534.bmp
+WizardSmallImageFile=assets\wizard-small-58.bmp,assets\wizard-small-77.bmp,assets\wizard-small-97.bmp,assets\wizard-small-116.bmp,assets\wizard-small-124.bmp,assets\wizard-small-143.bmp,assets\wizard-small-159.bmp
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -88,6 +90,9 @@ Source: "..\voxflow\src-tauri\resources\vad\*"; DestDir: "{app}\resources\vad"; 
 ; Neon gradient bitmap for the custom progress bar — temp-extracted at runtime,
 ; NOT installed to {app}.
 Source: "assets\progress-grad.bmp"; Flags: dontcopy
+; Same icon as SetupIconFile, explicitly loaded into the wizard window so the
+; taskbar button cannot fall back to a generic process icon.
+Source: "assets\voxflow-setup.ico"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\VoxFlow"; Filename: "{app}\voxflow.exe"
@@ -120,11 +125,33 @@ const
   clDivider   = $00281E1E;   { #1E1E28  divider                }
   clCyan      = $00FFE500;   { #00E5FF  neon cyan accent        }
   clMagenta   = $00D62BFF;   { #FF2BD6  neon magenta            }
+  WM_SETICON  = $0080;
+  ICON_SMALL  = 0;
+  ICON_BIG    = 1;
+  IMAGE_ICON  = 1;
+  GW_OWNER    = 4;
+  LR_LOADFROMFILE = $0010;
 
 var
   ProgTrack: TPanel;       { fixed-size dark track            }
   ProgClip:  TPanel;       { grows L->R, clips the gradient   }
   ProgGrad:  TBitmapImage; { full-width cyan->magenta bitmap  }
+  WizardIconSmall: LongInt;
+  WizardIconBig: LongInt;
+
+function LoadImage(hInst: LongInt; ImageName: String; ImageType: LongInt;
+  X, Y: LongInt; Flags: LongInt): LongInt;
+  external 'LoadImageW@user32.dll stdcall';
+
+function SendMessage(hWnd: LongInt; Msg: LongInt; wParam: LongInt;
+  lParam: LongInt): LongInt;
+  external 'SendMessageW@user32.dll stdcall';
+
+function GetParent(hWnd: LongInt): LongInt;
+  external 'GetParent@user32.dll stdcall';
+
+function GetWindow(hWnd: LongInt; uCmd: LongInt): LongInt;
+  external 'GetWindow@user32.dll stdcall';
 
 { VISIBILITY GUARD — per-user app must NOT be installed elevated.
   This is a PER-USER install (PrivilegesRequired=lowest): the uninstall entry is
@@ -172,6 +199,47 @@ begin
   ColorPage(WizardForm.PreparingPage);
   ColorPage(WizardForm.InstallingPage);
   ColorPage(WizardForm.InfoAfterPage);
+end;
+
+{ Apply the branded setup icon to the actual wizard window. SetupIconFile
+  updates the executable resource, but the taskbar button follows the window
+  icon at runtime, so keep both paths in sync. }
+procedure ApplyWizardIcon;
+var
+  IconPath: String;
+  ParentWindow: LongInt;
+  OwnerWindow: LongInt;
+begin
+  try
+    ExtractTemporaryFile('voxflow-setup.ico');
+    IconPath := ExpandConstant('{tmp}\voxflow-setup.ico');
+    if WizardIconSmall = 0 then
+      WizardIconSmall := LoadImage(0, IconPath, IMAGE_ICON, 16, 16, LR_LOADFROMFILE);
+    if WizardIconBig = 0 then
+      WizardIconBig := LoadImage(0, IconPath, IMAGE_ICON, 32, 32, LR_LOADFROMFILE);
+
+    if WizardIconSmall <> 0 then
+    begin
+      SendMessage(WizardForm.Handle, WM_SETICON, ICON_SMALL, WizardIconSmall);
+      ParentWindow := GetParent(WizardForm.Handle);
+      if ParentWindow <> 0 then
+        SendMessage(ParentWindow, WM_SETICON, ICON_SMALL, WizardIconSmall);
+      OwnerWindow := GetWindow(WizardForm.Handle, GW_OWNER);
+      if OwnerWindow <> 0 then
+        SendMessage(OwnerWindow, WM_SETICON, ICON_SMALL, WizardIconSmall);
+    end;
+    if WizardIconBig <> 0 then
+    begin
+      SendMessage(WizardForm.Handle, WM_SETICON, ICON_BIG, WizardIconBig);
+      ParentWindow := GetParent(WizardForm.Handle);
+      if ParentWindow <> 0 then
+        SendMessage(ParentWindow, WM_SETICON, ICON_BIG, WizardIconBig);
+      OwnerWindow := GetWindow(WizardForm.Handle, GW_OWNER);
+      if OwnerWindow <> 0 then
+        SendMessage(OwnerWindow, WM_SETICON, ICON_BIG, WizardIconBig);
+    end;
+  except
+  end;
 end;
 
 { Build the custom neon gradient progress bar over the native gauge. }
@@ -233,6 +301,8 @@ end;
 
 procedure InitializeWizard;
 begin
+  ApplyWizardIcon;
+
   { --- Window + top panel --- }
   WizardForm.Color := clBase;
   if WizardForm.MainPanel <> nil then
@@ -348,6 +418,11 @@ begin
 
   { --- Custom neon progress bar --- }
   BuildProgressBar;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  ApplyWizardIcon;
 end;
 
 { Drive the custom progress bar during file copy. }

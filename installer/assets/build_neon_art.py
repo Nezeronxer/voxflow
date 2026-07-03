@@ -7,8 +7,8 @@ then downscales with LANCZOS. Bakes the near-black base into every BMP because
 Inno wizard BMPs cannot use alpha.
 
 Outputs (relative to this file's directory = installer/assets):
-  Left banner (WizardImageFile)        : wizard-banner-164/-246/-328/-459.bmp
-  Top-right small (WizardSmallImageFile): wizard-small-55/-83/-110/-138.bmp
+  Left banner (WizardImageFile)        : wizard-banner-202/.../-534.bmp
+  Top-right small (WizardSmallImageFile): wizard-small-58/.../-159.bmp
   Progress gradient                    : progress-grad.bmp        (500x18, 24-bit)
   Installer icon                       : voxflow-neon.ico         (16..256)
 
@@ -21,7 +21,7 @@ Aesthetic (brief §4-§5):
 """
 
 import os
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageOps
 
 # ---------------------------------------------------------------- palette ----
 BASE        = (0x0A, 0x0A, 0x0F)   # near-black base
@@ -39,6 +39,7 @@ PALETTE = {
 }
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+AVATAR_MASTER = os.path.join(HERE, "voxflow-avatar-master.png")
 
 SS = 4  # supersampling factor for masters
 
@@ -52,6 +53,21 @@ def load_font(path, size):
 
 def lerp(a, b, t):
     return tuple(int(round(a[i] + (b[i] - a[i]) * t)) for i in range(3))
+
+
+def load_avatar(size):
+    """Load the generated VoxFlow avatar as a square RGBA image."""
+    if not os.path.exists(AVATAR_MASTER):
+        return None
+    avatar = Image.open(AVATAR_MASTER).convert("RGBA")
+    return ImageOps.fit(avatar, (size, size), method=Image.LANCZOS)
+
+
+def rounded_square_alpha(size, radius):
+    mask = Image.new("L", (size, size), 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rounded_rectangle([0, 0, size - 1, size - 1], radius=radius, fill=255)
+    return mask
 
 
 # --------------------------------------------------------- bubble geometry ---
@@ -196,33 +212,28 @@ def radial_glow_layer(w, h, center, color, radius, intensity=1.0):
 # --------------------------------------------------------------- banner ------
 def build_banner_master():
     """
-    Build the left-banner master at the largest target aspect (164x314),
+    Build the left-banner master at the largest modern target aspect,
     supersampled. Returns an RGB master image. Downscaling done by caller.
     """
-    BW, BH = 459, 916          # largest target, same 164:314 aspect-ish
-    # Note: targets are 164x314, 246x459, 328x627, 459x916 -> ratio varies
-    # slightly; we render at the 459x916 frame and resize to each exact size.
+    BW, BH = 534, 1022
     w, h = BW * SS, BH * SS
 
-    # 1) base vertical gradient (very subtle, panel-ish at top)
     bg = vertical_base_gradient(
         w, h,
         top=(0x0D, 0x0D, 0x14),
         bottom=BASE,
     ).convert("RGBA")
 
-    # 2) ambient neon glows in the background (very soft, low intensity)
     glowA = radial_glow_layer(w, h, (int(w * 0.30), int(h * 0.30)),
-                              NEON_CYAN, int(w * 0.55), intensity=0.22)
+                              NEON_CYAN, int(w * 0.58), intensity=0.18)
     glowB = radial_glow_layer(w, h, (int(w * 0.78), int(h * 0.72)),
-                              NEON_MAG, int(w * 0.55), intensity=0.18)
+                              NEON_MAG, int(w * 0.55), intensity=0.16)
     bg = Image.alpha_composite(bg, glowA)
     bg = Image.alpha_composite(bg, glowB)
 
-    # 3) thin neon divider near the bottom (cyan->magenta), subtle
     div = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     dd = ImageDraw.Draw(div)
-    dy = int(h * 0.80)
+    dy = int(h * 0.78)
     dh = max(1, int(h * 0.0035))
     for x in range(0, w, SS):
         t = x / max(1, w - 1)
@@ -231,61 +242,62 @@ def build_banner_master():
     div = div.filter(ImageFilter.GaussianBlur(SS * 1.0))
     bg = Image.alpha_composite(bg, div)
 
-    # 4) brand glyph: large neon speech bubble, upper-center
-    gw = int(w * 0.56)
-    gh = int(gw * 0.92)
-    stroke = max(2, int(gw * 0.045))
-    glyph = neon_glyph_rgba(
-        gw, gh, stroke,
-        glow_color=NEON_CYAN,
-        core_color=(0xEA, 0xFE, 0xFF),  # white tinted cyan
-        glow_radius=stroke * 3.2,
-        glow_passes=3,
-    )
-    # add a magenta rim glow underneath for two-tone neon
-    rim = neon_glyph_rgba(
-        gw, gh, max(2, int(stroke * 0.7)),
-        glow_color=NEON_MAG,
-        core_color=NEON_MAG,
-        glow_radius=stroke * 4.0,
-        glow_passes=2,
-    )
-    gx = (w - gw) // 2
-    gy = int(h * 0.18)
     composite = bg
-    rim_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    rim_layer.paste(rim, (gx, gy), rim)
-    composite = Image.alpha_composite(composite, rim_layer)
-    glyph_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    glyph_layer.paste(glyph, (gx, gy), glyph)
-    composite = Image.alpha_composite(composite, glyph_layer)
+    avatar_size = int(w * 0.73)
+    avatar = load_avatar(avatar_size)
+    if avatar is not None:
+        gx = (w - avatar_size) // 2
+        gy = int(h * 0.15)
 
-    # 5) wordmark "VoxFlow" in Segoe UI Bold, white, with faint neon glow
+        shadow = Image.new("RGBA", (avatar_size, avatar_size), (0, 0, 0, 0))
+        shadow_mask = rounded_square_alpha(
+            avatar_size, max(6, int(avatar_size * 0.19))
+        ).filter(ImageFilter.GaussianBlur(int(avatar_size * 0.055)))
+        shadow.putalpha(shadow_mask.point(lambda value: int(value * 0.45)))
+        composite.alpha_composite(shadow, (gx, gy + int(h * 0.012)))
+        composite.alpha_composite(avatar, (gx, gy))
+        art_bottom = gy + avatar_size
+    else:
+        # Fallback to the older generated neon glyph if the AI master is absent.
+        gw = int(w * 0.56)
+        gh = int(gw * 0.92)
+        stroke = max(2, int(gw * 0.045))
+        glyph = neon_glyph_rgba(
+            gw, gh, stroke,
+            glow_color=NEON_CYAN,
+            core_color=(0xEA, 0xFE, 0xFF),
+            glow_radius=stroke * 3.2,
+            glow_passes=3,
+        )
+        gx = (w - gw) // 2
+        gy = int(h * 0.18)
+        glyph_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        glyph_layer.paste(glyph, (gx, gy), glyph)
+        composite = Image.alpha_composite(composite, glyph_layer)
+        art_bottom = gy + gh
+
     font_size = int(w * 0.16)
     font = load_font(FONT_BOLD, font_size)
     word = "VoxFlow"
-    # measure
     tmp = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     td = ImageDraw.Draw(tmp)
     bbox = td.textbbox((0, 0), word, font=font)
     tw = bbox[2] - bbox[0]
     th = bbox[3] - bbox[1]
     tx = (w - tw) // 2 - bbox[0]
-    ty = gy + gh + int(h * 0.04) - bbox[1]
+    ty = art_bottom + int(h * 0.045) - bbox[1]
 
-    # glow copy
     glow_txt = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     gtd = ImageDraw.Draw(glow_txt)
     gtd.text((tx, ty), word, font=font, fill=NEON_CYAN + (200,))
     glow_txt = glow_txt.filter(ImageFilter.GaussianBlur(SS * 3.0))
     composite = Image.alpha_composite(composite, glow_txt)
-    # crisp white text
+
     crisp_txt = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     ctd = ImageDraw.Draw(crisp_txt)
     ctd.text((tx, ty), word, font=font, fill=TEXT + (255,))
     composite = Image.alpha_composite(composite, crisp_txt)
 
-    # 6) small tagline in secondary gray
     tag_font = load_font(FONT_REG, int(w * 0.052))
     tag = "Voice to text"
     tb = td.textbbox((0, 0), tag, font=tag_font)
@@ -303,11 +315,15 @@ def build_banner_master():
 # ----------------------------------------------------------- small image -----
 def build_small_master():
     """
-    Top-right small image: bubble glyph with neon ring, on dark.
-    Rendered square (140 target max). Returns RGB master.
+    Top-right small image: AI avatar master, square for Inno modern DPI.
+    Rendered at the largest target. Returns RGB master.
     """
-    S = 140
+    S = 159
     w = h = S * SS
+
+    avatar = load_avatar(w)
+    if avatar is not None:
+        return avatar.convert("RGB")
 
     bg = vertical_base_gradient(
         w, h, top=(0x10, 0x10, 0x18), bottom=BASE).convert("RGBA")
@@ -379,6 +395,19 @@ def build_icon_layer(size):
     w = h = size * SS
     canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
 
+    avatar = load_avatar(w)
+    if avatar is not None:
+        radius = max(4, int(w * 0.19))
+        mask = rounded_square_alpha(w, radius)
+        avatar.putalpha(mask)
+
+        shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        shadow_mask = mask.filter(ImageFilter.GaussianBlur(max(1, int(w * 0.035))))
+        shadow.putalpha(shadow_mask.point(lambda value: int(value * 0.32)))
+        canvas.alpha_composite(shadow, (0, max(1, int(w * 0.025))))
+        canvas.alpha_composite(avatar)
+        return canvas.resize((size, size), Image.LANCZOS)
+
     # soft dark disc behind glyph so it reads on light + dark backgrounds
     disc = Image.new("L", (w, h), 0)
     dd = ImageDraw.Draw(disc)
@@ -426,10 +455,13 @@ def main():
     # ---- banner ----
     banner_master = build_banner_master()
     banner_sizes = {
-        "wizard-banner-164.bmp": (164, 314),
-        "wizard-banner-246.bmp": (246, 459),
-        "wizard-banner-328.bmp": (328, 627),
-        "wizard-banner-459.bmp": (459, 916),
+        "wizard-banner-202.bmp": (202, 386),
+        "wizard-banner-269.bmp": (269, 515),
+        "wizard-banner-336.bmp": (336, 643),
+        "wizard-banner-403.bmp": (403, 772),
+        "wizard-banner-430.bmp": (430, 824),
+        "wizard-banner-498.bmp": (498, 953),
+        "wizard-banner-534.bmp": (534, 1022),
     }
     for name, sz in banner_sizes.items():
         p = os.path.join(HERE, name)
@@ -439,10 +471,13 @@ def main():
     # ---- small ----
     small_master = build_small_master()
     small_sizes = {
-        "wizard-small-55.bmp":  (55, 55),
-        "wizard-small-83.bmp":  (83, 80),
-        "wizard-small-110.bmp": (110, 106),
-        "wizard-small-138.bmp": (138, 140),
+        "wizard-small-58.bmp":  (58, 58),
+        "wizard-small-77.bmp":  (77, 77),
+        "wizard-small-97.bmp":  (97, 97),
+        "wizard-small-116.bmp": (116, 116),
+        "wizard-small-124.bmp": (124, 124),
+        "wizard-small-143.bmp": (143, 143),
+        "wizard-small-159.bmp": (159, 159),
     }
     for name, sz in small_sizes.items():
         p = os.path.join(HERE, name)
@@ -471,7 +506,7 @@ def main():
 
     print("=== WRITTEN ===")
     for p, sz in written:
-        print(f"  {p}  {sz}")
+        print(f"  {os.path.basename(p)}  {sz}")
 
     return written
 
