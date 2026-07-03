@@ -1,6 +1,6 @@
 [package]
 name = "voxflow"
-version = "1.0.5"
+version = "1.0.6"
 description = "Local-first voice dictation for Windows"
 authors = ["Nezeronxer"]
 license = "LicenseRef-Proprietary"

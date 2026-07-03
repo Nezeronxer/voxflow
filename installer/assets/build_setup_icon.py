@@ -15,8 +15,10 @@ from PIL import Image, ImageDraw, ImageFilter
 
 
 HERE = Path(__file__).resolve().parent
+APP_BRANDING = HERE.parent.parent / "voxflow" / "branding"
 OUT = HERE / "voxflow-setup.ico"
 SIZES = [256, 128, 64, 48, 32, 24, 16]
+APP_SMALL = Image.open(APP_BRANDING / "small_512.png").convert("RGBA")
 
 
 def rounded_rect_mask(size: int, radius: int) -> Image.Image:
@@ -27,6 +29,12 @@ def rounded_rect_mask(size: int, radius: int) -> Image.Image:
 
 
 def make_icon(size: int) -> Image.Image:
+    # The Windows taskbar often picks a small ICO frame while setup is running
+    # from Inno's temporary .tmp process. Keep those frames as the clean app
+    # mark; the installer badge only reads well at larger sizes.
+    if size <= 48:
+        return APP_SMALL.resize((size, size), Image.LANCZOS)
+
     scale = size / 256
     icon = Image.new("RGBA", (size, size), (0, 0, 0, 0))
 
