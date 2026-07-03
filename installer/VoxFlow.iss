@@ -5,7 +5,7 @@
 ;    npm run tauri -- build --no-bundle
 ;  Then compile with:
 ;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\VoxFlow.iss
-;  Output: installer\Output\VoxFlow-Setup-1.0.4.exe
+;  Output: installer\Output\VoxFlow-Setup-1.0.5.exe
 ;
 ;  Do NOT compile this installer after a plain `cargo build --release`: that
 ;  Tauri binary stays in dev mode and opens http://localhost:1420 in WebView2.
@@ -19,7 +19,7 @@
 ; ============================================================================
 
 #define AppName    "VoxFlow"
-#define AppVersion "1.0.4"
+#define AppVersion "1.0.5"
 #define Publisher  "Крылов Анатолий Евгеньевич"
 #define AppExe     "voxflow.exe"
 #define SrcDir     "..\voxflow\src-tauri\target\release"
@@ -30,7 +30,7 @@ AppId={{B2F1A9E0-7C4D-4E8A-9F3B-1A2C5D6E7F80}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
-VersionInfoVersion=1.0.4.0
+VersionInfoVersion=1.0.5.0
 
 ; --- Per-user install: no elevation, current user only. ---
 PrivilegesRequired=lowest

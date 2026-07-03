@@ -10,12 +10,14 @@ Outputs:
   out/<n>.png      — individual rasters (verification + Tauri assets)
   check.png        — contact sheet on white + dark for eyeballing
 """
-import io, os, struct
+import io, os, shutil, struct
 from PIL import Image
 
 BRAND = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(BRAND, "out")
+TAURI_ICONS = os.path.normpath(os.path.join(BRAND, "..", "src-tauri", "icons"))
 os.makedirs(OUT, exist_ok=True)
+os.makedirs(TAURI_ICONS, exist_ok=True)
 
 master = Image.open(os.path.join(BRAND, "master_1024.png")).convert("RGBA")
 small = Image.open(os.path.join(BRAND, "small_512.png")).convert("RGBA")
@@ -55,6 +57,17 @@ def write_ico(path, images):
 ico_frames = [frames[n] for n in SIZES]
 write_ico(os.path.join(BRAND, "icon.ico"), ico_frames)
 print("icon.ico written:", os.path.getsize(os.path.join(BRAND, "icon.ico")), "bytes,", len(ico_frames), "sizes")
+
+# Keep the Windows/Tauri app icon assets in sync with the canonical branding
+# rasters. The installer has its own setup.exe icon; these files are for
+# voxflow.exe, window, tray and shortcuts.
+frames[32].save(os.path.join(TAURI_ICONS, "32x32.png"))
+frames[128].save(os.path.join(TAURI_ICONS, "128x128.png"))
+frames[256].save(os.path.join(TAURI_ICONS, "128x128@2x.png"))
+frames[64].save(os.path.join(TAURI_ICONS, "64x64.png"))
+frames[256].save(os.path.join(TAURI_ICONS, "icon.png"))
+shutil.copyfile(os.path.join(BRAND, "icon.ico"), os.path.join(TAURI_ICONS, "icon.ico"))
+print("synced Windows/Tauri app icons")
 
 # ---- contact sheet: every size on white and on dark ----
 pad = 18
