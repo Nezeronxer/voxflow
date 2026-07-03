@@ -4,13 +4,13 @@ VoxFlow превращает речь в текст и вставляет рез
 чат, браузер, документ, IDE или окно Codex. По умолчанию он работает локально,
 а облачные провайдеры включаются только в формате BYOK — со своим ключом.
 
-![status](https://img.shields.io/badge/platform-Windows-blue) ![version](https://img.shields.io/badge/version-1.0.5-green) ![license](https://img.shields.io/badge/license-proprietary-red) ![privacy](https://img.shields.io/badge/privacy-local%20or%20BYOK-orange)
+![status](https://img.shields.io/badge/platform-Windows-blue) ![version](https://img.shields.io/badge/version-1.0.6-green) ![license](https://img.shields.io/badge/license-proprietary-red) ![privacy](https://img.shields.io/badge/privacy-local%20or%20BYOK-orange)
 
 VoxFlow — proprietary product by Nezeronxer. The source code is visible for
 review only; copying, redistribution, rebranding, resale, forks, clones and
 derivative products are prohibited without written permission. See [LICENSE](LICENSE).
 
-## Что умеет v1.0.5
+## Что умеет v1.0.6
 
 - Hold-to-talk и toggle-диктовка через глобальную горячую клавишу.
 - Автообновление через GitHub Releases: VoxFlow сам проверяет новую версию,
@@ -29,7 +29,7 @@ derivative products are prohibited without written permission. See [LICENSE](LIC
 Локальный release installer собирается сюда:
 
 ```powershell
-installer\Output\VoxFlow-Setup-1.0.5.exe
+installer\Output\VoxFlow-Setup-1.0.6.exe
 ```
 
 Установка идёт в профиль текущего пользователя:
@@ -115,7 +115,7 @@ plain `cargo build --release`, иначе WebView может искать dev se
 
 ## Локальный QA перед публикацией
 
-Минимальный gate для v1.0.5:
+Минимальный gate для v1.0.6:
 
 ```powershell
 cd "C:\Моя папка\wispr flow\voxflow"
