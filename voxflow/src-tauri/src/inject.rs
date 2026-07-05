@@ -21,6 +21,8 @@
 use anyhow::{anyhow, Result};
 use enigo::{Direction, Enigo, Key, Keyboard, Settings as ESettings};
 use parking_lot::Mutex;
+#[cfg(windows)]
+use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
 use std::{
@@ -403,6 +405,97 @@ fn incremental_keys(e: &mut Enigo, prev: &str, next: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+mod win_input {
+    use super::*;
+
+    const INPUT_KEYBOARD: u32 = 1;
+    const KEYEVENTF_KEYUP: u32 = 0x0002;
+    const VK_CONTROL: u16 = 0x11;
+    pub const VK_C: u16 = 0x43;
+    pub const VK_V: u16 = 0x56;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Input {
+        r#type: u32,
+        anonymous: InputUnion,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    union InputUnion {
+        ki: KeybdInput,
+        #[cfg(target_pointer_width = "64")]
+        _padding64: [u64; 4],
+        #[cfg(target_pointer_width = "32")]
+        _padding32: [u32; 6],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct KeybdInput {
+        w_vk: u16,
+        w_scan: u16,
+        dw_flags: u32,
+        time: u32,
+        dw_extra_info: usize,
+    }
+
+    #[link(name = "user32")]
+    extern "system" {
+        fn SendInput(c_inputs: u32, p_inputs: *const Input, cb_size: i32) -> u32;
+    }
+
+    fn key_input(vk: u16, keyup: bool) -> Input {
+        Input {
+            r#type: INPUT_KEYBOARD,
+            anonymous: InputUnion {
+                ki: KeybdInput {
+                    w_vk: vk,
+                    w_scan: 0,
+                    dw_flags: if keyup { KEYEVENTF_KEYUP } else { 0 },
+                    time: 0,
+                    dw_extra_info: 0,
+                },
+            },
+        }
+    }
+
+    fn send_key(vk: u16, keyup: bool) -> Result<()> {
+        let input = key_input(vk, keyup);
+        let sent = unsafe { SendInput(1, &input, size_of::<Input>() as i32) };
+        if sent == 1 {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "SendInput vk=0x{vk:02X} {} sent {sent}/1",
+                if keyup { "up" } else { "down" }
+            ))
+        }
+    }
+
+    /// Native Windows chord emitter. Enigo is fine for text typing, but Ctrl+V/C
+    /// through it can be flaky on Windows 10 under non-English layouts and some
+    /// Chromium/Electron targets. The paste/copy invariant matters here: after the
+    /// letter key is pressed, callers must treat the shortcut as delivered and only
+    /// do best-effort key releases.
+    pub fn ctrl_chord(vk: u16) -> Result<()> {
+        send_key(VK_CONTROL, false)?;
+        thread::sleep(Duration::from_millis(4));
+
+        if let Err(err) = send_key(vk, false) {
+            let _ = send_key(VK_CONTROL, true);
+            return Err(err);
+        }
+
+        let _ = send_key(vk, true);
+        thread::sleep(Duration::from_millis(4));
+        let _ = send_key(VK_CONTROL, true);
+        Ok(())
+    }
+}
+
 /// Clipboard-операция с ретраями: clipboard на Windows — глобальный ресурс,
 /// его может коротко держать другое приложение (ERROR_CLIPBOARD_BUSY и т.п.).
 /// 3 попытки с паузой 30мс между ними.
@@ -500,32 +593,32 @@ fn paste_text(
     thread::sleep(Duration::from_millis(25));
 
     // Послать Ctrl+V (Cmd+V на macOS) в активное окно.
-    #[cfg(target_os = "macos")]
-    let modkey = Key::Meta;
-    #[cfg(not(target_os = "macos"))]
-    let modkey = Key::Control;
-    // V шлём РАСКЛАДКО-НЕЗАВИСИМО по virtual-key code, иначе на русской раскладке
-    // enigo не может смаппить Unicode('v') в VK и тихо впрыскивает 'v' как
-    // KEYEVENTF_UNICODE-символ, который Windows не считает частью Ctrl-аккорда —
-    // и вставка не срабатывает. Key::Other(VK) на Windows = сырой virtual-key.
     #[cfg(windows)]
-    let vkey = Key::Other(0x56); // VK_V
-    #[cfg(not(windows))]
-    let vkey = Key::Unicode('v');
-
-    // --- до этой черты ошибки безопасны (V ещё не доставлена) ---
-    let e = enigo_of(enigo_slot)?;
-    e.key(modkey, Direction::Press)
-        .map_err(|e| anyhow!("mod down: {e}"))?;
-    if let Err(err) = e.key(vkey, Direction::Click) {
-        // V не доставлена — откатываем модификатор и сообщаем об ошибке, fallback в печать безопасен.
-        let _ = e.key(modkey, Direction::Release);
-        return Err(anyhow!("v: {err}"));
+    {
+        let _ = enigo_slot;
+        win_input::ctrl_chord(win_input::VK_V).map_err(|e| anyhow!("v: {e}"))?;
     }
-    // --- V ОТПРАВЛЕНА: дальше только best-effort, возвращаем строго Ok ---
-    // Отпускание модификатора best-effort: ошибка здесь НЕ должна вызвать дубль.
-    let _ = e.key(modkey, Direction::Release);
+    #[cfg(not(windows))]
+    {
+        #[cfg(target_os = "macos")]
+        let modkey = Key::Meta;
+        #[cfg(not(target_os = "macos"))]
+        let modkey = Key::Control;
+        let vkey = Key::Unicode('v');
 
+        // --- до этой черты ошибки безопасны (V ещё не доставлена) ---
+        let e = enigo_of(enigo_slot)?;
+        e.key(modkey, Direction::Press)
+            .map_err(|e| anyhow!("mod down: {e}"))?;
+        if let Err(err) = e.key(vkey, Direction::Click) {
+            // V не доставлена — откатываем модификатор и сообщаем об ошибке, fallback в печать безопасен.
+            let _ = e.key(modkey, Direction::Release);
+            return Err(anyhow!("v: {err}"));
+        }
+        // --- V ОТПРАВЛЕНА: дальше только best-effort, возвращаем строго Ok ---
+        // Отпускание модификатора best-effort: ошибка здесь НЕ должна вызвать дубль.
+        let _ = e.key(modkey, Direction::Release);
+    }
     // Короткий settle: дать окну принять аккорд (текст появляется в поле уже
     // здесь). Прежний буфер возвращаем НЕ тут, а после ack в worker_loop —
     // суммарная пауза V→restore остаётся 15+115=130мс (компромисс 140↔90:
@@ -549,6 +642,12 @@ fn run_copy_selection(enigo_slot: &mut Option<Enigo>) -> (Result<CmdResult>, Opt
     }
     thread::sleep(Duration::from_millis(25));
 
+    #[cfg(windows)]
+    let copy_res = {
+        let _ = enigo_slot;
+        win_input::ctrl_chord(win_input::VK_C)
+    };
+    #[cfg(not(windows))]
     let copy_res = enigo_of(enigo_slot).and_then(send_copy_chord);
     if let Err(e) = copy_res {
         return (Err(e), Some(prev));
@@ -567,6 +666,7 @@ fn run_copy_selection(enigo_slot: &mut Option<Enigo>) -> (Result<CmdResult>, Opt
     (Ok(CmdResult::Selection(selected)), Some(prev))
 }
 
+#[cfg(not(windows))]
 fn send_copy_chord(e: &mut Enigo) -> Result<()> {
     #[cfg(target_os = "macos")]
     let modkey = Key::Meta;
