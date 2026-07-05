@@ -1,28 +1,28 @@
-# VoxFlow v1.0.6
+# VoxFlow v1.0.7
 
 ## Highlights
 
-- Fixed the custom Inno Setup window/taskbar icon so the installer no longer appears as a generic Windows process on the taskbar.
-- Kept the installed VoxFlow app icon path separate from the setup icon path: this release only changes installer branding/runtime icon handling.
-- Refreshed Inno modern wizard assets with DPI-sized 24-bit BMPs, including square `WizardSmallImageFile` frames for current Windows scaling.
+- Fixed intermittent final-text insertion failures on Windows 10 by sending paste/copy shortcuts through native `SendInput` virtual-key events instead of the cross-platform `enigo` chord path.
+- Kept the existing safe clipboard flow: VoxFlow still writes the recognized text to clipboard, preserves the no-double-inject invariant after `Ctrl+V`, and leaves the final dictation text available for manual paste if the target app still refuses the shortcut.
+- The change is scoped to Windows `Ctrl+V`/`Ctrl+C` shortcut emission; non-Windows paths and text typing behavior are unchanged.
 
 ## Release Artifact
 
-- `VoxFlow-Setup-1.0.6.exe`
-- Size: `289070173` bytes
-- SHA256: `0154BE0B745B592BA0CC8FE9B2ABB052878516C8D2D767E292204E604A65F6E8`
-- Built from tag `v1.0.6` in the verified local Windows release environment.
+- `VoxFlow-Setup-1.0.7.exe`
+- Size: `289082143` bytes
+- SHA256: `29195CCE0FD4DD1BC51B0D47B1B68AD2F1BA9796B0CA3FED28B00EFF97DE4DE0`
+- Built from tag `v1.0.7` in the verified local Windows release environment.
 
 ## Verified For This Build
 
-- `npm run build` — OK.
-- `npm audit --audit-level=high` — OK, 0 vulnerabilities.
-- `cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check` — OK.
-- `TAURI_CONFIG={"bundle":{"resources":[]}} cargo test --manifest-path src-tauri\Cargo.toml --lib` — OK, 147 passed, 5 ignored.
+- `cargo fmt --manifest-path src-tauri\Cargo.toml --check` — OK.
 - `cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings` — OK.
-- `npm run tauri -- build --no-bundle` — OK, release exe built as `voxflow v1.0.6`.
-- Inno Setup 6.7.1 compile — OK, created `VoxFlow-Setup-1.0.6.exe`.
-- Runtime setup-icon probe — OK: launched setup without installing; `WM_GETICON` returned nonzero small/big icon handles for `VoxFlow-Setup-1.0.6.tmp`.
+- `cargo test --manifest-path src-tauri\Cargo.toml --lib` — OK, 147 passed, 5 ignored.
+- `npm run build` — OK.
+- `npm run tauri -- build --no-bundle` — OK, release exe built as `voxflow v1.0.7`.
+- Inno Setup 6.7.1 compile — OK, created `VoxFlow-Setup-1.0.7.exe`.
+- Installed-app Windows QA — OK: silent install over `%LOCALAPPDATA%\\VoxFlow`, installed exe hash matched release exe, registry `Version=1.0.7`, app launched as `%LOCALAPPDATA%\\VoxFlow\\voxflow.exe`.
+- Windows paste smoke — OK: clipboard text pasted into a fresh Notepad tab via `Ctrl+V`; text was visible and verified.
 - `git diff --check` — OK.
 
 ## Known Limits
