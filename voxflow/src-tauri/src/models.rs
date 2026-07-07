@@ -156,6 +156,13 @@ fn is_whisper_catalog_name(name: &str) -> bool {
     CATALOG.iter().any(|e| e.name == name)
 }
 
+fn language_wants_gigaam(language: &str) -> bool {
+    matches!(
+        language.trim().to_ascii_lowercase().as_str(),
+        "ru" | "russian" | "auto" | "all" | "any" | "multi" | "multilingual" | "*"
+    )
+}
+
 pub fn delete(name: &str) -> Result<()> {
     // Каталожная ONNX-модель — это каталог, а не одиночный файл: сносим целиком
     // (вместе с .part).
@@ -182,6 +189,11 @@ pub fn delete(name: &str) -> Result<()> {
 /// стартовым default: пользователь просил out-of-the-box мультиязычность.
 pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Settings) {
     let language = settings.language.trim().to_ascii_lowercase();
+    if language_wants_gigaam(&language) && !crate::gigaam::dir_ready(&gigaam_dir()) {
+        if let Err(e) = start_download(app.clone(), GIGAAM_NAME.to_string()) {
+            log::error!("ensure_default_models(gigaam): {e:#}");
+        }
+    }
     let wants_multilingual = matches!(
         language.as_str(),
         "auto" | "all" | "any" | "multi" | "multilingual" | "*"

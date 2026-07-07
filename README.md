@@ -4,13 +4,13 @@ VoxFlow превращает речь в текст и вставляет рез
 чат, браузер, документ, IDE или окно Codex. По умолчанию он работает локально,
 а облачные провайдеры включаются только в формате BYOK — со своим ключом.
 
-![status](https://img.shields.io/badge/platform-Windows-blue) ![version](https://img.shields.io/badge/version-1.0.7-green) ![license](https://img.shields.io/badge/license-proprietary-red) ![privacy](https://img.shields.io/badge/privacy-local%20or%20BYOK-orange)
+![status](https://img.shields.io/badge/platform-Windows-blue) ![version](https://img.shields.io/badge/version-1.0.8-green) ![license](https://img.shields.io/badge/license-proprietary-red) ![privacy](https://img.shields.io/badge/privacy-local%20or%20BYOK-orange)
 
 VoxFlow — proprietary product by Nezeronxer. The source code is visible for
 review only; copying, redistribution, rebranding, resale, forks, clones and
 derivative products are prohibited without written permission. See [LICENSE](LICENSE).
 
-## Что умеет v1.0.7
+## Что умеет v1.0.8
 
 - Hold-to-talk и toggle-диктовка через глобальную горячую клавишу.
 - Автообновление через GitHub Releases: VoxFlow сам проверяет новую версию,
@@ -22,6 +22,8 @@ derivative products are prohibited without written permission. See [LICENSE](LIC
 - Scratchpad и transforms для локальной проверки текста перед вставкой.
 - Current-app detector, test insert sandbox и API health center.
 - Более надёжная финальная вставка на Windows 10 через нативный SendInput для Ctrl+V/Ctrl+C.
+- Более стабильное русское распознавание в auto/Whisper-режиме: VoxFlow подтягивает
+  GigaAM и выбирает его финальный текст, когда Whisper auto уходит не в тот язык.
 - Мультиязычное локальное STT по умолчанию, cloud STT и rewrite только при настройке BYOK.
 - Личный словарь, сниппеты, исправления, история и статистика.
 
@@ -30,7 +32,7 @@ derivative products are prohibited without written permission. See [LICENSE](LIC
 Локальный release installer собирается сюда:
 
 ```powershell
-installer\Output\VoxFlow-Setup-1.0.7.exe
+installer\Output\VoxFlow-Setup-1.0.8.exe
 ```
 
 Установка идёт в профиль текущего пользователя:
@@ -116,7 +118,7 @@ plain `cargo build --release`, иначе WebView может искать dev se
 
 ## Локальный QA перед публикацией
 
-Минимальный gate для v1.0.7:
+Минимальный gate для v1.0.8:
 
 ```powershell
 cd "C:\Моя папка\wispr flow\voxflow"

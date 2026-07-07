@@ -299,6 +299,17 @@ fn is_auto_language_alias(language: &str) -> bool {
     )
 }
 
+fn is_russian_language(language: &str) -> bool {
+    matches!(
+        language.trim().to_ascii_lowercase().as_str(),
+        "ru" | "russian"
+    )
+}
+
+fn language_can_use_gigaam(language: &str) -> bool {
+    is_russian_language(language) || is_auto_language_alias(language)
+}
+
 fn local_route(s: &Settings) -> LocalRoute {
     let parakeet_ready = crate::parakeet::dir_ready(&paths::parakeet_dir());
     local_route_with_parakeet(s, parakeet_ready)
@@ -359,6 +370,13 @@ fn prefer_gigaam_for_auto(whisper_text: &str, gigaam_text: &str) -> bool {
     // Типичный сбой whisper auto на русской речи: короткая латинская фраза
     // вроде "After" / "Państwo, unze" вместо полноценной русской диктовки.
     !has_cyrillic(w) && gw >= 3 && (ww <= 2 || gw >= ww.saturating_mul(2))
+}
+
+fn prefer_gigaam_for_language(language: &str, whisper_text: &str, gigaam_text: &str) -> bool {
+    if is_russian_language(language) {
+        return !gigaam_text.trim().is_empty() && crate::parakeet::is_mostly_cyrillic(gigaam_text);
+    }
+    is_auto_language_alias(language) && prefer_gigaam_for_auto(whisper_text, gigaam_text)
 }
 
 const DEFAULT_MULTILINGUAL_PROMPT: &str = "Multilingual speech recognition. Preserve Russian, English and other language switches. Use punctuation. Keep technical terms such as VoxFlow, Tauri, whisper.cpp and Codex.";
@@ -448,9 +466,9 @@ fn warmup(ctx: EngineCtx) {
         }
         LocalRoute::Whisper => {}
     }
-    if s.language == "auto"
-        && s.engine == "gigaam"
-        && crate::gigaam::dir_ready(&paths::gigaam_dir())
+    if crate::gigaam::dir_ready(&paths::gigaam_dir())
+        && (is_russian_language(&s.language)
+            || (is_auto_language_alias(&s.language) && s.engine == "gigaam"))
     {
         warm_gigaam(&ctx);
     }
@@ -648,12 +666,15 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
     // Сегментная схема: VAD находит паузы; завершённые сегменты фиксируются
     // (committed растёт монотонно по построению), активный сегмент
     // перераспознаётся каждый тик (volatile, серый). По тишине ASR не гоняем.
-    if s.language == "auto" && s.engine == "gigaam" {
+    if crate::gigaam::dir_ready(&paths::gigaam_dir())
+        && (is_russian_language(&s.language)
+            || (is_auto_language_alias(&s.language) && s.engine == "gigaam"))
+    {
         if ensure_gigaam(ctx, &s).is_ok() {
-            // Auto сохраняет все языки в финале, но русскому live-preview нужен
-            // быстрый и сильный движок. Whisper auto слишком медленно обновлял
-            // кружок, а Parakeet давал мусор по русской речи. Поэтому в auto
-            // показываем быстрый GigaAM-preview только в кружке (без live-вставки).
+            // Auto/ru сохраняет выбранный финальный маршрут, но русскому live-preview
+            // нужен быстрый и сильный движок. Whisper auto слишком медленно обновлял
+            // кружок, а Parakeet давал мусор по русской речи. Поэтому, если GigaAM
+            // уже доступен, показываем быстрый GigaAM-preview в кружке без live-вставки.
             let mut preview_settings = s.clone();
             preview_settings.stream_mode = "never".into();
             start_local_partial_loop(
@@ -669,7 +690,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
             );
             return;
         }
-        dbg_log("partial: auto+gigaam preview недоступен — пробуем whisper-стрим");
+        dbg_log("partial: ru/auto GigaAM-preview недоступен — пробуем основной стрим");
     }
     match local_route(&s) {
         LocalRoute::GigaAm => {
@@ -2910,6 +2931,9 @@ fn whisper_model_installed(s: &Settings) -> bool {
 /// true, если выбранному маршруту нечем распознавать. Для быстрых RU/EN моделей
 /// допускаем whisper fallback; для остальных языков обязательна whisper-модель.
 fn no_model_installed(s: &Settings) -> bool {
+    if language_can_use_gigaam(&s.language) && crate::gigaam::dir_ready(&paths::gigaam_dir()) {
+        return false;
+    }
     let whisper_ready = || whisper_model_installed(s);
     match local_route(s) {
         LocalRoute::GigaAm => !crate::gigaam::dir_ready(&paths::gigaam_dir()) && !whisper_ready(),
@@ -3242,8 +3266,7 @@ fn local_asr(
         hint_parakeet_once(&ctx.app);
     }
     if route == LocalRoute::Whisper
-        && s.engine == "gigaam"
-        && is_auto_language_alias(&s.language)
+        && language_can_use_gigaam(&s.language)
         && !whisper_model_installed(s)
         && crate::gigaam::dir_ready(&paths::gigaam_dir())
     {
@@ -3286,10 +3309,7 @@ fn local_asr(
         let _g = ctx.asr_lock.lock();
         local_transcribe(ctx, s, dict, wav)?
     };
-    if s.language == "auto"
-        && s.engine == "gigaam"
-        && crate::gigaam::dir_ready(&paths::gigaam_dir())
-    {
+    if language_can_use_gigaam(&s.language) && crate::gigaam::dir_ready(&paths::gigaam_dir()) {
         match ensure_gigaam(ctx, s) {
             Ok(()) => {
                 let mut guard = ctx.gigaam.lock();
@@ -3297,10 +3317,10 @@ fn local_asr(
                     match local_transcribe_long(&ctx.vad_final, samples_16k, &mut |seg| {
                         g.transcribe(seg)
                     }) {
-                        Ok(t) if prefer_gigaam_for_auto(&whisper_text, &t) => {
+                        Ok(t) if prefer_gigaam_for_language(&s.language, &whisper_text, &t) => {
                             emit_stt_mode(&ctx.app, "gigaam", false);
                             dbg_log(&format!(
-                                "auto: выбран GigaAM вместо whisper auto (whisper_len={}, gigaam_len={})",
+                                "ru/auto: выбран GigaAM вместо whisper (whisper_len={}, gigaam_len={})",
                                 whisper_text.chars().count(),
                                 t.chars().count()
                             ));
@@ -3591,6 +3611,29 @@ mod seg_tests {
         ));
         assert!(prefer_gigaam_for_auto("After", "Исправь это пожалуйста"));
         assert!(!prefer_gigaam_for_auto(
+            "please update the prompt",
+            "Пожалуйста обнови промпт"
+        ));
+    }
+
+    #[test]
+    fn explicit_russian_prefers_gigaam_over_weaker_whisper_text() {
+        assert!(prefer_gigaam_for_language(
+            "ru",
+            "Пользователь говорит текст",
+            "Пользователь говорит обычный русский текст"
+        ));
+        assert!(!prefer_gigaam_for_language(
+            "ru",
+            "Пользователь говорит текст",
+            "please update the prompt"
+        ));
+    }
+
+    #[test]
+    fn auto_language_does_not_replace_clear_english_with_gigaam() {
+        assert!(!prefer_gigaam_for_language(
+            "auto",
             "please update the prompt",
             "Пожалуйста обнови промпт"
         ));
