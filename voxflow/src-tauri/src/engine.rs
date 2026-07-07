@@ -2809,7 +2809,7 @@ fn adaptive_prompt(db: &Arc<Mutex<Connection>>) -> Option<String> {
     if v.is_empty() {
         return None;
     }
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|item| std::cmp::Reverse(item.1));
     let top: Vec<String> = v.into_iter().take(40).map(|(w, _)| w).collect();
     Some(top.join(" "))
 }
