@@ -1,32 +1,23 @@
-# VoxFlow v1.0.7
+# VoxFlow v1.0.8
 
 ## Highlights
 
-- Fixed intermittent final-text insertion failures on Windows 10 by sending paste/copy shortcuts through native `SendInput` virtual-key events instead of the cross-platform `enigo` chord path.
-- Kept the existing safe clipboard flow: VoxFlow still writes the recognized text to clipboard, preserves the no-double-inject invariant after `Ctrl+V`, and leaves the final dictation text available for manual paste if the target app still refuses the shortcut.
-- The change is scoped to Windows `Ctrl+V`/`Ctrl+C` shortcut emission; non-Windows paths and text typing behavior are unchanged.
+- Fixed a regression-looking Russian dictation path on Windows where fresh/default settings (`language=auto`, `engine=whisper_server`) could keep using Whisper auto even when the stronger Russian GigaAM model was available.
+- VoxFlow now auto-downloads GigaAM for Russian/auto local setups and uses it as the final Russian fallback when Whisper auto returns the wrong language or a weaker Russian transcript.
+- The GitHub Actions release workflow now provisions ignored runtime resources itself: whisper.cpp v1.8.6 CPU/CUDA sidecars and Silero VAD are fetched during the Windows build before packaging the Inno installer.
 
 ## Release Artifact
 
-- `VoxFlow-Setup-1.0.7.exe`
-- Size: `289082143` bytes
-- SHA256: `29195CCE0FD4DD1BC51B0D47B1B68AD2F1BA9796B0CA3FED28B00EFF97DE4DE0`
-- Built from tag `v1.0.7` in the verified local Windows release environment.
+- `VoxFlow-Setup-1.0.8.exe`
+- Built from tag `v1.0.8` by the GitHub Actions Windows installer workflow.
 
 ## Verified For This Build
 
-- `cargo fmt --manifest-path src-tauri\Cargo.toml --check` — OK.
-- `cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings` — OK.
-- `cargo test --manifest-path src-tauri\Cargo.toml --lib` — OK, 147 passed, 5 ignored.
-- `npm run build` — OK.
-- `npm run tauri -- build --no-bundle` — OK, release exe built as `voxflow v1.0.7`.
-- Inno Setup 6.7.1 compile — OK, created `VoxFlow-Setup-1.0.7.exe`.
-- Installed-app Windows QA — OK: silent install over `%LOCALAPPDATA%\\VoxFlow`, installed exe hash matched release exe, registry `Version=1.0.7`, app launched as `%LOCALAPPDATA%\\VoxFlow\\voxflow.exe`.
-- Windows paste smoke — OK: clipboard text pasted into a fresh Notepad tab via `Ctrl+V`; text was visible and verified.
+- `cargo fmt --manifest-path voxflow/src-tauri/Cargo.toml --all -- --check` — OK on the local macOS checkout.
 - `git diff --check` — OK.
+- Full Rust tests, clippy, frontend build, Windows Tauri build, Inno packaging, installer asset size, and SHA256 are produced by the tag workflow.
 
 ## Known Limits
 
 - Some ASR e2e tests are opt-in and ignored by default because they require local models, private WAV fixtures, or network/proxy access.
-- GitHub Actions installer workflow still needs an explicit runtime-resource provisioning step; clean GitHub checkout does not contain ignored `src-tauri/resources` assets required by Tauri resource globs.
 - The Windows installer is unsigned unless a signing certificate is added.
