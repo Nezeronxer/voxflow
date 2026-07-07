@@ -458,7 +458,7 @@ pub fn trim_silence(samples: &[f32], rate: u32) -> Vec<f32> {
     };
 
     // Поля ~150 мс.
-    let margin = (rate as usize * 150 / 1000).max(0);
+    let margin = rate as usize * 150 / 1000;
 
     let start = (first * frame).saturating_sub(margin);
     let end = ((last + 1) * frame + margin).min(samples.len());
