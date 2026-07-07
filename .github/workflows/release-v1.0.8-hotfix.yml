@@ -1,0 +1,344 @@
+name: Release VoxFlow v1.0.8 Hotfix
+
+on:
+  push:
+    branches:
+      - 'codex/windows-10-dictation-reliability'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply v1.0.8 source patch and publish commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $patchGzipB64 = @'
+          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
+          '@
+          $compressed = [System.Convert]::FromBase64String(($patchGzipB64 -replace "\s", ""))
+          $inputStream = [System.IO.MemoryStream]::new($compressed)
+          $gzipStream = [System.IO.Compression.GZipStream]::new($inputStream, [System.IO.Compression.CompressionMode]::Decompress)
+          $outputStream = [System.IO.MemoryStream]::new()
+          $gzipStream.CopyTo($outputStream)
+          $gzipStream.Dispose()
+          $inputStream.Dispose()
+          $patch = [System.Text.Encoding]::UTF8.GetString($outputStream.ToArray())
+          $outputStream.Dispose()
+          $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+          [System.IO.File]::WriteAllText("voxflow-v1.0.8.patch", $patch, $utf8NoBom)
+          git apply --whitespace=nowarn voxflow-v1.0.8.patch
+          git rm .github/workflows/release-v1.0.8-hotfix.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git status --short
+          git commit -m "Release VoxFlow v1.0.8 Windows reliability"
+          git push origin HEAD:codex/windows-10-dictation-reliability
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Install frontend dependencies
+        working-directory: voxflow
+        run: npm ci
+
+      - name: Frontend build
+        working-directory: voxflow
+        run: npm run build
+
+      - name: NPM high-severity audit
+        working-directory: voxflow
+        run: npm audit --audit-level=high
+
+      - name: Fetch bundled runtime resources
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $runtimeRoot = "voxflow/src-tauri/resources"
+          $cpuDest = Join-Path $runtimeRoot "whisper/Release"
+          $cudaDest = Join-Path $runtimeRoot "whisper-cuda/Release"
+          $vadDest = Join-Path $runtimeRoot "vad"
+          New-Item -ItemType Directory -Force -Path $cpuDest, $cudaDest, $vadDest | Out-Null
+
+          $tmp = Join-Path $env:RUNNER_TEMP "voxflow-runtime"
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          $releaseBase = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.6"
+
+          $cpuZip = Join-Path $tmp "whisper-bin-x64.zip"
+          $cudaZip = Join-Path $tmp "whisper-cublas-12.4.0-bin-x64.zip"
+          curl.exe -L --fail --retry 3 --output $cpuZip "$releaseBase/whisper-bin-x64.zip"
+          curl.exe -L --fail --retry 3 --output $cudaZip "$releaseBase/whisper-cublas-12.4.0-bin-x64.zip"
+
+          $cpuExtract = Join-Path $tmp "cpu"
+          $cudaExtract = Join-Path $tmp "cuda"
+          Expand-Archive -Path $cpuZip -DestinationPath $cpuExtract -Force
+          Expand-Archive -Path $cudaZip -DestinationPath $cudaExtract -Force
+
+          $cpuFiles = @(
+            "ggml.dll",
+            "ggml-base.dll",
+            "ggml-cpu.dll",
+            "whisper.dll",
+            "whisper-cli.exe",
+            "whisper-server.exe"
+          )
+          foreach ($file in $cpuFiles) {
+            Copy-Item -Force (Join-Path $cpuExtract "Release/$file") (Join-Path $cpuDest $file)
+          }
+
+          $cudaFiles = @(
+            "cublas64_12.dll",
+            "cublasLt64_12.dll",
+            "cudart64_12.dll",
+            "ggml.dll",
+            "ggml-base.dll",
+            "ggml-cpu.dll",
+            "ggml-cuda.dll",
+            "nvrtc-builtins64_124.dll",
+            "nvrtc64_120_0.dll",
+            "whisper.dll",
+            "whisper-cli.exe",
+            "whisper-server.exe"
+          )
+          foreach ($file in $cudaFiles) {
+            Copy-Item -Force (Join-Path $cudaExtract "Release/$file") (Join-Path $cudaDest $file)
+          }
+
+          $vadModel = Join-Path $vadDest "silero_vad.onnx"
+          curl.exe -L --fail --retry 3 --output $vadModel "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx"
+
+      - name: Rust format check
+        working-directory: voxflow
+        run: cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check
+
+      - name: Rust clippy
+        working-directory: voxflow
+        run: cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
+
+      - name: Rust unit tests
+        working-directory: voxflow
+        run: cargo test --manifest-path src-tauri\Cargo.toml --lib
+
+      - name: Verify bundled runtime resources
+        shell: pwsh
+        run: |
+          $required = @(
+            "voxflow/src-tauri/resources/whisper/Release/whisper-cli.exe",
+            "voxflow/src-tauri/resources/whisper/Release/whisper-server.exe",
+            "voxflow/src-tauri/resources/vad/silero_vad.onnx"
+          )
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          if ($missing) {
+            $missing | ForEach-Object { Write-Error "Missing bundled runtime resource: $_" }
+            throw "Bundled runtime resources are required before building the installer."
+          }
+
+      - name: Build Tauri app (no bundle)
+        working-directory: voxflow
+        run: npx tauri build --no-bundle
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y
+
+      - name: Compile Inno Setup installer
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\VoxFlow.iss'
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VoxFlow-Setup
+          path: installer\Output\*.exe
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = "v1.0.8"
+          $target = (git rev-parse HEAD).Trim()
+          $installer = Get-ChildItem installer\Output\VoxFlow-Setup-*.exe | Select-Object -First 1
+          if (-not $installer) {
+            throw "Installer artifact was not produced."
+          }
+
+          $releaseExists = $false
+          try {
+            gh release view $tag *> $null
+            if ($LASTEXITCODE -eq 0) { $releaseExists = $true }
+          } catch {
+            $releaseExists = $false
+          }
+
+          if ($releaseExists) {
+            gh release edit $tag --title "VoxFlow $tag" --notes-file RELEASE_NOTES.md
+            gh release upload $tag $installer.FullName --clobber
+          } else {
+            gh release create $tag $installer.FullName --target $target --title "VoxFlow $tag" --notes-file RELEASE_NOTES.md
+          }
