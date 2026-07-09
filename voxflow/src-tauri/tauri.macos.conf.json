@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "resources": [
+      "resources/whisper-darwin-arm64/*",
+      "resources/whisper-darwin-x64/*",
+      "resources/vad/*"
+    ]
+  }
+}

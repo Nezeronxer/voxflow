@@ -93,8 +93,13 @@ export interface UpdateInstallResult {
   message: string;
 }
 
+export const DEFAULT_HOTKEY =
+  typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform)
+    ? "MetaRight"
+    : "ControlRight";
+
 export const DEFAULT_SETTINGS: Settings = {
-  hotkey: "ControlRight",
+  hotkey: DEFAULT_HOTKEY,
   improve_hotkey: "F8",
   mode: "hold",
   input_device: "",

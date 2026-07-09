@@ -19,7 +19,9 @@
 //! к инжектору) — воркер не трогает enigo/clipboard, а пишет задания в DRY_LOG.
 
 use anyhow::{anyhow, Result};
-use enigo::{Direction, Enigo, Key, Keyboard, Settings as ESettings};
+#[cfg(not(target_os = "macos"))]
+use enigo::{Direction, Key};
+use enigo::{Enigo, Keyboard, Settings as ESettings};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, OnceLock};
@@ -27,6 +29,82 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[cfg(target_os = "macos")]
+mod macos_keys {
+    use anyhow::{anyhow, Result};
+    use std::ffi::c_void;
+    use std::ptr;
+    use std::thread;
+    use std::time::Duration;
+
+    type CGEventRef = *mut c_void;
+
+    const K_CG_HID_EVENT_TAP: u32 = 0;
+    const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
+    const KEY_COMMAND: u16 = 55;
+    pub const KEY_C: u16 = 8;
+    pub const KEY_V: u16 = 9;
+    pub const KEY_BACKSPACE: u16 = 51;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn CGEventCreateKeyboardEvent(
+            source: *const c_void,
+            virtual_key: u16,
+            key_down: bool,
+        ) -> CGEventRef;
+        fn CGEventSetFlags(event: CGEventRef, flags: u64);
+        fn CGEventPost(tap: u32, event: CGEventRef);
+        fn CFRelease(cf: *const c_void);
+    }
+
+    fn ensure_post_event_access() -> Result<()> {
+        if crate::macos_permissions::post_event_allowed() {
+            return Ok(());
+        }
+        crate::macos_permissions::request_post_event_once();
+        if crate::macos_permissions::post_event_allowed() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "нет разрешения macOS Accessibility: включите VoxFlow в System Settings -> Privacy & Security -> Accessibility"
+            ))
+        }
+    }
+
+    fn post_key(key: u16, down: bool, flags: u64) -> Result<()> {
+        let event = unsafe { CGEventCreateKeyboardEvent(ptr::null(), key, down) };
+        if event.is_null() {
+            return Err(anyhow!("CGEventCreateKeyboardEvent failed for key {key}"));
+        }
+        unsafe {
+            CGEventSetFlags(event, flags);
+            CGEventPost(K_CG_HID_EVENT_TAP, event);
+            CFRelease(event as *const c_void);
+        }
+        Ok(())
+    }
+
+    pub fn command_chord(key: u16) -> Result<()> {
+        ensure_post_event_access()?;
+        post_key(KEY_COMMAND, true, K_CG_EVENT_FLAG_MASK_COMMAND)?;
+        thread::sleep(Duration::from_millis(2));
+        post_key(key, true, K_CG_EVENT_FLAG_MASK_COMMAND)?;
+        thread::sleep(Duration::from_millis(2));
+        post_key(key, false, K_CG_EVENT_FLAG_MASK_COMMAND)?;
+        thread::sleep(Duration::from_millis(2));
+        post_key(KEY_COMMAND, false, 0)?;
+        Ok(())
+    }
+
+    pub fn click_key(key: u16) -> Result<()> {
+        ensure_post_event_access()?;
+        post_key(key, true, 0)?;
+        thread::sleep(Duration::from_millis(1));
+        post_key(key, false, 0)
+    }
+}
 
 // ─────────────────────────── Очередь и воркер ───────────────────────────
 
@@ -232,18 +310,38 @@ fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<
                     }
                     // если paste не сработал — пробуем печать
                     Err(e) => {
-                        log::warn!("paste failed ({e}), fallback to type");
-                        (try_type(enigo, text).map(|_| CmdResult::Done), restore)
+                        #[cfg(target_os = "macos")]
+                        {
+                            return (Err(e), restore);
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            log::warn!("paste failed ({e}), fallback to type");
+                            (try_type(enigo, text).map(|_| CmdResult::Done), restore)
+                        }
                     }
                 }
             }
         },
-        Cmd::Incr { prev, next } => (
-            enigo_of(enigo)
-                .and_then(|e| incremental_keys(e, prev, next))
-                .map(|_| CmdResult::Done),
-            None,
-        ),
+        Cmd::Incr { prev, next } => {
+            #[cfg(target_os = "macos")]
+            {
+                let restore = clipboard_snapshot();
+                (
+                    macos_incremental_keys(prev, next).map(|_| CmdResult::Done),
+                    restore,
+                )
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                (
+                    enigo_of(enigo)
+                        .and_then(|e| incremental_keys(e, prev, next))
+                        .map(|_| CmdResult::Done),
+                    None,
+                )
+            }
+        }
         Cmd::SetClipboard { text } => (clipboard_set_retry(text).map(|_| CmdResult::Done), None),
         Cmd::CopySelection => run_copy_selection(enigo),
     }
@@ -276,10 +374,18 @@ fn has_line_break(text: &str) -> bool {
 /// содержимое буфера, а не нажатие клавиши. Однострочный текст — метод как
 /// задан, поведение прежнее.
 fn effective_method<'a>(text: &str, method: &'a str) -> &'a str {
-    if has_line_break(text) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (text, method);
         "clipboard"
-    } else {
-        method
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        if has_line_break(text) {
+            "clipboard"
+        } else {
+            method
+        }
     }
 }
 
@@ -371,6 +477,7 @@ fn type_text(e: &mut Enigo, text: &str) -> Result<()> {
 /// Сведение prev → next клавишами. Счёт ведём по СИМВОЛАМ (chars), не по байтам —
 /// для кириллицы один Backspace удаляет одну букву. Общий префикс ищем zip-ом
 /// итераторов char, без срезов байт.
+#[cfg(not(target_os = "macos"))]
 fn incremental_keys(e: &mut Enigo, prev: &str, next: &str) -> Result<()> {
     // Длина общего префикса в символах.
     let mut common = 0usize;
@@ -399,6 +506,33 @@ fn incremental_keys(e: &mut Enigo, prev: &str, next: &str) -> Result<()> {
     // Допечатываем новый хвост.
     if !suffix.is_empty() {
         e.text(&suffix).map_err(|e| anyhow!("type suffix: {e}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_incremental_keys(prev: &str, next: &str) -> Result<()> {
+    let mut common = 0usize;
+    for (a, b) in prev.chars().zip(next.chars()) {
+        if a == b {
+            common += 1;
+        } else {
+            break;
+        }
+    }
+
+    let prev_len = prev.chars().count();
+    let backspaces = prev_len - common;
+    let suffix: String = next.chars().skip(common).collect();
+
+    for _ in 0..backspaces {
+        macos_keys::click_key(macos_keys::KEY_BACKSPACE)?;
+    }
+    if !suffix.is_empty() {
+        clipboard_set_retry(&suffix)?;
+        thread::sleep(Duration::from_millis(25));
+        macos_keys::command_chord(macos_keys::KEY_V)?;
+        thread::sleep(Duration::from_millis(15));
     }
     Ok(())
 }
@@ -490,48 +624,69 @@ fn paste_text(
     restore_out: &mut Option<ClipSnapshot>,
     restore_previous: bool,
 ) -> Result<()> {
-    // Снимок текущего буфера: текст ИЛИ картинка (best-effort: пустой/нечитаемый
-    // формат — нечего восстанавливать, см. ClipSnapshot).
-    let prev = clipboard_snapshot().or_else(|| Some(ClipSnapshot::Text(String::new())));
+    #[cfg(target_os = "macos")]
+    let _ = enigo_slot;
+    // Снимок текущего буфера нужен только когда мы собираемся вернуть прежний
+    // clipboard. Финальная диктовка оставляет свой текст в буфере, поэтому
+    // пропускает этот лишний и иногда дорогой шаг.
+    let prev = if restore_previous {
+        clipboard_snapshot().or_else(|| Some(ClipSnapshot::Text(String::new())))
+    } else {
+        None
+    };
 
     // Положить наш текст (с ретраями ×3 по 30мс — см. clipboard_set_retry).
     clipboard_set_retry(text)?;
-    // Дать ОС увидеть новый буфер до Ctrl+V (срезано с 40мс — set_text синхронен).
+    // Дать ОС увидеть новый буфер до Ctrl+V. На macOS set_text синхронен, поэтому
+    // длинная пауза здесь только замедляет финальную вставку.
+    #[cfg(target_os = "macos")]
+    thread::sleep(Duration::from_millis(8));
+    #[cfg(not(target_os = "macos"))]
     thread::sleep(Duration::from_millis(25));
 
     // Послать Ctrl+V (Cmd+V на macOS) в активное окно.
     #[cfg(target_os = "macos")]
-    let modkey = Key::Meta;
-    #[cfg(not(target_os = "macos"))]
-    let modkey = Key::Control;
-    // V шлём РАСКЛАДКО-НЕЗАВИСИМО по virtual-key code, иначе на русской раскладке
-    // enigo не может смаппить Unicode('v') в VK и тихо впрыскивает 'v' как
-    // KEYEVENTF_UNICODE-символ, который Windows не считает частью Ctrl-аккорда —
-    // и вставка не срабатывает. Key::Other(VK) на Windows = сырой virtual-key.
-    #[cfg(windows)]
-    let vkey = Key::Other(0x56); // VK_V
-    #[cfg(not(windows))]
-    let vkey = Key::Unicode('v');
-
-    // --- до этой черты ошибки безопасны (V ещё не доставлена) ---
-    let e = enigo_of(enigo_slot)?;
-    e.key(modkey, Direction::Press)
-        .map_err(|e| anyhow!("mod down: {e}"))?;
-    if let Err(err) = e.key(vkey, Direction::Click) {
-        // V не доставлена — откатываем модификатор и сообщаем об ошибке, fallback в печать безопасен.
-        let _ = e.key(modkey, Direction::Release);
-        return Err(anyhow!("v: {err}"));
+    {
+        // Не используем Enigo для Cmd+V на macOS: его layout-зависимый путь
+        // вызывает HIToolbox/TSMGetInputSourceProperty с рабочего потока и на
+        // macOS 26 может падать через dispatch_assert_queue_fail. Виртуальный
+        // keycode 9 = V, layout-independent.
+        macos_keys::command_chord(macos_keys::KEY_V)?;
     }
-    // --- V ОТПРАВЛЕНА: дальше только best-effort, возвращаем строго Ok ---
-    // Отпускание модификатора best-effort: ошибка здесь НЕ должна вызвать дубль.
-    let _ = e.key(modkey, Direction::Release);
+    #[cfg(not(target_os = "macos"))]
+    {
+        #[cfg(target_os = "macos")]
+        let modkey = Key::Meta;
+        #[cfg(not(target_os = "macos"))]
+        let modkey = Key::Control;
+        // V шлём РАСКЛАДКО-НЕЗАВИСИМО по virtual-key code, иначе на русской раскладке
+        // enigo не может смаппить Unicode('v') в VK и тихо впрыскивает 'v' как
+        // KEYEVENTF_UNICODE-символ, который Windows не считает частью Ctrl-аккорда —
+        // и вставка не срабатывает. Key::Other(VK) на Windows = сырой virtual-key.
+        #[cfg(windows)]
+        let vkey = Key::Other(0x56); // VK_V
+        #[cfg(not(windows))]
+        let vkey = Key::Unicode('v');
 
-    // Короткий settle: дать окну принять аккорд (текст появляется в поле уже
-    // здесь). Прежний буфер возвращаем НЕ тут, а после ack в worker_loop —
-    // суммарная пауза V→restore остаётся 15+115=130мс (компромисс 140↔90:
-    // тяжёлые Electron/Chromium-приёмники читают буфер асинхронно и при 90мс
-    // изредка вставляли СТАРЫЙ буфер), но вызывающий больше эти 130мс не ждёт.
-    thread::sleep(Duration::from_millis(15));
+        // --- до этой черты ошибки безопасны (V ещё не доставлена) ---
+        let e = enigo_of(enigo_slot)?;
+        e.key(modkey, Direction::Press)
+            .map_err(|e| anyhow!("mod down: {e}"))?;
+        if let Err(err) = e.key(vkey, Direction::Click) {
+            // V не доставлена — откатываем модификатор и сообщаем об ошибке, fallback в печать безопасен.
+            let _ = e.key(modkey, Direction::Release);
+            return Err(anyhow!("v: {err}"));
+        }
+        // --- V ОТПРАВЛЕНА: дальше только best-effort, возвращаем строго Ok ---
+        // Отпускание модификатора best-effort: ошибка здесь НЕ должна вызвать дубль.
+        let _ = e.key(modkey, Direction::Release);
+    }
+
+    // Короткий settle нужен только перед восстановлением старого clipboard.
+    // Когда keep_clipboard=true, текст остаётся в буфере и ждать нечего.
+    if restore_previous {
+        thread::sleep(Duration::from_millis(15));
+    }
     if restore_previous {
         *restore_out = prev;
     }
@@ -549,6 +704,12 @@ fn run_copy_selection(enigo_slot: &mut Option<Enigo>) -> (Result<CmdResult>, Opt
     }
     thread::sleep(Duration::from_millis(25));
 
+    #[cfg(target_os = "macos")]
+    let copy_res = {
+        let _ = enigo_slot;
+        macos_keys::command_chord(macos_keys::KEY_C)
+    };
+    #[cfg(not(target_os = "macos"))]
     let copy_res = enigo_of(enigo_slot).and_then(send_copy_chord);
     if let Err(e) = copy_res {
         return (Err(e), Some(prev));
@@ -567,10 +728,8 @@ fn run_copy_selection(enigo_slot: &mut Option<Enigo>) -> (Result<CmdResult>, Opt
     (Ok(CmdResult::Selection(selected)), Some(prev))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn send_copy_chord(e: &mut Enigo) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let modkey = Key::Meta;
-    #[cfg(not(target_os = "macos"))]
     let modkey = Key::Control;
     #[cfg(windows)]
     let ckey = Key::Other(0x43); // VK_C
@@ -723,7 +882,11 @@ mod tests {
             "clipboard"
         );
         assert_eq!(effective_method("\n", "clipboard"), "clipboard");
-        // Однострочный текст — без изменений.
+        // На macOS любой полный ввод идёт clipboard+CGEvent: Enigo type/key
+        // вызывает layout API не с main queue и может уронить процесс.
+        #[cfg(target_os = "macos")]
+        assert_eq!(effective_method("привет", "type"), "clipboard");
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(effective_method("привет", "type"), "type");
         assert_eq!(effective_method("привет", "clipboard"), "clipboard");
     }

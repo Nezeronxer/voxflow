@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSAppleEventsUsageDescription</key>
+  <string>VoxFlow reads the active app and window title to adapt dictation output and paste text back into the selected app.</string>
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>VoxFlow listens for your configured push-to-talk hotkey while you dictate.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>VoxFlow uses the microphone to record dictation and turn your speech into text.</string>
+</dict>
+</plist>

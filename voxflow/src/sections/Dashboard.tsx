@@ -3,6 +3,8 @@ import { getStats, toggleDictation, subscribe } from "../api";
 import { PageHead, Icon, prettyHotkey } from "../ui";
 import type { Settings, Stats, OverlayStatus, TranscriptEvent } from "../types";
 
+type StatusPayload = OverlayStatus | { status?: OverlayStatus };
+
 export default function Dashboard({ settings }: { settings: Settings }) {
   const [stats, setStats] = useState<Stats>({
     today_words: 0,
@@ -34,8 +36,9 @@ export default function Dashboard({ settings }: { settings: Settings }) {
           getStats().then((s) => setStats(s));
         }
       }),
-      subscribe<string>("status", (e) => {
-        const v = e.payload;
+      subscribe<StatusPayload>("status", (e) => {
+        const p = e.payload;
+        const v = typeof p === "string" ? p : p?.status;
         if (v === "recording" || v === "transcribing" || v === "idle") {
           setStatus(v);
         }

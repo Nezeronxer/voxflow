@@ -3,10 +3,15 @@
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "macos")]
+pub const DEFAULT_HOTKEY: &str = "MetaRight";
+#[cfg(not(target_os = "macos"))]
+pub const DEFAULT_HOTKEY: &str = "ControlRight";
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
 pub struct Settings {
-    /// Клавиша hold-to-talk (rdev-имя), напр. "ControlRight".
+    /// Клавиша hold-to-talk (rdev-имя), напр. "ControlRight" / "MetaRight".
     pub hotkey: String,
     /// Клавиша улучшения выделенного текста. Работает одиночным нажатием.
     pub improve_hotkey: String,
@@ -145,7 +150,7 @@ pub struct AiPromptRule {
 impl Default for Settings {
     fn default() -> Self {
         Settings {
-            hotkey: "ControlRight".into(),
+            hotkey: DEFAULT_HOTKEY.into(),
             improve_hotkey: "F8".into(),
             mode: "hold".into(),
             input_device: String::new(),
@@ -201,6 +206,31 @@ impl Default for Settings {
 }
 
 impl Settings {
+    pub fn normalize_for_platform(&mut self) {
+        #[cfg(target_os = "macos")]
+        {
+            // До macOS-сборки 1.0.8 свежий default был Windows-style Right Ctrl.
+            // Мигрируем только этот legacy-default; явно выбранные пользователем
+            // клавиши вроде ControlLeft/Alt/F8 остаются как есть.
+            if self.hotkey == "ControlRight" {
+                self.hotkey = DEFAULT_HOTKEY.into();
+            }
+            // Старый macOS default `whisper_server + auto + large-v3-turbo` даёт
+            // слишком медленный финал и почти всегда таймаутит live-preview на
+            // локальной машине. Если быстрый русский GigaAM уже установлен,
+            // переводим только этот дефолтный профиль на GigaAM/RU. Явный выбор
+            // пользователя не трогаем.
+            if self.engine == "whisper_server"
+                && self.language == "auto"
+                && self.model == "ggml-large-v3-turbo-q5_0.bin"
+                && crate::gigaam::dir_ready(&crate::paths::gigaam_dir())
+            {
+                self.engine = "gigaam".into();
+                self.language = "ru".into();
+            }
+        }
+    }
+
     pub fn redacted_for_renderer(mut self) -> Self {
         self.ai_api_key.clear();
         self.oai_stt_key.clear();
@@ -349,10 +379,12 @@ fn rewrite_key_env_order(base_url: &str) -> [&'static str; 3] {
 }
 
 pub fn load(conn: &Connection) -> Settings {
-    match crate::db::kv_get(conn, "settings") {
+    let mut settings = match crate::db::kv_get(conn, "settings") {
         Some(j) => serde_json::from_str(&j).unwrap_or_default(),
         None => Settings::default(),
-    }
+    };
+    settings.normalize_for_platform();
+    settings
 }
 
 pub fn save(conn: &Connection, s: &Settings) -> anyhow::Result<()> {
@@ -388,6 +420,34 @@ mod tests {
         assert_eq!(s.hotkey, "ControlRight");
         assert!(s.auto_update_check);
         assert!(s.ai_prompt_rules.is_empty());
+    }
+
+    #[test]
+    fn default_hotkey_matches_platform() {
+        #[cfg(target_os = "macos")]
+        assert_eq!(Settings::default().hotkey, "MetaRight");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(Settings::default().hotkey, "ControlRight");
+    }
+
+    #[test]
+    fn platform_normalization_migrates_only_legacy_default_hotkey() {
+        let mut legacy = Settings {
+            hotkey: "ControlRight".into(),
+            ..Settings::default()
+        };
+        legacy.normalize_for_platform();
+        #[cfg(target_os = "macos")]
+        assert_eq!(legacy.hotkey, "MetaRight");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(legacy.hotkey, "ControlRight");
+
+        let mut chosen = Settings {
+            hotkey: "ControlLeft".into(),
+            ..Settings::default()
+        };
+        chosen.normalize_for_platform();
+        assert_eq!(chosen.hotkey, "ControlLeft");
     }
 
     #[test]

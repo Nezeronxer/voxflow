@@ -63,12 +63,98 @@ impl AppContext {
 }
 
 impl TargetFingerprint {
+    pub fn describe(&self) -> String {
+        format!(
+            "exe={} title_len={} window_id={}",
+            self.exe,
+            self.title.chars().count(),
+            self.window_id
+        )
+    }
+
+    pub fn is_own_app(&self) -> bool {
+        is_own_app_parts(&self.exe, &self.window_id)
+    }
+
+    pub fn is_transient_system_ui(&self) -> bool {
+        is_transient_system_ui_parts(&self.exe, &self.window_id)
+    }
+
+    pub fn is_usable_dictation_target(&self) -> bool {
+        !self.exe.is_empty() && !self.is_own_app() && !self.is_transient_system_ui()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn macos_pid(&self) -> Option<u32> {
+        value_from_window_id(&self.window_id, "pid=")?.parse().ok()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn macos_bundle_id(&self) -> Option<String> {
+        let bundle = value_from_window_id(&self.window_id, "bundle=")?;
+        if bundle.is_empty() {
+            None
+        } else {
+            Some(bundle.to_string())
+        }
+    }
+
     pub fn matches(&self, current: &AppContext) -> bool {
         if !self.window_id.is_empty() && !current.window_id.is_empty() {
             return self.exe == current.exe && self.window_id == current.window_id;
         }
         self.exe == current.exe && self.title == current.title
     }
+}
+
+impl AppContext {
+    pub fn is_own_app(&self) -> bool {
+        is_own_app_parts(&self.exe, &self.window_id)
+    }
+
+    pub fn is_transient_system_ui(&self) -> bool {
+        is_transient_system_ui_parts(&self.exe, &self.window_id)
+    }
+
+    pub fn is_usable_dictation_target(&self) -> bool {
+        !self.exe.is_empty() && !self.is_own_app() && !self.is_transient_system_ui()
+    }
+}
+
+fn is_own_app_parts(exe: &str, window_id: &str) -> bool {
+    exe.eq_ignore_ascii_case("voxflow")
+        || exe.eq_ignore_ascii_case("voxflow.exe")
+        || window_id.contains("bundle=com.nezeronxer.voxflow")
+}
+
+fn is_transient_system_ui_parts(exe: &str, window_id: &str) -> bool {
+    const BUNDLES: &[&str] = &[
+        "bundle=com.apple.UserNotificationCenter",
+        "bundle=com.apple.accessibility.universalAccessAuthWarn",
+        "bundle=com.apple.loginwindow",
+        "bundle=com.apple.systempreferences",
+        "bundle=com.apple.systemsettings",
+        "bundle=com.apple.SystemSettings",
+    ];
+    const EXES: &[&str] = &[
+        "usernotificationcenter",
+        "universalaccessauthwarn",
+        "loginwindow",
+        "system preferences",
+        "system settings",
+        "systemsettings",
+    ];
+    let exe = exe.trim().to_ascii_lowercase();
+    BUNDLES.iter().any(|b| window_id.contains(b))
+        || EXES.iter().any(|name| exe == *name || exe.contains(name))
+}
+
+#[cfg(target_os = "macos")]
+fn value_from_window_id<'a>(window_id: &'a str, key: &str) -> Option<&'a str> {
+    let start = window_id.find(key)? + key.len();
+    let rest = &window_id[start..];
+    let end = rest.find(';').unwrap_or(rest.len());
+    Some(&rest[..end])
 }
 
 /// Классифицирует приложение по имени exe и заголовку окна.
@@ -305,6 +391,7 @@ pub fn category_for(
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::category_for;
     use crate::settings::ProfileOverride;
@@ -541,37 +628,94 @@ pub fn detect() -> AppContext {
 /// на `osascript`; Windows-сборки это не касается.
 #[cfg(target_os = "macos")]
 pub fn detect() -> AppContext {
-    // Достаём имя фронтального приложения.
-    let app = run_osascript(
-        "tell application \"System Events\" to get name of first application process whose frontmost is true",
-    )
-    .unwrap_or_default();
-
-    // Заголовок окна — отдельным best-effort вызовом; ошибки/пустоту глотаем.
-    let title = if app.is_empty() {
-        String::new()
-    } else {
-        run_osascript(&format!(
-            "tell application \"System Events\" to tell process \"{}\" to get name of front window",
-            app.replace('"', "")
-        ))
-        .unwrap_or_default()
-    };
-
+    let snapshot = run_macos_context_script().unwrap_or_default();
+    let app = snapshot.app.trim().to_string();
+    let title = snapshot.title.trim().to_string();
     let exe = app.to_lowercase();
     let category = classify(&exe, &title.to_lowercase());
+    let window_id = snapshot.window_id();
     AppContext {
         exe,
         title,
-        window_id: String::new(),
+        window_id,
         category,
     }
 }
 
-/// Выполняет одну строку AppleScript через `osascript -e` и возвращает
-/// обрезанный stdout. Любая ошибка запуска/ненулевой код → `None`.
+#[derive(Default)]
+struct MacContextSnapshot {
+    app: String,
+    pid: String,
+    bundle: String,
+    title: String,
+    role: String,
+    subrole: String,
+    pos: String,
+    size: String,
+}
+
+impl MacContextSnapshot {
+    fn window_id(&self) -> String {
+        let pid = self.pid.trim();
+        if pid.is_empty() {
+            return String::new();
+        }
+        let mut parts = vec![format!("pid={pid}")];
+        if !self.bundle.trim().is_empty() {
+            parts.push(format!("bundle={}", self.bundle.trim()));
+        }
+        if !self.role.trim().is_empty() {
+            parts.push(format!("role={}", self.role.trim()));
+        }
+        if !self.subrole.trim().is_empty() {
+            parts.push(format!("subrole={}", self.subrole.trim()));
+        }
+        if !self.pos.trim().is_empty() {
+            parts.push(format!("pos={}", self.pos.trim()));
+        }
+        if !self.size.trim().is_empty() {
+            parts.push(format!("size={}", self.size.trim()));
+        }
+        parts.join(";")
+    }
+}
+
+/// Снимает контекст фронтального процесса одним AppleScript-вызовом.
+///
+/// Важно делать это атомарно: отдельные вызовы `osascript` иногда успевали увидеть
+/// уже другое frontmost-окно (например, собственный overlay VoxFlow). PID + frame
+/// дают macOS стабильный `window_id`, поэтому смена title во время распознавания
+/// больше не отменяет финальную вставку.
 #[cfg(target_os = "macos")]
-fn run_osascript(script: &str) -> Option<String> {
+fn run_macos_context_script() -> Option<MacContextSnapshot> {
+    let script = r#"
+tell application "System Events"
+  set p to first application process whose frontmost is true
+  set appName to name of p
+  set appPid to unix id of p as text
+  set bundleId to ""
+  try
+    set bundleId to bundle identifier of p
+  end try
+  set winTitle to ""
+  set winRole to ""
+  set winSubrole to ""
+  set winPos to ""
+  set winSize to ""
+  try
+    tell front window of p
+      set winTitle to name as text
+      set winRole to role as text
+      set winSubrole to subrole as text
+      set {x, y} to position
+      set {w, h} to size
+      set winPos to (x as text) & "," & (y as text)
+      set winSize to (w as text) & "x" & (h as text)
+    end tell
+  end try
+  return appName & linefeed & appPid & linefeed & bundleId & linefeed & winTitle & linefeed & winRole & linefeed & winSubrole & linefeed & winPos & linefeed & winSize
+end tell
+"#;
     let out = std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
@@ -580,11 +724,26 @@ fn run_osascript(script: &str) -> Option<String> {
     if !out.status.success() {
         return None;
     }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() {
+    let s = String::from_utf8_lossy(&out.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    if s.trim().is_empty() {
         None
     } else {
-        Some(s)
+        let parts: Vec<String> = s
+            .split('\n')
+            .map(|p| p.trim_end_matches('\r').to_string())
+            .collect();
+        Some(MacContextSnapshot {
+            app: parts.first().cloned().unwrap_or_default(),
+            pid: parts.get(1).cloned().unwrap_or_default(),
+            bundle: parts.get(2).cloned().unwrap_or_default(),
+            title: parts.get(3).cloned().unwrap_or_default(),
+            role: parts.get(4).cloned().unwrap_or_default(),
+            subrole: parts.get(5).cloned().unwrap_or_default(),
+            pos: parts.get(6).cloned().unwrap_or_default(),
+            size: parts.get(7).cloned().unwrap_or_default(),
+        })
     }
 }
 

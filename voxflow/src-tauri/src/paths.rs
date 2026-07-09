@@ -88,6 +88,15 @@ pub fn model_path(name: &str) -> PathBuf {
     models_dir().join(name)
 }
 
+#[cfg(target_os = "macos")]
+fn macos_whisper_resource_dir() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "whisper-darwin-arm64"
+    } else {
+        "whisper-darwin-x64"
+    }
+}
+
 /// Каталог моделей GigaAM (models/gigaam, ASCII-путь — ort открывает по wide,
 /// но единообразие с whisper-моделями дешевле, чем особые случаи).
 pub fn gigaam_dir() -> PathBuf {
@@ -140,11 +149,18 @@ const DEV_WHISPER_CUDA: &str = concat!(
 
 /// Есть ли NVIDIA-GPU с драйвером (наличие nvcuda.dll в System32).
 pub fn has_nvidia() -> bool {
-    let sys = std::env::var("SystemRoot").unwrap_or_else(|_| "C:/Windows".into());
-    std::path::Path::new(&sys)
-        .join("System32")
-        .join("nvcuda.dll")
-        .exists()
+    #[cfg(not(windows))]
+    {
+        false
+    }
+    #[cfg(windows)]
+    {
+        let sys = std::env::var("SystemRoot").unwrap_or_else(|_| "C:/Windows".into());
+        std::path::Path::new(&sys)
+            .join("System32")
+            .join("nvcuda.dll")
+            .exists()
+    }
 }
 
 /// Каталог с whisper-cli.exe / whisper-server.exe + DLL.
@@ -155,6 +171,22 @@ pub fn whisper_dir(app: &AppHandle) -> PathBuf {
     let gpu = has_nvidia();
     let res = app.path().resource_dir().ok();
     let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // macOS-бандл кладёт native whisper sidecar в resources/whisper-darwin-*.
+    // Ищем его первым, иначе fallback ниже упрётся в Windows .exe/DLL-ресурсы.
+    #[cfg(target_os = "macos")]
+    {
+        let dir = macos_whisper_resource_dir();
+        if let Some(r) = &res {
+            candidates.push(r.join("resources").join(dir));
+            candidates.push(r.join(dir));
+        }
+        candidates.push(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("resources")
+                .join(dir),
+        );
+    }
 
     // GPU-сборки имеют приоритет (и resource, и dev) над CPU.
     if gpu {
@@ -181,6 +213,15 @@ pub fn whisper_dir(app: &AppHandle) -> PathBuf {
 
 /// Dev-каталог whisper (для `--selftest` без Tauri-контекста): CUDA при наличии GPU.
 pub fn whisper_dir_standalone() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("resources")
+            .join(macos_whisper_resource_dir());
+        if p.join(whisper_cli_name()).exists() {
+            return p;
+        }
+    }
     if has_nvidia() {
         let p = PathBuf::from(DEV_WHISPER_CUDA);
         if p.join(whisper_cli_name()).exists() {

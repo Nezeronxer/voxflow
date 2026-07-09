@@ -1,15 +1,14 @@
 // Плавающий индикатор диктовки в стиле Aqua Voice (overlay-окно, url #/overlay).
 // Фон окна полностью прозрачный; пилюля по центру понизу, перетаскивается мышью
-// через data-tauri-drag-region на самой пилюле (декоративные дети получают
-// pointer-events:none, чтобы целью mousedown была пилюля; текстовая зона при
-// streaming — исключение: она интерактивна и drag не запускает).
+// из всей небольшой overlay-зоны. Короткий tap по самой пилюле вызывает диктовку,
+// движение мышью — перенос окна.
 //
 // Состояния пилюли (классы aq-* в overlay.css):
-//   idle   — мини-полоска 55×10, hover → 80×20 + тултип «Зажмите Right Ctrl»;
+//   idle   — мини-полоска 55×10, hover → 80×20 + тултип с текущей горячей клавишей;
 //   rec    — 110×37: орб с градиентом и glow от громкости + 12 баров ("level");
 //   stream — пришёл partial с текстом: до 400×~140, посимвольная печать (rAF);
 //   trans  — пилюля scale(.96), кольцо-спиннер поверх орба;
-//   done   — галочка на 900 мс после расшифровки → плавно обратно в idle;
+//   final  — короткая вспышка финального preview во время transcribing, без зависания после вставки;
 //   latch  — подтверждение двойного тапа: запись зафиксирована без удержания;
 //   notice — краткое предупреждение (no_model / error) поверх любого состояния.
 //
@@ -18,11 +17,14 @@
 // состояния (одиночный layout — допустимо). Громкость — JS-спринги на rAF,
 // пишем style баров/glow напрямую через ref'ы, БЕЗ setState на кадр (60 fps).
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { subscribe } from "./api";
+import { cursorPosition, getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
+import { getSettings, subscribe } from "./api";
 import FpsMeter from "./components/FpsMeter";
 import "./overlay.css";
+import { DEFAULT_HOTKEY } from "./types";
+import { prettyHotkey } from "./ui";
 import type {
   OverlayStatus,
   PartialEvent,
@@ -31,10 +33,11 @@ import type {
   LevelEvent,
   ErrorEvent as EngineErrorEvent,
   HotkeyLatchEvent,
+  Settings,
 } from "./types";
 
-// Режим пилюли = статус бэкенда + локальные надстройки (stream/done/notice).
-type PillMode = "idle" | "rec" | "stream" | "trans" | "done" | "latch" | "notice";
+// Режим пилюли = статус бэкенда + локальные надстройки (stream/notice).
+type PillMode = "idle" | "rec" | "stream" | "trans" | "latch" | "notice";
 
 // Контракт мультиязычности (RU/EN/auto): события "partial" и "status" МОГУТ
 // нести опциональное поле lang: "ru" | "en" | null — язык, определённый STT.
@@ -50,19 +53,30 @@ type PartialWithLang = PartialEvent & {
 };
 // "status": legacy-строка (текущий бэкенд) ЛИБО объект { status, lang }.
 type StatusPayload = string | { status?: string; lang?: DetectedLang };
+type DragPointer = {
+  id: number;
+  x: number;
+  y: number;
+  t: number;
+  dragging: boolean;
+  fromPill: boolean;
+  windowStart?: { x: number; y: number };
+  cursorStart?: { x: number; y: number };
+  raf?: number | null;
+};
 
 // Желаемый размер overlay-окна под каждый режим (ЛОГИЧЕСКИЕ px): пилюля + поля
-// под glow/тень; для idle/done — запас под hover-рост (80×20) и тултип сверху.
+// под glow/тень; для idle — запас под hover-рост (80×20) и тултип сверху.
 // Сообщается бэкенду командой overlay_box (реализует интегратор).
 const BOX: Record<PillMode, { w: number; h: number }> = {
   idle: { w: 220, h: 80 },
   rec: { w: 140, h: 64 },
   trans: { w: 176, h: 64 },
   stream: { w: 424, h: 168 },
-  done: { w: 220, h: 80 }, // запас под короткое «Готово»
   latch: { w: 300, h: 82 },
   notice: { w: 424, h: 92 },
 };
+const FINAL_PREVIEW_HOLD_MS = 360;
 
 // Раскладка громкости по 12 барам: центр громче краёв (сглаженный «холм» Aqua).
 const BAR_WEIGHTS = [0.5, 0.5, 0.7, 0.7, 1, 1, 1, 1, 0.8, 0.8, 0.6, 0.6];
@@ -80,15 +94,13 @@ export default function Overlay() {
   const [status, setStatus] = useState<OverlayStatus>("idle");
   // Зеркало статуса для rAF-цикла громкости (без пересоздания цикла на setState).
   const statusRef = useRef<OverlayStatus>("idle");
-  // done: галочка на 900 мс после transcribing→idle; отменяется новым recording.
-  const [done, setDone] = useState(false);
-  const doneTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // B3: окно настроек часто скрыто в трее, поэтому дублируем предупреждение
   // («выберите модель» / ошибка движка) в всегда-видимой пилюле (~3 c).
   const [notice, setNotice] = useState<string | null>(null);
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latchNotice, setLatchNotice] = useState<HotkeyLatchEvent | null>(null);
   const latchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const [hotkeyTip, setHotkeyTip] = useState(prettyHotkey(DEFAULT_HOTKEY));
   // D: метка «оффлайн» — облако было недоступно, сработал авто-fallback на
   // локальное распознавание ("stt_mode" offline=true). Сбрасывается на новой записи.
   const [offline, setOffline] = useState(false);
@@ -129,6 +141,8 @@ export default function Overlay() {
   const scrollRef = useRef<HTMLDivElement>(null);
   // Корневой узел пилюли — для замеров hit-rect (см. sendHit ниже).
   const pillRef = useRef<HTMLDivElement>(null);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const pointerRef = useRef<DragPointer | null>(null);
   // D (FPS): автоскролл хвоста — НЕ в useEffect([shown]) (там запись scrollTop на
   // КАЖДЫЙ символ форсит синхронный reflow). Вместо этого ставим флаг и сбрасываем
   // его одним rAF-тиком (≤1 запись scrollTop за кадр), коалесцируя пачку символов.
@@ -152,6 +166,16 @@ export default function Overlay() {
   useEffect(() => {
     document.body.classList.add("overlay-body");
     const unlisteners: Array<() => void> = [];
+    let alive = true;
+
+    getSettings().then((s) => {
+      if (alive) setHotkeyTip(prettyHotkey(s.hotkey));
+    });
+
+    const offSettings = subscribe<Settings>("settings_changed", (e) => {
+      const hotkey = e.payload?.hotkey;
+      if (typeof hotkey === "string") setHotkeyTip(prettyHotkey(hotkey));
+    });
 
     // Один rAF-тик автоскролла: пишем scrollTop максимум раз в кадр, даже если за
     // кадр проявилось несколько символов. Так forced layout случается ≤60 раз/сек,
@@ -311,12 +335,6 @@ export default function Overlay() {
       levelLastRef.current = 0;
     };
 
-    const clearDone = () => {
-      if (doneTimer.current) {
-        clearTimeout(doneTimer.current);
-        doneTimer.current = null;
-      }
-    };
     const clearLatch = () => {
       if (latchTimer.current) {
         clearTimeout(latchTimer.current);
@@ -325,8 +343,6 @@ export default function Overlay() {
       setLatchNotice(null);
     };
     const holdFinalPreview = () => {
-      clearDone();
-      setDone(false);
       if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
       finalHoldRef.current = true;
       setFinalHold(true);
@@ -335,7 +351,7 @@ export default function Overlay() {
         finalHoldRef.current = false;
         setFinalHold(false);
         if (statusRef.current === "idle") resetTextEngine();
-      }, 3000);
+      }, FINAL_PREVIEW_HOLD_MS);
     };
 
     // Применить lang из события: поля нет (undefined) — старый бэкенд, ничего
@@ -356,10 +372,7 @@ export default function Overlay() {
       setStatus(v);
 
       if (v === "recording") {
-        // Новая диктовка: отменяем done-галочку (двойной тап не мигает галочкой),
-        // сбрасываем метку «оффлайн» и поток печати прошлой записи.
-        clearDone();
-        setDone(false);
+        // Новая диктовка: сбрасываем метку «оффлайн» и поток печати прошлой записи.
         setOffline(false);
         // Язык прошлой диктовки не «бликует» в новой: бейдж скрыт до первого lang.
         setLang(null);
@@ -370,8 +383,6 @@ export default function Overlay() {
         rmsRef.current = 0;
         lastLevelAtRef.current = 0;
       } else if (v === "transcribing") {
-        clearDone();
-        setDone(false);
         // Финальная обработка/вставка началась: старое settled-«готово» больше
         // не должно висеть на экране. Пока backend готовит и вставляет текст,
         // показываем только явный spinner «Готовлю».
@@ -382,12 +393,11 @@ export default function Overlay() {
         // текст уже вставлен в целевое приложение, overlay должен свернуться.
         clearLatch();
         if (prev === "transcribing") {
-          clearDone();
-          setDone(false);
+          clearFinalHold();
           resetTextEngine();
         } else if (finalHoldRef.current) {
-          clearDone();
-          setDone(false);
+          clearFinalHold();
+          resetTextEngine();
         } else {
           resetTextEngine();
         }
@@ -409,10 +419,14 @@ export default function Overlay() {
       }
       const isFinalPreview = e.payload?.final === true;
       const isSettledPreview = e.payload?.settled === true;
-      if (statusRef.current === "transcribing") {
+      if (statusRef.current === "transcribing" && !isFinalPreview) {
         return;
       }
-      if ((isFinalPreview || isSettledPreview) && statusRef.current !== "recording") {
+      if (
+        (isFinalPreview || isSettledPreview) &&
+        statusRef.current !== "recording" &&
+        statusRef.current !== "transcribing"
+      ) {
         return;
       }
       if (!isFinalPreview && !isSettledPreview && finalHoldRef.current) {
@@ -503,34 +517,41 @@ export default function Overlay() {
       setOffline(e.payload?.offline === true);
     });
 
-    unlisteners.push(offStatus, offPartial, offLevel, offNoModel, offError, offHotkeyLatch, offSttMode);
+    unlisteners.push(
+      offSettings,
+      offStatus,
+      offPartial,
+      offLevel,
+      offNoModel,
+      offError,
+      offHotkeyLatch,
+      offSttMode,
+    );
 
     return () => {
+      alive = false;
       stopRaf();
       stopScrollRaf();
       stopLevelRaf();
       if (noticeTimer.current) clearTimeout(noticeTimer.current);
       if (latchTimer.current) clearTimeout(latchTimer.current);
       if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
-      clearDone();
       for (const fn of unlisteners) fn();
     };
   }, []);
 
   // Режим пилюли. notice поверх всего (запись при отсутствии модели не стартует,
-  // но юзера надо уведомить); done — короткое окно галочки после transcribing.
-  // stream — идёт запись И уже есть проявленный текст (shown реактивен).
+  // но юзера надо уведомить). stream — идёт запись И уже есть проявленный текст
+  // или пришёл короткий финальный preview во время transcribing.
   const mode: PillMode =
     notice != null
       ? "notice"
       : latchNotice != null
         ? "latch"
-        : status === "transcribing"
-        ? "trans"
         : finalHold && shown > 0
         ? "stream"
-        : done
-        ? "done"
+        : status === "transcribing"
+        ? "trans"
         : status === "recording"
             ? shown > 0
               ? "stream"
@@ -548,25 +569,23 @@ export default function Overlay() {
     }
   }, [mode]);
 
-  // Репорт hit-зоны: окно по умолчанию click-through, бэкенд включает мышь
-  // только когда курсор внутри прямоугольника ПИЛЮЛИ (overlay_hit, CSS px
-  // вьюпорта). ResizeObserver ловит смену размеров (режимы, hover-рост),
-  // довесок-таймер — смену позиции после ресайза окна (rect мог сдвинуться
-  // без изменения размеров пилюли). Debounce 80 мс.
+  // Репорт hit-зоны: окно по умолчанию click-through, бэкенд включает мышь,
+  // когда курсор внутри небольшого overlay-окна. Это даёт нормальную ручку для
+  // drag даже в idle, где чёрная полоска всего 55×10 и по ней легко промахнуться.
+  // Короткий tap по прозрачной зоне игнорируется; диктовку запускает tap по пилюле.
   useEffect(() => {
-    const el = pillRef.current;
+    const el = rootRef.current;
     if (!el) return;
     let t: ReturnType<typeof setTimeout> | null = null;
     const report = () => {
       if (t) clearTimeout(t);
       t = setTimeout(() => {
-        const r = el.getBoundingClientRect();
         try {
           void invoke("overlay_hit", {
-            x: r.x,
-            y: r.y,
-            w: r.width,
-            h: r.height,
+            x: 0,
+            y: 0,
+            w: window.innerWidth,
+            h: window.innerHeight,
           }).catch(() => {});
         } catch {
           /* команды может ещё не быть */
@@ -586,11 +605,15 @@ export default function Overlay() {
   // вьюпорте съезжает при том же размере — перемеряем по таймеру за CSS-переход.
   useEffect(() => {
     const id = setTimeout(() => {
-      const el = pillRef.current;
+      const el = rootRef.current;
       if (!el) return;
-      const r = el.getBoundingClientRect();
       try {
-        void invoke("overlay_hit", { x: r.x, y: r.y, w: r.width, h: r.height }).catch(() => {});
+        void invoke("overlay_hit", {
+          x: 0,
+          y: 0,
+          w: window.innerWidth,
+          h: window.innerHeight,
+        }).catch(() => {});
       } catch {
         /* нет команды — не страшно */
       }
@@ -603,9 +626,91 @@ export default function Overlay() {
   // условный рендер корня (иначе transition не сыграет и пилюля «мигнёт»).
   const showBars = mode === "rec" || mode === "trans";
   const showOrb = showBars || mode === "stream";
+  const applyManualDrag = async (p: DragPointer, requireActive = true) => {
+    if (!p.windowStart || !p.cursorStart) return;
+    const cur = await cursorPosition().catch(() => null);
+    if (!cur || (requireActive && pointerRef.current !== p)) return;
+    const x = Math.round(p.windowStart.x + (cur.x - p.cursorStart.x));
+    const y = Math.round(p.windowStart.y + (cur.y - p.cursorStart.y));
+    await getCurrentWindow().setPosition(new PhysicalPosition(x, y)).catch(() => {});
+  };
+  const scheduleManualDrag = (p: DragPointer) => {
+    if (p.raf != null) return;
+    p.raf = requestAnimationFrame(() => {
+      p.raf = null;
+      void applyManualDrag(p);
+    });
+  };
+  const onPillPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    const fromPill = !!pillRef.current?.contains(e.target as Node);
+    const state: DragPointer = {
+      id: e.pointerId,
+      x: e.clientX,
+      y: e.clientY,
+      t: performance.now(),
+      dragging: false,
+      fromPill,
+      raf: null,
+    };
+    pointerRef.current = state;
+    e.currentTarget.setPointerCapture?.(e.pointerId);
+    void Promise.all([getCurrentWindow().outerPosition(), cursorPosition()])
+      .then(([win, cur]) => {
+        if (pointerRef.current !== state) return;
+        state.windowStart = { x: win.x, y: win.y };
+        state.cursorStart = { x: cur.x, y: cur.y };
+        if (state.dragging) scheduleManualDrag(state);
+      })
+      .catch(() => {});
+  };
+  const onPillPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const p = pointerRef.current;
+    if (!p || p.id !== e.pointerId) return;
+    const dx = e.clientX - p.x;
+    const dy = e.clientY - p.y;
+    if (!p.dragging && Math.hypot(dx, dy) >= 4) {
+      p.dragging = true;
+    }
+    if (p.dragging) {
+      e.preventDefault();
+      scheduleManualDrag(p);
+    }
+  };
+  const onPillPointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    const p = pointerRef.current;
+    if (!p || p.id !== e.pointerId) return;
+    pointerRef.current = null;
+    if (p.raf != null) {
+      cancelAnimationFrame(p.raf);
+      p.raf = null;
+    }
+    e.currentTarget.releasePointerCapture?.(e.pointerId);
+    const moved = Math.hypot(e.clientX - p.x, e.clientY - p.y);
+    const elapsed = performance.now() - p.t;
+    if (p.dragging) {
+      void applyManualDrag(p, false);
+    } else if (p.fromPill && moved < 5 && elapsed < 550) {
+      void invoke("overlay_click").catch(() => {});
+    }
+  };
+  const onPillPointerCancel = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (pointerRef.current?.id === e.pointerId) {
+      if (pointerRef.current.raf != null) cancelAnimationFrame(pointerRef.current.raf);
+      pointerRef.current = null;
+    }
+  };
 
   return (
-    <div className="aq-root">
+    <div
+      className="aq-root"
+      ref={rootRef}
+      data-tauri-drag-region
+      onPointerDown={onPillPointerDown}
+      onPointerMove={onPillPointerMove}
+      onPointerUp={onPillPointerUp}
+      onPointerCancel={onPillPointerCancel}
+    >
       <FpsMeter />
       <div
         className={`aq-pill aq-${mode}`}
@@ -619,7 +724,7 @@ export default function Overlay() {
       >
         {/* Тултип idle-hover: всегда в DOM, виден только в .aq-idle:hover (CSS). */}
         <span className="aq-tip" aria-hidden>
-          Зажмите Right Ctrl — диктовка
+          Зажмите {hotkeyTip} — диктовка
         </span>
 
         {/* Бейдж определённого языка: только пока идёт диктовка и бэкенд прислал
@@ -640,20 +745,6 @@ export default function Overlay() {
               <strong>{latchNotice?.message || "Режим без удержания"}</strong>
               <small>{latchNotice?.detail || "Двойное нажатие"}</small>
             </span>
-          </span>
-        ) : mode === "done" ? (
-          <span className="aq-done-copy">
-            <svg className="aq-check" viewBox="0 0 12 12" aria-hidden>
-              <path
-                d="M2.4 6.4l2.5 2.6 4.7-5.4"
-                fill="none"
-                stroke="#fff"
-                strokeWidth="1.6"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-            <span>Готово</span>
           </span>
         ) : showOrb ? (
           <>

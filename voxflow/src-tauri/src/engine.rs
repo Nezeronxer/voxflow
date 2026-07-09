@@ -170,6 +170,14 @@ struct EngineCtx {
     inject_lock: Arc<Mutex<()>>,
     /// Состояние живого стриминга текущей диктовки (None, если петля не запущена).
     partial: Arc<Mutex<Option<PartialState>>>,
+    /// Целевое окно текущей записи, снятое ДО показа overlay/status.
+    active_target: Arc<Mutex<Option<TargetFingerprint>>>,
+    /// Последнее внешнее окно, куда можно безопасно возвращать фокус для вставки.
+    ///
+    /// macOS может на короткое время сделать frontmost наше окно/оверлей или
+    /// системное предупреждение. Без этой памяти старт диктовки ошибочно целился
+    /// в VoxFlow и финал не вставлялся в пользовательское поле.
+    last_external_target: Arc<Mutex<Option<TargetFingerprint>>>,
     /// «Поколение» диктовки. Инкрементируется на каждый старт захвата. Detached-поток
     /// финала запоминает своё поколение и перед вставкой сверяет его с текущим: если
     /// уже стартовала НОВАЯ диктовка (gen вырос) — «осиротевший» поток НЕ вставляет
@@ -224,6 +232,8 @@ pub fn spawn(
         asr_lock: Arc::new(Mutex::new(())),
         inject_lock: Arc::new(Mutex::new(())),
         partial: Arc::new(Mutex::new(None)),
+        active_target: Arc::new(Mutex::new(None)),
+        last_external_target: Arc::new(Mutex::new(None)),
         gen: Arc::new(AtomicU64::new(0)),
         last_injected_gen: Arc::new(AtomicU64::new(0)),
         gigaam: Arc::new(Mutex::new(None)),
@@ -240,6 +250,10 @@ pub fn spawn(
     // Монитор буфера обмена — авто-захват исправлений пользователя.
     let mon = ctx.clone();
     std::thread::spawn(move || clipboard_monitor(mon));
+    // Память внешнего окна: помогает диктовать из фона, даже если собственная
+    // панель или macOS privacy-alert коротко перехватили frontmost.
+    let target_watch = ctx.clone();
+    std::thread::spawn(move || external_target_watcher(target_watch));
     std::thread::Builder::new()
         .name("voxflow-engine".into())
         .spawn(move || engine_loop(rx, ctx))
@@ -259,6 +273,155 @@ pub fn dbg_log(msg: &str) {
         let now = chrono::Local::now().format("%H:%M:%S%.3f");
         let _ = writeln!(f, "[{now}] {msg}");
     }
+}
+
+fn remember_external_target(ctx: &EngineCtx, fp: &TargetFingerprint) {
+    if fp.is_usable_dictation_target() {
+        *ctx.last_external_target.lock() = Some(fp.clone());
+    }
+}
+
+fn resolve_start_target(ctx: &EngineCtx) -> TargetFingerprint {
+    let detected = crate::app_context::detect().target_fingerprint();
+    if detected.is_usable_dictation_target() {
+        remember_external_target(ctx, &detected);
+        return detected;
+    }
+    if let Some(prev) = ctx.last_external_target.lock().clone() {
+        dbg_log(&format!(
+            "start: frontmost {} не цель диктовки — используем последнее внешнее окно {}",
+            detected.describe(),
+            prev.describe()
+        ));
+        return prev;
+    }
+    dbg_log(&format!(
+        "start: внешняя цель неизвестна, frontmost {}",
+        detected.describe()
+    ));
+    detected
+}
+
+fn external_target_watcher(ctx: EngineCtx) {
+    loop {
+        if !ctx.recording.load(Ordering::SeqCst) {
+            let fp = crate::app_context::detect().target_fingerprint();
+            remember_external_target(&ctx, &fp);
+        }
+        std::thread::sleep(Duration::from_millis(350));
+    }
+}
+
+fn current_or_restored_target(
+    ctx: &EngineCtx,
+    target_fp: &mut TargetFingerprint,
+    stage: &str,
+) -> Option<crate::app_context::AppContext> {
+    let mut cur = crate::app_context::detect();
+    let mut cur_fp = cur.target_fingerprint();
+    if target_fp.matches(&cur) {
+        remember_external_target(ctx, target_fp);
+        return Some(cur);
+    }
+
+    if target_fp.is_own_app() && cur.is_usable_dictation_target() {
+        dbg_log(&format!(
+            "финал: target был VoxFlow ({stage}) — переносим цель на текущее внешнее окно {}",
+            cur_fp.describe()
+        ));
+        *target_fp = cur_fp.clone();
+        remember_external_target(ctx, target_fp);
+        return Some(cur);
+    }
+
+    if (cur.is_own_app() || cur.is_transient_system_ui()) && target_fp.is_usable_dictation_target()
+    {
+        if activate_target_for_insert(target_fp) {
+            std::thread::sleep(Duration::from_millis(160));
+            cur = crate::app_context::detect();
+            cur_fp = cur.target_fingerprint();
+            if target_fp.matches(&cur) {
+                dbg_log(&format!(
+                    "финал: восстановили фокус целевого окна ({stage}) {}",
+                    target_fp.describe()
+                ));
+                remember_external_target(ctx, target_fp);
+                return Some(cur);
+            }
+        }
+    }
+
+    if target_fp.is_own_app() {
+        dbg_log(&format!(
+            "финал: нет внешней цели для вставки ({stage}); current={}",
+            cur_fp.describe()
+        ));
+        emit_error(
+            &ctx.app,
+            "Поставьте курсор в поле текста и запустите диктовку из фона",
+        );
+        return None;
+    }
+
+    dbg_log(&format!(
+        "финал: окно изменилось ({stage}) — вставка отменена; target={} current={}",
+        target_fp.describe(),
+        cur_fp.describe()
+    ));
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn activate_target_for_insert(target_fp: &TargetFingerprint) -> bool {
+    if let Some(pid) = target_fp.macos_pid() {
+        let script = format!(
+            r#"tell application "System Events"
+  try
+    set frontmost of first application process whose unix id is {pid} to true
+    return "ok"
+  on error
+    return "err"
+  end try
+end tell"#
+        );
+        if run_osascript_ok(&script) {
+            return true;
+        }
+    }
+
+    let Some(bundle) = target_fp.macos_bundle_id() else {
+        return false;
+    };
+    let bundle = bundle.replace('"', "");
+    let script = format!(
+        r#"try
+  tell application id "{bundle}" to activate
+  return "ok"
+on error
+  return "err"
+end try"#
+    );
+    run_osascript_ok(&script)
+}
+
+#[cfg(target_os = "macos")]
+fn run_osascript_ok(script: &str) -> bool {
+    let out = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output();
+    match out {
+        Ok(out) if out.status.success() => {
+            let body = String::from_utf8_lossy(&out.stdout);
+            body.contains("ok")
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn activate_target_for_insert(_target_fp: &TargetFingerprint) -> bool {
+    false
 }
 
 /// Абстракция локального РЕЗИДЕНТНОГО STT (ort, живёт в памяти всю сессию):
@@ -540,6 +703,12 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     if capture.is_some() {
         return;
     }
+    // Снимаем целевое окно ДО любых status/overlay событий VoxFlow. На macOS
+    // System Events легко начинает видеть уже нашу floating-панель как frontmost,
+    // из-за чего финал раньше сам отменял ASR/вставку.
+    let target_fp = resolve_start_target(ctx);
+    dbg_log(&format!("start: target {}", target_fp.describe()));
+    *ctx.active_target.lock() = Some(target_fp.clone());
     let (device, play, auto_mute) = {
         let s = ctx.settings.lock();
         (s.input_device.clone(), s.play_sounds, s.auto_mute)
@@ -561,6 +730,7 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         let use_cloud = use_cloud_stt || use_cloud_gemini;
         if !use_cloud && no_model_installed(&s) {
             drop(s);
+            *ctx.active_target.lock() = None;
             dbg_log("start: модель не установлена — запись не начинаем, предупреждаем");
             emit_no_model(&ctx.app);
             set_status(&ctx.app, "idle");
@@ -592,12 +762,13 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             // Запускаем петлю живого стриминга, если GPU whisper-server доступен —
             // пилюля показывает живой текст и при whisper_cli (живой инжект при этом
             // выключен, см. maybe_start_partial_loop). Без GPU/модели — статичное «Слушаю…».
-            maybe_start_partial_loop(&c, ctx);
+            maybe_start_partial_loop(&c, ctx, &target_fp);
             // Петля уровня громкости для orb-визуализатора (событие "level").
             spawn_level_loop(&c, ctx);
             *capture = Some(c);
         }
         Err(err) => {
+            *ctx.active_target.lock() = None;
             log::error!("start_capture: {err:#}");
             emit_error(&ctx.app, &format!("Не удалось открыть микрофон: {err}"));
             set_status(&ctx.app, "idle");
@@ -612,7 +783,7 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
 ///
 /// ВАЖНО: для cli живой ИНЖЕКТ клавишами не нужен/опасен, поэтому stream_mode
 /// для петли при cli трактуем как "never" — показываем только серый текст в пилюле.
-fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
+fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &TargetFingerprint) {
     // Сбрасываем прошлое состояние на всякий случай (новая диктовка = чистый старт).
     *ctx.partial.lock() = None;
 
@@ -632,7 +803,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
     // модели слал no_model, хотя облако для распознавания полностью рабочее.
     if cloud_active {
         if s.cloud_live_draft {
-            start_cloud_partial_loop(capture, ctx, &s);
+            start_cloud_partial_loop(capture, ctx, &s, target_fp);
         } else {
             dbg_log("partial: облако активно, живой черновик выключен — пилюля статична");
         }
@@ -660,6 +831,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
                 capture,
                 ctx,
                 &preview_settings,
+                target_fp,
                 Arc::clone(&ctx.gigaam),
                 LocalLoopTuning {
                     tick_ms: 220,
@@ -670,6 +842,33 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
             return;
         }
         dbg_log("partial: auto+gigaam preview недоступен — пробуем whisper-стрим");
+    }
+    #[cfg(target_os = "macos")]
+    if s.engine == "whisper_server"
+        && (s.language.eq_ignore_ascii_case("ru") || is_auto_language_alias(&s.language))
+        && crate::gigaam::dir_ready(&paths::gigaam_dir())
+        && ensure_gigaam(ctx, &s).is_ok()
+    {
+        // macOS UX: универсальный Whisper large слишком медленный для живых
+        // partial-ов на CPU/Metal и часто упирается в короткий live timeout.
+        // Если русский GigaAM уже установлен, используем его как быстрый
+        // preview только в плашке; финальный движок остаётся выбранным в UI.
+        let mut preview_settings = s.clone();
+        preview_settings.stream_mode = "never".into();
+        dbg_log("partial: macOS fast GigaAM preview enabled");
+        start_local_partial_loop(
+            capture,
+            ctx,
+            &preview_settings,
+            target_fp,
+            Arc::clone(&ctx.gigaam),
+            LocalLoopTuning {
+                tick_ms: 260,
+                max_seg_samples: 25 * 16000,
+                fixed_lang: Some("ru"),
+            },
+        );
+        return;
     }
     match local_route(&s) {
         LocalRoute::GigaAm => {
@@ -684,6 +883,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
                 capture,
                 ctx,
                 &s,
+                target_fp,
                 Arc::clone(&ctx.gigaam),
                 LocalLoopTuning {
                     tick_ms: 350,
@@ -702,6 +902,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
                     capture,
                     ctx,
                     &s,
+                    target_fp,
                     Arc::clone(&ctx.parakeet),
                     LocalLoopTuning {
                         tick_ms: 500,
@@ -717,11 +918,16 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
         }
         LocalRoute::Whisper => {}
     }
-    // Живой стрим требует GPU whisper-server (CPU-сервер слишком медленный для тиков).
-    if !paths::has_nvidia() {
-        dbg_log("partial: нет NVIDIA GPU — без живого стрима (пилюля статична)");
+    // Живой whisper-стрим на Windows оставляем только для NVIDIA-сборки: CPU
+    // сервер там слишком медленный для тиков. На macOS используем native sidecar
+    // (Metal/CPU whisper.cpp), поэтому отсутствие NVIDIA не должно гасить overlay.
+    let whisper_live_supported = cfg!(target_os = "macos") || paths::has_nvidia();
+    if !whisper_live_supported {
+        dbg_log("partial: нет GPU whisper-server — без живого стрима (пилюля статична)");
         return;
     }
+    #[cfg(target_os = "macos")]
+    dbg_log("partial: macOS whisper-server live draft enabled");
 
     // Прогреваем сервер и получаем порт ДО спавна, чтобы первый тик не ждал JIT.
     let whisper_dir = paths::whisper_dir(&ctx.app);
@@ -760,8 +966,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx) {
     };
 
     // Отпечаток целевого окна на старте — для защиты от смены приложения.
-    let actx = crate::app_context::detect();
-    let start_fp = actx.target_fingerprint();
+    let start_fp = target_fp.clone();
     // Поколение этой диктовки — суффикс seq для событий partial (фронт отбрасывает
     // устаревшие партиалы прошлой диктовки при гонке доставки/StrictMode-листенерах).
     let my_seq = ctx.gen.load(Ordering::SeqCst);
@@ -841,9 +1046,13 @@ const CLOUD_DRAFT_CAP: u32 = 4;
 /// ощущался бы лагающим. Детач безопасен: петля само-ограничена (`stop` + CAP), эмитит
 /// `partial` ТОЛЬКО пока `stop`==false (проверка перед эмиссией), пишет в собственный
 /// WAV (имя по seq, без гонки с соседней диктовкой) и сама за собой убирает.
-fn start_cloud_partial_loop(capture: &Capture, ctx: &EngineCtx, s: &Settings) {
-    let actx = crate::app_context::detect();
-    let start_fp = actx.target_fingerprint();
+fn start_cloud_partial_loop(
+    capture: &Capture,
+    ctx: &EngineCtx,
+    s: &Settings,
+    target_fp: &TargetFingerprint,
+) {
+    let start_fp = target_fp.clone();
     let my_seq = ctx.gen.load(Ordering::SeqCst);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1284,11 +1493,11 @@ fn start_local_partial_loop<T: LocalStt + Send + 'static>(
     capture: &Capture,
     ctx: &EngineCtx,
     s: &Settings,
+    target_fp: &TargetFingerprint,
     engine: Arc<Mutex<Option<T>>>,
     tuning: LocalLoopTuning,
 ) {
-    let actx = crate::app_context::detect();
-    let start_fp = actx.target_fingerprint();
+    let start_fp = target_fp.clone();
     let my_seq = ctx.gen.load(Ordering::SeqCst);
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -1592,6 +1801,9 @@ fn partial_loop(a: PartialLoopArgs) {
     let mut cursor = 0usize;
     let mut rs = audio::Resampler16k::new(a.rate);
     let mut mono16: Vec<f32> = Vec::new();
+    let mut wav_error_logged = false;
+    let mut asr_error_logged = false;
+    let mut empty_logged = false;
     // P2-4: имя WAV с seq-суффиксом — никакой гонки на общем tmp/partial.wav
     // с петлёй соседней диктовки (cloud и финал суффикс уже имели).
     let wav = paths::tmp_dir().join(format!("partial_{}.wav", a.seq));
@@ -1618,7 +1830,11 @@ fn partial_loop(a: PartialLoopArgs) {
             continue; // < ~0.3 c полезного звука
         }
 
-        if audio::write_wav_16k_mono(&wav, &trimmed).is_err() {
+        if let Err(e) = audio::write_wav_16k_mono(&wav, &trimmed) {
+            if !wav_error_logged {
+                dbg_log(&format!("partial: write wav ошибка: {e}"));
+                wav_error_logged = true;
+            }
             continue;
         }
 
@@ -1627,13 +1843,26 @@ fn partial_loop(a: PartialLoopArgs) {
             let Some(_g) = a.asr_lock.try_lock() else {
                 continue;
             };
+            if a.stop.load(Ordering::Acquire) {
+                break;
+            }
             match asr::transcribe_server_partial(a.port, &wav, &a.language) {
                 Ok(t) => t,
-                Err(_) => continue, // тик глотает ошибку — частичные результаты best-effort
+                Err(e) => {
+                    if !asr_error_logged {
+                        dbg_log(&format!("partial: whisper-server ошибка: {e:#}"));
+                        asr_error_logged = true;
+                    }
+                    continue; // тик глотает ошибку — частичные результаты best-effort
+                }
             }
         };
 
         if txt.trim().is_empty() {
+            if !empty_logged {
+                dbg_log("partial: whisper-server вернул пустой текст");
+                empty_logged = true;
+            }
             continue;
         }
 
@@ -1683,6 +1912,9 @@ fn partial_loop(a: PartialLoopArgs) {
 /// если вставлять МОЖНО (окно то же и abort не выставлен).
 fn live_target_ok(start_fp: &TargetFingerprint, abort: &Arc<AtomicBool>) -> bool {
     if abort.load(Ordering::Acquire) {
+        return false;
+    }
+    if !start_fp.is_usable_dictation_target() {
         return false;
     }
     let cur = crate::app_context::detect();
@@ -1831,6 +2063,7 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     let samples = c.finish();
     ctx.recording.store(false, Ordering::SeqCst);
     restore_auto_mute(ctx);
+    let stored_target_fp = ctx.active_target.lock().take();
     // Поколение ЭТОЙ диктовки — финал-поток сверит его перед вставкой (C4).
     let my_gen = ctx.gen.load(Ordering::SeqCst);
     // UX: как только пользователь завершил запись, оверлей должен сразу уйти из
@@ -1838,11 +2071,11 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     // и готовим финальный ASR.
     set_status(&ctx.app, "transcribing");
 
-    // Останавливаем петлю частичных результатов. Ждём её НЕ дольше ~150 мс
-    // (P2-5): ASR-тик может длиться до ~1 c (whisper), и безусловный join
-    // подвешивал отпускание клавиши. Не успела — детачим: петля гаснет сама по
-    // stop-флагу, а пересечение с финалом исключают мьютексы движков/asr_lock
-    // (тик берёт их try_lock'ом и при занятости пропускается).
+    // Останавливаем петлю частичных результатов. Если она уже вошла в
+    // whisper-server /inference, детачить её нельзя: single-thread сервер может
+    // продолжить считать partial, а финал будет висеть на "Готово". Поэтому даём
+    // петле короткий шанс завершиться, а затем убиваем server-процесс: следующий
+    // финал поднимет чистый экземпляр.
     let pstate = ctx.partial.lock().take();
     if let Some(mut st) = pstate {
         st.stop.store(true, Ordering::Release);
@@ -1853,8 +2086,25 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
                     let _ = j.join();
                     break;
                 }
-                if t0.elapsed() >= Duration::from_millis(150) {
-                    dbg_log("stop: петля партиалов не успела за 150 мс — детачим (P2-5)");
+                if t0.elapsed() >= Duration::from_millis(700) {
+                    dbg_log(
+                        "stop: петля партиалов занята >700 мс — перезапускаем whisper-server перед финалом",
+                    );
+                    restart_whisper_server(ctx, "partial busy before final");
+                    let t1 = Instant::now();
+                    loop {
+                        if j.is_finished() {
+                            let _ = j.join();
+                            break;
+                        }
+                        if t1.elapsed() >= Duration::from_millis(1300) {
+                            dbg_log(
+                                "stop: петля партиалов не завершилась после kill — детачим, финал уйдёт в fallback при занятом asr_lock",
+                            );
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
@@ -1893,8 +2143,15 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     }
     // Тяжёлую обработку выносим в отдельный поток, чтобы движок мог принять новую запись.
     let ctx2 = ctx.clone();
-    let actx = crate::app_context::detect();
-    let target_fp = actx.target_fingerprint();
+    let target_fp = stored_target_fp.unwrap_or_else(|| {
+        let actx = crate::app_context::detect();
+        let fp = actx.target_fingerprint();
+        dbg_log(&format!(
+            "stop: target fallback after status {}",
+            fp.describe()
+        ));
+        fp
+    });
     std::thread::spawn(move || {
         if let Err(err) = process_utterance(&ctx2, samples, rate, None, my_gen, target_fp) {
             log::error!("process_utterance: {err:#}");
@@ -1923,6 +2180,7 @@ fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         let _ = c.finish();
         ctx.recording.store(false, Ordering::SeqCst);
         restore_auto_mute(ctx);
+        *ctx.active_target.lock() = None;
         let pstate = ctx.partial.lock().take();
         if let Some(mut st) = pstate {
             st.stop.store(true, Ordering::Release);
@@ -1950,6 +2208,7 @@ fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         return;
     }
     ctx.gen.fetch_add(1, Ordering::SeqCst);
+    *ctx.active_target.lock() = None;
     if ctx.improve_busy.load(Ordering::SeqCst) {
         emit_improve_status(&ctx.app, "cancelled", "Отменено");
     }
@@ -2311,9 +2570,14 @@ fn process_utterance(
     rate: u32,
     live: Option<LiveState>,
     my_gen: u64,
-    target_fp: TargetFingerprint,
+    mut target_fp: TargetFingerprint,
 ) -> anyhow::Result<()> {
     if samples.is_empty() {
+        dbg_log("финал: запись пустая — нечего распознавать");
+        let _ = ctx.app.emit(
+            "norecog",
+            serde_json::json!({ "message": "Запись пустая — проверьте микрофон" }),
+        );
         return Ok(());
     }
     let s = ctx.settings.lock().clone();
@@ -2326,8 +2590,20 @@ fn process_utterance(
     let trimmed = audio::trim_silence(&mono16, 16000);
     let speech_trimmed = compact_speech_for_final_asr(&ctx.vad_final, &trimmed);
     let pre_ms = t_pre.elapsed().as_millis() as u64;
+    dbg_log(&format!(
+        "финал: audio raw={}мс mono={}мс trimmed={}мс speech={}мс",
+        samples.len().saturating_mul(1000) as u64 / rate.max(1) as u64,
+        mono16.len().saturating_mul(1000) as u64 / 16000,
+        trimmed.len().saturating_mul(1000) as u64 / 16000,
+        speech_trimmed.len().saturating_mul(1000) as u64 / 16000
+    ));
     if speech_trimmed.len() < 16000 / 5 {
         // < ~0.2 c полезного звука — считаем, что речи не было
+        dbg_log("финал: VAD не нашёл речь — распознавание пропущено");
+        let _ = ctx.app.emit(
+            "norecog",
+            serde_json::json!({ "message": "Не услышал речь — проверьте микрофон" }),
+        );
         return Ok(());
     }
 
@@ -2362,13 +2638,11 @@ fn process_utterance(
     let use_cloud_stt = s.cloud_stt_active();
     let use_cloud_gemini =
         s.cloud_asr && s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key);
-    let asr_actx = crate::app_context::detect();
-    if !target_fp.matches(&asr_actx) {
-        dbg_log("финал: окно изменилось до ASR — распознавание отменено");
+    let Some(asr_actx) = current_or_restored_target(ctx, &mut target_fp, "до ASR") else {
         erase_live_draft(ctx, live.as_ref(), my_gen);
         let _ = std::fs::remove_file(&wav);
         return Ok(());
-    }
+    };
     let asr_tone =
         crate::app_context::category_for(&asr_actx.exe, &asr_actx.title, &s.app_profile_overrides);
     let asr_prompt = if use_cloud_stt {
@@ -2406,8 +2680,7 @@ fn process_utterance(
                 if s.stt_fallback_local {
                     log::warn!("облачный STT недоступен — откат на локальное распознавание");
                     emit_stt_mode(&ctx.app, "local", true);
-                    let _g = ctx.asr_lock.lock();
-                    local_transcribe(ctx, &s, &dict, &wav)?
+                    local_transcribe_guarded(ctx, &s, &dict, &wav)?
                 } else {
                     // Fallback выключен — честно сообщаем об ошибке и выходим.
                     if s.play_sounds {
@@ -2424,8 +2697,7 @@ fn process_utterance(
             Ok(t) => postprocess::dedup_repeated_ngrams(&t),
             Err(e) => {
                 log::warn!("облачный ASR (Gemini) ошибка: {e}; откат на локальное распознавание");
-                let _g = ctx.asr_lock.lock();
-                local_transcribe(ctx, &s, &dict, &wav)?
+                local_transcribe_guarded(ctx, &s, &dict, &wav)?
             }
         }
     } else {
@@ -2448,6 +2720,9 @@ fn process_utterance(
     let raw = postprocess::dedup_repeated_ngrams(&raw);
 
     if raw.trim().is_empty() {
+        dbg_log(&format!(
+            "финал: ASR вернул пустой текст за {ms}мс (pre={pre_ms}мс)"
+        ));
         // Гейт уверенности/VAD отклонил (невнятно / тишина / чужой язык).
         // Если в режиме always/auto мы УЖЕ напечатали лучший partial — НЕ стираем
         // экран (никакого mass-backspace), оставляем как есть; иначе старое поведение.
@@ -2470,12 +2745,11 @@ fn process_utterance(
 
     // Контекст окна нужен и для тона, и для payload Ollama, и для rule-based
     // продолжения фразы. Детектим один раз после ASR и до постобработки.
-    let actx = crate::app_context::detect();
-    if !target_fp.matches(&actx) {
-        dbg_log("финал: окно изменилось до постобработки — вставка отменена");
+    let Some(actx) = current_or_restored_target(ctx, &mut target_fp, "до постобработки")
+    else {
         erase_live_draft(ctx, live.as_ref(), my_gen);
         return Ok(());
-    }
+    };
     dbg_log(&format!(
         "app: exe={} title_len={} → {}",
         actx.exe,
@@ -2615,14 +2889,20 @@ fn process_utterance(
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
+    let Some(final_target_actx) = current_or_restored_target(ctx, &mut target_fp, "перед вставкой")
+    else {
+        drop(inject_guard);
+        let _ = std::fs::remove_file(&wav);
+        return Ok(());
+    };
     let mut final_inserted = false;
+    let mut insert_error: Option<String> = None;
     let t_inj = Instant::now();
     match (live.as_ref(), live_mode) {
         (Some(l), "always") | (Some(l), "auto") => {
-            let cur = crate::app_context::detect();
             if l.abort.load(Ordering::Acquire) {
                 dbg_log("финал: окно сменилось — реконсиляцию пропускаем");
-            } else if !l.start_fp.matches(&cur) {
+            } else if !target_fp.matches(&final_target_actx) {
                 l.abort.store(true, Ordering::Release);
                 dbg_log("финал: целевое окно изменилось — реконсиляцию пропускаем");
             } else {
@@ -2640,8 +2920,10 @@ fn process_utterance(
                         .map_err(|e| log::warn!("clipboard final text: {e}"));
                     if let Err(e) = inject::inject_incremental(&prev, "") {
                         log::warn!("финальная очистка live-черновика: {e}");
+                        insert_error = Some(format!("{e:#}"));
                     } else if let Err(e) = inject::inject_keep_clipboard(&text, "clipboard") {
                         log::warn!("финальная clipboard-вставка с абзацами: {e}");
+                        insert_error = Some(format!("{e:#}"));
                     } else if l.stream_mode == "always" {
                         *l.injected.lock() = text.clone();
                         final_inserted = true;
@@ -2655,6 +2937,7 @@ fn process_utterance(
                         .map_err(|e| log::warn!("clipboard final text: {e}"));
                     if let Err(e) = inject::inject_incremental(&prev, &flat) {
                         log::warn!("финальная реконсиляция: {e}");
+                        insert_error = Some(format!("{e:#}"));
                     } else if l.stream_mode == "always" {
                         *l.injected.lock() = flat;
                         final_inserted = true;
@@ -2667,14 +2950,9 @@ fn process_utterance(
         }
         _ => {
             // never-режим или петли не было — поведение как раньше (вставка целиком).
-            let cur = crate::app_context::detect();
-            if !target_fp.matches(&cur) {
-                dbg_log("финал: целевое окно изменилось — вставка отменена");
-                drop(inject_guard);
-                return Ok(());
-            }
             // Ошибку пробрасываем ПОСЛЕ уборки временного WAV (иначе утечка в tmp).
             if let Err(e) = inject::inject_keep_clipboard(&text, &s.paste_method) {
+                dbg_log(&format!("финал: ошибка вставки: {e:#}"));
                 drop(inject_guard);
                 let _ = std::fs::remove_file(&wav);
                 return Err(e);
@@ -2683,6 +2961,21 @@ fn process_utterance(
         }
     }
     drop(inject_guard); // освобождаем замок клавиш сразу после вставки
+    if !final_inserted {
+        if let Some(err) = insert_error {
+            dbg_log(&format!(
+                "финал: вставка не выполнена — история/transcript пропущены: {err}"
+            ));
+            emit_error(
+                &ctx.app,
+                "Не удалось вставить текст. Разрешите VoxFlow в macOS Privacy & Security -> Accessibility",
+            );
+        } else {
+            dbg_log("финал: вставка не выполнена — история/transcript пропущены");
+        }
+        let _ = std::fs::remove_file(&wav);
+        return Ok(());
+    }
     if final_inserted {
         remember_dictation_context(ctx, &actx, &text);
         emit_final_preview(&ctx.app, &text, my_gen, lang_badge);
@@ -2787,7 +3080,7 @@ fn adaptive_prompt(db: &Arc<Mutex<Connection>>) -> Option<String> {
     if v.is_empty() {
         return None;
     }
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     let top: Vec<String> = v.into_iter().take(40).map(|(w, _)| w).collect();
     Some(top.join(" "))
 }
@@ -2871,6 +3164,14 @@ fn ensure_server(
         Ok(srv.port)
     } else {
         Err(anyhow::anyhow!("whisper-server не инициализирован"))
+    }
+}
+
+fn restart_whisper_server(ctx: &EngineCtx, reason: &str) {
+    dbg_log(&format!("whisper-server: stop/restart ({reason})"));
+    if let Some(mut old) = ctx.server.lock().take() {
+        let _ = old.child.kill();
+        let _ = old.child.wait();
     }
 }
 
@@ -3275,10 +3576,7 @@ fn local_asr(
             Err(e) => log::warn!("auto-fallback GigaAM недоступен ({e})"),
         }
     }
-    let whisper_text = {
-        let _g = ctx.asr_lock.lock();
-        local_transcribe(ctx, s, dict, wav)?
-    };
+    let whisper_text = { local_transcribe_guarded(ctx, s, dict, wav)? };
     if s.language == "auto"
         && s.engine == "gigaam"
         && crate::gigaam::dir_ready(&paths::gigaam_dir())
@@ -3658,6 +3956,45 @@ mod seg_tests {
 }
 
 /// Локальное распознавание whisper (server → cli fallback).
+fn local_transcribe_guarded(
+    ctx: &EngineCtx,
+    s: &Settings,
+    dict: &[postprocess::Dict],
+    wav: &std::path::Path,
+) -> anyhow::Result<String> {
+    if let Some(_g) = ctx.asr_lock.try_lock_for(Duration::from_secs(3)) {
+        return local_transcribe(ctx, s, dict, wav);
+    }
+
+    dbg_log(
+        "финал: asr_lock занят >3 с — сбрасываем whisper-server и используем whisper-cli fallback",
+    );
+    restart_whisper_server(ctx, "final asr_lock timeout");
+    local_transcribe_cli_only(ctx, s, dict, wav)
+}
+
+fn local_transcribe_cli_only(
+    ctx: &EngineCtx,
+    s: &Settings,
+    dict: &[postprocess::Dict],
+    wav: &std::path::Path,
+) -> anyhow::Result<String> {
+    let whisper_dir = paths::whisper_dir(&ctx.app);
+    let model = resolve_model(s)?;
+    let language = whisper_language_arg(&s.language);
+    let base_prompt = whisper_base_prompt(&s.language);
+    let prompt = postprocess::dict_bias_prompt(dict, base_prompt);
+    let params = AsrParams {
+        whisper_dir: &whisper_dir,
+        model_path: &model,
+        wav_path: wav,
+        language: &language,
+        threads: s.effective_threads(),
+        initial_prompt: prompt.as_deref(),
+    };
+    asr::transcribe_cli(&params)
+}
+
 fn local_transcribe(
     ctx: &EngineCtx,
     s: &Settings,
