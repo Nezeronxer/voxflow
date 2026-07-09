@@ -7,6 +7,7 @@ import {
   Switch,
   HotkeyCapture,
   normalizeTheme,
+  HOTKEY_FIELD_HINT,
 } from "../ui";
 import type { Settings } from "../types";
 import type { UpdateInfo } from "../types";
@@ -96,7 +97,7 @@ export default function Control({
 
         <Field
           label="Горячая клавиша"
-          hint="Нажмите поле и клавишу. Для удержания лучше Ctrl, Alt или F-клавиши."
+          hint={HOTKEY_FIELD_HINT}
         >
           <HotkeyCapture
             value={settings.hotkey}

@@ -1023,7 +1023,8 @@ textarea {
   gap: 6px;
 }
 .hotkey-btn {
-  width: 180px;
+  width: 240px;
+  max-width: 100%;
   text-align: left;
   background: var(--bg-input);
   border: none;
@@ -1172,6 +1173,12 @@ textarea {
   }
   .field-control > input,
   .field-control > select {
+    width: 100%;
+  }
+  .hotkey-capture {
+    align-items: stretch;
+  }
+  .hotkey-btn {
     width: 100%;
   }
   .cloud-provider-head,

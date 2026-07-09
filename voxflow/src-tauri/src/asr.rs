@@ -247,7 +247,7 @@ pub fn transcribe_server(
     let mut cmd = Command::new("curl");
     cmd.arg("-s")
         .arg("-m")
-        .arg("120")
+        .arg("45")
         .arg("-F")
         .arg(&file_arg)
         .arg("-F")
@@ -276,7 +276,8 @@ pub fn transcribe_server(
 /// Для ЖИВЫХ (partial) результатов: текст может быть черновым/«мусорным» —
 /// мы показываем его в пилюле серым и (опционально) вставляем инкрементально,
 /// но НЕ применяем порог уверенности (его место — финальный проход).
-/// Таймаут короче (10 c), чтобы зависший тик не блокировал петлю надолго.
+/// Таймаут очень короткий: live-preview best-effort, а зависший тик держит
+/// общий asr_lock и задерживает финальный проход после отпускания хоткея.
 pub fn transcribe_server_partial(port: u16, wav: &Path, language: &str) -> anyhow::Result<String> {
     let url = format!("http://127.0.0.1:{port}/inference");
     let file_arg = format!("file=@{}", wav.display());
@@ -284,7 +285,7 @@ pub fn transcribe_server_partial(port: u16, wav: &Path, language: &str) -> anyho
     let mut cmd = Command::new("curl");
     cmd.arg("-s")
         .arg("-m")
-        .arg("10")
+        .arg("2")
         .arg("-F")
         .arg(&file_arg)
         .arg("-F")

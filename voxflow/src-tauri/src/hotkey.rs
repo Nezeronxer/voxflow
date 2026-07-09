@@ -1,5 +1,7 @@
-//! Глобальный слушатель клавиш (rdev): hold-to-talk + двойное-нажатие-защёлка.
-//! rdev::listen ставит low-level hook (WH_KEYBOARD_LL на Windows) и блокирует поток.
+//! Глобальный слушатель клавиш: hold-to-talk + двойное-нажатие-защёлка.
+//! Windows/Linux используют rdev; macOS использует CGEventTap без перевода
+//! keycode → Unicode, потому что HIToolbox требует main-thread queue и падает
+//! при таком вызове из event tap callback на новых macOS.
 //!
 //! Поведение в режиме "hold":
 //! - зажал и держишь → запись, пока держишь (отпустил — стоп);
@@ -13,10 +15,129 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use tauri::AppHandle;
+
+#[cfg(not(target_os = "macos"))]
 use rdev::{listen, Event, EventType, Key};
 
 use crate::engine::EngineCmd;
 use crate::settings::Settings;
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventType {
+    KeyPress(Key),
+    KeyRelease(Key),
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Key {
+    ControlRight,
+    ControlLeft,
+    Alt,
+    AltGr,
+    ShiftRight,
+    ShiftLeft,
+    MetaLeft,
+    MetaRight,
+    CapsLock,
+    Insert,
+    ScrollLock,
+    Pause,
+    PrintScreen,
+    NumLock,
+    Escape,
+    Return,
+    Space,
+    Tab,
+    Backspace,
+    Delete,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    UpArrow,
+    DownArrow,
+    LeftArrow,
+    RightArrow,
+    KeyA,
+    KeyB,
+    KeyC,
+    KeyD,
+    KeyE,
+    KeyF,
+    KeyG,
+    KeyH,
+    KeyI,
+    KeyJ,
+    KeyK,
+    KeyL,
+    KeyM,
+    KeyN,
+    KeyO,
+    KeyP,
+    KeyQ,
+    KeyR,
+    KeyS,
+    KeyT,
+    KeyU,
+    KeyV,
+    KeyW,
+    KeyX,
+    KeyY,
+    KeyZ,
+    Num0,
+    Num1,
+    Num2,
+    Num3,
+    Num4,
+    Num5,
+    Num6,
+    Num7,
+    Num8,
+    Num9,
+    Kp0,
+    Kp1,
+    Kp2,
+    Kp3,
+    Kp4,
+    Kp5,
+    Kp6,
+    Kp7,
+    Kp8,
+    Kp9,
+    KpPlus,
+    KpMinus,
+    KpMultiply,
+    KpDivide,
+    KpDelete,
+    KpReturn,
+    Minus,
+    Equal,
+    LeftBracket,
+    RightBracket,
+    BackSlash,
+    IntlBackslash,
+    SemiColon,
+    Quote,
+    BackQuote,
+    Comma,
+    Dot,
+    Slash,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+}
 
 /// Дольше — это удержание; короче — тап.
 const HOLD_MIN: Duration = Duration::from_millis(250);
@@ -67,7 +188,12 @@ impl HotState {
     }
 }
 
-pub fn spawn(tx: Sender<EngineCmd>, settings: Arc<Mutex<Settings>>) {
+pub fn spawn(tx: Sender<EngineCmd>, settings: Arc<Mutex<Settings>>, app: AppHandle) {
+    spawn_platform(tx, settings, app);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_platform(tx: Sender<EngineCmd>, settings: Arc<Mutex<Settings>>, _app: AppHandle) {
     std::thread::Builder::new()
         .name("voxflow-hotkey".into())
         .spawn(move || {
@@ -90,6 +216,14 @@ pub fn spawn(tx: Sender<EngineCmd>, settings: Arc<Mutex<Settings>>) {
                 log::error!("rdev listen error: {err:?}");
             }
         })
+        .expect("spawn hotkey thread");
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_platform(tx: Sender<EngineCmd>, settings: Arc<Mutex<Settings>>, app: AppHandle) {
+    std::thread::Builder::new()
+        .name("voxflow-hotkey".into())
+        .spawn(move || macos::listen(tx, settings, app))
         .expect("spawn hotkey thread");
 }
 
@@ -349,6 +483,336 @@ pub fn parse_key(name: &str) -> Option<Key> {
     Some(k)
 }
 
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::{dispatch, parse_key, EventType, HotState, Key};
+    use crate::engine::EngineCmd;
+    use crate::settings::Settings;
+    use parking_lot::Mutex;
+    use serde_json::json;
+    use std::ffi::c_void;
+    use std::sync::mpsc::Sender;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tauri::{AppHandle, Emitter};
+
+    type CGEventRef = *mut c_void;
+    type CGEventTapProxy = *mut c_void;
+    type CFMachPortRef = *mut c_void;
+    type CFRunLoopRef = *mut c_void;
+    type CFRunLoopSourceRef = *mut c_void;
+    type CFStringRef = *const c_void;
+
+    type CGEventTapCallBack =
+        extern "C" fn(CGEventTapProxy, u32, CGEventRef, *mut c_void) -> CGEventRef;
+
+    const K_CG_HID_EVENT_TAP: u32 = 0;
+    const K_CG_HEAD_INSERT_EVENT_TAP: u32 = 0;
+    const K_CG_EVENT_TAP_OPTION_LISTEN_ONLY: u32 = 1;
+    const K_CG_EVENT_KEY_DOWN: u32 = 10;
+    const K_CG_EVENT_KEY_UP: u32 = 11;
+    const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
+    const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn CGEventTapCreate(
+            tap: u32,
+            place: u32,
+            options: u32,
+            events_of_interest: u64,
+            callback: CGEventTapCallBack,
+            user_info: *mut c_void,
+        ) -> CFMachPortRef;
+        fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        static kCFRunLoopCommonModes: CFStringRef;
+        fn CFRunLoopGetCurrent() -> CFRunLoopRef;
+        fn CFMachPortCreateRunLoopSource(
+            allocator: *const c_void,
+            port: CFMachPortRef,
+            order: isize,
+        ) -> CFRunLoopSourceRef;
+        fn CFRunLoopAddSource(rl: CFRunLoopRef, source: CFRunLoopSourceRef, mode: CFStringRef);
+        fn CFRunLoopRun();
+        fn CFRelease(cf: *const c_void);
+    }
+
+    struct ListenerCtx {
+        state: Arc<Mutex<HotState>>,
+        tx: Sender<EngineCmd>,
+        settings: Arc<Mutex<Settings>>,
+        modifier_down: Mutex<Vec<Key>>,
+    }
+
+    pub fn listen(tx: Sender<EngineCmd>, settings: Arc<Mutex<Settings>>, app: AppHandle) {
+        let mut requested_permission = false;
+        loop {
+            if !listen_event_allowed() {
+                if crate::macos_permissions::onboarding_active() {
+                    crate::engine::dbg_log(
+                        "hotkey: waiting while macOS permissions onboarding is active",
+                    );
+                    std::thread::sleep(Duration::from_secs(2));
+                    continue;
+                }
+                if !requested_permission {
+                    crate::engine::dbg_log(
+                        "hotkey: Input Monitoring permission missing; requesting kTCCServiceListenEvent",
+                    );
+                    emit_permission_error(&app);
+                    crate::macos_permissions::request_input_monitoring_once();
+                    if !crate::macos_permissions::onboarding_active() {
+                        open_input_monitoring_settings();
+                    }
+                    requested_permission = true;
+                } else {
+                    crate::engine::dbg_log("hotkey: waiting for macOS Input Monitoring permission");
+                }
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+
+            let ctx = Box::into_raw(Box::new(ListenerCtx {
+                state: Arc::new(Mutex::new(HotState::new())),
+                tx: tx.clone(),
+                settings: settings.clone(),
+                modifier_down: Mutex::new(Vec::new()),
+            }));
+
+            let mask = (1u64 << K_CG_EVENT_KEY_DOWN)
+                | (1u64 << K_CG_EVENT_KEY_UP)
+                | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
+            let tap = unsafe {
+                CGEventTapCreate(
+                    K_CG_HID_EVENT_TAP,
+                    K_CG_HEAD_INSERT_EVENT_TAP,
+                    K_CG_EVENT_TAP_OPTION_LISTEN_ONLY,
+                    mask,
+                    callback,
+                    ctx.cast(),
+                )
+            };
+            if tap.is_null() {
+                crate::engine::dbg_log(
+                    "hotkey: CGEventTapCreate failed; grant Input Monitoring permission",
+                );
+                log::error!(
+                    "macOS hotkey listener is unavailable; grant VoxFlow Input Monitoring permission"
+                );
+                emit_permission_error(&app);
+                if !requested_permission && !crate::macos_permissions::onboarding_active() {
+                    open_input_monitoring_settings();
+                    requested_permission = true;
+                }
+                unsafe {
+                    drop(Box::from_raw(ctx));
+                }
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+
+            let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0) };
+            if source.is_null() {
+                crate::engine::dbg_log("hotkey: failed to create CGEventTap run loop source");
+                log::error!("macOS hotkey listener failed to create run loop source");
+                unsafe {
+                    CFRelease(tap.cast());
+                    drop(Box::from_raw(ctx));
+                }
+                std::thread::sleep(Duration::from_secs(2));
+                continue;
+            }
+
+            crate::engine::dbg_log("hotkey: macOS CGEventTap listener ready");
+
+            unsafe {
+                CFRunLoopAddSource(CFRunLoopGetCurrent(), source, kCFRunLoopCommonModes);
+                CFRelease(source.cast());
+                CFRunLoopRun();
+            }
+            return;
+        }
+    }
+
+    fn listen_event_allowed() -> bool {
+        crate::macos_permissions::input_monitoring_allowed()
+    }
+
+    fn emit_permission_error(app: &AppHandle) {
+        let _ = app.emit(
+            "error",
+            json!({
+                "message": "Разрешите VoxFlow доступ «Input Monitoring» в macOS Privacy — горячая клавиша подключится автоматически"
+            }),
+        );
+    }
+
+    fn open_input_monitoring_settings() {
+        crate::macos_permissions::open_input_monitoring_settings();
+    }
+
+    extern "C" fn callback(
+        _proxy: CGEventTapProxy,
+        event_type: u32,
+        event: CGEventRef,
+        user_info: *mut c_void,
+    ) -> CGEventRef {
+        if event.is_null() || user_info.is_null() {
+            return event;
+        }
+        let ctx = unsafe { &*(user_info as *const ListenerCtx) };
+        handle_event(ctx, event_type, event);
+        event
+    }
+
+    fn handle_event(ctx: &ListenerCtx, event_type: u32, event: CGEventRef) {
+        let keycode = unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
+        let Some(key) = key_from_keycode(keycode as u16) else {
+            return;
+        };
+        let event_type = match event_type {
+            K_CG_EVENT_KEY_DOWN => EventType::KeyPress(key),
+            K_CG_EVENT_KEY_UP => EventType::KeyRelease(key),
+            K_CG_EVENT_FLAGS_CHANGED => modifier_event(ctx, key),
+            _ => return,
+        };
+        let (target, improve, mode) = {
+            let s = ctx.settings.lock();
+            (
+                parse_key(&s.hotkey),
+                parse_key(&s.improve_hotkey),
+                s.mode.clone(),
+            )
+        };
+        let Some(target) = target else {
+            return;
+        };
+        dispatch(&ctx.state, &ctx.tx, event_type, target, improve, &mode);
+    }
+
+    fn modifier_event(ctx: &ListenerCtx, key: Key) -> EventType {
+        let mut down = ctx.modifier_down.lock();
+        if let Some(pos) = down.iter().position(|k| *k == key) {
+            down.swap_remove(pos);
+            EventType::KeyRelease(key)
+        } else {
+            down.push(key);
+            EventType::KeyPress(key)
+        }
+    }
+
+    fn key_from_keycode(code: u16) -> Option<Key> {
+        let key = match code {
+            0 => Key::KeyA,
+            1 => Key::KeyS,
+            2 => Key::KeyD,
+            3 => Key::KeyF,
+            4 => Key::KeyH,
+            5 => Key::KeyG,
+            6 => Key::KeyZ,
+            7 => Key::KeyX,
+            8 => Key::KeyC,
+            9 => Key::KeyV,
+            10 => Key::IntlBackslash,
+            11 => Key::KeyB,
+            12 => Key::KeyQ,
+            13 => Key::KeyW,
+            14 => Key::KeyE,
+            15 => Key::KeyR,
+            16 => Key::KeyY,
+            17 => Key::KeyT,
+            18 => Key::Num1,
+            19 => Key::Num2,
+            20 => Key::Num3,
+            21 => Key::Num4,
+            22 => Key::Num6,
+            23 => Key::Num5,
+            24 => Key::Equal,
+            25 => Key::Num9,
+            26 => Key::Num7,
+            27 => Key::Minus,
+            28 => Key::Num8,
+            29 => Key::Num0,
+            30 => Key::RightBracket,
+            31 => Key::KeyO,
+            32 => Key::KeyU,
+            33 => Key::LeftBracket,
+            34 => Key::KeyI,
+            35 => Key::KeyP,
+            36 => Key::Return,
+            37 => Key::KeyL,
+            38 => Key::KeyJ,
+            39 => Key::Quote,
+            40 => Key::KeyK,
+            41 => Key::SemiColon,
+            42 => Key::BackSlash,
+            43 => Key::Comma,
+            44 => Key::Slash,
+            45 => Key::KeyN,
+            46 => Key::KeyM,
+            47 => Key::Dot,
+            48 => Key::Tab,
+            49 => Key::Space,
+            50 => Key::BackQuote,
+            51 => Key::Backspace,
+            53 => Key::Escape,
+            54 => Key::MetaRight,
+            55 => Key::MetaLeft,
+            56 => Key::ShiftLeft,
+            57 => Key::CapsLock,
+            58 => Key::Alt,
+            59 => Key::ControlLeft,
+            60 => Key::ShiftRight,
+            61 => Key::AltGr,
+            62 => Key::ControlRight,
+            65 => Key::KpDelete,
+            67 => Key::KpMultiply,
+            69 => Key::KpPlus,
+            71 => Key::NumLock,
+            75 => Key::KpDivide,
+            76 => Key::KpReturn,
+            78 => Key::KpMinus,
+            82 => Key::Kp0,
+            83 => Key::Kp1,
+            84 => Key::Kp2,
+            85 => Key::Kp3,
+            86 => Key::Kp4,
+            87 => Key::Kp5,
+            88 => Key::Kp6,
+            89 => Key::Kp7,
+            91 => Key::Kp8,
+            92 => Key::Kp9,
+            96 => Key::F5,
+            97 => Key::F6,
+            98 => Key::F7,
+            99 => Key::F3,
+            100 => Key::F8,
+            101 => Key::F9,
+            103 => Key::F11,
+            109 => Key::F10,
+            111 => Key::F12,
+            115 => Key::Home,
+            116 => Key::PageUp,
+            117 => Key::Delete,
+            118 => Key::F4,
+            119 => Key::End,
+            120 => Key::F2,
+            121 => Key::PageDown,
+            122 => Key::F1,
+            123 => Key::LeftArrow,
+            124 => Key::RightArrow,
+            125 => Key::DownArrow,
+            126 => Key::UpArrow,
+            _ => return None,
+        };
+        Some(key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,6 +963,29 @@ mod tests {
         );
         assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
         assert!(!state.lock().key_down);
+    }
+
+    #[test]
+    fn right_option_hotkey_starts_hold_to_talk() {
+        assert!(matches!(parse_key("AltRight"), Some(Key::AltGr)));
+        let (state, tx, rx) = mk();
+        dispatch(
+            &state,
+            &tx,
+            EventType::KeyPress(Key::AltGr),
+            Key::AltGr,
+            "hold",
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        backdate_press(&state);
+        dispatch(
+            &state,
+            &tx,
+            EventType::KeyRelease(Key::AltGr),
+            Key::AltGr,
+            "hold",
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
     }
 
     #[test]

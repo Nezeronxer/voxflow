@@ -22,6 +22,10 @@
   padding-bottom: 12px;
   background: transparent;
   overflow: hidden;
+  cursor: grab;
+}
+.aq-root:active {
+  cursor: grabbing;
 }
 
 /* ---------- Пилюля: общий каркас + «пружина» переходов ---------- */
@@ -37,7 +41,7 @@
   border-radius: 30px;
   /* Лёгкая посадочная тень, чтобы чёрная пилюля не «прилипала» к светлым окнам. */
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
-  cursor: default;
+  cursor: grab;
   user-select: none;
   -webkit-user-select: none;
   /* Пружина ≈140 мс с лёгким овершутом (bezier y>1). Геометрия (width/height)
@@ -49,15 +53,12 @@
     opacity 140ms cubic-bezier(0.22, 1.2, 0.36, 1);
 }
 
-/* Декоративные дети «прозрачны» для мыши: цель mousedown — сама пилюля с
-   data-tauri-drag-region (Tauri проверяет атрибут именно на event.target),
-   поэтому перетаскивание работает с любой точки, кроме текстовой зоны. */
+/* Декоративные дети «прозрачны» для мыши: Pointer Events на .aq-pill отличают
+   короткий tap от drag, поэтому перетаскивание работает с любой точки. */
 .aq-tip,
 .aq-lang,
 .aq-orbwrap,
 .aq-bars,
-.aq-check,
-.aq-done-copy,
 .aq-final-badge,
 .aq-latch-copy,
 .aq-msg,
@@ -77,6 +78,9 @@
   width: 80px;
   height: 20px;
   opacity: 1;
+}
+.aq-pill:active {
+  cursor: grabbing;
 }
 
 /* rec: 110×37 — орб слева, 12 баров справа (space-between, поля 13px). */
@@ -104,12 +108,6 @@
   padding: 10px 14px 10px 12px;
   justify-content: flex-start;
   gap: 9px;
-}
-
-/* done: компактная пилюля с галочкой на 900 мс, затем плавный спад в idle. */
-.aq-done {
-  width: 92px;
-  height: 26px;
 }
 
 /* latch: подтверждение double-press, что запись закреплена без удержания. */
@@ -264,7 +262,7 @@
   line-height: 1.45;
   font-weight: 450;
   color: rgba(255, 255, 255, 0.95);
-  cursor: default;
+  cursor: grab;
 }
 .aq-text::-webkit-scrollbar {
   display: none; /* WebView2/Chromium: без полосы */
@@ -392,7 +390,7 @@
   animation: aq-lang-in 160ms ease-out both;
 }
 
-/* ---------- Latch, галочка done и текст notice ---------- */
+/* ---------- Latch, финальный бейдж и текст notice ---------- */
 
 .aq-latch-copy {
   display: flex;
@@ -442,17 +440,6 @@
   white-space: nowrap;
 }
 
-.aq-done-copy {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 6px;
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 11px;
-  font-weight: 700;
-  line-height: 1;
-}
-
 @keyframes aq-latch-pop {
   from {
     opacity: 0;
@@ -461,22 +448,6 @@
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
-  }
-}
-
-.aq-check {
-  width: 12px;
-  height: 12px;
-  animation: aq-check-in 180ms cubic-bezier(0.22, 1.2, 0.36, 1) both;
-}
-@keyframes aq-check-in {
-  from {
-    opacity: 0;
-    transform: scale(0.6);
-  }
-  to {
-    opacity: 1;
-    transform: scale(1);
   }
 }
 
@@ -497,7 +468,6 @@
   .aq-pill,
   .aq-tip,
   .aq-latch,
-  .aq-check,
   .aq-ring,
   .aq-caret {
     transition-duration: 1ms !important;

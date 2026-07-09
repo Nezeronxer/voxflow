@@ -461,10 +461,7 @@ fn apply_self_corrections_line(line: &str) -> String {
         return line.to_string();
     }
 
-    loop {
-        let Some((start, len)) = find_last_self_correction_marker(&toks) else {
-            break;
-        };
+    while let Some((start, len)) = find_last_self_correction_marker(&toks) {
         if start == 0 || start + len >= toks.len() {
             break;
         }

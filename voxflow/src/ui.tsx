@@ -4,7 +4,7 @@ import {
   useEffect,
   useRef,
   useState,
-  type KeyboardEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
 
@@ -142,11 +142,21 @@ export function Select({
 // принимает Rust-парсер hotkey.rs::parse_key. SUPPORTED_HOTKEYS ниже — ЗЕРКАЛО
 // parse_key: меняешь там — меняй и тут, иначе захваченная клавиша молча не
 // сработает в глобальном хуке.
+export const IS_APPLE_PLATFORM =
+  typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
+
+export const HOTKEY_FIELD_HINT = IS_APPLE_PLATFORM
+  ? "Нажмите поле и клавишу. Для удержания лучше Cmd, Option или F-клавиши."
+  : "Нажмите поле и клавишу. Для удержания лучше Ctrl, Alt или F-клавиши.";
+
 export const HOTKEY_LABELS: Record<string, string> = {
-  ControlLeft: "Left Ctrl", ControlRight: "Right Ctrl",
+  ControlLeft: IS_APPLE_PLATFORM ? "Left Control" : "Left Ctrl",
+  ControlRight: IS_APPLE_PLATFORM ? "Right Control" : "Right Ctrl",
   ShiftLeft: "Left Shift", ShiftRight: "Right Shift",
-  AltLeft: "Left Alt", AltRight: "Right Alt",
-  MetaLeft: "Left Win", MetaRight: "Right Win",
+  AltLeft: IS_APPLE_PLATFORM ? "Left Option" : "Left Alt",
+  AltRight: IS_APPLE_PLATFORM ? "Right Option" : "Right Alt",
+  MetaLeft: IS_APPLE_PLATFORM ? "Left Cmd" : "Left Win",
+  MetaRight: IS_APPLE_PLATFORM ? "Right Cmd" : "Right Win",
   CapsLock: "Caps Lock", Insert: "Insert", ScrollLock: "Scroll Lock",
   Pause: "Pause", PrintScreen: "Print Screen", NumLock: "Num Lock",
   Enter: "Enter", Space: "Space", Tab: "Tab", Backspace: "Backspace", Delete: "Delete",
@@ -215,7 +225,43 @@ export function HotkeyCapture({
   const [error, setError] = useState<string | null>(null);
   const ref = useRef<HTMLButtonElement>(null);
 
-  function onKeyDown(e: KeyboardEvent<HTMLButtonElement>) {
+  function captureCode(code: string) {
+    if (code === "Escape") {
+      setError(null);
+      setCapturing(false);
+      ref.current?.blur();
+      return;
+    }
+    if (!code) return; // мёртвые клавиши без кода
+    if (!SUPPORTED_HOTKEYS.has(code)) {
+      // Экзотика (медиа/ContextMenu/Fn) — глобальный хук её не поймает: не сохраняем,
+      // остаёмся в захвате, чтобы пользователь нажал другую.
+      setError(
+        `${prettyHotkey(code)} не поддерживается глобальным хуком — нажмите другую клавишу.`,
+      );
+      return;
+    }
+    onChange(code);
+    setError(null);
+    setCapturing(false);
+    ref.current?.blur();
+  }
+
+  useEffect(() => {
+    if (!capturing) return;
+    const onWindowKeyDown = (e: globalThis.KeyboardEvent) => {
+      // WebKit на macOS иногда не отдаёт modifier-key keydown именно кнопке,
+      // даже если она была сфокусирована кликом. Глобальный capture-слушатель
+      // живёт только во время назначения и ловит Ctrl/Alt/F-клавиши надёжно.
+      e.preventDefault();
+      e.stopPropagation();
+      captureCode(e.code);
+    };
+    window.addEventListener("keydown", onWindowKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", onWindowKeyDown, { capture: true });
+  }, [capturing, onChange]);
+
+  function onKeyDown(e: ReactKeyboardEvent<HTMLButtonElement>) {
     if (!capturing) {
       // Enter/Space «нажимают» сфокусированную кнопку — входим в режим захвата,
       // не давая браузеру сразу же сгенерить click.
@@ -229,28 +275,11 @@ export function HotkeyCapture({
     // В режиме захвата гасим клавишу, чтобы она не утекла в приложение.
     e.preventDefault();
     e.stopPropagation();
-    if (e.code === "Escape") {
-      setError(null);
-      setCapturing(false);
-      ref.current?.blur();
-      return;
-    }
-    if (!e.code) return; // мёртвые клавиши без кода
-    if (!SUPPORTED_HOTKEYS.has(e.code)) {
-      // Экзотика (медиа/ContextMenu/Fn) — глобальный хук её не поймает: не сохраняем,
-      // остаёмся в захвате, чтобы пользователь нажал другую.
-      setError(
-        `${prettyHotkey(e.code)} не поддерживается глобальным хуком — нажмите другую клавишу.`,
-      );
-      return;
-    }
-    onChange(e.code);
-    setError(null);
-    setCapturing(false);
-    ref.current?.blur();
+    captureCode(e.code);
   }
 
   const printableWarn = !capturing && !error && isPrintableHotkey(value);
+  const safeHoldKeys = IS_APPLE_PLATFORM ? "Cmd / Option / F-клавиша" : "Ctrl / Alt / F-клавиша";
 
   return (
     <div className="hotkey-capture">
@@ -273,7 +302,7 @@ export function HotkeyCapture({
       ) : printableWarn ? (
         <div className="hotkey-error">
           Печатная клавиша: в режиме «Удержание» будет печататься символ в активном
-          окне. Надёжнее Ctrl / Alt / F-клавиша.
+          окне. Надёжнее {safeHoldKeys}.
         </div>
       ) : null}
     </div>

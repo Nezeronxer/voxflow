@@ -166,7 +166,7 @@ pub fn openrouter_free_models(s: &crate::settings::Settings) -> Result<Vec<Model
     let response: OpenRouterModelsResponse = serde_json::from_value(v)
         .map_err(|e| anyhow!("OpenRouter models: неожиданный JSON: {e}"))?;
     let mut out = free_model_options(response.data);
-    out.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    out.sort_by_key(|a| a.label.to_lowercase());
     Ok(out)
 }
 

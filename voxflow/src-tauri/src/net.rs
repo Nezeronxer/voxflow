@@ -15,13 +15,18 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Создать `curl`-команду с подавленным окном (Windows) — единая точка входа.
 pub fn curl() -> Command {
-    let mut c = Command::new("curl");
+    let c = Command::new("curl");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
+        let mut c = c;
         c.creation_flags(CREATE_NO_WINDOW);
+        c
     }
-    c
+    #[cfg(not(windows))]
+    {
+        c
+    }
 }
 
 /// Добавить `-x <proxy>` к curl-команде, если `proxy` непустой.

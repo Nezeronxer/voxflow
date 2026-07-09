@@ -11,6 +11,7 @@ mod gemini;
 mod gigaam;
 mod hotkey;
 mod inject;
+mod macos_permissions;
 mod models;
 mod net;
 mod ollama;
@@ -24,7 +25,7 @@ mod updater;
 mod vad;
 mod voice_cmds;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -69,6 +70,7 @@ pub fn run() {
         ))
         .setup(|app| {
             let handle = app.handle().clone();
+            let autostarted = std::env::args().any(|a| a == "--autostart");
 
             // БД + настройки. P2-7: не молчаливый краш через .expect, а понятное
             // окно (permission denied / занятый файл / диск) и корректный выход.
@@ -98,7 +100,12 @@ pub fn run() {
                 settings_arc.clone(),
                 recording.clone(),
             );
-            hotkey::spawn(tx.clone(), settings_arc.clone());
+            if !autostarted {
+                // Поднимаем onboarding до запуска CGEventTap-слушателя, чтобы он
+                // не успевал первым открыть Input Monitoring вместо Accessibility.
+                macos_permissions::onboard_on_launch(handle.clone());
+            }
+            hotkey::spawn(tx.clone(), settings_arc.clone(), handle.clone());
 
             let want_autostart = settings_arc.lock().autostart;
 
@@ -116,6 +123,7 @@ pub fn run() {
             build_tray(&handle)?;
             setup_overlay(&handle);
             spawn_overlay_hover_poller(&handle, overlay_hit);
+            spawn_overlay_drag_poller(&handle);
 
             // Первый запуск/legacy-default: подготовить модель под текущий
             // локальный маршрут. Свежий default — multilingual Whisper auto;
@@ -138,7 +146,6 @@ pub fn run() {
             }
 
             // Показать окно настроек при запуске, НО не при автозапуске (тогда — в трей).
-            let autostarted = std::env::args().any(|a| a == "--autostart");
             if !autostarted {
                 if let Some(main) = handle.get_webview_window("main") {
                     let _ = main.show();
@@ -156,21 +163,65 @@ pub fn run() {
                     let _ = window.hide();
                 }
             }
-            // Overlay перетаскивают мышью — запоминаем позицию (debounce 600 мс:
-            // пишем только последнюю точку серии, не каждый пиксель драга).
+            // Overlay перетаскивают мышью — после короткой паузы притягиваем к
+            // ближайшему якорю и запоминаем уже закреплённую позицию.
             if window.label() == "overlay" {
                 if let tauri::WindowEvent::Moved(pos) = event {
                     use std::sync::atomic::{AtomicU64, Ordering as AO};
                     static MOVE_SEQ: AtomicU64 = AtomicU64::new(0);
                     let seq = MOVE_SEQ.fetch_add(1, AO::SeqCst) + 1;
                     let app = window.app_handle().clone();
-                    let (x, y) = (pos.x, pos.y);
+                    let fallback_pos = (pos.x, pos.y);
                     std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_millis(600));
+                        std::thread::sleep(std::time::Duration::from_millis(360));
                         if MOVE_SEQ.load(AO::SeqCst) == seq {
+                            let mut save_pos = fallback_pos;
+                            if let Some(ov) = app.get_webview_window("overlay") {
+                                let cur_pos = ov
+                                    .outer_position()
+                                    .map(|p| (p.x, p.y))
+                                    .unwrap_or(fallback_pos);
+                                let win_size = ov
+                                    .outer_size()
+                                    .map(|s| (s.width as i32, s.height as i32))
+                                    .unwrap_or((220, 80));
+                                let scale = ov.scale_factor().unwrap_or(1.0);
+                                if let Ok(monitors) = ov.available_monitors() {
+                                    let work_areas: Vec<_> = monitors
+                                        .iter()
+                                        .map(|mon| {
+                                            let area = mon.work_area();
+                                            (
+                                                area.position.x,
+                                                area.position.y,
+                                                area.size.width as i32,
+                                                area.size.height as i32,
+                                            )
+                                        })
+                                        .collect();
+                                    if let Some(snapped) =
+                                        overlay_snap_position(cur_pos, win_size, &work_areas, scale)
+                                    {
+                                        if snapped != cur_pos {
+                                            let _ = ov.set_position(PhysicalPosition::new(
+                                                snapped.0, snapped.1,
+                                            ));
+                                        }
+                                        save_pos = snapped;
+                                    } else {
+                                        save_pos = cur_pos;
+                                    }
+                                } else {
+                                    save_pos = cur_pos;
+                                }
+                            }
                             if let Some(state) = app.try_state::<AppState>() {
                                 let conn = state.db.lock();
-                                let _ = db::kv_set(&conn, "overlay_pos", &format!("[{x},{y}]"));
+                                let _ = db::kv_set(
+                                    &conn,
+                                    "overlay_pos",
+                                    &format!("[{},{}]", save_pos.0, save_pos.1),
+                                );
                             }
                         }
                     });
@@ -185,6 +236,7 @@ pub fn run() {
             commands::download_model,
             commands::delete_model,
             commands::toggle_dictation,
+            commands::overlay_click,
             commands::is_recording,
             commands::get_stats,
             commands::get_history,
@@ -209,8 +261,14 @@ pub fn run() {
             commands::overlay_box,
             commands::overlay_hit,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running VoxFlow");
+        .build(tauri::generate_context!())
+        .expect("error while building VoxFlow")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                request_shutdown(app);
+            }
+            _ => {}
+        });
 }
 
 /// Показать фатальную ошибку старта понятным окном (GUI ещё не поднят, поэтому
@@ -489,11 +547,13 @@ pub fn stt_test_cli(wav: &str) {
     }
 }
 
-/// Поллер «мышь над пилюлей»: каждые 120 мс сравнивает глобальный курсор с
+/// Поллер «мышь над пилюлей»: на Windows каждые 120 мс сравнивает глобальный курсор с
 /// зоной пилюли (overlay_hit от фронта, CSS px × scale + позиция окна) и
 /// переключает click-through. Вне пилюли окно прозрачно для мыши — кнопки
 /// фуллскрин-приложений под оверлеем остаются кликабельными. Во время зажатой
-/// ЛКМ состояние не переключаем (не рвать drag пилюли).
+/// ЛКМ состояние не переключаем (не рвать drag пилюли). На macOS overlay
+/// оставляем интерактивным всегда: системный click-through слишком легко
+/// ломает реальный drag маленькой плавающей панели.
 fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitRect>>) {
     #[cfg(windows)]
     {
@@ -556,6 +616,104 @@ fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitR
     {
         let _ = (app, hit);
     }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_overlay_drag_poller(app: &tauri::AppHandle) {
+    let app = app.clone();
+    std::thread::Builder::new()
+        .name("voxflow-overlay-drag".into())
+        .spawn(move || {
+            let mut drag: Option<((f64, f64), (i32, i32))> = None;
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+                let Some(ov) = app.get_webview_window("overlay") else {
+                    drag = None;
+                    continue;
+                };
+                let down = macos_left_mouse_down();
+                let Some(cursor) = macos_cursor_position() else {
+                    drag = None;
+                    continue;
+                };
+                if !down {
+                    drag = None;
+                    continue;
+                }
+                if let Some((start_cursor, start_pos)) = drag {
+                    let dx = cursor.0 - start_cursor.0;
+                    let dy = cursor.1 - start_cursor.1;
+                    if dx.abs() >= 1.0 || dy.abs() >= 1.0 {
+                        let x = (start_pos.0 as f64 + dx).round() as i32;
+                        let y = (start_pos.1 as f64 + dy).round() as i32;
+                        let _ = ov.set_position(PhysicalPosition::new(x, y));
+                    }
+                    continue;
+                }
+                if overlay_cursor_inside_window(&ov, cursor) {
+                    if let Ok(pos) = ov.outer_position() {
+                        drag = Some((cursor, (pos.x, pos.y)));
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_overlay_drag_poller(_app: &tauri::AppHandle) {}
+
+#[cfg(target_os = "macos")]
+fn overlay_cursor_inside_window(ov: &tauri::WebviewWindow, cursor: (f64, f64)) -> bool {
+    let (Ok(pos), Ok(size)) = (ov.outer_position(), ov.outer_size()) else {
+        return false;
+    };
+    let x = pos.x as f64;
+    let y = pos.y as f64;
+    let w = size.width as f64;
+    let h = size.height as f64;
+    cursor.0 >= x && cursor.0 <= x + w && cursor.1 >= y && cursor.1 <= y + h
+}
+
+#[cfg(target_os = "macos")]
+#[repr(C)]
+struct MacosCGPoint {
+    x: f64,
+    y: f64,
+}
+
+#[cfg(target_os = "macos")]
+type MacosCGEventRef = *mut std::ffi::c_void;
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventCreate(source: *const std::ffi::c_void) -> MacosCGEventRef;
+    fn CGEventGetLocation(event: MacosCGEventRef) -> MacosCGPoint;
+    fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "CoreFoundation", kind = "framework")]
+extern "C" {
+    fn CFRelease(cf: *const std::ffi::c_void);
+}
+
+#[cfg(target_os = "macos")]
+fn macos_cursor_position() -> Option<(f64, f64)> {
+    let event = unsafe { CGEventCreate(std::ptr::null()) };
+    if event.is_null() {
+        return None;
+    }
+    let p = unsafe { CGEventGetLocation(event) };
+    unsafe { CFRelease(event.cast()) };
+    Some((p.x, p.y))
+}
+
+#[cfg(target_os = "macos")]
+fn macos_left_mouse_down() -> bool {
+    // 0 = kCGEventSourceStateCombinedSessionState, 0 = kCGMouseButtonLeft.
+    unsafe { CGEventSourceButtonState(0, 0) }
 }
 
 /// Headless-проверка GigaAM-пайплайна (без GUI/микрофона): грузит VAD+GigaAM,
@@ -692,6 +850,10 @@ fn read_wav_mono_16k(wav_path: &str) -> Vec<f32> {
 }
 
 fn request_shutdown(app: &tauri::AppHandle) {
+    static SHUTDOWN_SENT: AtomicBool = AtomicBool::new(false);
+    if SHUTDOWN_SENT.swap(true, Ordering::SeqCst) {
+        return;
+    }
     if let Some(state) = app.try_state::<AppState>() {
         state.engine.restore_auto_mute();
         let _ = state.engine_tx.lock().send(EngineCmd::Shutdown);
@@ -878,45 +1040,275 @@ fn build_tray(app: &tauri::AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Overlay-индикатор (orb): маленькое интерактивное окно (drag по пилюле,
-/// hover-состояния), НЕ click-through — мёртвой зоны нет, потому что окно
-/// ужимается под пилюлю (фронт зовёт overlay_box на каждой смене состояния).
+/// Overlay-индикатор (orb): маленькое плавающее окно. На macOS оно всегда
+/// интерактивно в пределах своего небольшого бокса, чтобы drag не ломался
+/// из-за системного click-through. На Windows hover-poller по-прежнему
+/// включает мышь только над актуальным hit-rect.
 /// Позиция запоминается в kv "overlay_pos" и восстанавливается на старте.
 fn setup_overlay(app: &tauri::AppHandle) {
     if let Some(ov) = app.get_webview_window("overlay") {
-        // По умолчанию click-through: иначе невидимые поля окна перехватывали
-        // клики по нижнему центру экрана (кнопки фуллскрин-приложений).
-        // Интерактивность включает поллер курсора, только когда мышь над пилюлей.
+        // На macOS настоящие mouse-drag события должны доходить до webview.
+        // Windows сохраняет старую click-through модель через hover-poller.
+        #[cfg(target_os = "macos")]
+        let _ = ov.set_ignore_cursor_events(false);
+        #[cfg(not(target_os = "macos"))]
         let _ = ov.set_ignore_cursor_events(true);
+        let _ = ov.set_always_on_top(true);
         let scale = ov.scale_factor().unwrap_or(1.0);
         // Стартовый размер = idle-запрос фронта (220×80: запас под hover-рост
         // и тултип); дальше фронт сам зовёт overlay_box на каждом состоянии.
         let win_w = 220.0 * scale;
         let win_h = 80.0 * scale;
         let _ = ov.set_size(PhysicalSize::new(win_w as u32, win_h as u32));
-        // Сохранённая позиция, если она в пределах экрана; иначе низ-центр.
+        // Сохранённая позиция, если она остаётся видимой на одном из экранов;
+        // иначе низ-центр. На macOS координаты могут быть глобальными для
+        // нескольких мониторов, поэтому нельзя валидировать только через
+        // primary_monitor().size().
         let saved: Option<(i32, i32)> = {
             let state = app.state::<AppState>();
             let conn = state.db.lock();
             db::kv_get(&conn, "overlay_pos").and_then(|j| serde_json::from_str(&j).ok())
         };
         let mut placed = false;
-        if let (Some((x, y)), Ok(Some(mon))) = (saved, ov.primary_monitor()) {
-            let size = mon.size();
-            if x > -64 && y > -64 && x < size.width as i32 && y < size.height as i32 {
+        if let (Some((x, y)), Ok(monitors)) = (saved, ov.available_monitors()) {
+            let win_w_i = win_w.round() as i32;
+            let win_h_i = win_h.round() as i32;
+            let visible = monitors.iter().any(|mon| {
+                let area = mon.work_area();
+                overlay_position_visible(
+                    (x, y),
+                    (win_w_i, win_h_i),
+                    (
+                        area.position.x,
+                        area.position.y,
+                        area.size.width as i32,
+                        area.size.height as i32,
+                    ),
+                )
+            });
+            if visible {
                 let _ = ov.set_position(PhysicalPosition::new(x, y));
                 placed = true;
             }
         }
         if !placed {
             if let Ok(Some(mon)) = ov.primary_monitor() {
-                let size = mon.size();
-                let x = ((size.width as f64 - win_w) / 2.0) as i32;
-                // 64px над низом: выше панели задач, пилюля не прячется за ней.
-                let y = (size.height as f64 - win_h - 64.0 * scale) as i32;
+                let area = mon.work_area();
+                let x = area.position.x + ((area.size.width as f64 - win_w) / 2.0).max(0.0) as i32;
+                // Держим заметно выше Dock/menu-safe area: на macOS маленькая
+                // recording-пилюля иначе визуально терялась у нижней кромки.
+                let y = area.position.y
+                    + (area.size.height as f64 - win_h - 156.0 * scale).max(0.0) as i32;
                 let _ = ov.set_position(PhysicalPosition::new(x, y));
             }
         }
         let _ = ov.show();
+    }
+}
+
+fn overlay_position_visible(
+    position: (i32, i32),
+    window_size: (i32, i32),
+    work_area: (i32, i32, i32, i32),
+) -> bool {
+    const MIN_VISIBLE: i64 = 48;
+    const MIN_BOTTOM_GAP: i64 = 96;
+    let (x, y) = position;
+    let (win_w, win_h) = window_size;
+    let (area_x, area_y, area_w, area_h) = work_area;
+    let (x, y, win_w, win_h) = (x as i64, y as i64, win_w as i64, win_h as i64);
+    let (area_x, area_y, area_w, area_h) =
+        (area_x as i64, area_y as i64, area_w as i64, area_h as i64);
+    let area_right = area_x + area_w;
+    let area_bottom = area_y + area_h;
+
+    x + win_w - area_x >= MIN_VISIBLE
+        && y + win_h - area_y >= MIN_VISIBLE
+        && area_right - x >= MIN_VISIBLE
+        && area_bottom - y >= MIN_VISIBLE
+        && area_bottom - (y + win_h) >= MIN_BOTTOM_GAP
+}
+
+fn overlay_snap_position(
+    position: (i32, i32),
+    window_size: (i32, i32),
+    work_areas: &[(i32, i32, i32, i32)],
+    scale_factor: f64,
+) -> Option<(i32, i32)> {
+    let work_area = overlay_best_work_area(position, window_size, work_areas)?;
+    Some(overlay_snap_position_in_work_area(
+        position,
+        window_size,
+        work_area,
+        scale_factor,
+    ))
+}
+
+fn overlay_best_work_area(
+    position: (i32, i32),
+    window_size: (i32, i32),
+    work_areas: &[(i32, i32, i32, i32)],
+) -> Option<(i32, i32, i32, i32)> {
+    let (x, y) = position;
+    let (win_w, win_h) = window_size;
+    let center = (x as i64 + win_w as i64 / 2, y as i64 + win_h as i64 / 2);
+
+    work_areas
+        .iter()
+        .copied()
+        .min_by_key(|&(area_x, area_y, area_w, area_h)| {
+            let left = area_x as i64;
+            let top = area_y as i64;
+            let right = left + area_w as i64;
+            let bottom = top + area_h as i64;
+            let dx = if center.0 < left {
+                left - center.0
+            } else if center.0 > right {
+                center.0 - right
+            } else {
+                0
+            };
+            let dy = if center.1 < top {
+                top - center.1
+            } else if center.1 > bottom {
+                center.1 - bottom
+            } else {
+                0
+            };
+            dx * dx + dy * dy
+        })
+}
+
+fn overlay_snap_position_in_work_area(
+    position: (i32, i32),
+    window_size: (i32, i32),
+    work_area: (i32, i32, i32, i32),
+    scale_factor: f64,
+) -> (i32, i32) {
+    let (x, y) = position;
+    let (win_w, win_h) = window_size;
+    let (area_x, area_y, area_w, area_h) = work_area;
+    let scale = scale_factor.clamp(1.0, 3.0);
+    let side_gap = ((16.0 * scale).round() as i32).max(14);
+    let bottom_gap = ((56.0 * scale).round() as i32).max(96);
+    let y_threshold = ((64.0 * scale).round() as i32).max(70);
+
+    let max_x = area_x + area_w - win_w - side_gap;
+    let left_x = area_x + side_gap;
+    let center_x = area_x + ((area_w - win_w) / 2).max(0);
+    let right_x = max_x.max(left_x);
+    let snapped_x = [left_x, center_x, right_x]
+        .into_iter()
+        .min_by_key(|candidate| (x - *candidate).abs())
+        .unwrap_or(center_x);
+
+    let top_y = area_y + side_gap;
+    let bottom_y = (area_y + area_h - win_h - bottom_gap).max(top_y);
+    let center_y = area_y + ((area_h - win_h) / 2).max(0);
+    let mut snapped_y = y.clamp(top_y, bottom_y);
+    if let Some(anchor) = [top_y, center_y, bottom_y]
+        .into_iter()
+        .min_by_key(|candidate| (y - *candidate).abs())
+    {
+        if (y - anchor).abs() <= y_threshold {
+            snapped_y = anchor.clamp(top_y, bottom_y);
+        }
+    }
+
+    (snapped_x, snapped_y)
+}
+
+#[cfg(test)]
+mod lib_tests {
+    use super::{
+        overlay_best_work_area, overlay_position_visible, overlay_snap_position,
+        overlay_snap_position_in_work_area,
+    };
+
+    #[test]
+    fn overlay_position_accepts_visible_saved_position() {
+        assert!(overlay_position_visible(
+            (1200, 800),
+            (220, 80),
+            (0, 0, 3000, 1700)
+        ));
+    }
+
+    #[test]
+    fn overlay_position_rejects_mostly_offscreen_saved_position() {
+        assert!(!overlay_position_visible(
+            (1700, 2198),
+            (220, 80),
+            (0, 0, 3000, 1700)
+        ));
+        assert!(!overlay_position_visible(
+            (-210, 100),
+            (220, 80),
+            (0, 0, 3000, 1700)
+        ));
+        assert!(!overlay_position_visible(
+            (900, 1131),
+            (220, 80),
+            (0, 0, 1976, 1211)
+        ));
+    }
+
+    #[test]
+    fn overlay_position_accepts_secondary_monitor_coordinates() {
+        assert!(overlay_position_visible(
+            (3300, 600),
+            (220, 80),
+            (3000, 0, 1920, 1080)
+        ));
+    }
+
+    #[test]
+    fn overlay_snap_uses_left_center_right_anchors() {
+        let area = (0, 0, 3000, 1700);
+        assert_eq!(
+            overlay_snap_position_in_work_area((40, 800), (220, 80), area, 2.0).0,
+            32
+        );
+        assert_eq!(
+            overlay_snap_position_in_work_area((1370, 800), (220, 80), area, 2.0).0,
+            1390
+        );
+        assert_eq!(
+            overlay_snap_position_in_work_area((2740, 800), (220, 80), area, 2.0).0,
+            2748
+        );
+    }
+
+    #[test]
+    fn overlay_snap_preserves_free_vertical_position_away_from_anchors() {
+        let snapped =
+            overlay_snap_position_in_work_area((40, 430), (220, 80), (0, 0, 3000, 1700), 2.0);
+        assert_eq!(snapped, (32, 430));
+    }
+
+    #[test]
+    fn overlay_snap_magnets_vertical_edges_when_nearby() {
+        let area = (0, 0, 3000, 1700);
+        assert_eq!(
+            overlay_snap_position_in_work_area((40, 26), (220, 80), area, 2.0),
+            (32, 32)
+        );
+        assert_eq!(
+            overlay_snap_position_in_work_area((40, 1488), (220, 80), area, 2.0),
+            (32, 1508)
+        );
+    }
+
+    #[test]
+    fn overlay_snap_selects_nearest_monitor() {
+        let monitors = [(0, 0, 3000, 1700), (3000, 0, 1920, 1080)];
+        assert_eq!(
+            overlay_best_work_area((3300, 600), (220, 80), &monitors),
+            Some((3000, 0, 1920, 1080))
+        );
+        assert_eq!(
+            overlay_snap_position((3300, 600), (220, 80), &monitors, 2.0),
+            Some((3032, 500))
+        );
     }
 }

@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "VoxFlow",
-  "version": "1.0.3",
-  "identifier": "com.voxflow.app",
+  "version": "1.0.8",
+  "identifier": "com.nezeronxer.voxflow.macos",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "node ./node_modules/vite/bin/vite.js",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "node ./node_modules/typescript/bin/tsc && node ./node_modules/vite/bin/vite.js build",
     "frontendDist": "../dist"
   },
   "app": {
@@ -63,6 +63,25 @@
       "resources/whisper-cuda/Release/*",
       "resources/vad/*"
     ],
+    "macOS": {
+      "minimumSystemVersion": "11.0",
+      "hardenedRuntime": true,
+      "infoPlist": "Info.plist",
+      "dmg": {
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
+      }
+    },
     "windows": {
       "nsis": {
         "installMode": "currentUser",
