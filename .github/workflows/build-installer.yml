@@ -154,7 +154,18 @@ jobs:
             throw "Installer is empty: $($installer.FullName)"
           }
           $digest = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLowerInvariant()
-          "$digest  $($installer.Name)" | Set-Content -Encoding ascii installer/Output/SHA256SUMS-windows.txt
+          $checksumPath = "installer/Output/SHA256SUMS-windows.txt"
+          # Write a portable LF-only checksum file. Set-Content on Windows emits
+          # CRLF, which makes GNU sha256sum treat the trailing CR as part of the
+          # filename when the cross-platform release orchestrator verifies it.
+          [IO.File]::WriteAllText(
+            $checksumPath,
+            "$digest  $($installer.Name)`n",
+            [Text.UTF8Encoding]::new($false)
+          )
+          if ([IO.File]::ReadAllBytes($checksumPath) -contains 13) {
+            throw "Windows checksum file contains a carriage return"
+          }
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
