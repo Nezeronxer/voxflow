@@ -12,12 +12,25 @@ const [engineSource, permissionsSource, tauriSource, entitlementSource, infoSour
   ]);
 
 function rustFunction(source, signature, nextMarker) {
-  const start = source.indexOf(signature);
+  // Git may check text files out with CRLF on Windows runners. Normalize the
+  // source before matching structural line markers so this release gate checks
+  // the same Rust body on every supported platform.
+  const normalizedSource = source.replaceAll("\r\n", "\n");
+  const start = normalizedSource.indexOf(signature);
   assert.notEqual(start, -1, `missing ${signature}`);
-  const end = source.indexOf(nextMarker, start);
+  const end = normalizedSource.indexOf(nextMarker, start);
   assert.notEqual(end, -1, `missing end marker for ${signature}`);
-  return source.slice(start, end);
+  return normalizedSource.slice(start, end);
 }
+
+test("Rust release gates tolerate Windows CRLF checkouts", () => {
+  const body = rustFunction(
+    "pub fn example() {\r\n    verify();\r\n}\r\n\r\n#[cfg(test)]",
+    "pub fn example(",
+    "\n}\n\n#[cfg(test)]",
+  );
+  assert.match(body, /verify\(\);/);
+});
 
 test("the packaged macOS app declares both microphone privacy contracts", () => {
   const config = JSON.parse(tauriSource);
