@@ -102,11 +102,18 @@ const BUILTIN_ASR_TERMS: &[&str] = &[
 #[derive(Clone)]
 pub struct EngineHandle {
     auto_mute: Arc<Mutex<Option<AutoMuteGuard>>>,
+    cancel_active: Arc<AtomicBool>,
 }
 
 impl EngineHandle {
     pub fn restore_auto_mute(&self) {
         restore_auto_mute_arc(&self.auto_mute);
+    }
+
+    /// Общий с hotkey признак реально отменяемой работы: активная запись,
+    /// финальная обработка или улучшение выделения.
+    pub fn cancel_active_flag(&self) -> Arc<AtomicBool> {
+        self.cancel_active.clone()
     }
 }
 
@@ -135,6 +142,16 @@ struct PartialState {
     start_fp: TargetFingerprint,
     /// Режим вставки на момент старта: "never" | "auto" | "always".
     stream_mode: String,
+    /// Чем занята петля: whisper-server требует аккуратного join/kill перед
+    /// финалом, локальные/облачные черновики можно детачить быстрее.
+    kind: PartialKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PartialKind {
+    WhisperServer,
+    Local,
+    Cloud,
 }
 
 #[derive(Default)]
@@ -211,6 +228,12 @@ struct EngineCtx {
     dictation_memory: Arc<Mutex<DictationMemory>>,
     /// Guard системного mute на время активной диктовки.
     auto_mute: Arc<Mutex<Option<AutoMuteGuard>>>,
+    /// `Esc` имеет смысл только пока действительно идёт запись/финал/улучшение.
+    /// Отдельный флаг нужен, потому что `recording=false` уже во время финального ASR.
+    cancel_active: Arc<AtomicBool>,
+    /// Сериализует смену поколения и `cancel_active` между engine-loop и detached
+    /// финалами, чтобы завершение старого финала не очистило флаг новой записи.
+    cancel_activity_lock: Arc<Mutex<()>>,
 }
 
 /// Поднять рабочий поток движка.
@@ -222,6 +245,7 @@ pub fn spawn(
     recording: Arc<AtomicBool>,
 ) -> EngineHandle {
     let auto_mute = Arc::new(Mutex::new(None));
+    let cancel_active = Arc::new(AtomicBool::new(false));
     let ctx = EngineCtx {
         app,
         db,
@@ -243,6 +267,8 @@ pub fn spawn(
         improve_busy: Arc::new(AtomicBool::new(false)),
         dictation_memory: Arc::new(Mutex::new(DictationMemory::default())),
         auto_mute: auto_mute.clone(),
+        cancel_active: cancel_active.clone(),
+        cancel_activity_lock: Arc::new(Mutex::new(())),
     };
     // Прогрев whisper-server в фоне (CUDA JIT один раз → первая диктовка тоже быстрая).
     let warm = ctx.clone();
@@ -258,18 +284,17 @@ pub fn spawn(
         .name("voxflow-engine".into())
         .spawn(move || engine_loop(rx, ctx))
         .expect("spawn engine thread");
-    EngineHandle { auto_mute }
+    EngineHandle {
+        auto_mute,
+        cancel_active,
+    }
 }
 
 /// Простой файловый лог для диагностики (data_dir/debug.log).
 pub fn dbg_log(msg: &str) {
     use std::io::Write;
     let p = paths::data_dir().join("debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(p)
-    {
+    if let Ok(mut f) = paths::open_private_append(&p) {
         let now = chrono::Local::now().format("%H:%M:%S%.3f");
         let _ = writeln!(f, "[{now}] {msg}");
     }
@@ -334,20 +359,20 @@ fn current_or_restored_target(
         return Some(cur);
     }
 
-    if (cur.is_own_app() || cur.is_transient_system_ui()) && target_fp.is_usable_dictation_target()
+    if (cur.is_own_app() || cur.is_transient_system_ui())
+        && target_fp.is_usable_dictation_target()
+        && activate_target_for_insert(target_fp)
     {
-        if activate_target_for_insert(target_fp) {
-            std::thread::sleep(Duration::from_millis(160));
-            cur = crate::app_context::detect();
-            cur_fp = cur.target_fingerprint();
-            if target_fp.matches(&cur) {
-                dbg_log(&format!(
-                    "финал: восстановили фокус целевого окна ({stage}) {}",
-                    target_fp.describe()
-                ));
-                remember_external_target(ctx, target_fp);
-                return Some(cur);
-            }
+        std::thread::sleep(Duration::from_millis(160));
+        cur = crate::app_context::detect();
+        cur_fp = cur.target_fingerprint();
+        if target_fp.matches(&cur) {
+            dbg_log(&format!(
+                "финал: восстановили фокус целевого окна ({stage}) {}",
+                target_fp.describe()
+            ));
+            remember_external_target(ctx, target_fp);
+            return Some(cur);
         }
     }
 
@@ -671,6 +696,8 @@ fn engine_loop(rx: Receiver<EngineCmd>, ctx: EngineCtx) {
                 std::thread::spawn(move || warmup(wctx));
             }
             EngineCmd::Shutdown => {
+                let _activity = ctx.cancel_activity_lock.lock();
+                ctx.cancel_active.store(false, Ordering::SeqCst);
                 restore_auto_mute(&ctx);
                 if let Some(mut srv) = ctx.server.lock().take() {
                     let _ = srv.child.kill();
@@ -743,6 +770,13 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             // «не писали → пишем». Если запись уже шла (Start поверх ещё активной
             // диктовки при rapid-fire) — звук не переигрываем.
             let was_recording = ctx.recording.swap(true, Ordering::SeqCst);
+            {
+                let _activity = ctx.cancel_activity_lock.lock();
+                // Новая диктовка → новое поколение (C4): осиротевшие финал-потоки
+                // прошлых диктовок не смогут очистить её activity-флаг или вставить текст.
+                ctx.gen.fetch_add(1, Ordering::SeqCst);
+                ctx.cancel_active.store(true, Ordering::SeqCst);
+            }
             if auto_mute && !was_recording {
                 match AutoMuteGuard::engage() {
                     Ok(guard) => {
@@ -755,9 +789,6 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             if play && !was_recording {
                 sound::play(true);
             }
-            // Новая диктовка → новое поколение (C4): осиротевшие финал-потоки прошлых
-            // диктовок увидят расхождение gen и не станут вставлять повторно.
-            ctx.gen.fetch_add(1, Ordering::SeqCst);
             set_status(&ctx.app, "recording");
             // Запускаем петлю живого стриминга, если GPU whisper-server доступен —
             // пилюля показывает живой текст и при whisper_cli (живой инжект при этом
@@ -1028,6 +1059,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
         abort,
         start_fp,
         stream_mode: mode,
+        kind: PartialKind::WhisperServer,
     });
 }
 
@@ -1091,6 +1123,7 @@ fn start_cloud_partial_loop(
         abort: Arc::new(AtomicBool::new(false)),
         start_fp,
         stream_mode: "never".to_string(),
+        kind: PartialKind::Cloud,
     });
 }
 
@@ -1539,6 +1572,7 @@ fn start_local_partial_loop<T: LocalStt + Send + 'static>(
         abort,
         start_fp,
         stream_mode: s.stream_mode.clone(),
+        kind: PartialKind::Local,
     });
 }
 
@@ -2080,34 +2114,51 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     if let Some(mut st) = pstate {
         st.stop.store(true, Ordering::Release);
         if let Some(j) = st.join.take() {
-            let t0 = Instant::now();
-            loop {
-                if j.is_finished() {
-                    let _ = j.join();
-                    break;
-                }
-                if t0.elapsed() >= Duration::from_millis(700) {
-                    dbg_log(
-                        "stop: петля партиалов занята >700 мс — перезапускаем whisper-server перед финалом",
-                    );
-                    restart_whisper_server(ctx, "partial busy before final");
-                    let t1 = Instant::now();
+            match st.kind {
+                PartialKind::WhisperServer => {
+                    let t0 = Instant::now();
                     loop {
                         if j.is_finished() {
                             let _ = j.join();
                             break;
                         }
-                        if t1.elapsed() >= Duration::from_millis(1300) {
+                        if t0.elapsed() >= Duration::from_millis(700) {
                             dbg_log(
-                                "stop: петля партиалов не завершилась после kill — детачим, финал уйдёт в fallback при занятом asr_lock",
+                                "stop: петля партиалов занята >700 мс — перезапускаем whisper-server перед финалом",
                             );
+                            restart_whisper_server(ctx, "partial busy before final");
+                            let t1 = Instant::now();
+                            loop {
+                                if j.is_finished() {
+                                    let _ = j.join();
+                                    break;
+                                }
+                                if t1.elapsed() >= Duration::from_millis(1300) {
+                                    dbg_log(
+                                        "stop: петля партиалов не завершилась после kill — детачим, финал уйдёт в fallback при занятом asr_lock",
+                                    );
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
                             break;
                         }
-                        std::thread::sleep(Duration::from_millis(20));
+                        std::thread::sleep(Duration::from_millis(10));
                     }
-                    break;
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                PartialKind::Local | PartialKind::Cloud => {
+                    let t0 = Instant::now();
+                    while !j.is_finished() && t0.elapsed() < Duration::from_millis(120) {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if j.is_finished() {
+                        let _ = j.join();
+                    } else {
+                        dbg_log(
+                            "stop: локальная петля партиалов ещё занята — детачим, финал стартует сразу",
+                        );
+                    }
+                }
             }
         }
         // Переносим живое состояние в финальный проход (для inject_incremental реконсиляции).
@@ -2134,6 +2185,7 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             if ctx2.gen.load(Ordering::SeqCst) == my_gen {
                 set_status(&ctx2.app, "idle");
             }
+            clear_cancel_active_if_current(&ctx2, my_gen);
         });
         return;
     }
@@ -2160,6 +2212,7 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         if ctx2.gen.load(Ordering::SeqCst) == my_gen {
             set_status(&ctx2.app, "idle");
         }
+        clear_cancel_active_if_current(&ctx2, my_gen);
     });
 }
 
@@ -2171,6 +2224,16 @@ fn restore_auto_mute_arc(auto_mute: &Arc<Mutex<Option<AutoMuteGuard>>>) {
     if let Some(mut guard) = auto_mute.lock().take() {
         guard.restore();
         dbg_log("auto-mute: system output restored");
+    }
+}
+
+fn clear_cancel_active_if_current(ctx: &EngineCtx, my_gen: u64) {
+    let _activity = ctx.cancel_activity_lock.lock();
+    if ctx.gen.load(Ordering::SeqCst) == my_gen
+        && !ctx.recording.load(Ordering::SeqCst)
+        && !ctx.improve_busy.load(Ordering::SeqCst)
+    {
+        ctx.cancel_active.store(false, Ordering::SeqCst);
     }
 }
 
@@ -2202,12 +2265,24 @@ fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             };
             erase_live_draft(ctx, Some(&live), my_gen);
         }
-        ctx.gen.fetch_add(1, Ordering::SeqCst);
+        {
+            let _activity = ctx.cancel_activity_lock.lock();
+            ctx.gen.fetch_add(1, Ordering::SeqCst);
+            ctx.cancel_active.store(false, Ordering::SeqCst);
+        }
         set_status(&ctx.app, "idle");
         dbg_log("cancel: активная диктовка отменена Esc");
         return;
     }
-    ctx.gen.fetch_add(1, Ordering::SeqCst);
+    {
+        let _activity = ctx.cancel_activity_lock.lock();
+        if !ctx.cancel_active.load(Ordering::SeqCst) && !ctx.improve_busy.load(Ordering::SeqCst) {
+            dbg_log("cancel: Esc проигнорирован — активной работы нет");
+            return;
+        }
+        ctx.gen.fetch_add(1, Ordering::SeqCst);
+        ctx.cancel_active.store(false, Ordering::SeqCst);
+    }
     *ctx.active_target.lock() = None;
     if ctx.improve_busy.load(Ordering::SeqCst) {
         emit_improve_status(&ctx.app, "cancelled", "Отменено");
@@ -2225,11 +2300,16 @@ fn improve_selection(ctx: &EngineCtx) {
         emit_improve_status(&ctx.app, "busy", "Улучшение уже выполняется");
         return;
     }
+    {
+        let _activity = ctx.cancel_activity_lock.lock();
+        ctx.cancel_active.store(true, Ordering::SeqCst);
+    }
     let ctx2 = ctx.clone();
     let my_gen = ctx.gen.load(Ordering::SeqCst);
     std::thread::spawn(move || {
         let result = improve_selection_inner(&ctx2, my_gen);
         ctx2.improve_busy.store(false, Ordering::SeqCst);
+        clear_cancel_active_if_current(&ctx2, my_gen);
         if let Err(e) = result {
             log::warn!("improve selection: {e:#}");
             emit_improve_status(&ctx2.app, "error", &format!("{e}"));
@@ -2680,7 +2760,9 @@ fn process_utterance(
                 if s.stt_fallback_local {
                     log::warn!("облачный STT недоступен — откат на локальное распознавание");
                     emit_stt_mode(&ctx.app, "local", true);
-                    local_transcribe_guarded(ctx, &s, &dict, &wav)?
+                    let (text, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed)?;
+                    lang_badge = lang;
+                    text
                 } else {
                     // Fallback выключен — честно сообщаем об ошибке и выходим.
                     if s.play_sounds {
@@ -2697,7 +2779,9 @@ fn process_utterance(
             Ok(t) => postprocess::dedup_repeated_ngrams(&t),
             Err(e) => {
                 log::warn!("облачный ASR (Gemini) ошибка: {e}; откат на локальное распознавание");
-                local_transcribe_guarded(ctx, &s, &dict, &wav)?
+                let (text, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed)?;
+                lang_badge = lang;
+                text
             }
         }
     } else {
@@ -2794,10 +2878,11 @@ fn process_utterance(
     text = reconcile_final_with_live_preview(live.as_ref(), &text);
 
     // ── «Умный» рерайт под стиль активного приложения (Gemini/Ollama/OpenAI-compatible) ──
-    // verbatim и нейтральный/пустой профиль LLM не зовут (правила уже отработали).
-    // "ai" теперь eligible: пользователь ожидает Wispr Flow-поведение — из одной
-    // сбивчивой диктовки получить готовый промпт. Если LLM недоступна, остаётся
-    // быстрый deterministic fallback после правил.
+    // verbatim/neutral и встроенный AI-профиль LLM не зовут: вставка должна быть
+    // мгновенной. Явный smart prompt / правило для конкретной нейросети остаётся
+    // opt-in и может синхронно отрефайнить текст.
+    let explicit_smart_instruction =
+        ai_prompt_rule_for_app(&s, &actx).is_some() || effective_smart_instruction(&s).is_some();
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
     let context_hint = rewrite_context_hint(ctx, &actx, None);
@@ -2807,13 +2892,8 @@ fn process_utterance(
         tone.as_str()
     };
     let smart_active = smart_instruction.is_some();
-    let llm_eligible = !s.verbatim
-        && (ai_prompt_context
-            || smart_active
-            || (!rewrite_tone.is_empty()
-                && rewrite_tone != "neutral"
-                && rewrite_tone != "verbatim"
-                && rewrite_tone != "code"));
+    let llm_eligible =
+        final_rewrite_eligible(&s, rewrite_tone, smart_active, explicit_smart_instruction);
     let t_llm = Instant::now();
     if llm_eligible {
         text = refine_text_with_fallback(
@@ -3029,7 +3109,14 @@ fn save_sample(ctx: &EngineCtx, wav: &std::path::Path, text: &str) {
     let stamp = now.format("%Y%m%d_%H%M%S_%3f").to_string();
     let dest = paths::dataset_dir().join(format!("{stamp}.wav"));
     let audio = match std::fs::copy(wav, &dest) {
-        Ok(_) => dest.to_string_lossy().to_string(),
+        Ok(_) => match paths::set_private_file_permissions(&dest) {
+            Ok(()) => dest.to_string_lossy().to_string(),
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest);
+                log::warn!("save_sample permissions: {e}");
+                String::new()
+            }
+        },
         Err(e) => {
             log::warn!("save_sample copy: {e}");
             String::new()
@@ -3096,6 +3183,7 @@ fn ensure_gigaam(ctx: &EngineCtx, s: &Settings) -> anyhow::Result<()> {
     if !crate::gigaam::dir_ready(&dir) {
         return Err(anyhow::Error::new(ModelMissing));
     }
+    crate::models::verify_dir_model(crate::models::GIGAAM_NAME)?;
     let t = Instant::now();
     let g = crate::gigaam::GigaAm::load(&dir, s.effective_threads() as usize)?;
     dbg_log(&format!(
@@ -3118,6 +3206,7 @@ fn ensure_parakeet(ctx: &EngineCtx, s: &Settings) -> anyhow::Result<()> {
     if !crate::parakeet::dir_ready(&dir) {
         return Err(anyhow::Error::new(ModelMissing));
     }
+    crate::models::verify_dir_model(crate::models::PARAKEET_NAME)?;
     let t = Instant::now();
     let p = crate::parakeet::Parakeet::load(&dir, s.effective_threads() as usize)?;
     dbg_log(&format!(
@@ -3191,12 +3280,14 @@ impl std::fmt::Display for ModelMissing {
 impl std::error::Error for ModelMissing {}
 
 fn whisper_model_installed(s: &Settings) -> bool {
-    if paths::model_path(&s.model).exists() {
+    if crate::models::verify_whisper_model_path(&paths::model_path(&s.model)).is_ok() {
         return true;
     }
     if let Ok(rd) = std::fs::read_dir(paths::models_dir()) {
         for entry in rd.flatten() {
-            if entry.path().extension().and_then(|x| x.to_str()) == Some("bin") {
+            if entry.path().extension().and_then(|x| x.to_str()) == Some("bin")
+                && crate::models::verify_whisper_model_path(&entry.path()).is_ok()
+            {
                 return true;
             }
         }
@@ -3209,14 +3300,16 @@ fn whisper_model_installed(s: &Settings) -> bool {
 fn no_model_installed(s: &Settings) -> bool {
     let whisper_ready = || whisper_model_installed(s);
     match local_route(s) {
-        LocalRoute::GigaAm => !crate::gigaam::dir_ready(&paths::gigaam_dir()) && !whisper_ready(),
+        LocalRoute::GigaAm => {
+            !crate::models::dir_model_ready(crate::models::GIGAAM_NAME) && !whisper_ready()
+        }
         LocalRoute::Parakeet => {
-            !crate::parakeet::dir_ready(&paths::parakeet_dir()) && !whisper_ready()
+            !crate::models::dir_model_ready(crate::models::PARAKEET_NAME) && !whisper_ready()
         }
         LocalRoute::Whisper
             if s.engine == "gigaam"
                 && is_auto_language_alias(&s.language)
-                && crate::gigaam::dir_ready(&paths::gigaam_dir()) =>
+                && crate::models::dir_model_ready(crate::models::GIGAAM_NAME) =>
         {
             false
         }
@@ -3229,13 +3322,19 @@ fn no_model_installed(s: &Settings) -> bool {
 fn resolve_model(s: &Settings) -> anyhow::Result<std::path::PathBuf> {
     let p = paths::model_path(&s.model);
     if p.exists() {
-        return Ok(p);
+        match crate::models::verify_whisper_model_path(&p) {
+            Ok(()) => return Ok(p),
+            Err(error) => log::warn!("выбранная Whisper-модель повреждена: {error:#}"),
+        }
     }
     let mut best: Option<(u64, std::path::PathBuf)> = None;
     if let Ok(rd) = std::fs::read_dir(paths::models_dir()) {
         for entry in rd.flatten() {
             let pp = entry.path();
             if pp.extension().and_then(|x| x.to_str()) == Some("bin") {
+                if crate::models::verify_whisper_model_path(&pp).is_err() {
+                    continue;
+                }
                 let sz = entry.metadata().map(|m| m.len()).unwrap_or(0);
                 if best.as_ref().map(|(b, _)| sz > *b).unwrap_or(true) {
                     best = Some((sz, pp));
@@ -3338,6 +3437,25 @@ fn settled_partial_payload(
 
 fn emit_final_preview(app: &AppHandle, text: &str, seq: u64, lang: Option<&'static str>) {
     let _ = app.emit("partial", final_preview_payload(text, seq, lang));
+}
+
+fn final_rewrite_eligible(
+    s: &Settings,
+    rewrite_tone: &str,
+    smart_active: bool,
+    explicit_smart_instruction: bool,
+) -> bool {
+    if s.verbatim {
+        return false;
+    }
+    match rewrite_tone {
+        "verbatim" | "code" => false,
+        // Built-in AI context shapes prompts without blocking insertion on LLM.
+        // User rules/global smart prompts are the explicit opt-in for sync rewrite.
+        "ai" => smart_active && explicit_smart_instruction,
+        "" | "neutral" => smart_active && explicit_smart_instruction,
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -3937,6 +4055,23 @@ mod seg_tests {
 
         s.language = "*".to_string();
         assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
+    }
+
+    #[test]
+    fn cloud_fallback_preserves_selected_local_route() {
+        let mut s = Settings {
+            engine: "gigaam".to_string(),
+            language: "ru".to_string(),
+            ..Settings::default()
+        };
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::GigaAm);
+
+        s.language = "auto".to_string();
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
+        assert_eq!(local_route_with_parakeet(&s, false), LocalRoute::Whisper);
+
+        s.engine = "whisper_server".to_string();
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Whisper);
     }
 
     #[test]
@@ -4790,6 +4925,52 @@ mod smart_prompt_tests {
         assert!(instruction
             .expect("ai default instruction")
             .contains("готовый промпт"));
+    }
+
+    #[test]
+    fn builtin_ai_context_does_not_block_final_insert_on_rewrite() {
+        let s = Settings {
+            smart_prompt_enabled: false,
+            ai_prompt_rules: Vec::new(),
+            ..Settings::default()
+        };
+        let actx = app("Claude");
+
+        let (instruction, is_ai) = effective_smart_instruction_for_app(&s, &actx, "ai");
+
+        assert!(is_ai);
+        assert!(
+            instruction.is_some(),
+            "ASR/context still gets prompt shaping"
+        );
+        assert!(
+            !final_rewrite_eligible(&s, "ai", instruction.is_some(), false),
+            "built-in AI profile must keep insertion fast"
+        );
+    }
+
+    #[test]
+    fn explicit_ai_rule_opts_back_into_sync_rewrite() {
+        let s = Settings {
+            smart_prompt_enabled: false,
+            ai_prompt_rules: vec![crate::settings::AiPromptRule {
+                pattern: "claude".to_string(),
+                prompt: "Делай структурный промпт с критериями готовности.".to_string(),
+            }],
+            ..Settings::default()
+        };
+        let actx = app("Claude");
+
+        let (instruction, is_ai) = effective_smart_instruction_for_app(&s, &actx, "ai");
+
+        assert!(is_ai);
+        assert!(instruction.is_some());
+        assert!(final_rewrite_eligible(
+            &s,
+            "ai",
+            instruction.is_some(),
+            true
+        ));
     }
 
     #[test]

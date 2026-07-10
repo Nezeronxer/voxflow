@@ -81,8 +81,8 @@ mod imp {
         }
         engine::dbg_log("permissions: requesting Accessibility");
         unsafe {
-            let keys = [kAXTrustedCheckOptionPrompt as *const c_void];
-            let values = [kCFBooleanTrue as *const c_void];
+            let keys = [kAXTrustedCheckOptionPrompt];
+            let values = [kCFBooleanTrue];
             let options = CFDictionaryCreate(
                 std::ptr::null(),
                 keys.as_ptr(),

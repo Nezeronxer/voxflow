@@ -9,6 +9,8 @@ export interface Settings {
   model: string;
   engine: string; // "gigaam" | "whisper_server" | "whisper_cli"
   theme: string; // "system" | "light" | "dark"
+  // Масштаб плавающей плашки: 0.75..1.5 (75..150%).
+  overlay_scale: number;
   verbatim: boolean;
   remove_fillers: boolean;
   auto_punct: boolean;
@@ -93,10 +95,28 @@ export interface UpdateInstallResult {
   message: string;
 }
 
+export interface SecretStatus {
+  ai_api_key: boolean;
+  oai_stt_key: boolean;
+  deepgram_key: boolean;
+  rewrite_key: boolean;
+}
+
+export type SecretKind = keyof SecretStatus;
+
 export const DEFAULT_HOTKEY =
   typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform)
-    ? "MetaRight"
+    ? "AltRight"
     : "ControlRight";
+
+export const OVERLAY_SCALE_MIN = 0.75;
+export const OVERLAY_SCALE_MAX = 1.5;
+export const OVERLAY_SCALE_STEP = 0.05;
+
+export function normalizeOverlayScale(value: number | null | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return 1;
+  return Math.min(OVERLAY_SCALE_MAX, Math.max(OVERLAY_SCALE_MIN, value));
+}
 
 export const DEFAULT_SETTINGS: Settings = {
   hotkey: DEFAULT_HOTKEY,
@@ -109,6 +129,7 @@ export const DEFAULT_SETTINGS: Settings = {
   model: "ggml-large-v3-turbo-q5_0.bin",
   engine: "whisper_server",
   theme: "system",
+  overlay_scale: 1,
   verbatim: false,
   remove_fillers: true,
   auto_punct: true,
@@ -121,7 +142,7 @@ export const DEFAULT_SETTINGS: Settings = {
   auto_mute: true,
   autostart: false,
   auto_update_check: true,
-  personalize: true,
+  personalize: false,
   threads: 0,
   ai_backend: "ollama",
   ai_api_key: "",

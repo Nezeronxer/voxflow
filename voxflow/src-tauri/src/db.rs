@@ -118,13 +118,19 @@ fn open_readonly_at(path: &Path) -> Result<Connection> {
 /// (voxflow.db.corrupt-<unix_ts>) и создать свежую БД. Приложение обязано
 /// подниматься всегда, паника на старте недопустима.
 fn open_at(path: &Path) -> Result<Connection> {
-    match try_open(path) {
+    let conn = match try_open(path) {
         Ok(conn) => Ok(conn),
         Err(e) => {
             quarantine(path, &e);
             try_open(path) // повторная попытка на чистом месте
         }
-    }
+    }?;
+    // This database contains transcripts and API keys. Tighten both a newly
+    // created file and legacy files that may have inherited a permissive umask.
+    // Permission errors must not be treated as corruption (and must therefore
+    // never quarantine an otherwise healthy database).
+    secure_database_files(path)?;
+    Ok(conn)
 }
 
 /// Открытие + прагмы + проверка целостности + схема. Любая ошибка = файл под подозрением.
@@ -153,6 +159,21 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
+fn secure_database_files(path: &Path) -> Result<()> {
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let candidate = sibling(path, suffix);
+        if !candidate.exists() {
+            continue;
+        }
+        match crate::paths::set_private_file_permissions(&candidate) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => anyhow::bail!("не удалось защитить {}: {e}", candidate.display()),
+        }
+    }
+    Ok(())
+}
+
 /// Убрать битую БД в карантин: voxflow.db.corrupt-<unix_ts>. Sidecar'ы -wal/-shm
 /// тоже уносим — оставлять старый WAL-журнал рядом со свежим файлом нельзя.
 fn quarantine(path: &Path, err: &anyhow::Error) {
@@ -168,6 +189,11 @@ fn quarantine(path: &Path, err: &anyhow::Error) {
         let dst = sibling(&src, &format!(".corrupt-{ts}"));
         if std::fs::rename(&src, &dst).is_err() {
             let _ = std::fs::remove_file(&src); // rename не удался — хотя бы убрать с дороги
+        } else if let Err(permission_error) = crate::paths::set_private_file_permissions(&dst) {
+            log::warn!(
+                "не удалось защитить файл карантина {}: {permission_error}",
+                dst.display()
+            );
         }
     }
     log::warn!(
@@ -313,5 +339,25 @@ mod tests {
         let conn2 = open_at(&p).expect("повторное открытие");
         assert_eq!(kv_get(&conn2, "keep").as_deref(), Some("me"));
         assert!(!has_corrupt_sibling(&p), "здоровую БД унесло в карантин");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writable_database_and_sidecars_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let p = tmp_db("private");
+        let conn = open_at(&p).expect("свежая БД");
+        kv_set(&conn, "secret", "value").unwrap();
+
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = sibling(&p, suffix);
+            if sidecar.exists() {
+                let mode = std::fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "неприватный sidecar: {}", sidecar.display());
+            }
+        }
     }
 }

@@ -1,139 +1,145 @@
-# VoxFlow — бесплатный диктовщик для Windows
+# VoxFlow 2.0 — бесплатная диктовка для macOS и Windows
 
-VoxFlow превращает речь в текст и вставляет результат в активное приложение:
-чат, браузер, документ, IDE или окно Codex. По умолчанию он работает локально,
-а облачные провайдеры включаются только в формате BYOK — со своим ключом.
+VoxFlow превращает речь в готовый текст в активном приложении: чате, браузере,
+документе или IDE. Локальное распознавание работает без подписки и API-ключа;
+облачные STT/rewrite-провайдеры подключаются только пользователем в режиме BYOK.
 
-![status](https://img.shields.io/badge/platform-Windows-blue) ![version](https://img.shields.io/badge/version-1.0.3-green) ![license](https://img.shields.io/badge/license-proprietary-red) ![privacy](https://img.shields.io/badge/privacy-local%20or%20BYOK-orange)
+![version](https://img.shields.io/badge/version-2.0.0-6b7cff)
+![macOS](https://img.shields.io/badge/macOS-ARM64-111827)
+![Windows](https://img.shields.io/badge/Windows-x64-2563eb)
+![privacy](https://img.shields.io/badge/privacy-local%20by%20default-16a34a)
+![license](https://img.shields.io/badge/personal%20use-free-f59e0b)
 
-VoxFlow — proprietary product by Nezeronxer. The source code is visible for
-review only; copying, redistribution, rebranding, resale, forks, clones and
-derivative products are prohibited without written permission. See [LICENSE](LICENSE).
+Официальные бинарники бесплатны для личного использования. Исходный код
+остаётся proprietary и доступен для проверки; условия описаны в [LICENSE](LICENSE).
 
-## Что умеет v1.0.3
+## Что нового в 2.0
 
-- Hold-to-talk и toggle-диктовка через глобальную горячую клавишу.
-- Автообновление через GitHub Releases: VoxFlow сам проверяет новую версию,
-  скачивает `VoxFlow-Setup-*.exe` и запускает установщик после подтверждения.
-- Автовосстановление звука после диктовки через режим auto-mute.
-- Wispr-style профили приложений: Telegram/Discord/WhatsApp, Gmail/Outlook,
-  Codex/ChatGPT/Claude, VS Code/Cursor, Word/Docs.
-- Категории стиля: чат, письма, промпты, код, документы, нейтральный и дословный режим.
-- Scratchpad и transforms для локальной проверки текста перед вставкой.
-- Current-app detector, test insert sandbox и API health center.
-- Мультиязычное локальное STT по умолчанию, cloud STT и rewrite только при настройке BYOK.
-- Личный словарь, сниппеты, исправления, история и статистика.
+- Полностью новый адаптивный интерфейс: главный экран, компактная навигация,
+  вложенные настройки и отдельный Flow Bar для диктовки.
+- Контекст активного приложения и профили для чатов, почты, документов, кода и
+  AI-промптов.
+- Hold-to-talk и toggle-режимы с исправленным поведением короткого нажатия,
+  отмены через `Esc` и смены хоткея/режима во время удержания.
+- Две пользовательские физические клавиши — для диктовки и улучшения выделенного
+  текста — с проверкой конфликтов и применением без перезапуска.
+- Flow Bar свободно перетаскивается между экранами, запоминает позицию и меняет
+  размер от 75% до 150% в основных настройках.
+- Личный словарь, сниппеты, история, статистика, изученные исправления,
+  smart formatting и опциональный rewrite.
+- Быстрые локальные маршруты GigaAM v3 для русского и Parakeet TDT v3 для
+  25 языков, плюс универсальный Whisper.
+- Новые Whisper-профили: Tiny, Base, Small, Medium, Large v3 Turbo Q5/Q8,
+  полный Turbo и Large v3.
+- Возобновляемые загрузки Whisper-моделей и проверка SHA-256 до установки.
+- Локальный fallback сохраняет выбранный маршрут GigaAM/Parakeet/Whisper, даже
+  если облачный провайдер временно недоступен.
+- Секреты больше не возвращаются в интерфейс: UI видит только статус ключа и
+  поддерживает явное удаление.
+- Раздельные release-контуры: macOS ARM64 и Windows x64, platform-safe updater,
+  version gate и автоматические frontend/Rust проверки.
 
-## Установка Windows
+## Платформы
 
-Локальный release installer собирается сюда:
+| Платформа | Цель релиза 2.0 | Артефакт |
+|---|---|---|
+| macOS Apple Silicon | macOS 11+, ARM64 | `VoxFlow-macOS-2.0.0-arm64-unsigned.dmg` |
+| Windows | Windows 10/11, x64 | `VoxFlow-Setup-2.0.0.exe` |
 
-```powershell
-installer\Output\VoxFlow-Setup-1.0.3.exe
-```
+Windows-установщик работает per-user и не требует отдельной установки VC++
+Redistributable с повышением прав: нужные Microsoft VC++ CRT/OpenMP DLL лежат
+рядом с приложением и Whisper-sidecar. Microsoft-signed Evergreen WebView2
+bootstrapper встроен в setup и запускается без показа окна только тогда, когда
+WebView2 Runtime не найден; в этом редком случае установщику нужен интернет.
+Это не означает, что сам `VoxFlow-Setup-*.exe` подписан — текущий CI выпускает
+unsigned setup, пока владелец не предоставит Authenticode-сертификат.
 
-Установка идёт в профиль текущего пользователя:
-
-```powershell
-%LOCALAPPDATA%\VoxFlow\voxflow.exe
-```
-
-Администраторские права не нужны. Данные пользователя, модели, база SQLite и
-логи остаются в `%LOCALAPPDATA%\VoxFlow`.
+Intel Mac не входит в подтверждённую матрицу 2.0: текущий ONNX Runtime для
+GigaAM/Parakeet не предоставляет используемый проектом macOS x86_64 runtime.
 
 ## Как пользоваться
 
-1. Поставьте курсор в нужное поле ввода.
-2. Зажмите правый `Ctrl` или нажмите выбранную toggle-клавишу.
-3. Скажите фразу.
-4. VoxFlow распознает речь, применит профиль активного приложения и вставит текст.
+1. Установите VoxFlow и выдайте доступ к микрофону. На macOS для глобальной
+   вставки также потребуется Accessibility permission.
+2. Поставьте курсор в нужное поле.
+3. Удерживайте выбранную клавишу (на macOS по умолчанию правый `Option`) либо
+   используйте toggle-режим.
+4. Говорите: Flow Bar показывает запись и обработку, после чего текст попадает
+   в активное окно.
 
-Для проверки без внешних приложений используйте встроенные проверки на вкладках
-**Главная**, **Приложения** и **ИИ**: test insert sandbox, current-app detector
-и health check не отправляют текст в Telegram, Codex или браузер.
+Flow Bar можно перетащить за любую точку плашки. Размер меняется в «Настройки →
+Основные → Вид» кнопками, ползунком или сбрасывается к 100%.
 
-Если диктовка распознаётся неправильно, сначала смените язык или модель на
-вкладке **Модель**: для русского лучше выбрать **Русский** и GigaAM, для
-смешанной речи и других языков — **Все языки (авто)** и Whisper Server. Если
-локальное распознавание нестабильно именно на вашем голосе, микрофоне или языке,
-включите cloud STT на вкладке **Облако** и добавьте свой API-ключ. Онлайн
-зависит от сети, лимитов и доступности провайдера, поэтому выбор cloud/API
-остаётся за пользователем.
+Для русского выберите GigaAM, для английского/мультиязычной речи — Parakeet или
+Whisper. Локальный режим не требует аккаунта; cloud STT и rewrite остаются
+опциональными BYOK-функциями.
 
-## Вкладки
+## Настройки
 
-| Вкладка | Назначение |
-|---|---|
-| Главная | статус, старт/стоп диктовки, статистика, последняя диктовка |
-| Модель | локальные модели и движок распознавания |
-| Распознавание | пунктуация, слова-паразиты, tone, prompt и способ вставки |
-| Управление | устройство ввода, хоткей, режим, тема, звуки, auto-mute, автозапуск |
-| Словарь | термины и замены |
-| Сниппеты | триггеры и шаблоны |
-| Исправления | устойчивые автозамены ошибок распознавания |
-| Приложения | app-specific профили и current-app detector |
-| ИИ | rewrite backend: off, Ollama, Gemini или OpenAI-compatible |
-| Облако | cloud STT, fallback и BYOK-провайдеры |
-| История | последние диктовки |
+- **Основные** — микрофон, клавиши диктовки/улучшения, размер Flow Bar,
+  hold/toggle, языки, автозапуск и auto-mute.
+- **Диктовка** — пунктуация, слова-паразиты, voice commands, форматирование и
+  способ безопасной вставки.
+- **Модели** — движок, язык, каталог локальных моделей, скорость и потоки CPU.
+- **Персонализация** — словарь, сниппеты, исправления и rewrite-профили.
+- **Приложения** — правила для активного приложения и проверка текущего контекста.
+- **Приватность** — локальный/BYOK режим и управление сохранёнными ключами.
+- **Дополнительно** — диагностика и обновления.
 
 ## Приватность
 
-- Локальный режим не отправляет аудио и текст наружу.
-- BYOK-режим использует только ключи, которые пользователь сам добавил в UI или env.
-- Fake/env key QA не требует реальных секретов.
-- Ключи должны быть замаскированы в UI и не должны попадать в `debug.log`.
-- Автозапуск включается только через настройку пользователя.
+- Локальный режим не отправляет аудио или текст внешним STT-сервисам.
+- Персонализация на новых установках выключена до явного согласия пользователя.
+- После включения она локально сохраняет пары аудио/текст и отслеживает
+  последующие исправления через буфер обмена; это явно описано рядом с переключателем.
+- API-ключи маскируются и не совершают обратный путь из backend в React state.
+- Пользовательские данные хранятся в локальном каталоге приложения; на Unix
+  чувствительные каталоги/файлы получают ограниченные permissions.
+- BYOK-запросы выполняются только после настройки соответствующего провайдера.
+
+## Автоматическая проверка
+
+Frontend:
+
+```bash
+cd voxflow
+npm ci
+npm test
+npm run build
+npm audit --audit-level=high
+```
+
+Rust:
+
+```bash
+cargo fmt --manifest-path voxflow/src-tauri/Cargo.toml --all -- --check
+cargo clippy --locked --manifest-path voxflow/src-tauri/Cargo.toml --all-targets -- -D warnings
+cargo test --locked --manifest-path voxflow/src-tauri/Cargo.toml --lib
+python3 script/check_versions.py --tag v2.0.0
+```
+
+`.github/workflows/ci.yml` повторяет проверки на Windows x64 и macOS ARM64.
+Tag-release запускает `.github/workflows/release.yml`: он вызывает Windows-
+сборщик `.github/workflows/build-installer.yml` и macOS ARM64-сборщик
+`.github/workflows/release-macos-arm64.yml`. Отдельные сборщики можно запускать
+вручную для QA-артефактов; GitHub Release они не публикуют. Оркестратор
+публикует общий release только после проверки обоих платформенных
+пакетов и их SHA-256.
+
+Некоторые model/audio E2E-тесты намеренно opt-in: им нужны локальные веса,
+приватные голосовые WAV-файлы или сетевой провайдер. Они не заменяются
+синтетическим «успехом» в обычном CI.
+
+## Подпись релизов
+
+Workflow способен собрать проверяемые unsigned-артефакты. Для публичного релиза
+без предупреждений Gatekeeper/SmartScreen владелец должен добавить Apple
+Developer ID + notarization и Windows Authenticode certificate; сертификаты не
+хранятся в репозитории.
 
 ## Лицензия
 
-Copyright (c) 2026 Nezeronxer. All rights reserved.
-
-VoxFlow не является open-source проектом. Код открыт только для просмотра и
-проверки. Нельзя копировать, перепродавать, переименовывать, публиковать форки,
-клоны или производные продукты без письменного разрешения Nezeronxer.
-
-## Сборка из исходников
-
-Требуется Windows, Rust stable с MSVC toolchain, Node.js 22+ и Inno Setup 6.
-
-```powershell
-cd voxflow
-npm install
-npm run build
-cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check
-cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri\Cargo.toml --lib
-npm run tauri -- build --no-bundle
-
-cd ..
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ".\installer\VoxFlow.iss"
-```
-
-Важно: для Inno installer используйте production exe после
-`npm run tauri -- build --no-bundle`. Не собирайте финальный installer поверх
-plain `cargo build --release`, иначе WebView может искать dev server `localhost:1420`.
-
-## Локальный QA перед публикацией
-
-Минимальный gate для v1.0.3:
-
-```powershell
-cd "C:\Моя папка\wispr flow\voxflow"
-npm run build
-cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check
-cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
-cargo test --manifest-path src-tauri\Cargo.toml --lib
-npm run tauri -- build --no-bundle
-
-cd ..
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" ".\installer\VoxFlow.iss"
-```
-
-После установки проверить запуск `%LOCALAPPDATA%\VoxFlow\voxflow.exe`, вкладки,
-app-profile CRUD, fake/env API-key сценарии, отсутствие ключей в логах, правый
-клик без WebView menu и start/stop диктовки в безопасной песочнице.
-
-## Лицензии
-
-- Tauri, React, Rust dependencies — по лицензиям upstream-пакетов.
-- Локальные ASR runtime/model assets поставляются отдельно в рамках текущей сборки.
+Copyright (c) 2026 Nezeronxer. All rights reserved. Официальные release-бинарники
+можно бесплатно запускать для личного использования; копирование, ребрендинг,
+перепродажа, публикация форков и производных продуктов запрещены без письменного
+разрешения. См. [LICENSE](LICENSE).

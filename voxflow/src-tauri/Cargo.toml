@@ -1,6 +1,6 @@
 [package]
 name = "voxflow"
-version = "1.0.8"
+version = "2.0.0"
 description = "Local-first voice dictation for desktop"
 authors = ["Nezeronxer"]
 license = "LicenseRef-Proprietary"
@@ -38,6 +38,7 @@ tauri-plugin-autostart = "2.5.1"
 tauri-plugin-single-instance = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 base64 = "0.22.1"
+sha2 = "0.10.9"
 # ONNX Runtime для GigaAM-v3 (русский ASR) и Silero VAD. Статическая линковка
 # prebuilt-бинарей (download-binaries) — cmake/clang не нужны, onnxruntime.dll
 # не дистрибутируется. CPU EP по умолчанию.

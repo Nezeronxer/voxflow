@@ -141,11 +141,14 @@ pub struct TempPayload {
 impl TempPayload {
     pub fn write_json(prefix: &str, payload: &[u8]) -> Result<Self> {
         let path = crate::paths::unique_tmp_path(prefix, "json");
-        std::fs::write(&path, payload)
+        // Install the guard before I/O so a partial payload is also removed if
+        // creation or write fails midway.
+        let guard = crate::paths::TempFileGuard::new(path.clone());
+        let mut file = crate::paths::create_private_file(&path)
+            .map_err(|e| anyhow!("не удалось создать {}: {e}", path.display()))?;
+        file.write_all(payload)
             .map_err(|e| anyhow!("не удалось записать {}: {e}", path.display()))?;
-        Ok(Self {
-            guard: crate::paths::TempFileGuard::new(path),
-        })
+        Ok(Self { guard })
     }
 
     pub fn path(&self) -> &Path {

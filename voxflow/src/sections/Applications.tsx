@@ -1,17 +1,24 @@
 import { useEffect, useMemo, useState } from "react";
 import { activeAppContext, defaultAppProfilePresets } from "../api";
 import type { ActiveAppContext, AiPromptRule, ProfileOverride, Settings } from "../types";
-import { Icon, PageHead, Select } from "../ui";
+import { Icon, IS_APPLE_PLATFORM, PageHead, Select } from "../ui";
 
 const PROFILE_OPTIONS = [
-  { value: "formal", label: "Формальный" },
+  { value: "neutral", label: "Нейтральный" },
   { value: "casual", label: "Неформальный" },
-  { value: "work", label: "Официальный" },
+  { value: "work", label: "Рабочий" },
+  { value: "formal", label: "Формальный" },
+  { value: "doc", label: "Документ" },
+  { value: "ai", label: "Промпт для ИИ" },
+  { value: "code", label: "Код (дословно)" },
+  { value: "verbatim", label: "Дословно" },
 ];
+const PROFILE_VALUES = new Set(PROFILE_OPTIONS.map((item) => item.value));
 
 type AppPreset = {
   name: string;
   match: string;
+  macMatch?: string;
   profile: string;
   group: string;
   hint: string;
@@ -31,53 +38,56 @@ const APP_GROUPS: { title: string; apps: AppPreset[] }[] = [
     title: "Почта",
     apps: [
       { name: "Gmail", match: "gmail", profile: "formal", group: "Почта", hint: "Аккуратные абзацы и деловой тон.", glyph: "gmail" },
-      { name: "Outlook", match: "outlook", profile: "work", group: "Почта", hint: "Официальные письма без разговорного тона.", glyph: "outlook" },
+      { name: "Outlook", match: "outlook", macMatch: "microsoft outlook", profile: "formal", group: "Почта", hint: "Официальные письма без разговорного тона.", glyph: "outlook" },
     ],
   },
   {
     title: "Промты",
     apps: [
-      { name: "Codex", match: "codex", profile: "work", group: "Промты", hint: "Команды, списки и технический контекст.", glyph: "terminal" },
-      { name: "ChatGPT", match: "chatgpt", profile: "work", group: "Промты", hint: "Промты без случайной отправки.", glyph: "spark" },
-      { name: "Claude", match: "claude", profile: "work", group: "Промты", hint: "Чёткие инструкции и длинный контекст.", glyph: "claude" },
-      { name: "Gemini", match: "gemini", profile: "work", group: "Промты", hint: "Структурные запросы без лишней воды.", glyph: "spark" },
-      { name: "Perplexity", match: "perplexity", profile: "work", group: "Промты", hint: "Вопросы с контекстом и критериями поиска.", glyph: "spark" },
-      { name: "DeepSeek", match: "deepseek", profile: "work", group: "Промты", hint: "Чёткие задачи для кода и анализа.", glyph: "spark" },
-      { name: "Grok", match: "grok", profile: "work", group: "Промты", hint: "Короткие постановки с явным результатом.", glyph: "spark" },
-      { name: "OpenRouter", match: "openrouter", profile: "work", group: "Промты", hint: "Единые правила для веб-чата и роутера моделей.", glyph: "spark" },
+      { name: "Codex", match: "codex", profile: "ai", group: "Промты", hint: "Команды, списки и технический контекст.", glyph: "terminal" },
+      { name: "ChatGPT", match: "chatgpt", profile: "ai", group: "Промты", hint: "Промты без случайной отправки.", glyph: "spark" },
+      { name: "Claude", match: "claude", profile: "ai", group: "Промты", hint: "Чёткие инструкции и длинный контекст.", glyph: "claude" },
+      { name: "Gemini", match: "gemini", profile: "ai", group: "Промты", hint: "Структурные запросы без лишней воды.", glyph: "spark" },
+      { name: "Perplexity", match: "perplexity", profile: "ai", group: "Промты", hint: "Вопросы с контекстом и критериями поиска.", glyph: "spark" },
+      { name: "DeepSeek", match: "deepseek", profile: "ai", group: "Промты", hint: "Чёткие задачи для кода и анализа.", glyph: "spark" },
+      { name: "Grok", match: "grok", profile: "ai", group: "Промты", hint: "Короткие постановки с явным результатом.", glyph: "spark" },
+      { name: "OpenRouter", match: "openrouter", profile: "ai", group: "Промты", hint: "Единые правила для веб-чата и роутера моделей.", glyph: "spark" },
     ],
   },
   {
     title: "Код",
     apps: [
-      { name: "VS Code", match: "code.exe", profile: "work", group: "Код", hint: "Бережно к переменным и символам.", glyph: "code" },
-      { name: "Cursor", match: "cursor", profile: "work", group: "Код", hint: "Меньше переписывания, больше точности.", glyph: "cursor" },
-      { name: "Windsurf", match: "windsurf", profile: "work", group: "Код", hint: "Команды и имена файлов сохраняются.", glyph: "wave" },
+      { name: "VS Code", match: "code.exe", macMatch: "code", profile: "code", group: "Код", hint: "Бережно к переменным и символам.", glyph: "code" },
+      { name: "Cursor", match: "cursor", profile: "code", group: "Код", hint: "Меньше переписывания, больше точности.", glyph: "cursor" },
+      { name: "Windsurf", match: "windsurf", profile: "code", group: "Код", hint: "Команды и имена файлов сохраняются.", glyph: "wave" },
     ],
   },
   {
     title: "Документы",
     apps: [
-      { name: "Word", match: "word", profile: "formal", group: "Документы", hint: "Полные предложения и мягкая редактура.", glyph: "word" },
-      { name: "Google Docs", match: "google docs", profile: "formal", group: "Документы", hint: "Длинный текст без чатового тона.", glyph: "docs" },
+      { name: "Word", match: "word", macMatch: "microsoft word", profile: "doc", group: "Документы", hint: "Полные предложения и мягкая редактура.", glyph: "word" },
+      { name: "Google Docs", match: "google docs", profile: "doc", group: "Документы", hint: "Длинный текст без чатового тона.", glyph: "docs" },
     ],
   },
 ];
 
 function profileLabel(profile: string): string {
-  return PROFILE_OPTIONS.find((item) => item.value === profileToStyle(profile))?.label ?? profile;
+  const value = profile.trim() || "neutral";
+  return PROFILE_OPTIONS.find((item) => item.value === value)?.label ?? value;
 }
 
-function profileToStyle(profile: string): string {
-  if (profile === "casual" || profile === "very_casual") return "casual";
-  if (profile === "formal" || profile === "doc") return "formal";
-  return "work";
+function profileOptionsWithCurrent(profile: string) {
+  const value = profile.trim() || "neutral";
+  if (PROFILE_VALUES.has(value)) return PROFILE_OPTIONS;
+  return [{ value, label: `Текущий: ${value}` }, ...PROFILE_OPTIONS];
 }
 
 function normalizeRule(rule: ProfileOverride): ProfileOverride | null {
   const match = rule.match.trim();
   if (!match) return null;
-  return { match, profile: profileToStyle(rule.profile || "work") };
+  // Профиль не сводим к трём вариантам: backend различает ai/code/doc/
+  // verbatim/neutral, и потеря этих значений меняет поведение диктовки.
+  return { match, profile: rule.profile.trim() || "neutral" };
 }
 
 function normalizePromptRule(rule: AiPromptRule): AiPromptRule | null {
@@ -90,16 +100,55 @@ function sameMatch(a: string, b: string): boolean {
   return a.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
+function preferredMatch(app: AppPreset): string {
+  return IS_APPLE_PLATFORM && app.macMatch ? app.macMatch : app.match;
+}
+
+function appMatches(app: AppPreset): string[] {
+  return Array.from(
+    new Set([preferredMatch(app), app.match, app.macMatch].filter((v): v is string => !!v)),
+  );
+}
+
+function sameAppMatch(a: string, b: string): boolean {
+  if (sameMatch(a, b)) return true;
+  return APP_GROUPS.some((group) =>
+    group.apps.some((app) => {
+      const matches = appMatches(app);
+      return matches.some((value) => sameMatch(value, a)) &&
+        matches.some((value) => sameMatch(value, b));
+    }),
+  );
+}
+
 function sameRule(a: ProfileOverride, b: ProfileOverride): boolean {
-  return sameMatch(a.match, b.match);
+  return sameAppMatch(a.match, b.match);
 }
 
-function ruleFor(rules: ProfileOverride[], match: string): ProfileOverride | undefined {
-  return rules.find((rule) => sameMatch(rule.match, match));
+function ruleForApp(rules: ProfileOverride[], app: AppPreset): ProfileOverride | undefined {
+  const matches = appMatches(app);
+  return rules.find((rule) => matches.some((match) => sameMatch(rule.match, match)));
 }
 
-function promptRuleFor(rules: AiPromptRule[], match: string): AiPromptRule | undefined {
-  return rules.find((rule) => sameMatch(rule.match, match));
+function promptRuleForApp(rules: AiPromptRule[], app: AppPreset): AiPromptRule | undefined {
+  const matches = appMatches(app);
+  return rules.find((rule) => matches.some((match) => sameMatch(rule.match, match)));
+}
+
+function platformPreset(rule: ProfileOverride): ProfileOverride {
+  const app = APP_GROUPS.flatMap((group) => group.apps).find((candidate) =>
+    appMatches(candidate).some((match) => sameMatch(match, rule.match)),
+  );
+  return app ? { ...rule, match: preferredMatch(app) } : rule;
+}
+
+function matchHint(app: AppPreset): string {
+  if (!app.macMatch || sameMatch(app.macMatch, app.match)) {
+    return `Match: ${app.match}`;
+  }
+  return IS_APPLE_PLATFORM
+    ? `Match: ${app.macMatch} (macOS; Windows: ${app.match})`
+    : `Match: ${app.match} (Windows; macOS: ${app.macMatch})`;
 }
 
 function promptPlaceholder(appName: string): string {
@@ -276,17 +325,9 @@ export default function Applications({ settings, update }: Props) {
   useEffect(() => {
     refreshContext();
     defaultAppProfilePresets()
-      .then(setPresets)
+      .then((items) => setPresets(items.map(platformPreset)))
       .catch(() => setPresets([]));
   }, []);
-
-  useEffect(() => {
-    const normalized = rules.map(normalizeRule).filter((item): item is ProfileOverride => item !== null);
-    if (JSON.stringify(normalized) !== JSON.stringify(rules)) {
-      update({ app_profile_overrides: normalized });
-      setStatus("Стили приведены к трём вариантам.");
-    }
-  }, [rules, update]);
 
   return (
     <>
@@ -334,14 +375,17 @@ export default function Applications({ settings, update }: Props) {
               <div className="app-group-title">{group.title}</div>
               <div className="app-tile-grid">
                 {group.apps.map((app) => {
-                  const configured = ruleFor(rules, app.match);
-                  const promptConfigured = promptRuleFor(promptRules, app.match);
-                  const currentProfile = profileToStyle(configured?.profile ?? app.profile);
+                  const configured = ruleForApp(rules, app);
+                  const promptConfigured = promptRuleForApp(promptRules, app);
+                  const currentProfile = configured?.profile || app.profile;
+                  const targetMatch = configured?.match || preferredMatch(app);
+                  const promptTargetMatch =
+                    promptConfigured?.match || preferredMatch(app);
                   const isPromptApp = group.title === "Промты";
                   return (
                     <div
                       className={`app-tile ${configured || promptConfigured ? "is-configured" : ""}`}
-                      key={app.match}
+                      key={app.name}
                     >
                       <span className={`app-icon app-icon-${app.glyph}`}>
                         <AppGlyph glyph={app.glyph} />
@@ -349,13 +393,19 @@ export default function Applications({ settings, update }: Props) {
                       <span className="app-tile-copy">
                         <strong>{app.name}</strong>
                         <small>{app.hint}</small>
+                        <small>{matchHint(app)}</small>
                       </span>
                       <label className="app-tile-style">
                         <span>Стиль</span>
                         <Select
                           value={currentProfile}
-                          onChange={(value) => upsertRule({ match: app.match, profile: value }, `${app.name}: ${profileLabel(value)}.`)}
-                          options={PROFILE_OPTIONS}
+                          onChange={(value) =>
+                            upsertRule(
+                              { match: targetMatch, profile: value },
+                              `${app.name}: ${profileLabel(value)}.`,
+                            )
+                          }
+                          options={profileOptionsWithCurrent(currentProfile)}
                         />
                       </label>
                       {isPromptApp && (
@@ -364,7 +414,10 @@ export default function Applications({ settings, update }: Props) {
                           <textarea
                             value={promptConfigured?.prompt ?? ""}
                             onChange={(event) => upsertPromptRule(
-                              { match: app.match, prompt: event.currentTarget.value },
+                              {
+                                match: promptTargetMatch,
+                                prompt: event.currentTarget.value,
+                              },
                               `${app.name}: промт обновлён.`,
                             )}
                             placeholder={promptPlaceholder(app.name)}
@@ -391,7 +444,7 @@ export default function Applications({ settings, update }: Props) {
               onKeyDown={(event) => {
                 if (event.key === "Enter") addRule();
               }}
-              placeholder="telegram.exe, Chrome, Codex, Visual Studio Code..."
+              placeholder="telegram, code (macOS), code.exe (Windows), Codex..."
             />
             <Select value={profile} onChange={setProfile} options={PROFILE_OPTIONS} />
             <button className="btn btn-primary" type="button" onClick={addRule}>
@@ -405,7 +458,7 @@ export default function Applications({ settings, update }: Props) {
             <table className="table">
               <thead>
                 <tr>
-                  <th>Окно или exe</th>
+                  <th>Приложение, exe или заголовок</th>
                   <th>Профиль</th>
                   <th aria-label="Действия" />
                 </tr>
@@ -417,11 +470,15 @@ export default function Applications({ settings, update }: Props) {
                       <input
                         value={rule.match}
                         onChange={(event) => editRule(index, { match: event.target.value })}
-                        aria-label="Окно или exe"
+                        aria-label="Приложение, exe или заголовок"
                       />
                     </td>
                     <td>
-                      <Select value={profileToStyle(rule.profile)} onChange={(value) => editRule(index, { profile: value })} options={PROFILE_OPTIONS} />
+                      <Select
+                        value={rule.profile || "neutral"}
+                        onChange={(value) => editRule(index, { profile: value })}
+                        options={profileOptionsWithCurrent(rule.profile)}
+                      />
                     </td>
                     <td className="table-actions">
                       <button className="btn btn-sm btn-danger btn-ghost" type="button" aria-label="Удалить правило" onClick={() => deleteRule(index)}>

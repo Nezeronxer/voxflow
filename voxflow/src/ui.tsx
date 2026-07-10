@@ -7,6 +7,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
 } from "react";
+import { setHotkeyCaptureActive } from "./api";
 
 /* ---------- Тема (light / dark / system) ----------
    Источник истины — Settings.theme в БД. localStorage "vf-theme" — только кэш:
@@ -146,8 +147,8 @@ export const IS_APPLE_PLATFORM =
   typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform);
 
 export const HOTKEY_FIELD_HINT = IS_APPLE_PLATFORM
-  ? "Нажмите поле и клавишу. Для удержания лучше Cmd, Option или F-клавиши."
-  : "Нажмите поле и клавишу. Для удержания лучше Ctrl, Alt или F-клавиши.";
+  ? "Назначается одна физическая клавиша. Для удержания лучше Cmd, Option или F-клавиши."
+  : "Назначается одна физическая клавиша. Для удержания лучше Ctrl, Alt или F-клавиши.";
 
 export const HOTKEY_LABELS: Record<string, string> = {
   ControlLeft: IS_APPLE_PLATFORM ? "Left Control" : "Left Ctrl",
@@ -177,8 +178,9 @@ export const HOTKEY_LABELS: Record<string, string> = {
 const SUPPORTED_HOTKEYS = new Set<string>([
   "ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight",
   "AltLeft", "AltRight", "MetaLeft", "MetaRight",
-  "CapsLock", "Insert", "ScrollLock", "Pause", "PrintScreen", "NumLock",
-  "Escape", "Enter", "Space", "Tab", "Backspace", "Delete",
+  "CapsLock", "NumLock",
+  ...(IS_APPLE_PLATFORM ? [] : ["Insert", "ScrollLock", "Pause", "PrintScreen"]),
+  "Enter", "Space", "Tab", "Backspace", "Delete",
   "Home", "End", "PageUp", "PageDown",
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
   "Minus", "Equal", "BracketLeft", "BracketRight", "Backslash", "IntlBackslash",
@@ -217,13 +219,26 @@ export function prettyHotkey(h: string): string {
 export function HotkeyCapture({
   value,
   onChange,
+  exclude,
+  excludeLabel,
 }: {
   value: string;
   onChange: (code: string) => void;
+  exclude?: string;
+  excludeLabel?: string;
 }) {
   const [capturing, setCapturing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const ref = useRef<HTMLButtonElement>(null);
+  const activationCodeRef = useRef<string | null>(null);
+
+  function beginCapture(activationCode: string | null = null) {
+    activationCodeRef.current = activationCode;
+    setError(null);
+    // Стартуем нативную паузу до следующего физического нажатия, не ожидая effect.
+    void setHotkeyCaptureActive(true);
+    setCapturing(true);
+  }
 
   function captureCode(code: string) {
     if (code === "Escape") {
@@ -241,6 +256,12 @@ export function HotkeyCapture({
       );
       return;
     }
+    if (exclude && code === exclude) {
+      setError(
+        `${prettyHotkey(code)} уже назначена для ${excludeLabel || "другого действия"}.`,
+      );
+      return;
+    }
     onChange(code);
     setError(null);
     setCapturing(false);
@@ -249,17 +270,35 @@ export function HotkeyCapture({
 
   useEffect(() => {
     if (!capturing) return;
+    void setHotkeyCaptureActive(true);
     const onWindowKeyDown = (e: globalThis.KeyboardEvent) => {
       // WebKit на macOS иногда не отдаёт modifier-key keydown именно кнопке,
       // даже если она была сфокусирована кликом. Глобальный capture-слушатель
       // живёт только во время назначения и ловит Ctrl/Alt/F-клавиши надёжно.
       e.preventDefault();
       e.stopPropagation();
+      // Назначение фиксируем на keyup: нативный listener остаётся выключенным
+      // до физического отпускания и не примет release без соответствующего press.
+      if (e.code === "Escape") captureCode(e.code);
+    };
+    const onWindowKeyUp = (e: globalThis.KeyboardEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      if (activationCodeRef.current === e.code) {
+        activationCodeRef.current = null;
+        return;
+      }
       captureCode(e.code);
     };
     window.addEventListener("keydown", onWindowKeyDown, { capture: true });
-    return () => window.removeEventListener("keydown", onWindowKeyDown, { capture: true });
-  }, [capturing, onChange]);
+    window.addEventListener("keyup", onWindowKeyUp, { capture: true });
+    return () => {
+      window.removeEventListener("keydown", onWindowKeyDown, { capture: true });
+      window.removeEventListener("keyup", onWindowKeyUp, { capture: true });
+      activationCodeRef.current = null;
+      void setHotkeyCaptureActive(false);
+    };
+  }, [capturing, onChange, exclude, excludeLabel]);
 
   function onKeyDown(e: ReactKeyboardEvent<HTMLButtonElement>) {
     if (!capturing) {
@@ -267,15 +306,10 @@ export function HotkeyCapture({
       // не давая браузеру сразу же сгенерить click.
       if (e.code === "Enter" || e.code === "Space") {
         e.preventDefault();
-        setError(null);
-        setCapturing(true);
+        beginCapture(e.code);
       }
       return;
     }
-    // В режиме захвата гасим клавишу, чтобы она не утекла в приложение.
-    e.preventDefault();
-    e.stopPropagation();
-    captureCode(e.code);
   }
 
   const printableWarn = !capturing && !error && isPrintableHotkey(value);
@@ -287,10 +321,7 @@ export function HotkeyCapture({
         ref={ref}
         type="button"
         className={`input-mono hotkey-btn${capturing ? " capturing" : ""}`}
-        onClick={() => {
-          setError(null);
-          setCapturing(true);
-        }}
+        onClick={() => beginCapture()}
         onKeyDown={onKeyDown}
         onBlur={() => setCapturing(false)}
         aria-label="Назначить горячую клавишу"

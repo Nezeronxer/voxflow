@@ -1,6 +1,6 @@
 //! IPC-команды для фронтенда + общее состояние приложения.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 
@@ -41,6 +41,9 @@ pub struct AppState {
     pub engine: EngineHandle,
     pub engine_tx: Mutex<Sender<EngineCmd>>,
     pub recording: Arc<AtomicBool>,
+    /// Пока UI захватывает новое назначение, глобальный listener не должен
+    /// запускать старое действие на ту же физическую клавишу.
+    pub hotkey_capture_active: Arc<AtomicBool>,
     /// Прямоугольник пилюли внутри overlay-окна (CSS px: x,y,w,h) — зона, где
     /// окно должно ловить мышь. Вне её окно click-through (фуллскрин-приложения
     /// под оверлеем остаются кликабельными). Обновляет фронт (overlay_hit).
@@ -61,8 +64,60 @@ pub fn get_settings(state: State<AppState>) -> Settings {
     state.settings.lock().clone().redacted_for_renderer()
 }
 
+#[derive(Serialize, Clone)]
+pub struct SecretStatus {
+    pub ai_api_key: bool,
+    pub oai_stt_key: bool,
+    pub deepgram_key: bool,
+    pub rewrite_key: bool,
+}
+
+impl SecretStatus {
+    fn from_settings(settings: &Settings) -> Self {
+        Self {
+            ai_api_key: !settings.ai_api_key.trim().is_empty(),
+            oai_stt_key: !settings.oai_stt_key.trim().is_empty(),
+            deepgram_key: !settings.deepgram_key.trim().is_empty(),
+            rewrite_key: !settings.rewrite_key.trim().is_empty(),
+        }
+    }
+}
+
+#[tauri::command]
+pub fn get_secret_status(state: State<AppState>) -> SecretStatus {
+    SecretStatus::from_settings(&state.settings.lock())
+}
+
+/// Explicit secret removal. Empty values in `save_settings` intentionally mean
+/// "keep the existing secret" so redacted renderer snapshots are safe; deletion
+/// therefore needs its own unambiguous command.
+#[tauri::command]
+pub fn clear_secret(app: AppHandle, state: State<AppState>, secret: String) -> R<SecretStatus> {
+    let mut next = state.settings.lock().clone();
+    match secret.as_str() {
+        "ai_api_key" => next.ai_api_key.clear(),
+        "oai_stt_key" => next.oai_stt_key.clear(),
+        "deepgram_key" => next.deepgram_key.clear(),
+        "rewrite_key" => next.rewrite_key.clear(),
+        _ => return Err("unknown secret field".into()),
+    }
+
+    {
+        let conn = state.db.lock();
+        settings::save(&conn, &next).map_err(err)?;
+    }
+    *state.settings.lock() = next.clone();
+    let status = SecretStatus::from_settings(&next);
+    if let Err(error) = app.emit("secret_status", status.clone()) {
+        log::warn!("secret_status не разослался: {error}");
+    }
+    Ok(status)
+}
+
 #[tauri::command]
 pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Settings) -> R<()> {
+    settings.normalize_user_values();
+    crate::hotkey::validate_bindings(&settings)?;
     let previous = state.settings.lock().clone();
     settings.preserve_empty_secrets_from(&previous);
     apply_autostart(&app, settings.autostart);
@@ -91,6 +146,9 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
     if let Err(e) = app.emit("settings_changed", settings.clone().redacted_for_renderer()) {
         log::warn!("settings_changed не разослалось: {e}");
     }
+    if let Err(e) = app.emit("secret_status", SecretStatus::from_settings(&settings)) {
+        log::warn!("secret_status не разослался: {e}");
+    }
     // Язык сменился → фоновый прогрев движка под новые настройки: без него первый
     // Start после переключения на en/auto синхронно грузит ~650 МБ Parakeet и
     // подвешивает начало диктовки на секунды.
@@ -100,6 +158,11 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
         }
     }
     Ok(())
+}
+
+#[tauri::command]
+pub fn set_hotkey_capture_active(state: State<AppState>, active: bool) {
+    state.hotkey_capture_active.store(active, Ordering::SeqCst);
 }
 
 fn apply_autostart(app: &AppHandle, on: bool) {
@@ -975,4 +1038,11 @@ pub fn overlay_box(app: AppHandle, w: f64, h: f64) -> R<()> {
 pub fn overlay_hit(state: State<AppState>, x: f64, y: f64, w: f64, h: f64) -> R<()> {
     *state.overlay_hit.lock() = Some((x, y, w, h));
     Ok(())
+}
+
+/// Завершить drag: применить мягкие экранные магниты и сохранить устойчивый
+/// center/bottom anchor для следующего запуска.
+#[tauri::command]
+pub fn overlay_commit_position(app: AppHandle) -> R<()> {
+    crate::commit_overlay_position(&app)
 }

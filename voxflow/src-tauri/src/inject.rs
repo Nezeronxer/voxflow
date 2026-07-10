@@ -312,7 +312,7 @@ fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<
                     Err(e) => {
                         #[cfg(target_os = "macos")]
                         {
-                            return (Err(e), restore);
+                            (Err(e), restore)
                         }
                         #[cfg(not(target_os = "macos"))]
                         {
@@ -530,9 +530,9 @@ fn macos_incremental_keys(prev: &str, next: &str) -> Result<()> {
     }
     if !suffix.is_empty() {
         clipboard_set_retry(&suffix)?;
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(5));
         macos_keys::command_chord(macos_keys::KEY_V)?;
-        thread::sleep(Duration::from_millis(15));
+        thread::sleep(Duration::from_millis(2));
     }
     Ok(())
 }
@@ -640,7 +640,7 @@ fn paste_text(
     // Дать ОС увидеть новый буфер до Ctrl+V. На macOS set_text синхронен, поэтому
     // длинная пауза здесь только замедляет финальную вставку.
     #[cfg(target_os = "macos")]
-    thread::sleep(Duration::from_millis(8));
+    thread::sleep(Duration::from_millis(2));
     #[cfg(not(target_os = "macos"))]
     thread::sleep(Duration::from_millis(25));
 

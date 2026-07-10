@@ -14,9 +14,16 @@ _journal_block.md
 /voxflow/src-tauri/resources/whisper-darwin-x64/
 /voxflow/src-tauri/resources/models/
 /voxflow/src-tauri/resources/vad/
+/voxflow/src-tauri/resources/windows-redist/
+/voxflow/src-tauri/resources/windows-prerequisites/
 
 # installer build output
 /installer/Output/
+/voxflow/release/
+
+# Python cache files
+__pycache__/
+*.py[cod]
 
 # unrelated local scratch (other projects)
 /_s.sh

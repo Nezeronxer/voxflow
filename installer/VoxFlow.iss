@@ -5,7 +5,7 @@
 ;    npm run tauri -- build --no-bundle
 ;  Then compile with:
 ;    "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\VoxFlow.iss
-;  Output: installer\Output\VoxFlow-Setup-1.0.3.exe
+;  Output: installer\Output\VoxFlow-Setup-2.0.0.exe
 ;
 ;  Do NOT compile this installer after a plain `cargo build --release`: that
 ;  Tauri binary stays in dev mode and opens http://localhost:1420 in WebView2.
@@ -19,7 +19,7 @@
 ; ============================================================================
 
 #define AppName    "VoxFlow"
-#define AppVersion "1.0.3"
+#define AppVersion "2.0.0"
 #define Publisher  "Крылов Анатолий Евгеньевич"
 #define AppExe     "voxflow.exe"
 #define SrcDir     "..\voxflow\src-tauri\target\release"
@@ -30,7 +30,7 @@ AppId={{B2F1A9E0-7C4D-4E8A-9F3B-1A2C5D6E7F80}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
-VersionInfoVersion=1.0.3.0
+VersionInfoVersion=2.0.0.0
 
 ; --- Per-user install: no elevation, current user only. ---
 PrivilegesRequired=lowest
@@ -73,22 +73,30 @@ Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
 
 [Files]
+; Keep prerequisite payloads first: with SolidCompression, ExtractTemporaryFile
+; otherwise has to decompress every preceding (including CUDA) file before the
+; prerequisite can start. noencryption permits early extraction if installer
+; encryption is enabled in a future release; nocompression avoids useless work
+; on the already-compressed signed bootstrapper.
+Source: "..\voxflow\src-tauri\resources\windows-prerequisites\MicrosoftEdgeWebview2Setup.exe"; Flags: dontcopy noencryption nocompression
+; The wizard extracts this bitmap during InitializeWizard, so it must also stay
+; ahead of the large solid-compressed application payload.
+Source: "assets\progress-grad.bmp"; Flags: dontcopy noencryption
 ; Main executable.
 Source: "{#SrcDir}\voxflow.exe"; DestDir: "{app}"; Flags: ignoreversion
+; App-local Microsoft VC++ CRT/OpenMP. This keeps the per-user install free of a
+; VC_redist elevation/UAC step. The same DLLs are already copied into both
+; whisper Release folders by fetch_windows_runtime.ps1 and travel with the
+; wildcard resource entries below.
+Source: "..\voxflow\src-tauri\resources\windows-redist\*"; DestDir: "{app}"; Flags: ignoreversion
 ; Whisper runtime — MUST land at {app}\resources\whisper\Release\* (paths.rs
 ; resolves resource_dir() == exe directory).
 Source: "{#SrcDir}\resources\whisper\Release\*"; DestDir: "{app}\resources\whisper\Release"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; GPU (CUDA) whisper runtime (~698 MB). paths.rs prefers this over the CPU build
 ; when NVIDIA nvcuda.dll is present. Lands at {app}\resources\whisper-cuda\Release\*.
 Source: "{#SrcDir}\resources\whisper-cuda\Release\*"; DestDir: "{app}\resources\whisper-cuda\Release"; Flags: ignoreversion recursesubdirs createallsubdirs
-; Silero VAD (~2.3 МБ) — берём НАПРЯМУЮ из src-tauri/resources: в bundle.resources
-; tauri.conf.json папка vad не входит, поэтому в target/release/resources её нет.
-; Ложится в {app}\resources\vad\silero_vad.onnx.
+; Silero VAD (~2.3 МБ) — берём напрямую из проверенного runtime-каталога.
 Source: "..\voxflow\src-tauri\resources\vad\*"; DestDir: "{app}\resources\vad"; Flags: ignoreversion
-; Neon gradient bitmap for the custom progress bar — temp-extracted at runtime,
-; NOT installed to {app}.
-Source: "assets\progress-grad.bmp"; Flags: dontcopy
-
 [Icons]
 Name: "{autoprograms}\VoxFlow"; Filename: "{app}\voxflow.exe"
 Name: "{autodesktop}\VoxFlow"; Filename: "{app}\voxflow.exe"; Tasks: desktopicon
@@ -105,6 +113,12 @@ Filename: "{app}\voxflow.exe"; Description: "{cm:LaunchProgram,VoxFlow}"; Flags:
 [CustomMessages]
 english.CreateDesktopIcon=Create a desktop shortcut
 russian.CreateDesktopIcon=Создать ярлык на рабочем столе
+english.WebView2LaunchFailed=Could not start the Microsoft WebView2 Runtime installer (error %1). VoxFlow was not installed.
+russian.WebView2LaunchFailed=Не удалось запустить установщик Microsoft WebView2 Runtime (ошибка %1). VoxFlow не установлен.
+english.WebView2InstallFailed=Microsoft WebView2 Runtime installation failed (exit code %1). Check the internet connection and try again.
+russian.WebView2InstallFailed=Не удалось установить Microsoft WebView2 Runtime (код %1). Проверьте подключение к интернету и повторите попытку.
+english.WebView2StillMissing=Microsoft WebView2 Runtime was not detected after installation. VoxFlow was not installed.
+russian.WebView2StillMissing=Microsoft WebView2 Runtime не обнаружен после установки. VoxFlow не установлен.
 
 ; ============================================================================
 ;  [Code] — dark-neon recolor + custom cyan->magenta gradient progress bar.
@@ -120,6 +134,7 @@ const
   clDivider   = $00281E1E;   { #1E1E28  divider                }
   clCyan      = $00FFE500;   { #00E5FF  neon cyan accent        }
   clMagenta   = $00D62BFF;   { #FF2BD6  neon magenta            }
+  WebView2ClientKey = 'Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}';
 
 var
   ProgTrack: TPanel;       { fixed-size dark track            }
@@ -144,6 +159,72 @@ begin
       'Похоже, установщик запущен «от имени администратора». В этом случае запись об установке попадёт в список приложений АДМИНИСТРАТОРСКОГО профиля и НЕ будет видна в «Приложениях и компонентах» вашего профиля.' + #13#10 + #13#10 +
       'Рекомендуется: закройте установщик и запустите его ОБЫЧНЫМ двойным кликом (без «от имени администратора»).',
       mbInformation, MB_OK);
+end;
+
+{ The Evergreen runtime can be installed per-user or per-machine, and EdgeUpdate
+  is a 32-bit component on many x64 systems. Check both registry views and both
+  scopes before extracting or running the embedded online bootstrapper. }
+function WebView2At(RootKey: Integer): Boolean;
+var
+  Version: String;
+begin
+  Result := RegQueryStringValue(RootKey, WebView2ClientKey, 'pv', Version);
+  if Result then
+  begin
+    Version := Trim(Version);
+    Result := (Version <> '') and (Version <> '0.0.0.0');
+  end;
+end;
+
+function WebView2RuntimeInstalled(): Boolean;
+begin
+  Result :=
+    WebView2At(HKCU32) or WebView2At(HKCU64) or
+    WebView2At(HKLM32) or WebView2At(HKLM64);
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  Bootstrapper: String;
+  ResultCode: Integer;
+  Attempt: Integer;
+begin
+  Result := '';
+  if WebView2RuntimeInstalled() then
+  begin
+    Log('Microsoft WebView2 Runtime detected; bootstrapper skipped.');
+    Exit;
+  end;
+
+  Log('Microsoft WebView2 Runtime missing; running embedded Evergreen bootstrapper.');
+  ExtractTemporaryFile('MicrosoftEdgeWebview2Setup.exe');
+  Bootstrapper := ExpandConstant('{tmp}\MicrosoftEdgeWebview2Setup.exe');
+  if not Exec(
+    Bootstrapper, '/silent /install', ExpandConstant('{tmp}'),
+    SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := FmtMessage(CustomMessage('WebView2LaunchFailed'), [IntToStr(ResultCode)]);
+    Exit;
+  end;
+  if ResultCode <> 0 then
+  begin
+    Result := FmtMessage(CustomMessage('WebView2InstallFailed'), [IntToStr(ResultCode)]);
+    Exit;
+  end;
+
+  { EdgeUpdate can publish the registry value a moment after the bootstrapper
+    process exits. Wait briefly, then fail closed instead of installing an app
+    whose only UI cannot start. }
+  for Attempt := 1 to 20 do
+  begin
+    if WebView2RuntimeInstalled() then
+    begin
+      Log('Microsoft WebView2 Runtime installed successfully.');
+      Exit;
+    end;
+    Sleep(500);
+  end;
+  Result := CustomMessage('WebView2StillMissing');
 end;
 
 { Recolor a single notebook page to the neon base (guarded). }

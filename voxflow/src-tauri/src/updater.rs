@@ -1,21 +1,67 @@
-//! GitHub Releases updater for the custom Inno Setup installer.
+//! GitHub Releases updater.
 //!
-//! The project ships `VoxFlow-Setup-<version>.exe` from GitHub Releases. We keep
-//! the updater intentionally small: query the latest release, pick that installer
-//! asset, download it to VoxFlow's temp directory, then launch it visibly.
+//! Asset discovery is platform-specific. Windows x64 keeps the existing custom
+//! Inno Setup flow. macOS may report the matching DMG, but automatic download and
+//! launch stays disabled until a signed and notarized updater is implemented.
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::process::Command;
 
 const OWNER: &str = "Nezeronxer";
 const REPO: &str = "voxflow";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Nezeronxer/voxflow/releases/latest";
 const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/Nezeronxer/voxflow/releases/download/";
-const INSTALLER_PREFIX: &str = "VoxFlow-Setup-";
-const INSTALLER_SUFFIX: &str = ".exe";
 const USER_AGENT: &str = "VoxFlow-Updater";
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateTarget {
+    WindowsX64,
+    MacosArm64,
+    MacosX64,
+    Unsupported,
+}
+
+impl UpdateTarget {
+    fn asset_pattern(self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::WindowsX64 => Some(("VoxFlow-Setup-", ".exe")),
+            Self::MacosArm64 => Some(("VoxFlow-macOS-", "-arm64.dmg")),
+            Self::MacosX64 => Some(("VoxFlow-macOS-", "-x64.dmg")),
+            Self::Unsupported => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::WindowsX64 => "Windows x64",
+            Self::MacosArm64 => "macOS ARM64",
+            Self::MacosX64 => "macOS x64",
+            Self::Unsupported => "этой платформы",
+        }
+    }
+}
+
+fn current_update_target() -> UpdateTarget {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        return UpdateTarget::WindowsX64;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        return UpdateTarget::MacosArm64;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        return UpdateTarget::MacosX64;
+    }
+    #[allow(unreachable_code)]
+    UpdateTarget::Unsupported
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateInfo {
@@ -66,16 +112,17 @@ pub fn check(proxy_url: &str) -> Result<UpdateInfo> {
 
     let release: serde_json::Value = serde_json::from_slice(&out.stdout)
         .map_err(|e| anyhow!("GitHub Releases вернул не-JSON: {e}"))?;
-    update_info_from_release(&release)
+    update_info_from_release_for(&release, current_update_target())
 }
 
+#[cfg(windows)]
 pub fn download_and_launch(
     asset_url: &str,
     asset_name: &str,
     proxy_url: &str,
 ) -> Result<UpdateInstallResult> {
     validate_asset_url(asset_url)?;
-    validate_asset_name(asset_name)?;
+    validate_asset_name_for(asset_name, current_update_target())?;
 
     let dest = installer_download_path(asset_name);
     let mut cmd = crate::net::curl();
@@ -119,7 +166,22 @@ pub fn download_and_launch(
     })
 }
 
-fn update_info_from_release(release: &serde_json::Value) -> Result<UpdateInfo> {
+#[cfg(not(windows))]
+pub fn download_and_launch(
+    _asset_url: &str,
+    _asset_name: &str,
+    _proxy_url: &str,
+) -> Result<UpdateInstallResult> {
+    Err(anyhow!(
+        "автоустановка обновлений для {} отключена: откройте подписанный релиз вручную",
+        current_update_target().label()
+    ))
+}
+
+fn update_info_from_release_for(
+    release: &serde_json::Value,
+    target: UpdateTarget,
+) -> Result<UpdateInfo> {
     let tag = release
         .get("tag_name")
         .and_then(|v| v.as_str())
@@ -129,8 +191,15 @@ fn update_info_from_release(release: &serde_json::Value) -> Result<UpdateInfo> {
         return Err(anyhow!("GitHub release tag пустой"));
     }
 
-    let asset = find_installer_asset(release).ok_or_else(|| {
-        anyhow!("в latest release {tag} нет установщика {INSTALLER_PREFIX}*{INSTALLER_SUFFIX}")
+    let pattern = target
+        .asset_pattern()
+        .map(|(prefix, suffix)| format!("{prefix}*{suffix}"))
+        .unwrap_or_else(|| "нет поддерживаемого пакета".to_string());
+    let asset = find_installer_asset_for(release, target).ok_or_else(|| {
+        anyhow!(
+            "в latest release {tag} нет пакета {pattern} для {}",
+            target.label()
+        )
     })?;
     let asset_name = asset
         .get("name")
@@ -143,7 +212,7 @@ fn update_info_from_release(release: &serde_json::Value) -> Result<UpdateInfo> {
         .unwrap_or("")
         .to_string();
     validate_asset_url(&asset_url)?;
-    validate_asset_name(&asset_name)?;
+    validate_asset_name_for(&asset_name, target)?;
 
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let available = version_cmp(&latest_version, &current_version)
@@ -176,7 +245,11 @@ fn update_info_from_release(release: &serde_json::Value) -> Result<UpdateInfo> {
     })
 }
 
-fn find_installer_asset(release: &serde_json::Value) -> Option<&serde_json::Value> {
+fn find_installer_asset_for(
+    release: &serde_json::Value,
+    target: UpdateTarget,
+) -> Option<&serde_json::Value> {
+    let (prefix, suffix) = target.asset_pattern()?;
     release
         .get("assets")
         .and_then(|v| v.as_array())
@@ -187,7 +260,8 @@ fn find_installer_asset(release: &serde_json::Value) -> Option<&serde_json::Valu
                     .get("browser_download_url")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                is_installer_asset_name(name) && url.starts_with(RELEASE_DOWNLOAD_PREFIX)
+                is_installer_asset_name_for(name, prefix, suffix)
+                    && url.starts_with(RELEASE_DOWNLOAD_PREFIX)
             })
         })
 }
@@ -204,8 +278,11 @@ fn validate_asset_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_asset_name(name: &str) -> Result<()> {
-    if is_installer_asset_name(name)
+fn validate_asset_name_for(name: &str, target: UpdateTarget) -> Result<()> {
+    let (prefix, suffix) = target
+        .asset_pattern()
+        .ok_or_else(|| anyhow!("обновления для {} не поддерживаются", target.label()))?;
+    if is_installer_asset_name_for(name, prefix, suffix)
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains(':')
@@ -213,15 +290,25 @@ fn validate_asset_name(name: &str) -> Result<()> {
         Ok(())
     } else {
         Err(anyhow!(
-            "недоверенное имя установщика обновления: ожидалось {INSTALLER_PREFIX}*{INSTALLER_SUFFIX}"
+            "недоверенное имя пакета обновления: ожидалось {prefix}*{suffix}"
         ))
     }
 }
 
-fn is_installer_asset_name(name: &str) -> bool {
-    name.starts_with(INSTALLER_PREFIX) && name.ends_with(INSTALLER_SUFFIX)
+fn is_installer_asset_name_for(name: &str, prefix: &str, suffix: &str) -> bool {
+    if !name.starts_with(prefix) {
+        return false;
+    }
+    name.ends_with(suffix)
+        || (suffix == "-arm64.dmg"
+            && (name.ends_with("-arm64-unsigned.dmg")
+                || name.ends_with("-arm64-signed-unnotarized.dmg")))
+        || (suffix == "-x64.dmg"
+            && (name.ends_with("-x64-unsigned.dmg")
+                || name.ends_with("-x64-signed-unnotarized.dmg")))
 }
 
+#[cfg(windows)]
 fn installer_download_path(asset_name: &str) -> PathBuf {
     let safe_name: String = asset_name
         .chars()
@@ -233,7 +320,7 @@ fn installer_download_path(asset_name: &str) -> PathBuf {
             }
         })
         .collect();
-    let stem = safe_name.trim_end_matches(INSTALLER_SUFFIX);
+    let stem = safe_name.trim_end_matches(".exe");
     crate::paths::unique_tmp_path(stem, "exe")
 }
 
@@ -273,6 +360,7 @@ fn clamp_notes(notes: &str) -> String {
     out
 }
 
+#[cfg(windows)]
 #[allow(dead_code)]
 fn _is_exe_path(path: &Path) -> bool {
     path.extension()
@@ -303,8 +391,27 @@ mod tests {
 
     #[test]
     fn validates_only_repo_release_installers() {
-        assert!(validate_asset_name("VoxFlow-Setup-1.0.3.exe").is_ok());
-        assert!(validate_asset_name("..\\evil.exe").is_err());
+        assert!(
+            validate_asset_name_for("VoxFlow-Setup-1.0.3.exe", UpdateTarget::WindowsX64).is_ok()
+        );
+        assert!(validate_asset_name_for("..\\evil.exe", UpdateTarget::WindowsX64).is_err());
+        assert!(
+            validate_asset_name_for("VoxFlow-macOS-1.0.8-arm64.dmg", UpdateTarget::MacosArm64)
+                .is_ok()
+        );
+        assert!(validate_asset_name_for(
+            "VoxFlow-macOS-2.0.0-arm64-unsigned.dmg",
+            UpdateTarget::MacosArm64
+        )
+        .is_ok());
+        assert!(validate_asset_name_for(
+            "VoxFlow-macOS-2.0.0-x64-unsigned.dmg",
+            UpdateTarget::MacosArm64
+        )
+        .is_err());
+        assert!(
+            validate_asset_name_for("VoxFlow-Setup-1.0.8.exe", UpdateTarget::MacosArm64).is_err()
+        );
         assert!(
             validate_asset_url(
                 "https://github.com/Nezeronxer/voxflow/releases/download/v1.0.3/VoxFlow-Setup-1.0.3.exe"
@@ -318,22 +425,59 @@ mod tests {
     }
 
     #[test]
-    fn extracts_update_info_from_release_json() {
+    fn selects_platform_specific_asset_from_release_json() {
         let release = serde_json::json!({
             "tag_name": "v99.0.0",
             "name": "VoxFlow v99.0.0",
             "html_url": "https://github.com/Nezeronxer/voxflow/releases/tag/v99.0.0",
             "published_at": "2026-07-02T00:00:00Z",
             "body": "notes",
-            "assets": [{
-                "name": "VoxFlow-Setup-99.0.0.exe",
-                "size": 123,
-                "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-Setup-99.0.0.exe"
-            }]
+            "assets": [
+                {
+                    "name": "VoxFlow-Setup-99.0.0.exe",
+                    "size": 123,
+                    "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-Setup-99.0.0.exe"
+                },
+                {
+                    "name": "VoxFlow-macOS-99.0.0-arm64.dmg",
+                    "size": 456,
+                    "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-macOS-99.0.0-arm64.dmg"
+                },
+                {
+                    "name": "VoxFlow-macOS-99.0.0-x64.dmg",
+                    "size": 789,
+                    "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-macOS-99.0.0-x64.dmg"
+                }
+            ]
         });
-        let info = update_info_from_release(&release).unwrap();
-        assert!(info.available);
-        assert_eq!(info.latest_version, "99.0.0");
-        assert_eq!(info.asset_name, "VoxFlow-Setup-99.0.0.exe");
+        let windows = update_info_from_release_for(&release, UpdateTarget::WindowsX64).unwrap();
+        let mac_arm = update_info_from_release_for(&release, UpdateTarget::MacosArm64).unwrap();
+        let mac_x64 = update_info_from_release_for(&release, UpdateTarget::MacosX64).unwrap();
+
+        assert!(windows.available);
+        assert_eq!(windows.latest_version, "99.0.0");
+        assert_eq!(windows.asset_name, "VoxFlow-Setup-99.0.0.exe");
+        assert_eq!(mac_arm.asset_name, "VoxFlow-macOS-99.0.0-arm64.dmg");
+        assert_eq!(mac_x64.asset_name, "VoxFlow-macOS-99.0.0-x64.dmg");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_never_selects_or_launches_windows_installer() {
+        assert!(matches!(
+            current_update_target(),
+            UpdateTarget::MacosArm64 | UpdateTarget::MacosX64
+        ));
+        assert!(
+            validate_asset_name_for("VoxFlow-Setup-99.0.0.exe", current_update_target()).is_err()
+        );
+
+        let err = download_and_launch(
+            "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-Setup-99.0.0.exe",
+            "VoxFlow-Setup-99.0.0.exe",
+            "",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("автоустановка"));
     }
 }
