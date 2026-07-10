@@ -20,11 +20,11 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { cursorPosition, getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
-import { getSettings, subscribe } from "./api";
+import { getSettings, IS_TAURI_RUNTIME, subscribe } from "./api";
 import FpsMeter from "./components/FpsMeter";
 import "./overlay.css";
-import { DEFAULT_HOTKEY } from "./types";
-import { prettyHotkey } from "./ui";
+import { DEFAULT_HOTKEY, normalizeOverlayScale } from "./types";
+import { IS_APPLE_PLATFORM, prettyHotkey } from "./ui";
 import type {
   OverlayStatus,
   PartialEvent,
@@ -60,23 +60,25 @@ type DragPointer = {
   t: number;
   dragging: boolean;
   fromPill: boolean;
-  windowStart?: { x: number; y: number };
   cursorStart?: { x: number; y: number };
   raf?: number | null;
+  applyChain?: Promise<void> | null;
 };
 
 // Желаемый размер overlay-окна под каждый режим (ЛОГИЧЕСКИЕ px): пилюля + поля
-// под glow/тень; для idle — запас под hover-рост (80×20) и тултип сверху.
+// под glow/тень; для idle — компактный запас под hover-рост (80×20) и тултип
+// сверху, без слишком широкой невидимой drag-зоны вокруг полоски.
 // Сообщается бэкенду командой overlay_box (реализует интегратор).
 const BOX: Record<PillMode, { w: number; h: number }> = {
-  idle: { w: 220, h: 80 },
-  rec: { w: 140, h: 64 },
-  trans: { w: 176, h: 64 },
-  stream: { w: 424, h: 168 },
-  latch: { w: 300, h: 82 },
-  notice: { w: 424, h: 92 },
+  idle: { w: 392, h: 88 },
+  rec: { w: 452, h: 92 },
+  trans: { w: 392, h: 88 },
+  stream: { w: 552, h: 126 },
+  latch: { w: 360, h: 92 },
+  notice: { w: 480, h: 96 },
 };
 const FINAL_PREVIEW_HOLD_MS = 360;
+const DRAG_HIT_PADDING = 6;
 
 // Раскладка громкости по 12 барам: центр громче краёв (сглаженный «холм» Aqua).
 const BAR_WEIGHTS = [0.5, 0.5, 0.7, 0.7, 1, 1, 1, 1, 0.8, 0.8, 0.6, 0.6];
@@ -101,6 +103,7 @@ export default function Overlay() {
   const [latchNotice, setLatchNotice] = useState<HotkeyLatchEvent | null>(null);
   const latchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [hotkeyTip, setHotkeyTip] = useState(prettyHotkey(DEFAULT_HOTKEY));
+  const [overlayScale, setOverlayScale] = useState(1);
   // D: метка «оффлайн» — облако было недоступно, сработал авто-fallback на
   // локальное распознавание ("stt_mode" offline=true). Сбрасывается на новой записи.
   const [offline, setOffline] = useState(false);
@@ -118,6 +121,7 @@ export default function Overlay() {
   // изменчиво» (в символах): slice(0,committedLen) — committed (белый), остаток —
   // volatile (серый хвост). shown — сколько символов уже проявлено.
   const targetTextRef = useRef<string>("");
+  const targetCharsRef = useRef<string[]>([]);
   const committedLenRef = useRef(0);
   const shownRef = useRef(0);
   const [shown, setShown] = useState(0);
@@ -164,17 +168,54 @@ export default function Overlay() {
   const levelLastRef = useRef(0);
 
   useEffect(() => {
+    if (IS_TAURI_RUNTIME) return;
+    const query = window.location.hash.split("?")[1] ?? "";
+    const demoParams = new URLSearchParams(query);
+    const demo = demoParams.get("demo");
+    const timer = setTimeout(() => {
+      const demoScale = Number(demoParams.get("scale"));
+      if (Number.isFinite(demoScale)) {
+        setOverlayScale(normalizeOverlayScale(demoScale));
+      }
+      if (demo === "recording" || demo === "stream") {
+        statusRef.current = "recording";
+        setStatus("recording");
+      } else if (demo === "processing") {
+        statusRef.current = "transcribing";
+        setStatus("transcribing");
+      } else if (demo === "error") {
+        setNotice("Не удалось вставить текст");
+      }
+      if (demo === "stream") {
+        const text = "Добавь автоматические тесты для Windows";
+        const chars = Array.from(text);
+        targetTextRef.current = text;
+        targetCharsRef.current = chars;
+        committedLenRef.current = Array.from("Добавь автоматические тесты").length;
+        shownFloatRef.current = chars.length;
+        shownRef.current = chars.length;
+        setShown(chars.length);
+        setLang("ru");
+      }
+    }, 60);
+    return () => clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
     document.body.classList.add("overlay-body");
     const unlisteners: Array<() => void> = [];
     let alive = true;
 
     getSettings().then((s) => {
-      if (alive) setHotkeyTip(prettyHotkey(s.hotkey));
+      if (!alive) return;
+      setHotkeyTip(prettyHotkey(s.hotkey));
+      setOverlayScale(normalizeOverlayScale(s.overlay_scale));
     });
 
     const offSettings = subscribe<Settings>("settings_changed", (e) => {
       const hotkey = e.payload?.hotkey;
       if (typeof hotkey === "string") setHotkeyTip(prettyHotkey(hotkey));
+      setOverlayScale(normalizeOverlayScale(e.payload?.overlay_scale));
     });
 
     // Один rAF-тик автоскролла: пишем scrollTop максимум раз в кадр, даже если за
@@ -229,6 +270,7 @@ export default function Overlay() {
     const resetTextEngine = () => {
       stopRaf();
       targetTextRef.current = "";
+      targetCharsRef.current = [];
       committedLenRef.current = 0;
       shownFloatRef.current = 0;
       lastFrameRef.current = 0;
@@ -242,7 +284,7 @@ export default function Overlay() {
     // копится в shownFloat). dt берём из реального времени → темп ровный и не зависит
     // от FPS. Каждый новый символ мягко проявляется через CSS (.aq-ch) → текст «течёт».
     const tick = (now: number) => {
-      const total = targetTextRef.current.length;
+      const total = targetCharsRef.current.length;
       if (shownFloatRef.current > total) shownFloatRef.current = total;
       const last = lastFrameRef.current || now;
       const dt = Math.min(64, now - last); // клампим скачок после простоя/таб-аут
@@ -442,24 +484,26 @@ export default function Overlay() {
         committed || volatileTail
           ? (committed + " " + volatileTail).trim()
           : (e.payload.text ?? "").trim();
-      const nextCommittedLen = Math.min(committed.length, text.length);
+      const chars = Array.from(text);
+      const nextCommittedLen = Math.min(Array.from(committed).length, chars.length);
       const previewChanged =
         targetTextRef.current !== text ||
         committedLenRef.current !== nextCommittedLen;
       targetTextRef.current = text;
+      targetCharsRef.current = chars;
       // committed — префикс text; его длина в символах = граница «белое/серое».
       committedLenRef.current = nextCommittedLen;
       if (previewChanged) setPreviewVersion((v) => v + 1);
       // Хвост укоротился (whisper переписал короче) — подрезаем показанное, без скачка.
-      if (shownFloatRef.current > text.length) shownFloatRef.current = text.length;
-      if (shownRef.current > text.length) setShownBoth(text.length);
+      if (shownFloatRef.current > chars.length) shownFloatRef.current = chars.length;
+      if (shownRef.current > chars.length) setShownBoth(chars.length);
       // Если ASR прислал большой новый кусок, не заставляем пользователя ждать
       // посимвольную анимацию всей фразы: держим максимум небольшой live-lag.
       if (previewChanged) {
         const maxLiveLag = isFinalPreview || isSettledPreview ? 0 : 28;
-        const lag = text.length - shownFloatRef.current;
+        const lag = chars.length - shownFloatRef.current;
         if (lag > maxLiveLag) {
-          shownFloatRef.current = Math.max(0, text.length - maxLiveLag);
+          shownFloatRef.current = Math.max(0, chars.length - maxLiveLag);
           setShownBoth(Math.floor(shownFloatRef.current));
         }
       }
@@ -558,42 +602,63 @@ export default function Overlay() {
               : "rec"
             : "idle";
 
+  const pillHitRect = () => {
+    const rect = pillRef.current?.getBoundingClientRect();
+    if (!rect) return null;
+    const pad = DRAG_HIT_PADDING;
+    const x = Math.max(0, rect.left - pad);
+    const y = Math.max(0, rect.top - pad);
+    const right = Math.min(window.innerWidth, rect.right + pad);
+    const bottom = Math.min(window.innerHeight, rect.bottom + pad);
+    return { x, y, w: Math.max(1, right - x), h: Math.max(1, bottom - y) };
+  };
+  const reportPillHit = () => {
+    const hit = pillHitRect();
+    if (!hit) return;
+    try {
+      void invoke("overlay_hit", hit).catch(() => {});
+    } catch {
+      /* команды может ещё не быть */
+    }
+  };
+  const pointInPillHit = (x: number, y: number) => {
+    const hit = pillHitRect();
+    return !!hit && x >= hit.x && x <= hit.x + hit.w && y >= hit.y && y <= hit.y + hit.h;
+  };
+
   // Сообщаем бэкенду желаемый размер окна под режим. Команду overlay_box реализует
   // интегратор; до интеграции команды нет — это НЕ ошибка, глушим оба пути отказа.
   useEffect(() => {
     const box = BOX[mode];
     try {
-      void invoke("overlay_box", { w: box.w, h: box.h }).catch(() => {});
+      void invoke("overlay_box", {
+        w: box.w * overlayScale,
+        h: box.h * overlayScale,
+      }).catch(() => {});
     } catch {
       /* команда ещё не существует */
     }
-  }, [mode]);
+  }, [mode, overlayScale]);
 
   // Репорт hit-зоны: окно по умолчанию click-through, бэкенд включает мышь,
-  // когда курсор внутри небольшого overlay-окна. Это даёт нормальную ручку для
-  // drag даже в idle, где чёрная полоска всего 55×10 и по ней легко промахнуться.
+  // когда курсор рядом с самой плашкой, а не внутри всего overlay-окна.
+  // Так прозрачные края не ловят случайные drag/click, но полоску всё ещё
+  // можно схватить без хирургической точности.
   // Короткий tap по прозрачной зоне игнорируется; диктовку запускает tap по пилюле.
   useEffect(() => {
-    const el = rootRef.current;
-    if (!el) return;
+    const rootEl = rootRef.current;
+    const pillEl = pillRef.current;
+    if (!rootEl || !pillEl) return;
     let t: ReturnType<typeof setTimeout> | null = null;
     const report = () => {
       if (t) clearTimeout(t);
       t = setTimeout(() => {
-        try {
-          void invoke("overlay_hit", {
-            x: 0,
-            y: 0,
-            w: window.innerWidth,
-            h: window.innerHeight,
-          }).catch(() => {});
-        } catch {
-          /* команды может ещё не быть */
-        }
+        reportPillHit();
       }, 80);
     };
     const ro = new ResizeObserver(report);
-    ro.observe(el);
+    ro.observe(rootEl);
+    ro.observe(pillEl);
     report();
     return () => {
       ro.disconnect();
@@ -605,21 +670,10 @@ export default function Overlay() {
   // вьюпорте съезжает при том же размере — перемеряем по таймеру за CSS-переход.
   useEffect(() => {
     const id = setTimeout(() => {
-      const el = rootRef.current;
-      if (!el) return;
-      try {
-        void invoke("overlay_hit", {
-          x: 0,
-          y: 0,
-          w: window.innerWidth,
-          h: window.innerHeight,
-        }).catch(() => {});
-      } catch {
-        /* нет команды — не страшно */
-      }
+      reportPillHit();
     }, 220);
     return () => clearTimeout(id);
-  }, [mode]);
+  }, [mode, overlayScale]);
 
   // ВАЖНО: узел .aq-pill ВСЕГДА в DOM и никогда не размонтируется — все переходы
   // размеров/прозрачности идут CSS-transition по смене класса режима, а не через
@@ -627,22 +681,40 @@ export default function Overlay() {
   const showBars = mode === "rec" || mode === "trans";
   const showOrb = showBars || mode === "stream";
   const applyManualDrag = async (p: DragPointer, requireActive = true) => {
-    if (!p.windowStart || !p.cursorStart) return;
-    const cur = await cursorPosition().catch(() => null);
-    if (!cur || (requireActive && pointerRef.current !== p)) return;
-    const x = Math.round(p.windowStart.x + (cur.x - p.cursorStart.x));
-    const y = Math.round(p.windowStart.y + (cur.y - p.cursorStart.y));
-    await getCurrentWindow().setPosition(new PhysicalPosition(x, y)).catch(() => {});
+    if (!p.cursorStart) return;
+    const overlayWindow = getCurrentWindow();
+    const [win, cur] = await Promise.all([
+      overlayWindow.outerPosition().catch(() => null),
+      cursorPosition().catch(() => null),
+    ]);
+    if (!win || !cur || (requireActive && pointerRef.current !== p)) return;
+    const x = Math.round(win.x + (cur.x - p.cursorStart.x));
+    const y = Math.round(win.y + (cur.y - p.cursorStart.y));
+    try {
+      await overlayWindow.setPosition(new PhysicalPosition(x, y));
+      // Incremental baseline: if overlay_box resized/re-anchored the window
+      // between frames, the next delta starts from that current position instead
+      // of restoring the stale top-left captured at pointer-down.
+      p.cursorStart = { x: cur.x, y: cur.y };
+    } catch {
+      /* keep the previous baseline so the movement can be retried */
+    }
   };
   const scheduleManualDrag = (p: DragPointer) => {
     if (p.raf != null) return;
     p.raf = requestAnimationFrame(() => {
       p.raf = null;
-      void applyManualDrag(p);
+      const previous = p.applyChain ?? Promise.resolve();
+      const current = previous.then(() => applyManualDrag(p));
+      p.applyChain = current;
+      void current.finally(() => {
+        if (p.applyChain === current) p.applyChain = null;
+      });
     });
   };
   const onPillPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.button !== 0) return;
+    if (!pointInPillHit(e.clientX, e.clientY)) return;
     const fromPill = !!pillRef.current?.contains(e.target as Node);
     const state: DragPointer = {
       id: e.pointerId,
@@ -652,17 +724,25 @@ export default function Overlay() {
       dragging: false,
       fromPill,
       raf: null,
+      applyChain: null,
     };
     pointerRef.current = state;
     e.currentTarget.setPointerCapture?.(e.pointerId);
-    void Promise.all([getCurrentWindow().outerPosition(), cursorPosition()])
-      .then(([win, cur]) => {
-        if (pointerRef.current !== state) return;
-        state.windowStart = { x: win.x, y: win.y };
-        state.cursorStart = { x: cur.x, y: cur.y };
-        if (state.dragging) scheduleManualDrag(state);
-      })
-      .catch(() => {});
+    if (IS_APPLE_PLATFORM) {
+      void cursorPosition()
+        .then((cur) => {
+          if (pointerRef.current === state) state.cursorStart = { x: cur.x, y: cur.y };
+        })
+        .catch(() => {});
+    } else {
+      void cursorPosition()
+        .then((cur) => {
+          if (pointerRef.current !== state) return;
+          state.cursorStart = { x: cur.x, y: cur.y };
+          if (state.dragging) scheduleManualDrag(state);
+        })
+        .catch(() => {});
+    }
   };
   const onPillPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
     const p = pointerRef.current;
@@ -672,7 +752,7 @@ export default function Overlay() {
     if (!p.dragging && Math.hypot(dx, dy) >= 4) {
       p.dragging = true;
     }
-    if (p.dragging) {
+    if (p.dragging && !IS_APPLE_PLATFORM) {
       e.preventDefault();
       scheduleManualDrag(p);
     }
@@ -688,16 +768,34 @@ export default function Overlay() {
     e.currentTarget.releasePointerCapture?.(e.pointerId);
     const moved = Math.hypot(e.clientX - p.x, e.clientY - p.y);
     const elapsed = performance.now() - p.t;
-    if (p.dragging) {
-      void applyManualDrag(p, false);
-    } else if (p.fromPill && moved < 5 && elapsed < 550) {
-      void invoke("overlay_click").catch(() => {});
-    }
+    const finish = async () => {
+      const cursor = await cursorPosition().catch(() => null);
+      const physicalMoved =
+        cursor && p.cursorStart
+          ? Math.hypot(cursor.x - p.cursorStart.x, cursor.y - p.cursorStart.y)
+          : moved;
+      if (p.dragging || physicalMoved >= 5) {
+        if (!IS_APPLE_PLATFORM) {
+          await p.applyChain?.catch(() => {});
+          await applyManualDrag(p, false);
+        }
+        await invoke("overlay_commit_position").catch(() => {});
+      } else if (p.fromPill && elapsed < 550) {
+        await invoke("overlay_click").catch(() => {});
+      }
+    };
+    void finish();
   };
   const onPillPointerCancel = (e: ReactPointerEvent<HTMLDivElement>) => {
-    if (pointerRef.current?.id === e.pointerId) {
-      if (pointerRef.current.raf != null) cancelAnimationFrame(pointerRef.current.raf);
+    const p = pointerRef.current;
+    if (p?.id === e.pointerId) {
+      if (p.raf != null) cancelAnimationFrame(p.raf);
       pointerRef.current = null;
+      if (p.dragging) {
+        void (p.applyChain ?? Promise.resolve()).then(() =>
+          invoke("overlay_commit_position").catch(() => {}),
+        );
+      }
     }
   };
 
@@ -705,7 +803,6 @@ export default function Overlay() {
     <div
       className="aq-root"
       ref={rootRef}
-      data-tauri-drag-region
       onPointerDown={onPillPointerDown}
       onPointerMove={onPillPointerMove}
       onPointerUp={onPillPointerUp}
@@ -713,15 +810,21 @@ export default function Overlay() {
     >
       <FpsMeter />
       <div
-        className={`aq-pill aq-${mode}`}
-        ref={pillRef}
-        data-tauri-drag-region
-        title={
-          offline && mode === "trans"
-            ? "Облако недоступно — локальное распознавание"
-            : undefined
-        }
+        className="aq-scale-stage"
+        style={{ transform: `scale(${overlayScale})` }}
+        data-scale={overlayScale.toFixed(2)}
       >
+        <div
+          className={`aq-pill aq-${mode}`}
+          ref={pillRef}
+          data-mode={mode}
+          data-shown={shown}
+          title={
+            offline && mode === "trans"
+              ? "Облако недоступно — локальное распознавание"
+              : undefined
+          }
+        >
         {/* Тултип idle-hover: всегда в DOM, виден только в .aq-idle:hover (CSS). */}
         <span className="aq-tip" aria-hidden>
           Зажмите {hotkeyTip} — диктовка
@@ -734,7 +837,13 @@ export default function Overlay() {
           <span className="aq-lang">{lang.toUpperCase()}</span>
         )}
 
-        {mode === "notice" ? (
+        {mode === "idle" ? (
+          <span className="aq-idle-copy">
+            <span className="aq-logo-wave" aria-hidden><i /><i /><i /><i /><i /></span>
+            <strong>{hotkeyTip} — говорить</strong>
+            <span className="aq-idle-lang">Авто</span>
+          </span>
+        ) : mode === "notice" ? (
           <span className="aq-msg">{notice}</span>
         ) : mode === "latch" ? (
           <span className="aq-latch-copy">
@@ -757,30 +866,20 @@ export default function Overlay() {
             </span>
             {mode === "stream" ? (
               (() => {
-                const full = targetTextRef.current;
-                const vis = Math.min(shown, full.length);
+                const chars = targetCharsRef.current;
+                const vis = Math.min(shown, chars.length);
                 // Граница committed — не дальше показанного.
                 const cut = Math.min(committedLenRef.current, vis);
-                // Каждый видимый символ — отдельный span с ключом = АБСОЛЮТНЫЙ индекс:
-                // новый символ монтируется и мягко проявляется (CSS .aq-ch), уже показанные
-                // не перемонтируются (не мигают), а смена класса volatile→committed даёт
-                // плавный переход цвета серый→белый при фиксации. Array.from — корректно
-                // по код-поинтам (кириллица ок).
-                const chars = Array.from(full.slice(0, vis));
+                const committedText = chars.slice(0, cut).join("");
+                const volatileText = chars.slice(cut, vis).join("");
                 return (
                   <div
                     className="aq-text"
                     ref={scrollRef}
                     data-preview-version={previewVersion}
                   >
-                    {chars.map((ch, i) => (
-                      <span
-                        key={i}
-                        className={i < cut ? "aq-ch committed" : "aq-ch volatile"}
-                      >
-                        {ch}
-                      </span>
-                    ))}
+                    <span className="aq-chunk committed">{committedText}</span>
+                    <span className="aq-chunk volatile">{volatileText}</span>
                     {/* Каретка-кружок — последний inline-элемент: всегда вплотную за
                         текстом и переносится вместе с ним. Пульс при печати, мигание в покое. */}
                     <span
@@ -803,23 +902,27 @@ export default function Overlay() {
               // 12 баров визуализатора; высоту/прозрачность пишет rAF-цикл громкости.
               // Пока событий "level" нет (бэкенд не готов) — стоят на CSS-минимуме.
               mode === "trans" ? (
-                <span className="aq-trans-copy">Готовлю</span>
+                <span className="aq-trans-copy">Улучшаю текст…</span>
               ) : (
-                <span className="aq-bars" aria-hidden>
-                  {BAR_WEIGHTS.map((_, i) => (
-                    <span
-                      key={i}
-                      className="aq-bar"
-                      ref={(el) => {
-                        barEls.current[i] = el;
-                      }}
-                    />
-                  ))}
-                </span>
+                <>
+                  <span className="aq-rec-copy">Слушаю</span>
+                  <span className="aq-bars" aria-hidden>
+                    {BAR_WEIGHTS.map((_, i) => (
+                      <span
+                        key={i}
+                        className="aq-bar"
+                        ref={(el) => {
+                          barEls.current[i] = el;
+                        }}
+                      />
+                    ))}
+                  </span>
+                </>
               )
             )}
           </>
         ) : null}
+        </div>
       </div>
     </div>
   );

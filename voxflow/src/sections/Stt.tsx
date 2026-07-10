@@ -2,6 +2,7 @@ import { useState } from "react";
 import { saveSettings, sttTest } from "../api";
 import { PageHead, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
+import SecretControl from "../components/SecretControl";
 
 // Облачный STT (D-022). Локальный роутер GigaAM/Parakeet/Whisper остаётся
 // дефолтом и приватен — аудио не покидает устройство. Облачные провайдеры
@@ -87,9 +88,11 @@ const STT_PRESETS: SttPreset[] = [
 export default function Stt({
   settings,
   update,
+  persist,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
+  persist?: (settings: Settings) => Promise<boolean>;
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<string | null>(null);
@@ -123,7 +126,11 @@ export default function Stt({
       // Бэкенд stt_test читает провайдера/ключи из настроек в БД. update() пишет
       // в БД с debounce (400 мс), поэтому здесь сохраняем синхронно — иначе можно
       // проверить устаревшие значения.
-      await saveSettings(settings);
+      const saved = await (persist ? persist(settings) : saveSettings(settings));
+      if (!saved) {
+        setResult("Не удалось сохранить настройки");
+        return;
+      }
       const r = await sttTest();
       setResult(r);
     } finally {
@@ -270,12 +277,10 @@ export default function Stt({
               label="API-ключ"
               hint="Ключ хранится локально и используется только для запросов к выбранному провайдеру"
             >
-              <input
-                type="password"
-                placeholder="Вставьте ключ"
+              <SecretControl
+                kind="oai_stt_key"
                 value={settings.oai_stt_key}
-                onChange={(e) => update({ oai_stt_key: e.currentTarget.value })}
-                style={{ width: 260 }}
+                onChange={(value) => update({ oai_stt_key: value })}
               />
             </Field>
 
@@ -321,14 +326,10 @@ export default function Stt({
               label="API-ключ"
               hint="Ключ хранится локально и используется только для запросов к Deepgram"
             >
-              <input
-                type="password"
-                placeholder="Вставьте ключ"
+              <SecretControl
+                kind="deepgram_key"
                 value={settings.deepgram_key}
-                onChange={(e) =>
-                  update({ deepgram_key: e.currentTarget.value })
-                }
-                style={{ width: 260 }}
+                onChange={(value) => update({ deepgram_key: value })}
               />
             </Field>
           </>

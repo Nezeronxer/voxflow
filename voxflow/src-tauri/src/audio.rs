@@ -477,7 +477,8 @@ pub fn write_wav_16k_mono(path: &std::path::Path, samples: &[f32]) -> Result<()>
         sample_format: hound::SampleFormat::Int,
     };
 
-    let mut writer = hound::WavWriter::create(path, spec).context("не удалось создать WAV-файл")?;
+    let file = crate::paths::create_private_file(path).context("не удалось создать WAV-файл")?;
+    let mut writer = hound::WavWriter::new(file, spec).context("не удалось создать WAV-файл")?;
 
     for &s in samples {
         let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
@@ -538,6 +539,27 @@ mod tests {
     #[test]
     fn resampler16k_matches_batch_44100() {
         assert_incremental_matches_batch(44100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wav_files_are_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let path = std::env::temp_dir().join(format!(
+            "voxflow-private-wav-{}-{nanos}.wav",
+            std::process::id()
+        ));
+
+        write_wav_16k_mono(&path, &[0.0, 0.25, -0.25]).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
