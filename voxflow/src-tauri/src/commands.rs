@@ -204,14 +204,14 @@ pub fn toggle_dictation(state: State<AppState>) -> R<()> {
 }
 
 #[tauri::command]
-pub fn overlay_click(app: AppHandle, state: State<AppState>) -> R<()> {
+pub fn overlay_click(_app: AppHandle, state: State<AppState>) -> R<()> {
     #[cfg(target_os = "macos")]
     {
         if !crate::macos_permissions::post_event_allowed() {
             crate::engine::dbg_log("permissions: overlay click opened Accessibility");
             crate::macos_permissions::request_post_event_once();
             crate::macos_permissions::open_accessibility_settings();
-            let _ = app.emit(
+            let _ = _app.emit(
                 "error",
                 serde_json::json!({
                     "message": "Разрешите VoxFlow в macOS Privacy & Security -> Accessibility, чтобы панель могла вставлять текст"

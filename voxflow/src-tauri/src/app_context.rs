@@ -642,6 +642,7 @@ pub fn detect() -> AppContext {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[derive(Default)]
 struct MacContextSnapshot {
     app: String,
@@ -654,6 +655,7 @@ struct MacContextSnapshot {
     size: String,
 }
 
+#[cfg(target_os = "macos")]
 impl MacContextSnapshot {
     fn window_id(&self) -> String {
         let pid = self.pid.trim();
