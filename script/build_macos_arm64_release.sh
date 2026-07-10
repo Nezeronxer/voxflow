@@ -3,11 +3,13 @@ set -euo pipefail
 
 # Reproducible-input macOS release builder for VoxFlow.
 #
-# The default path is intentionally unsigned: it passes --no-sign to Tauri and
-# names the artifacts accordingly. A local machine may opt into Developer ID
-# signing by setting VOXFLOW_SIGNING_IDENTITY to an identity already installed
-# in the current keychain. This script never imports certificates or handles
-# notarization credentials.
+# The secret-free path uses Tauri's complete ad-hoc bundle signing (`-`). This
+# is not a trusted Developer ID signature, but it binds Info.plist/resources and
+# prevents the linker-only signature from becoming an invalid distributed app.
+# A local machine may opt into Developer ID signing by setting
+# VOXFLOW_SIGNING_IDENTITY to an identity already installed in the current
+# keychain. This script never imports certificates or handles notarization
+# credentials.
 
 readonly TARGET_TRIPLE="aarch64-apple-darwin"
 readonly TARGET_ARCH="arm64"
@@ -52,7 +54,7 @@ Usage: script/build_macos_arm64_release.sh [--tag vX.Y.Z] [--runtime-only]
 Environment:
   VOXFLOW_RELEASE_DIR         Output parent (default: voxflow/release/macos)
   VOXFLOW_SIGNING_IDENTITY    Optional installed Developer ID identity.
-                              Omit for the CI-default unsigned build.
+                              Omit for the CI-default complete ad-hoc seal.
   VOXFLOW_XCODE_VERSION       Optional exact Xcode version gate (for CI).
   VOXFLOW_XCODE_BUILD         Optional exact Xcode build gate (for CI).
 EOF
@@ -329,15 +331,15 @@ rust_gates() {
 }
 
 configure_signing() {
-  SIGNING_LABEL="unsigned"
-  unset APPLE_SIGNING_IDENTITY
+  SIGNING_LABEL="adhoc"
+  export APPLE_SIGNING_IDENTITY="-"
   # Notarization is deliberately out of scope for this secret-free workflow.
   # Clear ambient credentials so a local signed run cannot be mislabeled.
   unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
   unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
   unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
 
-  if [[ -n "${VOXFLOW_SIGNING_IDENTITY:-}" ]]; then
+  if [[ -n "${VOXFLOW_SIGNING_IDENTITY:-}" && "$VOXFLOW_SIGNING_IDENTITY" != "-" ]]; then
     /usr/bin/security find-identity -v -p codesigning \
       | grep -F -- "$VOXFLOW_SIGNING_IDENTITY" >/dev/null \
       || die "requested signing identity is not installed: $VOXFLOW_SIGNING_IDENTITY"
@@ -346,23 +348,112 @@ configure_signing() {
   fi
 }
 
+sign_runtime_binaries() {
+  local identity="$APPLE_SIGNING_IDENTITY"
+  local timestamp_args=(--timestamp)
+  local binary identifier details
+  if [[ "$identity" == "-" ]]; then
+    timestamp_args=(--timestamp=none)
+  fi
+
+  while IFS='|' read -r binary identifier; do
+    /usr/bin/codesign --force --sign "$identity" \
+      --identifier "$identifier" --options runtime "${timestamp_args[@]}" "$binary"
+    /usr/bin/codesign --verify --strict --verbose=4 "$binary"
+    details="$(/usr/bin/codesign -dvvv "$binary" 2>&1)"
+    grep -q 'flags=.*runtime' <<< "$details" \
+      || die "runtime sidecar is missing hardened runtime: $binary"
+    ! grep -q 'linker-signed' <<< "$details" \
+      || die "runtime sidecar still has only a linker signature: $binary"
+    if [[ "$SIGNING_LABEL" == "adhoc" ]]; then
+      grep -q '^Signature=adhoc$' <<< "$details" \
+        || die "runtime sidecar is not ad-hoc signed: $binary"
+    fi
+  done <<EOF
+$ARM_RUNTIME_DIR/whisper-cli|com.nezeronxer.voxflow.whisper-cli
+$ARM_RUNTIME_DIR/whisper-server|com.nezeronxer.voxflow.whisper-server
+EOF
+}
+
 validate_signing_state() {
   local app="$1"
   local details
+  local embedded_entitlements="$TEMP_ROOT/embedded-entitlements.plist"
   local team_identifier
-  details="$(/usr/bin/codesign -dvvv "$app" 2>&1 || true)"
-  if [[ "$SIGNING_LABEL" == "unsigned" ]]; then
+  local nested_details
+  local nested_binary
+  details="$(/usr/bin/codesign -dvvv "$app" 2>&1)" \
+    || die "app bundle has no complete code signature: $app"
+  /usr/bin/codesign --verify --strict --verbose=4 "$app"
+  /usr/bin/codesign --verify --deep --strict --verbose=4 "$app"
+  [[ -s "$app/Contents/_CodeSignature/CodeResources" ]] \
+    || die "app bundle has no sealed CodeResources"
+  grep -q '^Info.plist entries=' <<< "$details" \
+    || die "app signature does not bind Info.plist"
+  grep -q '^Sealed Resources version=2' <<< "$details" \
+    || die "app signature does not seal bundle resources"
+  grep -q 'flags=.*runtime' <<< "$details" || die "app is missing hardened runtime"
+  /usr/bin/codesign --display --entitlements - --xml "$app" \
+    > "$embedded_entitlements" 2>/dev/null \
+    || die "could not extract embedded app entitlements: $app"
+  [[ -s "$embedded_entitlements" ]] \
+    || die "app signature has no embedded entitlements: $app"
+  python3 - "$embedded_entitlements" <<'PY'
+import plistlib
+import sys
+
+path = sys.argv[1]
+with open(path, "rb") as stream:
+    entitlements = plistlib.load(stream)
+
+required = (
+    "com.apple.security.device.audio-input",
+    "com.apple.security.automation.apple-events",
+)
+missing = [key for key in required if entitlements.get(key) is not True]
+if missing:
+    raise SystemExit(
+        "missing required true app entitlements: " + ", ".join(missing)
+    )
+PY
+
+  if [[ "$SIGNING_LABEL" == "adhoc" ]]; then
     ! grep -q '^Authority=' <<< "$details" \
-      || die "unsigned build unexpectedly contains a signing authority"
+      || die "ad-hoc build unexpectedly contains a signing authority"
     team_identifier="$(awk -F= '$1 == "TeamIdentifier" { print $2 }' <<< "$details")"
     [[ -z "$team_identifier" || "$team_identifier" == "not set" ]] \
-      || die "unsigned build unexpectedly contains TeamIdentifier=$team_identifier"
+      || die "ad-hoc build unexpectedly contains TeamIdentifier=$team_identifier"
+    grep -q '^Signature=adhoc$' <<< "$details" || die "app is not ad-hoc signed"
   else
-    /usr/bin/codesign --verify --deep --strict "$app"
     team_identifier="$(awk -F= '$1 == "TeamIdentifier" { print $2 }' <<< "$details")"
     [[ -n "$team_identifier" && "$team_identifier" != "not set" ]] \
       || die "signed app has no TeamIdentifier"
-    grep -q 'flags=.*runtime' <<< "$details" || die "signed app is missing hardened runtime"
+  fi
+
+  for nested_binary in \
+    "$app/Contents/Resources/resources/whisper-darwin-arm64/whisper-cli" \
+    "$app/Contents/Resources/resources/whisper-darwin-arm64/whisper-server"; do
+    /usr/bin/codesign --verify --strict --verbose=4 "$nested_binary"
+    nested_details="$(/usr/bin/codesign -dvvv "$nested_binary" 2>&1)"
+    grep -q 'flags=.*runtime' <<< "$nested_details" \
+      || die "bundled runtime sidecar is missing hardened runtime: $nested_binary"
+    ! grep -q 'linker-signed' <<< "$nested_details" \
+      || die "bundled runtime sidecar has only a linker signature: $nested_binary"
+    if [[ "$SIGNING_LABEL" == "adhoc" ]]; then
+      grep -q '^Signature=adhoc$' <<< "$nested_details" \
+        || die "bundled runtime sidecar is not ad-hoc signed: $nested_binary"
+    fi
+  done
+
+  # syspolicy_check still reports the expected Adhoc Signed App / missing
+  # notarization ticket in the secret-free build. A structural Codesign Error,
+  # however, is always a broken artifact and previously produced macOS's
+  # misleading "application is damaged" dialog after a browser download.
+  if [[ -x /usr/bin/syspolicy_check ]]; then
+    local policy_report
+    policy_report="$(/usr/bin/syspolicy_check distribution "$app" 2>&1 || true)"
+    ! grep -q 'Codesign Error' <<< "$policy_report" \
+      || die "Gatekeeper found a structural code-signing error: $policy_report"
   fi
 }
 
@@ -412,13 +503,7 @@ build_bundles() {
   export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS_VERSION"
   for attempt in 1 2; do
     rm -rf "$TARGET_RELEASE_DIR/bundle/macos" "$TARGET_RELEASE_DIR/bundle/dmg"
-    if [[ "$SIGNING_LABEL" == "unsigned" ]]; then
-      if (cd "$APP_DIR" && node "$tauri_cli" build --ci --target "$TARGET_TRIPLE" \
-        --bundles app,dmg --no-sign); then
-        built=1
-        break
-      fi
-    elif (cd "$APP_DIR" && node "$tauri_cli" build --ci --target "$TARGET_TRIPLE" \
+    if (cd "$APP_DIR" && node "$tauri_cli" build --ci --target "$TARGET_TRIPLE" \
       --bundles app,dmg); then
       built=1
       break
@@ -492,6 +577,8 @@ package_outputs() {
     echo "minimum_macos=$MIN_MACOS_VERSION"
     echo "signing=$SIGNING_LABEL"
     echo "notarized=false"
+    echo "microphone_entitlement=true"
+    echo "apple_events_entitlement=true"
     echo "whisper_version=$WHISPER_VERSION"
     echo "whisper_commit=$WHISPER_COMMIT"
     echo "whisper_source_date_epoch=$WHISPER_SOURCE_DATE_EPOCH"
@@ -534,6 +621,7 @@ main() {
   prepare_runtime
   rust_gates
   configure_signing
+  sign_runtime_binaries
 
   local version
   version="$(cd "$APP_DIR" && node -p "require('./package.json').version")"

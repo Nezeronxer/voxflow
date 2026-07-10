@@ -37,7 +37,7 @@ use tauri_plugin_autostart::MacosLauncher;
 use commands::{AppState, OverlayHitRect};
 use engine::EngineCmd;
 
-const OVERLAY_IDLE_BOX: (i32, i32) = (392, 88);
+const OVERLAY_IDLE_BOX: (i32, i32) = (266, 60);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -146,8 +146,7 @@ pub fn run() {
 
             build_tray(&handle)?;
             setup_overlay(&handle);
-            spawn_overlay_hover_poller(&handle, overlay_hit.clone());
-            spawn_overlay_drag_poller(&handle, overlay_hit);
+            spawn_overlay_hover_poller(&handle, overlay_hit);
 
             // Первый запуск/legacy-default: подготовить модель под текущий
             // локальный маршрут. Свежий default — multilingual Whisper auto;
@@ -516,8 +515,7 @@ pub fn stt_test_cli(wav: &str) {
 /// переключает click-through. Вне пилюли окно прозрачно для мыши — кнопки
 /// фуллскрин-приложений под оверлеем остаются кликабельными. Во время зажатой
 /// ЛКМ состояние не переключаем (не рвать drag пилюли). На macOS overlay
-/// оставляем интерактивным всегда, но drag-poller ниже всё равно стартует
-/// перенос только из hit-rect самой пилюли.
+/// оставляем интерактивным всегда, а drag обрабатывает общий pointer-путь в Overlay.tsx.
 fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitRect>>) {
     #[cfg(windows)]
     {
@@ -580,131 +578,6 @@ fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitR
     {
         let _ = (app, hit);
     }
-}
-
-#[cfg(target_os = "macos")]
-fn spawn_overlay_drag_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitRect>>) {
-    let app = app.clone();
-    std::thread::Builder::new()
-        .name("voxflow-overlay-drag".into())
-        .spawn(move || {
-            let mut drag: Option<(f64, f64)> = None;
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(16));
-                let Some(ov) = app.get_webview_window("overlay") else {
-                    drag = None;
-                    continue;
-                };
-                let down = macos_left_mouse_down();
-                let Some(cursor) = macos_cursor_position() else {
-                    drag = None;
-                    continue;
-                };
-                if !down {
-                    if drag.take().is_some() {
-                        let _ = commit_overlay_position(&app);
-                    }
-                    continue;
-                }
-                if let Some(previous_cursor) = drag {
-                    let dx = cursor.0 - previous_cursor.0;
-                    let dy = cursor.1 - previous_cursor.1;
-                    if dx.abs() >= 1.0 || dy.abs() >= 1.0 {
-                        if let Ok(current_pos) = ov.outer_position() {
-                            let x = (current_pos.x as f64 + dx).round() as i32;
-                            let y = (current_pos.y as f64 + dy).round() as i32;
-                            if ov.set_position(PhysicalPosition::new(x, y)).is_ok() {
-                                // Incremental cursor baseline preserves any
-                                // center/bottom correction made by overlay_box
-                                // when the pill changes mode during this drag.
-                                drag = Some(cursor);
-                            }
-                        }
-                    }
-                    continue;
-                }
-                let hit_rect = *hit.lock();
-                if overlay_cursor_inside_hit_rect(&ov, cursor, hit_rect) {
-                    drag = Some(cursor);
-                }
-            }
-        })
-        .ok();
-}
-
-#[cfg(not(target_os = "macos"))]
-fn spawn_overlay_drag_poller(_app: &tauri::AppHandle, _hit: Arc<Mutex<OverlayHitRect>>) {}
-
-#[cfg(target_os = "macos")]
-fn overlay_cursor_inside_hit_rect(
-    ov: &tauri::WebviewWindow,
-    cursor: (f64, f64),
-    hit: OverlayHitRect,
-) -> bool {
-    let (Ok(pos), Ok(size)) = (ov.outer_position(), ov.outer_size()) else {
-        return false;
-    };
-    let scale = ov.scale_factor().unwrap_or(1.0);
-    let (x, y, w, h) = match hit {
-        Some((x, y, w, h)) => (
-            pos.x as f64 + x * scale,
-            pos.y as f64 + y * scale,
-            w * scale,
-            h * scale,
-        ),
-        None => {
-            let w = 92.0 * scale;
-            let h = 32.0 * scale;
-            (
-                pos.x as f64 + ((size.width as f64 - w) / 2.0).max(0.0),
-                pos.y as f64 + (size.height as f64 - 12.0 * scale - h).max(0.0),
-                w,
-                h,
-            )
-        }
-    };
-    cursor.0 >= x && cursor.0 <= x + w && cursor.1 >= y && cursor.1 <= y + h
-}
-
-#[cfg(target_os = "macos")]
-#[repr(C)]
-struct MacosCGPoint {
-    x: f64,
-    y: f64,
-}
-
-#[cfg(target_os = "macos")]
-type MacosCGEventRef = *mut std::ffi::c_void;
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGEventCreate(source: *const std::ffi::c_void) -> MacosCGEventRef;
-    fn CGEventGetLocation(event: MacosCGEventRef) -> MacosCGPoint;
-    fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
-}
-
-#[cfg(target_os = "macos")]
-#[link(name = "CoreFoundation", kind = "framework")]
-extern "C" {
-    fn CFRelease(cf: *const std::ffi::c_void);
-}
-
-#[cfg(target_os = "macos")]
-fn macos_cursor_position() -> Option<(f64, f64)> {
-    let event = unsafe { CGEventCreate(std::ptr::null()) };
-    if event.is_null() {
-        return None;
-    }
-    let p = unsafe { CGEventGetLocation(event) };
-    unsafe { CFRelease(event.cast()) };
-    Some((p.x, p.y))
-}
-
-#[cfg(target_os = "macos")]
-fn macos_left_mouse_down() -> bool {
-    // 0 = kCGEventSourceStateCombinedSessionState, 0 = kCGMouseButtonLeft.
-    unsafe { CGEventSourceButtonState(0, 0) }
 }
 
 /// Headless-проверка GigaAM-пайплайна (без GUI/микрофона): грузит VAD+GigaAM,
@@ -1097,8 +970,8 @@ fn setup_overlay(app: &tauri::AppHandle) {
         let _ = ov.set_always_on_top(true);
         let scale = ov.scale_factor().unwrap_or(1.0);
         let user_scale = app.state::<AppState>().settings.lock().overlay_scale;
-        // Стартовый размер = idle-запрос фронта: компактный запас под hover-рост
-        // и тултип, без слишком широкой невидимой drag-зоны вокруг полоски.
+        // Стартовый размер = компактный idle-запрос фронта с небольшим
+        // запасом под тень; контракт защищён overlay-geometry.test.mjs.
         let win_w = f64::from(OVERLAY_IDLE_BOX.0) * scale * user_scale;
         let win_h = f64::from(OVERLAY_IDLE_BOX.1) * scale * user_scale;
         let _ = ov.set_size(PhysicalSize::new(win_w as u32, win_h as u32));
@@ -1301,7 +1174,8 @@ mod lib_tests {
             (0, 0, 3000, 1700)
         ));
         assert!(!overlay_position_visible(
-            (900, 1131),
+            // 11 px от нижней границы — меньше контракта MIN_BOTTOM_GAP=12.
+            (900, 1211 - OVERLAY_IDLE_BOX.1 - 11),
             OVERLAY_IDLE_BOX,
             (0, 0, 1976, 1211)
         ));
@@ -1319,7 +1193,9 @@ mod lib_tests {
     #[test]
     fn overlay_snap_magnets_x_only_near_anchors() {
         let area = (0, 0, 1920, 1080);
-        for (x, expected) in [(20, 16), (750, 764), (1489, 1512)] {
+        let center = (area.2 - OVERLAY_IDLE_BOX.0) / 2;
+        let right = area.2 - OVERLAY_IDLE_BOX.0 - 16;
+        for (x, expected) in [(20, 16), (center - 14, center), (right - 23, right)] {
             assert_eq!(
                 overlay_snap_position_in_work_area((x, 300), OVERLAY_IDLE_BOX, area, 1.0).0,
                 expected
@@ -1340,7 +1216,7 @@ mod lib_tests {
         );
         assert_eq!(
             overlay_snap_position_in_work_area((1800, 300), OVERLAY_IDLE_BOX, area, 1.0).0,
-            1512
+            area.2 - OVERLAY_IDLE_BOX.0 - 16
         );
     }
 
@@ -1353,7 +1229,7 @@ mod lib_tests {
         );
         assert_eq!(
             overlay_snap_position_in_work_area((500, 980), OVERLAY_IDLE_BOX, area, 1.0),
-            (500, 976)
+            (500, area.3 - OVERLAY_IDLE_BOX.1 - 16)
         );
     }
 
@@ -1361,9 +1237,10 @@ mod lib_tests {
     fn overlay_snap_scales_threshold_for_hidpi() {
         let physical_window = (OVERLAY_IDLE_BOX.0 * 2, OVERLAY_IDLE_BOX.1 * 2);
         let area = (0, 0, 3840, 2160);
+        let center = (area.2 - physical_window.0) / 2;
         assert_eq!(
-            overlay_snap_position_in_work_area((1560, 700), physical_window, area, 2.0).0,
-            1528
+            overlay_snap_position_in_work_area((center - 40, 700), physical_window, area, 2.0).0,
+            center
         );
         assert_eq!(
             overlay_snap_position_in_work_area((1000, 700), physical_window, area, 2.0).0,
@@ -1380,7 +1257,7 @@ mod lib_tests {
         );
         assert_eq!(
             overlay_snap_position((3020, 510), OVERLAY_IDLE_BOX, &monitors, 2.0),
-            Some((3032, 496))
+            Some((3032, (1080 - OVERLAY_IDLE_BOX.1) / 2))
         );
     }
 }

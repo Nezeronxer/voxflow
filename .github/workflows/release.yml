@@ -45,7 +45,7 @@ jobs:
       - name: Download verified macOS artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: VoxFlow-macOS-arm64-unsigned-${{ github.sha }}
+          name: VoxFlow-macOS-arm64-adhoc-${{ github.sha }}
           path: release/macos
 
       - name: Verify artifacts and publish complete release

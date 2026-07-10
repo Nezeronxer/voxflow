@@ -1,4 +1,4 @@
-name: Release macOS ARM64 (unsigned)
+name: Release macOS ARM64 (ad-hoc)
 
 on:
   workflow_call:
@@ -23,7 +23,7 @@ concurrency:
 
 jobs:
   build:
-    name: macOS 15 ARM64 / unsigned
+    name: macOS 15 ARM64 / complete ad-hoc seal
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -68,7 +68,7 @@ jobs:
           node --version
           python3 --version
 
-      - name: Build, test, package, and verify unsigned release
+      - name: Build, test, package, and verify ad-hoc release
         shell: bash
         run: |
           set -euo pipefail
@@ -81,7 +81,7 @@ jobs:
       - name: Upload app, DMG, manifest, and SHA256 checksums
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: VoxFlow-macOS-arm64-unsigned-${{ github.sha }}
+          name: VoxFlow-macOS-arm64-adhoc-${{ github.sha }}
           path: voxflow/release/macos/*/
           if-no-files-found: error
           compression-level: 0

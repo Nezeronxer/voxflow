@@ -10,6 +10,18 @@ pub const DEFAULT_HOTKEY: &str = "ControlRight";
 pub const OVERLAY_SCALE_MIN: f64 = 0.75;
 pub const OVERLAY_SCALE_MAX: f64 = 1.50;
 pub const OVERLAY_SCALE_DEFAULT: f64 = 1.0;
+const DOUBLE_TAP_BEHAVIOR_VERSION: u8 = 1;
+const AI_BACKEND_BEHAVIOR_VERSION: u8 = 1;
+const LEGACY_DEFAULT_OLLAMA_URL: &str = "http://localhost:11434";
+const LEGACY_DEFAULT_OLLAMA_MODEL: &str = "qwen3:4b";
+
+fn legacy_double_tap_behavior_version() -> u8 {
+    0
+}
+
+fn legacy_ai_backend_behavior_version() -> u8 {
+    0
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -20,10 +32,12 @@ pub struct Settings {
     pub improve_hotkey: String,
     /// "hold" | "toggle".
     pub mode: String,
-    /// Двойной короткий тап в hold-режиме оставляет запись включённой.
-    /// Выключено по умолчанию: одиночный release должен финализироваться без
-    /// ожидания окна второго тапа.
+    /// Двойной быстрый тап в hold-режиме оставляет запись включённой.
     pub double_tap_latch: bool,
+    /// Версия семантики защёлки. Нужна для одноразовой миграции
+    /// настроек 2.0.0, где `false` был не выбором пользователя, а новым дефолтом.
+    #[serde(default = "legacy_double_tap_behavior_version")]
+    pub double_tap_behavior_version: u8,
     /// Имя устройства ввода ("" = системное по умолчанию).
     pub input_device: String,
     /// Язык ASR: "ru" | "en" | "auto" | ...
@@ -64,6 +78,10 @@ pub struct Settings {
     pub personalize: bool,
     /// ИИ-движок рефайна: "off" | "gemini" | "ollama" | "openai_compat".
     pub ai_backend: String,
+    /// Версия семантики дефолтного ИИ-бэкенда. В 2.0.0 Ollama была включена
+    /// без opt-in и могла синхронно занять CPU до 10 секунд перед вставкой.
+    #[serde(default = "legacy_ai_backend_behavior_version")]
+    pub ai_backend_behavior_version: u8,
     /// API-ключ ИИ (Google AI Studio / Gemini). Хранится локально, в URL не попадает.
     pub ai_api_key: String,
     /// Модель ИИ (напр. "gemini-2.5-flash").
@@ -162,7 +180,8 @@ impl Default for Settings {
             hotkey: DEFAULT_HOTKEY.into(),
             improve_hotkey: "F8".into(),
             mode: "hold".into(),
-            double_tap_latch: false,
+            double_tap_latch: true,
+            double_tap_behavior_version: DOUBLE_TAP_BEHAVIOR_VERSION,
             input_device: String::new(),
             language: "auto".into(),
             model: "ggml-large-v3-turbo-q5_0.bin".into(),
@@ -187,7 +206,10 @@ impl Default for Settings {
             // Audio/text training pairs are sensitive and persistent. Fresh
             // installs collect them only after an explicit user opt-in.
             personalize: false,
-            ai_backend: "ollama".into(),
+            // Тяжёлый LLM-rewrite всегда opt-in. Профиль приложения сам по себе
+            // не должен запускать Qwen3 и задерживать короткую диктовку.
+            ai_backend: "off".into(),
+            ai_backend_behavior_version: AI_BACKEND_BEHAVIOR_VERSION,
             ai_api_key: String::new(),
             ai_model: "gemini-2.5-flash".into(),
             ollama_url: "http://localhost:11434".into(),
@@ -220,6 +242,29 @@ impl Default for Settings {
 
 impl Settings {
     pub fn normalize_user_values(&mut self) {
+        // 2.0.0 записывал новый флаг как false даже без явного выбора. Один раз
+        // переводим такой снимок на новый безопасный дефолт. После сохранения
+        // version=1 явное отключение в UI снова становится устойчивым.
+        if self.double_tap_behavior_version < DOUBLE_TAP_BEHAVIOR_VERSION {
+            self.double_tap_latch = true;
+            self.double_tap_behavior_version = DOUBLE_TAP_BEHAVIOR_VERSION;
+        }
+        if self.ai_backend_behavior_version < AI_BACKEND_BEHAVIOR_VERSION {
+            // 2.0.0 сохраняла Ollama/Qwen3 как дефолт даже без явного
+            // выбора. Мигрируем только точный нетронутый набор. Другая
+            // модель/адрес или явная smart-инструкция означают настройку
+            // пользователя и сохраняются.
+            let untouched_implicit_ollama = self.ai_backend == "ollama"
+                && self.ollama_url.trim().trim_end_matches('/') == LEGACY_DEFAULT_OLLAMA_URL
+                && self.ollama_model.trim() == LEGACY_DEFAULT_OLLAMA_MODEL
+                && self.smart_prompt_source.trim().is_empty()
+                && self.smart_prompt_instruction.trim().is_empty()
+                && self.ai_prompt_rules.is_empty();
+            if untouched_implicit_ollama {
+                self.ai_backend = "off".into();
+            }
+            self.ai_backend_behavior_version = AI_BACKEND_BEHAVIOR_VERSION;
+        }
         self.overlay_scale = if self.overlay_scale.is_finite() {
             self.overlay_scale
                 .clamp(OVERLAY_SCALE_MIN, OVERLAY_SCALE_MAX)
@@ -416,20 +461,98 @@ mod tests {
     #[test]
     fn legacy_settings_json_defaults_ai_prompt_rules() {
         let json = r#"{"hotkey":"ControlRight","ai_backend":"off"}"#;
-        let s: Settings = serde_json::from_str(json).expect("legacy settings parse");
+        let mut s: Settings = serde_json::from_str(json).expect("legacy settings parse");
+        s.normalize_user_values();
         assert_eq!(s.hotkey, "ControlRight");
-        assert!(!s.double_tap_latch);
+        assert!(s.double_tap_latch);
+        assert_eq!(s.double_tap_behavior_version, DOUBLE_TAP_BEHAVIOR_VERSION);
         assert!(s.auto_update_check);
         assert!(!s.personalize);
+        assert_eq!(s.ai_backend, "off");
+        assert_eq!(s.ai_backend_behavior_version, AI_BACKEND_BEHAVIOR_VERSION);
         assert!(s.ai_prompt_rules.is_empty());
         assert_eq!(s.overlay_scale, OVERLAY_SCALE_DEFAULT);
     }
 
     #[test]
-    fn explicit_double_tap_latch_survives_deserialization() {
-        let s: Settings = serde_json::from_str(r#"{"double_tap_latch":true}"#)
-            .expect("settings with latch parse");
+    fn v2_0_0_disabled_default_migrates_once_but_later_opt_out_survives() {
+        let mut legacy: Settings =
+            serde_json::from_str(r#"{"double_tap_latch":false}"#).expect("2.0.0 settings parse");
+        legacy.normalize_user_values();
+        assert!(legacy.double_tap_latch);
+        assert_eq!(
+            legacy.double_tap_behavior_version,
+            DOUBLE_TAP_BEHAVIOR_VERSION
+        );
+
+        legacy.double_tap_latch = false;
+        let persisted = serde_json::to_string(&legacy).expect("migrated settings serialize");
+        let mut reloaded: Settings = serde_json::from_str(&persisted).expect("settings reload");
+        reloaded.normalize_user_values();
+        assert!(!reloaded.double_tap_latch);
+        assert_eq!(
+            reloaded.double_tap_behavior_version,
+            DOUBLE_TAP_BEHAVIOR_VERSION
+        );
+    }
+
+    #[test]
+    fn double_tap_latch_is_enabled_for_new_installs() {
+        let s = Settings::default();
         assert!(s.double_tap_latch);
+        assert_eq!(s.double_tap_behavior_version, DOUBLE_TAP_BEHAVIOR_VERSION);
+    }
+
+    #[test]
+    fn implicit_v2_0_ollama_default_migrates_off_once() {
+        let mut legacy: Settings = serde_json::from_str(
+            r#"{
+                "ai_backend":"ollama",
+                "ollama_url":"http://localhost:11434/",
+                "ollama_model":"qwen3:4b"
+            }"#,
+        )
+        .expect("2.0.0 settings parse");
+
+        legacy.normalize_user_values();
+
+        assert_eq!(legacy.ai_backend, "off");
+        assert_eq!(
+            legacy.ai_backend_behavior_version,
+            AI_BACKEND_BEHAVIOR_VERSION
+        );
+
+        // После миграции явный выбор того же бэкенда должен жить.
+        legacy.ai_backend = "ollama".into();
+        let persisted = serde_json::to_string(&legacy).expect("migrated settings serialize");
+        let mut reloaded: Settings = serde_json::from_str(&persisted).expect("settings reload");
+        reloaded.normalize_user_values();
+        assert_eq!(reloaded.ai_backend, "ollama");
+    }
+
+    #[test]
+    fn legacy_explicit_ai_configuration_survives_migration() {
+        for json in [
+            r#"{"ai_backend":"ollama","ollama_url":"http://127.0.0.1:11435","ollama_model":"qwen3:4b"}"#,
+            r#"{"ai_backend":"ollama","ollama_url":"http://localhost:11434","ollama_model":"qwen3:8b"}"#,
+            r#"{"ai_backend":"ollama","ollama_url":"http://localhost:11434","ollama_model":"qwen3:4b","smart_prompt_source":"Пиши коротко"}"#,
+            r#"{"ai_backend":"gemini","ai_api_key":"configured"}"#,
+        ] {
+            let mut explicit: Settings = serde_json::from_str(json).expect("legacy settings parse");
+            explicit.normalize_user_values();
+            assert_ne!(explicit.ai_backend, "off", "must preserve {json}");
+            assert_eq!(
+                explicit.ai_backend_behavior_version,
+                AI_BACKEND_BEHAVIOR_VERSION
+            );
+        }
+    }
+
+    #[test]
+    fn new_installs_do_not_enable_heavy_rewrite_backend() {
+        let s = Settings::default();
+        assert_eq!(s.ai_backend, "off");
+        assert_eq!(s.ai_backend_behavior_version, AI_BACKEND_BEHAVIOR_VERSION);
     }
 
     #[test]
