@@ -118,6 +118,21 @@ jobs:
               '
           }
 
+          wait_for_release() {
+            local release_json attempt
+            for attempt in {1..10}; do
+              release_json="$(find_release)"
+              if [[ "$release_json" != null ]]; then
+                printf '%s\n' "$release_json"
+                return 0
+              fi
+              if [[ "$attempt" -lt 10 ]]; then
+                sleep 2
+              fi
+            done
+            printf 'null\n'
+          }
+
           release_json="$(find_release)"
           if [[ "$release_json" != null ]]; then
             echo "Release $RELEASE_TAG already exists; completing it idempotently."
@@ -127,7 +142,10 @@ jobs:
               --verify-tag \
               --title "VoxFlow $RELEASE_TAG" \
               --notes-file RELEASE_NOTES.md
-            release_json="$(find_release)"
+            # A newly created draft can take a few seconds to appear in the
+            # paginated releases endpoint even though `gh release create`
+            # already returned success. Retry the read-back before failing.
+            release_json="$(wait_for_release)"
             if [[ "$release_json" == null ]]; then
               echo "Draft release $RELEASE_TAG was created but cannot be read back" >&2
               exit 1
