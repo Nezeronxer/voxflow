@@ -200,6 +200,20 @@ assert_runner() {
   fi
 }
 
+developer_tools_description() {
+  local details
+  local clt_version
+  details="$(/usr/bin/xcodebuild -version 2>/dev/null | tr '\n' ' ' | sed 's/ $//' || true)"
+  if [[ -n "$details" ]]; then
+    printf '%s\n' "$details"
+    return
+  fi
+  clt_version="$(/usr/sbin/pkgutil --pkg-info=com.apple.pkg.CLTools_Executables 2>/dev/null \
+    | awk -F': ' '$1 == "version" { print $2 }' || true)"
+  [[ -n "$clt_version" ]] || clt_version="unknown"
+  printf 'Command Line Tools %s\n' "$clt_version"
+}
+
 assert_tauri_cli() {
   [[ -x "$APP_DIR/node_modules/@tauri-apps/cli/tauri.js" ]] \
     || die "Tauri CLI is missing after npm ci"
@@ -494,7 +508,7 @@ package_outputs() {
     echo "rustc=$(rustc --version)"
     echo "node=$(node --version)"
     echo "npm=$(npm --version)"
-    /usr/bin/xcodebuild -version | tr '\n' ' ' | sed 's/ $//' | sed 's/^/xcode=/'
+    echo "xcode=$(developer_tools_description)"
   } > "$manifest"
 
   (cd "$output_dir" && /usr/bin/shasum -a 256 -c "$(basename "$checksums")")

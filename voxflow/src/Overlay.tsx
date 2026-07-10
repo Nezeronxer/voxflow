@@ -73,7 +73,7 @@ const BOX: Record<PillMode, { w: number; h: number }> = {
   idle: { w: 392, h: 88 },
   rec: { w: 452, h: 92 },
   trans: { w: 392, h: 88 },
-  stream: { w: 552, h: 126 },
+  stream: { w: 552, h: 128 },
   latch: { w: 360, h: 92 },
   notice: { w: 480, h: 96 },
 };
@@ -173,8 +173,9 @@ export default function Overlay() {
     const demoParams = new URLSearchParams(query);
     const demo = demoParams.get("demo");
     const timer = setTimeout(() => {
-      const demoScale = Number(demoParams.get("scale"));
-      if (Number.isFinite(demoScale)) {
+      const demoScaleParam = demoParams.get("scale");
+      const demoScale = Number(demoScaleParam);
+      if (demoScaleParam !== null && Number.isFinite(demoScale)) {
         setOverlayScale(normalizeOverlayScale(demoScale));
       }
       if (demo === "recording" || demo === "stream") {

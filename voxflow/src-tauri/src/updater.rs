@@ -7,6 +7,10 @@
 use anyhow::{anyhow, Result};
 use serde::Serialize;
 #[cfg(windows)]
+use sha2::{Digest, Sha256};
+#[cfg(windows)]
+use std::io::Read;
+#[cfg(windows)]
 use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
@@ -66,6 +70,7 @@ fn current_update_target() -> UpdateTarget {
 #[derive(Debug, Clone, Serialize)]
 pub struct UpdateInfo {
     pub available: bool,
+    pub auto_install: bool,
     pub current_version: String,
     pub latest_version: String,
     pub release_name: String,
@@ -73,6 +78,7 @@ pub struct UpdateInfo {
     pub asset_name: String,
     pub asset_url: String,
     pub asset_size: u64,
+    pub asset_digest: String,
     pub published_at: String,
     pub notes: String,
 }
@@ -119,6 +125,8 @@ pub fn check(proxy_url: &str) -> Result<UpdateInfo> {
 pub fn download_and_launch(
     asset_url: &str,
     asset_name: &str,
+    expected_size: u64,
+    expected_digest: &str,
     proxy_url: &str,
 ) -> Result<UpdateInstallResult> {
     validate_asset_url(asset_url)?;
@@ -151,9 +159,9 @@ pub fn download_and_launch(
             stderr.trim()
         ));
     }
-    if !dest.exists() || std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0) == 0 {
-        return Err(anyhow!("скачанный установщик пустой или не найден"));
-    }
+    verify_downloaded_asset(&dest, expected_size, expected_digest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&dest);
+    })?;
 
     Command::new(&dest)
         .spawn()
@@ -170,10 +178,12 @@ pub fn download_and_launch(
 pub fn download_and_launch(
     _asset_url: &str,
     _asset_name: &str,
+    _expected_size: u64,
+    _expected_digest: &str,
     _proxy_url: &str,
 ) -> Result<UpdateInstallResult> {
     Err(anyhow!(
-        "автоустановка обновлений для {} отключена: откройте подписанный релиз вручную",
+        "автоустановка обновлений для {} отключена: откройте релиз вручную",
         current_update_target().label()
     ))
 }
@@ -195,12 +205,13 @@ fn update_info_from_release_for(
         .asset_pattern()
         .map(|(prefix, suffix)| format!("{prefix}*{suffix}"))
         .unwrap_or_else(|| "нет поддерживаемого пакета".to_string());
-    let asset = find_installer_asset_for(release, target).ok_or_else(|| {
-        anyhow!(
-            "в latest release {tag} нет пакета {pattern} для {}",
-            target.label()
-        )
-    })?;
+    let asset =
+        find_installer_asset_for(release, target, tag, &latest_version).ok_or_else(|| {
+            anyhow!(
+                "в latest release {tag} нет пакета {pattern} для {}",
+                target.label()
+            )
+        })?;
     let asset_name = asset
         .get("name")
         .and_then(|v| v.as_str())
@@ -213,6 +224,16 @@ fn update_info_from_release_for(
         .to_string();
     validate_asset_url(&asset_url)?;
     validate_asset_name_for(&asset_name, target)?;
+    let asset_size = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+    if asset_size == 0 {
+        return Err(anyhow!("GitHub release содержит пустой пакет обновления"));
+    }
+    let asset_digest = asset
+        .get("digest")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    validate_asset_digest(&asset_digest)?;
 
     let current_version = env!("CARGO_PKG_VERSION").to_string();
     let available = version_cmp(&latest_version, &current_version)
@@ -221,6 +242,7 @@ fn update_info_from_release_for(
 
     Ok(UpdateInfo {
         available,
+        auto_install: matches!(target, UpdateTarget::WindowsX64),
         current_version,
         latest_version,
         release_name: release
@@ -235,7 +257,8 @@ fn update_info_from_release_for(
             .to_string(),
         asset_name,
         asset_url,
-        asset_size: asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
+        asset_size,
+        asset_digest,
         published_at: release
             .get("published_at")
             .and_then(|v| v.as_str())
@@ -245,10 +268,12 @@ fn update_info_from_release_for(
     })
 }
 
-fn find_installer_asset_for(
-    release: &serde_json::Value,
+fn find_installer_asset_for<'a>(
+    release: &'a serde_json::Value,
     target: UpdateTarget,
-) -> Option<&serde_json::Value> {
+    tag: &str,
+    version: &str,
+) -> Option<&'a serde_json::Value> {
     let (prefix, suffix) = target.asset_pattern()?;
     release
         .get("assets")
@@ -261,9 +286,31 @@ fn find_installer_asset_for(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 is_installer_asset_name_for(name, prefix, suffix)
-                    && url.starts_with(RELEASE_DOWNLOAD_PREFIX)
+                    && asset_name_matches_version(name, target, version)
+                    && url == format!("{RELEASE_DOWNLOAD_PREFIX}{tag}/{name}")
             })
         })
+}
+
+fn asset_name_matches_version(name: &str, target: UpdateTarget, version: &str) -> bool {
+    match target {
+        UpdateTarget::WindowsX64 => name == format!("VoxFlow-Setup-{version}.exe"),
+        UpdateTarget::MacosArm64 => [
+            format!("VoxFlow-macOS-{version}-arm64.dmg"),
+            format!("VoxFlow-macOS-{version}-arm64-unsigned.dmg"),
+            format!("VoxFlow-macOS-{version}-arm64-signed-unnotarized.dmg"),
+        ]
+        .iter()
+        .any(|expected| expected == name),
+        UpdateTarget::MacosX64 => [
+            format!("VoxFlow-macOS-{version}-x64.dmg"),
+            format!("VoxFlow-macOS-{version}-x64-unsigned.dmg"),
+            format!("VoxFlow-macOS-{version}-x64-signed-unnotarized.dmg"),
+        ]
+        .iter()
+        .any(|expected| expected == name),
+        UpdateTarget::Unsupported => false,
+    }
 }
 
 fn validate_asset_url(url: &str) -> Result<()> {
@@ -293,6 +340,60 @@ fn validate_asset_name_for(name: &str, target: UpdateTarget) -> Result<()> {
             "недоверенное имя пакета обновления: ожидалось {prefix}*{suffix}"
         ))
     }
+}
+
+fn validate_asset_digest(digest: &str) -> Result<()> {
+    if digest.is_empty() {
+        return Ok(());
+    }
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(anyhow!(
+            "GitHub release содержит неподдерживаемый digest пакета"
+        ));
+    };
+    if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "GitHub release содержит некорректный SHA-256 пакета"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn verify_downloaded_asset(path: &Path, expected_size: u64, expected_digest: &str) -> Result<()> {
+    let actual_size = std::fs::metadata(path)
+        .map_err(|e| anyhow!("скачанный установщик не найден: {e}"))?
+        .len();
+    if expected_size == 0 || actual_size != expected_size {
+        return Err(anyhow!(
+            "размер скачанного установщика не совпадает: ожидалось {expected_size}, получено {actual_size}"
+        ));
+    }
+    validate_asset_digest(expected_digest)?;
+    let Some(expected_hex) = expected_digest.strip_prefix("sha256:") else {
+        return Ok(());
+    };
+
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| anyhow!("не удалось открыть скачанный установщик: {e}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 1024 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|e| anyhow!("не удалось проверить SHA-256 установщика: {e}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let actual_hex = format!("{:x}", hasher.finalize());
+    if !actual_hex.eq_ignore_ascii_case(expected_hex) {
+        return Err(anyhow!(
+            "SHA-256 скачанного установщика не совпадает с GitHub Release"
+        ));
+    }
+    Ok(())
 }
 
 fn is_installer_asset_name_for(name: &str, prefix: &str, suffix: &str) -> bool {
@@ -422,6 +523,10 @@ mod tests {
             "https://github.com/other/voxflow/releases/download/v1.0.3/VoxFlow-Setup-1.0.3.exe"
         )
         .is_err());
+        assert!(validate_asset_digest("").is_ok());
+        assert!(validate_asset_digest(&format!("sha256:{}", "a".repeat(64))).is_ok());
+        assert!(validate_asset_digest("sha512:abcd").is_err());
+        assert!(validate_asset_digest("sha256:abcd").is_err());
     }
 
     #[test]
@@ -455,10 +560,26 @@ mod tests {
         let mac_x64 = update_info_from_release_for(&release, UpdateTarget::MacosX64).unwrap();
 
         assert!(windows.available);
+        assert!(windows.auto_install);
         assert_eq!(windows.latest_version, "99.0.0");
         assert_eq!(windows.asset_name, "VoxFlow-Setup-99.0.0.exe");
         assert_eq!(mac_arm.asset_name, "VoxFlow-macOS-99.0.0-arm64.dmg");
+        assert!(!mac_arm.auto_install);
         assert_eq!(mac_x64.asset_name, "VoxFlow-macOS-99.0.0-x64.dmg");
+    }
+
+    #[test]
+    fn rejects_installer_whose_filename_does_not_match_release_tag() {
+        let release = serde_json::json!({
+            "tag_name": "v2.0.0",
+            "assets": [{
+                "name": "VoxFlow-Setup-1.0.8.exe",
+                "size": 123,
+                "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v2.0.0/VoxFlow-Setup-1.0.8.exe"
+            }]
+        });
+
+        assert!(update_info_from_release_for(&release, UpdateTarget::WindowsX64).is_err());
     }
 
     #[cfg(target_os = "macos")]
@@ -475,6 +596,8 @@ mod tests {
         let err = download_and_launch(
             "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-Setup-99.0.0.exe",
             "VoxFlow-Setup-99.0.0.exe",
+            123,
+            "",
             "",
         )
         .unwrap_err();

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { checkForUpdate, installUpdate, listAudioDevices } from "../api";
+import { checkForUpdate, installUpdate, listAudioDevices, openReleaseUrl } from "../api";
 import {
   PageHead,
   Field,
@@ -73,8 +73,19 @@ export default function Control({
   async function onInstallUpdate() {
     if (!updateInfo?.available) return;
     setInstallingUpdate(true);
+    if (!updateInfo.auto_install) {
+      const opened = await openReleaseUrl(updateInfo.release_url);
+      setInstallingUpdate(false);
+      setUpdateStatus(opened ? "Страница релиза открыта" : "Не удалось открыть релиз");
+      return;
+    }
     setUpdateStatus("Скачиваю установщик…");
-    const result = await installUpdate(updateInfo.asset_url, updateInfo.asset_name);
+    const result = await installUpdate(
+      updateInfo.asset_url,
+      updateInfo.asset_name,
+      updateInfo.asset_size,
+      updateInfo.asset_digest,
+    );
     setInstallingUpdate(false);
     setUpdateStatus(
       result?.launched
@@ -151,6 +162,16 @@ export default function Control({
               );
             })}
           </div>
+        </Field>
+
+        <Field
+          label="Защёлка двойным тапом"
+          hint="В hold-режиме двойное нажатие оставляет запись включённой. Короткий одиночный тап будет ждать до 300 мс."
+        >
+          <Switch
+            checked={settings.double_tap_latch}
+            onChange={(v) => update({ double_tap_latch: v })}
+          />
         </Field>
 
         <Field label="Языки" hint="Авто определяет русский и английский по фразе">
@@ -321,7 +342,13 @@ export default function Control({
                 onClick={onInstallUpdate}
                 disabled={checkingUpdate || installingUpdate}
               >
-                {installingUpdate ? "Скачиваю…" : "Установить"}
+                {installingUpdate
+                  ? updateInfo.auto_install
+                    ? "Скачиваю…"
+                    : "Открываю…"
+                  : updateInfo.auto_install
+                    ? "Установить"
+                    : "Открыть релиз"}
               </button>
             )}
           </div>

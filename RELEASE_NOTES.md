@@ -1,35 +1,68 @@
-# VoxFlow v1.0.3
+# VoxFlow v2.0.0 — macOS и Windows
 
-## Highlights
+Первый единый стабильный релиз VoxFlow 2.0 для macOS Apple Silicon и Windows x64.
+Обе платформы собираются из одного тега и публикуются только после прохождения
+общих frontend/Rust-проверок, платформенной упаковки и проверки SHA-256.
 
-- GitHub Releases updater: VoxFlow can check `Nezeronxer/voxflow` for the latest release, show an update toast, download `VoxFlow-Setup-*.exe`, and launch the installer after user confirmation.
-- Startup auto-check is enabled by default and can be toggled in `Управление`; manual `Проверить` and `Установить` controls are available there too.
-- Multilingual local ASR defaults: fresh installs now prefer `language=auto`, `whisper_server`, and the multilingual Whisper q5 model.
-- Cloud STT now receives a compact recognition-bias prompt with active app label, recent dictation tail, project terms, user dictionary, snippet triggers, and learned corrections.
-- Final cloud STT is cancelled before the network call if the target window changed, reducing wrong-target and privacy risk.
-- Installer polish: dedicated branded setup icon and improved small-icon legibility.
+## Главное
 
-## Release Artifact
+- Новый адаптивный интерфейс и отдельный перетаскиваемый Flow Bar диктовки.
+- Локальное распознавание без подписки: GigaAM v3 для русского, Parakeet TDT v3
+  для мультиязычной речи и Whisper для универсальных сценариев.
+- Профили активных приложений, личный словарь, сниппеты, история, статистика,
+  изученные исправления и опциональный BYOK rewrite/STT.
+- Настраиваемые физические клавиши диктовки и улучшения выделенного текста.
+- Безопасная вставка через системный буфер с сохранением последнего результата.
+- Per-user Windows-установщик со встроенной проверкой WebView2 и app-local
+  Microsoft VC++/OpenMP runtime; права администратора не требуются.
+- Platform-safe updater выбирает только пакет своей ОС и проверяет версию,
+  размер и доступный GitHub SHA-256 перед запуском Windows-установщика.
 
-- `VoxFlow-Setup-1.0.3.exe`
-- Size: `288162743` bytes
-- SHA256: `820D69AB02B807A1073D622CCAB59D1A17DB050380A24A13637E038CB0A66BAA`
+## Исправления диктовки и интерфейса
 
-## Verified For This Build
+- Исправлен слишком большой круг индикатора записи на macOS и Windows: поздний
+  CSS-каскад 2.0 увеличивал орб с 13 до 28 px и расходился с расчётами glow.
+- Обычный hold-to-talk теперь завершает запись сразу после отпускания клавиши.
+  Двойной тап с защёлкой сохранён как отдельная явная настройка и по умолчанию
+  выключен, поэтому больше не добавляет скрытые 300 мс к короткой диктовке.
+- На macOS сокращены синхронные проверки активного окна и остановлен фоновый
+  AppleScript-поллер во время финального распознавания/вставки. Локальный ASR
+  переиспользует контекст окна, снятый при нажатии, а вызовы AppleScript ограничены таймаутом.
+- Запуск live-preview больше не блокирует Stop: короткая диктовка сразу переходит к финалу,
+  даже если Whisper/CUDA-сервер ещё загружается.
+- Исправлены обрезка максимального потокового Flow Bar и неверный demo-масштаб.
+- Windows по умолчанию использует Right Control; Right Option остаётся
+  macOS-названием для `AltRight`.
 
-- `npm run build` — OK.
-- `npm audit --audit-level=high` — OK, 0 vulnerabilities.
-- `cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check` — OK.
-- `cargo test --manifest-path src-tauri\Cargo.toml --lib` — OK, 140 passed, 5 ignored.
-- `cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings` — OK.
-- `npm run tauri -- build --no-bundle` — OK, release exe built as `voxflow v1.0.3`.
-- Inno Setup 6.7.1 compile — OK, created `VoxFlow-Setup-1.0.3.exe`.
-- Silent per-user install — OK, registry version `1.0.3`, installed exe product version `1.0.3`, installed exe SHA256 `284124AAC4C8D51A5EB0BB8A8A76B730E4BF0D758A367A706826D5DF5277895A`.
-- `git diff --check` — OK.
+## Надёжность Windows
 
-## Known Limits
+- Добавлены Windows CI-проверки чистой тихой установки, версии и файлов runtime,
+  первого запуска, single-instance, закрытия окна в трей, повторного запуска,
+  удаления приложения и сохранности пользовательской базы.
+- Проверяются Microsoft-подпись WebView2 bootstrapper, целостность runtime,
+  portable SHA256SUMS и итоговый installer artifact.
+- Восстанавливается фокус целевого HWND после клика по Flow Bar; Windows shell UI не считается
+  безопасной целью автовставки.
+- При несовместимом NVIDIA/CUDA-драйвере VoxFlow ограничивает startup/CLI таймаутом, отключает
+  сбойный runtime до перезапуска и переходит на bundled CPU Whisper. Loopback-запросы не зависят от
+  системного HTTP(S)-proxy.
 
-- Some ASR e2e tests are opt-in and ignored by default because they require local models, private WAV fixtures, or network/proxy access.
-- Recognition quality depends on selected language, model, microphone, and provider. If dictation is wrong, change language/model first; BYOK cloud STT can help, but online/API providers depend on network, quota, and service availability.
-- The Windows installer is unsigned unless a signing certificate is added.
-- The GitHub Actions installer workflow still needs a committed or downloaded runtime-resource step before it can build fully on a clean runner; this release was built and uploaded from the verified local Windows release environment.
+## Артефакты
+
+- `VoxFlow-Setup-2.0.0.exe`
+- `SHA256SUMS-windows.txt`
+- `VoxFlow-macOS-2.0.0-arm64-unsigned.dmg`
+- `VoxFlow-macOS-2.0.0-arm64-unsigned.app.zip`
+- `SHA256SUMS.txt`
+- `release-manifest.txt`
+
+## Ограничения подписи
+
+В репозитории и GitHub Actions нет Windows Authenticode-сертификата и Apple
+Developer ID/notarization credentials. Поэтому Windows setup и macOS app/DMG в
+этом релизе криптографически проверяются SHA-256, но не подписаны издателем;
+SmartScreen или Gatekeeper могут показать системное предупреждение. macOS
+автоустановка намеренно выключена до появления подписанного и notarized пакета.
+
+Intel Mac не входит в подтверждённую матрицу: релиз macOS предназначен для
+Apple Silicon и требует macOS 11 или новее.

@@ -20,6 +20,10 @@ pub struct Settings {
     pub improve_hotkey: String,
     /// "hold" | "toggle".
     pub mode: String,
+    /// Двойной короткий тап в hold-режиме оставляет запись включённой.
+    /// Выключено по умолчанию: одиночный release должен финализироваться без
+    /// ожидания окна второго тапа.
+    pub double_tap_latch: bool,
     /// Имя устройства ввода ("" = системное по умолчанию).
     pub input_device: String,
     /// Язык ASR: "ru" | "en" | "auto" | ...
@@ -158,6 +162,7 @@ impl Default for Settings {
             hotkey: DEFAULT_HOTKEY.into(),
             improve_hotkey: "F8".into(),
             mode: "hold".into(),
+            double_tap_latch: false,
             input_device: String::new(),
             language: "auto".into(),
             model: "ggml-large-v3-turbo-q5_0.bin".into(),
@@ -413,10 +418,18 @@ mod tests {
         let json = r#"{"hotkey":"ControlRight","ai_backend":"off"}"#;
         let s: Settings = serde_json::from_str(json).expect("legacy settings parse");
         assert_eq!(s.hotkey, "ControlRight");
+        assert!(!s.double_tap_latch);
         assert!(s.auto_update_check);
         assert!(!s.personalize);
         assert!(s.ai_prompt_rules.is_empty());
         assert_eq!(s.overlay_scale, OVERLAY_SCALE_DEFAULT);
+    }
+
+    #[test]
+    fn explicit_double_tap_latch_survives_deserialization() {
+        let s: Settings = serde_json::from_str(r#"{"double_tap_latch":true}"#)
+            .expect("settings with latch parse");
+        assert!(s.double_tap_latch);
     }
 
     #[test]
