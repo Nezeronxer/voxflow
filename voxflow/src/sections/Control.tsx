@@ -11,6 +11,12 @@ import {
 } from "../ui";
 import type { Settings } from "../types";
 import type { UpdateInfo } from "../types";
+import {
+  normalizeOverlayScale,
+  OVERLAY_SCALE_MAX,
+  OVERLAY_SCALE_MIN,
+  OVERLAY_SCALE_STEP,
+} from "../types";
 
 // Сегменты темы: значения зеркалят Settings.theme ("system"|"light"|"dark").
 // Применение мгновенное (эффект в App.tsx), сохранение — штатным debounce-
@@ -33,6 +39,8 @@ export default function Control({
   const [updateStatus, setUpdateStatus] = useState("");
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
+  const overlayScale = normalizeOverlayScale(settings.overlay_scale);
+  const overlayPercent = Math.round(overlayScale * 100);
 
   useEffect(() => {
     let alive = true;
@@ -78,16 +86,16 @@ export default function Control({
   return (
     <div className="content-inner">
       <PageHead
-        title="Управление"
-        desc="Устройство ввода, горячая клавиша и поведение приложения."
+        title="Основные настройки"
+        desc="Горячие клавиши, микрофон и поведение приложения."
       />
 
       <div className="card">
         <div className="card-head">
-          <div className="card-title">Аудио и горячая клавиша</div>
+          <div className="card-title">Диктовка</div>
         </div>
 
-        <Field label="Устройство ввода" hint="Микрофон для записи речи">
+        <Field label="Микрофон" hint="Устройство для записи речи">
           <Select
             value={settings.input_device}
             onChange={(v) => update({ input_device: v })}
@@ -96,12 +104,14 @@ export default function Control({
         </Field>
 
         <Field
-          label="Горячая клавиша"
+          label="Горячая клавиша диктовки"
           hint={HOTKEY_FIELD_HINT}
         >
           <HotkeyCapture
             value={settings.hotkey}
             onChange={(code) => update({ hotkey: code })}
+            exclude={settings.improve_hotkey}
+            excludeLabel="улучшения выделенного"
           />
         </Field>
 
@@ -112,6 +122,8 @@ export default function Control({
           <HotkeyCapture
             value={settings.improve_hotkey}
             onChange={(code) => update({ improve_hotkey: code })}
+            exclude={settings.hotkey}
+            excludeLabel="диктовки"
           />
         </Field>
 
@@ -119,14 +131,50 @@ export default function Control({
           label="Режим"
           hint="«Удержание» пишет, пока клавиша зажата. «Переключатель» — нажал/нажал."
         >
-          <Select
-            value={settings.mode}
-            onChange={(v) => update({ mode: v })}
-            options={[
+          <div className="seg" role="radiogroup" aria-label="Режим диктовки">
+            {[
               { value: "hold", label: "Удержание" },
               { value: "toggle", label: "Переключатель" },
-            ]}
-          />
+            ].map((option) => {
+              const active = settings.mode === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  className={`seg-btn${active ? " active" : ""}`}
+                  onClick={() => update({ mode: option.value })}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        </Field>
+
+        <Field label="Языки" hint="Авто определяет русский и английский по фразе">
+          <div className="seg" role="radiogroup" aria-label="Язык распознавания">
+            {[
+              { value: "auto", label: "Авто" },
+              { value: "ru", label: "Русский" },
+              { value: "en", label: "English" },
+            ].map((option) => {
+              const active = settings.language === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  className={`seg-btn${active ? " active" : ""}`}
+                  onClick={() => update({ language: option.value })}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
         </Field>
       </div>
 
@@ -137,7 +185,7 @@ export default function Control({
 
         <Field
           label="Тема"
-          hint="«Системная» следует за темой Windows. Применяется мгновенно и сохраняется автоматически."
+          hint="«Системная» следует за оформлением операционной системы. Применяется мгновенно и сохраняется автоматически."
         >
           {/* radiogroup: один выбор из трёх; активный сегмент — инверсия. */}
           <div className="seg" role="radiogroup" aria-label="Тема оформления">
@@ -158,6 +206,65 @@ export default function Control({
             })}
           </div>
         </Field>
+
+        <Field
+          label="Размер плашки"
+          hint="Масштаб Flow Bar сохраняется автоматически и применяется без перезапуска."
+        >
+          <div className="overlay-scale-control">
+            <button
+              type="button"
+              className="scale-step"
+              aria-label="Уменьшить плашку"
+              disabled={overlayScale <= OVERLAY_SCALE_MIN}
+              onClick={() =>
+                update({
+                  overlay_scale: normalizeOverlayScale(
+                    overlayScale - OVERLAY_SCALE_STEP,
+                  ),
+                })
+              }
+            >
+              −
+            </button>
+            <input
+              type="range"
+              min={OVERLAY_SCALE_MIN * 100}
+              max={OVERLAY_SCALE_MAX * 100}
+              step={OVERLAY_SCALE_STEP * 100}
+              value={overlayPercent}
+              onChange={(event) =>
+                update({ overlay_scale: Number(event.currentTarget.value) / 100 })
+              }
+              aria-label="Размер плавающей плашки"
+              aria-valuetext={`${overlayPercent}%`}
+            />
+            <output>{overlayPercent}%</output>
+            <button
+              type="button"
+              className="scale-step"
+              aria-label="Увеличить плашку"
+              disabled={overlayScale >= OVERLAY_SCALE_MAX}
+              onClick={() =>
+                update({
+                  overlay_scale: normalizeOverlayScale(
+                    overlayScale + OVERLAY_SCALE_STEP,
+                  ),
+                })
+              }
+            >
+              +
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={overlayPercent === 100}
+              onClick={() => update({ overlay_scale: 1 })}
+            >
+              Сбросить
+            </button>
+          </div>
+        </Field>
       </div>
 
       <div className="card">
@@ -165,7 +272,7 @@ export default function Control({
           <div className="card-title">Приложение</div>
         </div>
 
-        <Field label="Звуки" hint="Звуковой сигнал при старте и завершении записи">
+        <Field label="Звуки" hint="Сигнал при старте и завершении записи">
           <Switch
             checked={settings.play_sounds}
             onChange={(v) => update({ play_sounds: v })}
@@ -173,8 +280,8 @@ export default function Control({
         </Field>
 
         <Field
-          label="Автомьют"
-          hint="Глушить системный звук на время диктовки и возвращать после остановки или Esc"
+          label="Приглушать звук во время диктовки"
+          hint="Возвращать системную громкость после остановки или Esc"
         >
           <Switch
             checked={settings.auto_mute}
@@ -182,7 +289,7 @@ export default function Control({
           />
         </Field>
 
-        <Field label="Автозапуск" hint="Запускать VoxFlow при входе в систему">
+        <Field label="Запускать при входе" hint="Автоматически открывать VoxFlow вместе с системой">
           <Switch
             checked={settings.autostart}
             onChange={(v) => update({ autostart: v })}

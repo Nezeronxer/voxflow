@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { aiTest, saveSettings, type AiModelOption } from "../api";
 import { PageHead, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
+import SecretControl from "../components/SecretControl";
 
 type Option = AiModelOption;
 
@@ -82,9 +83,11 @@ function providerFromBaseUrl(baseUrl: string) {
 export default function Ai({
   settings,
   update,
+  persist,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
+  persist?: (settings: Settings) => Promise<boolean>;
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(
@@ -127,7 +130,7 @@ export default function Ai({
     setTesting(true);
     setResult(null);
     try {
-      const saved = await saveSettings(settings);
+      const saved = await (persist ? persist(settings) : saveSettings(settings));
       if (!saved) {
         setResult({ ok: false, message: "Не удалось сохранить настройки" });
         return;
@@ -217,12 +220,10 @@ export default function Ai({
               label="API-ключ"
               hint="Ключ хранится локально и используется только для запросов к выбранному бэкенду"
             >
-              <input
-                type="password"
-                placeholder="Вставьте ключ"
+              <SecretControl
+                kind="ai_api_key"
                 value={settings.ai_api_key}
-                onChange={(e) => update({ ai_api_key: e.currentTarget.value })}
-                style={{ width: 260 }}
+                onChange={(value) => update({ ai_api_key: value })}
               />
             </Field>
 
@@ -320,16 +321,14 @@ export default function Ai({
               label="API-ключ"
               hint="Ключ хранится локально и используется только для запросов к выбранному провайдеру"
             >
-              <input
-                type="password"
-                placeholder="Вставьте ключ"
+              <SecretControl
+                kind="rewrite_key"
                 value={settings.rewrite_key}
-                onChange={(e) => {
+                onChange={(value) => {
                   setResult(null);
                   setOpenRouterModels([]);
-                  update({ rewrite_key: e.currentTarget.value });
+                  update({ rewrite_key: value });
                 }}
-                style={{ width: 260 }}
               />
             </Field>
 

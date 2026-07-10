@@ -1,0 +1,27 @@
+diff --git a/ggml/src/ggml-metal/ggml-metal-device.m b/ggml/src/ggml-metal/ggml-metal-device.m
+index 535f2d3..5b403cf 100644
+--- a/ggml/src/ggml-metal/ggml-metal-device.m
++++ b/ggml/src/ggml-metal/ggml-metal-device.m
+@@ -1026,6 +1026,21 @@ void ggml_metal_device_event_free(ggml_metal_device_t dev, ggml_metal_event_t ev
+ void ggml_metal_device_event_synchronize(ggml_metal_device_t dev, ggml_metal_event_t ev) {
+     id<MTLSharedEvent> event = ev->obj;
+-    const bool res = [event waitUntilSignaledValue:atomic_load_explicit(&ev->value, memory_order_relaxed) timeoutMS:60000];
++    const uint64_t value = atomic_load_explicit(&ev->value, memory_order_relaxed);
++    bool res;
++
++    if (@available(macOS 12.0, iOS 15.0, *)) {
++        res = [event waitUntilSignaledValue:value timeoutMS:60000];
++    } else {
++        // waitUntilSignaledValue:timeoutMS: is unavailable on macOS 11.
++        // MTLSharedEvent.signaledValue is available since macOS 10.14, so a
++        // bounded 1 ms poll preserves the timeout behavior on Big Sur.
++        int remaining_ms = 60000;
++        while (event.signaledValue < value && remaining_ms-- > 0) {
++            usleep(1000);
++        }
++        res = event.signaledValue >= value;
++    }
++
+     if (!res) {
+         GGML_ABORT("%s: failed to wait for event\n", __func__);
+     }

@@ -1,5 +1,12 @@
-import { useEffect, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { checkForUpdate, getSettings, installUpdate, saveSettings, subscribe } from "./api";
 import { Icon, Toast, applyTheme, normalizeTheme } from "./ui";
 import FpsMeter from "./components/FpsMeter";
@@ -11,138 +18,130 @@ import type {
   UpdateInfo,
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
-
+import {
+  SECRET_FIELDS,
+  mergeRendererSettings,
+  settingsFingerprint,
+} from "./settingsSync";
 import Dashboard from "./sections/Dashboard";
-import Models from "./sections/Models";
-import Recognition from "./sections/Recognition";
-import Control from "./sections/Control";
-import Dictionary from "./sections/Dictionary";
-import Snippets from "./sections/Snippets";
-import History from "./sections/History";
-import Ai from "./sections/Ai";
-import Stt from "./sections/Stt";
-import Corrections from "./sections/Corrections";
-import Applications from "./sections/Applications";
+import type { SettingsPageId } from "./sections/SettingsHub";
 import { ErrorBoundary } from "./ErrorBoundary";
 
-// Иконка «Облако» для вкладки STT. Inline-компонент (а не Icon.* из ui.tsx),
-// так как ui.tsx не входит в зону правок этой ветки. Сигнатура совместима с Icon.*.
-function CloudIcon(p: { className?: string }) {
-  return (
-    <svg
-      className={p.className}
-      viewBox="0 0 24 24"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth="2"
-      strokeLinecap="round"
-      strokeLinejoin="round"
-    >
-      <path d="M17.5 19a4.5 4.5 0 0 0 .5-8.97A6 6 0 0 0 6.2 9.3 4 4 0 0 0 7 19h10.5Z" />
-    </svg>
-  );
-}
+const History = lazy(() => import("./sections/History"));
+const Dictionary = lazy(() => import("./sections/Dictionary"));
+const Snippets = lazy(() => import("./sections/Snippets"));
+const SettingsHub = lazy(() => import("./sections/SettingsHub"));
 
-type TabId =
-  | "dashboard"
-  | "models"
-  | "recognition"
-  | "control"
-  | "dictionary"
-  | "snippets"
-  | "corrections"
-  | "applications"
-  | "ai"
-  | "stt"
-  | "history";
+type TabId = "dashboard" | "history" | "dictionary" | "snippets" | "settings";
 
-const NAV: { id: TabId; label: string; icon: (p: { className?: string }) => ReactNode }[] = [
+const NAV: {
+  id: Exclude<TabId, "settings">;
+  label: string;
+  icon: (props: { className?: string }) => ReactNode;
+}[] = [
   { id: "dashboard", label: "Главная", icon: Icon.Home },
-  { id: "models", label: "Модель", icon: Icon.Cube },
-  { id: "recognition", label: "Распознавание", icon: Icon.Wand },
-  { id: "control", label: "Управление", icon: Icon.Sliders },
+  { id: "history", label: "История", icon: Icon.Clock },
   { id: "dictionary", label: "Словарь", icon: Icon.Book },
   { id: "snippets", label: "Сниппеты", icon: Icon.Code },
-  { id: "corrections", label: "Исправления", icon: Icon.Check },
-  { id: "applications", label: "Приложения", icon: Icon.Sliders },
-  { id: "ai", label: "ИИ", icon: Icon.Sparkles },
-  { id: "stt", label: "Облако", icon: CloudIcon },
-  { id: "history", label: "История", icon: Icon.Clock },
 ];
 
+type Route = { tab: TabId; settingsPage?: SettingsPageId };
 type Notice = {
   message: string;
   variant: "warning" | "error";
   actionLabel?: string;
-  action?: TabId;
+  route?: Route;
   onAction?: () => void;
 };
 
-// Детерминированная сериализация настроек для сравнения «локальное == бэкенд».
-// Обычный JSON.stringify не годится: payload с бэкенда идёт в порядке полей
-// Rust-структуры (serde), а локальный объект — в порядке ключей DEFAULT_SETTINGS,
-// поэтому одинаковые по содержимому объекты дали бы разные строки. Сортируем
-// ключи на всех уровнях вложенности (replacer вызывается рекурсивно).
-function stableSerialize(value: unknown): string {
-  return JSON.stringify(value, (_key, val) =>
-    val && typeof val === "object" && !Array.isArray(val)
-      ? Object.keys(val as Record<string, unknown>)
-          .sort()
-          .reduce<Record<string, unknown>>((acc, k) => {
-            acc[k] = (val as Record<string, unknown>)[k];
-            return acc;
-          }, {})
-      : val,
+function RouteFallback() {
+  return (
+    <div className="route-fallback" role="status" aria-label="Загрузка раздела">
+      <span />
+      <span />
+      <span />
+    </div>
   );
 }
 
 export default function App() {
   const [tab, setTab] = useState<TabId>("dashboard");
+  const [settingsPage, setSettingsPage] = useState<SettingsPageId>("general");
   const [settings, setSettings] = useState<Settings>({ ...DEFAULT_SETTINGS });
   const [loaded, setLoaded] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loadedRef = useRef(false);
-  // Держим последние настройки в ref, чтобы flush'ить их синхронно при сокрытии окна.
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
-  // Анти lost-update: сериализация последних настроек, ПОЛУЧЕННЫХ с бэкенда
-  // (initial load + событие settings_changed). Если локальное состояние от неё
-  // не отличается — сейв (debounce/flush) подавляем: иначе спрятанное окно
-  // перетирало бы смену языка из трея своим устаревшим снапшотом.
-  const lastFromBackendRef = useRef<string>("");
-  // Сериализация последнего снапшота, ОТПРАВЛЕННОГО нами в save_settings: по ней
-  // отличаем эхо собственного сейва (его не применяем — локальное состояние могло
-  // уйти вперёд) от настоящей внешней смены (например, язык из трея).
-  const lastSentRef = useRef<string>("");
+  const backendSnapshotRef = useRef<Settings>({ ...DEFAULT_SETTINGS });
+  const lastFromBackendRef = useRef("");
+  const localEchoesRef = useRef<string[]>([]);
+  const saveChainRef = useRef<Promise<unknown>>(Promise.resolve());
+
+  const enqueueSave = useCallback((snapshot: Settings): Promise<boolean> => {
+    const fingerprint = settingsFingerprint(snapshot);
+    localEchoesRef.current.push(fingerprint);
+    if (localEchoesRef.current.length > 12) localEchoesRef.current.shift();
+
+    const task = saveChainRef.current.then(async () => {
+      const ok = await saveSettings(snapshot);
+      if (ok) {
+        lastFromBackendRef.current = fingerprint;
+        // Do not keep successfully persisted API keys in React state. The
+        // backend reports only `configured: boolean`; empty renderer fields
+        // subsequently mean "leave the stored secret unchanged".
+        setSettings((current) => {
+          let changed = false;
+          const next = { ...current };
+          for (const field of SECRET_FIELDS) {
+            if (snapshot[field] && current[field] === snapshot[field]) {
+              next[field] = "";
+              changed = true;
+            }
+          }
+          if (changed) settingsRef.current = next;
+          return changed ? next : current;
+        });
+      } else {
+        const index = localEchoesRef.current.indexOf(fingerprint);
+        if (index >= 0) localEchoesRef.current.splice(index, 1);
+        setNotice({
+          message: "Не удалось сохранить настройки. Изменения оставлены на экране — повторите попытку.",
+          variant: "error",
+        });
+      }
+      return ok;
+    });
+    saveChainRef.current = task.catch(() => undefined);
+    return task;
+  }, []);
+
+  const goTo = useCallback((route: Route) => {
+    if (route.settingsPage) setSettingsPage(route.settingsPage);
+    setTab(route.tab);
+  }, []);
 
   async function handleInstallUpdate(info: UpdateInfo) {
-    setNotice({
-      message: `Скачиваю VoxFlow ${info.latest_version}…`,
-      variant: "warning",
-    });
+    setNotice({ message: `Скачиваю VoxFlow ${info.latest_version}…`, variant: "warning" });
     const result = await installUpdate(info.asset_url, info.asset_name);
-    if (result?.launched) {
-      setNotice({
-        message: "Установщик обновления запущен. VoxFlow сейчас закроется.",
-        variant: "warning",
-      });
-    } else {
-      setNotice({
-        message: "Не удалось скачать или запустить обновление.",
-        variant: "error",
-      });
-    }
+    setNotice({
+      message: result?.launched
+        ? "Установщик обновления запущен. VoxFlow сейчас закроется."
+        : "Не удалось скачать или запустить обновление.",
+      variant: result?.launched ? "warning" : "error",
+    });
   }
 
-  // Initial load.
   useEffect(() => {
     let alive = true;
-    getSettings().then((s) => {
+    void getSettings().then((initial) => {
       if (!alive) return;
-      lastFromBackendRef.current = stableSerialize(s);
-      setSettings(s);
+      backendSnapshotRef.current = initial;
+      lastFromBackendRef.current = settingsFingerprint(initial);
+      settingsRef.current = initial;
+      setSettings(initial);
       loadedRef.current = true;
       setLoaded(true);
     });
@@ -151,44 +150,42 @@ export default function App() {
     };
   }, []);
 
-  // Лекарство от lost update: окно прячется (hide), React остаётся смонтированным,
-  // и раньше смена языка из трея (commands::save_settings) откатывалась устаревшим
-  // снапшотом при flush на visibilitychange. Теперь бэкенд после каждого успешного
-  // save_settings шлёт settings_changed с полными настройками — применяем их и
-  // запоминаем как «последнее с бэкенда» для подавления эха.
   useEffect(() => {
-    const off = subscribe<Settings>("settings_changed", (e) => {
-      if (!e.payload) return;
-      const s: Settings = { ...DEFAULT_SETTINGS, ...e.payload };
-      const ser = stableSerialize(s);
-      const isEcho = ser === lastSentRef.current;
-      lastFromBackendRef.current = ser;
-      // Эхо собственного сейва или состояние уже совпадает — не дёргаем setState:
-      // затирать более свежие локальные правки (пользователь продолжает печатать,
-      // пока invoke летит) нельзя, а лишний ре-рендер ни к чему.
-      if (isEcho || ser === stableSerialize(settingsRef.current)) return;
-      // Сразу и в ref — flush при сокрытии окна может случиться до ре-рендера.
-      settingsRef.current = s;
-      setSettings(s);
+    return subscribe<Settings>("settings_changed", (event) => {
+      if (!event.payload) return;
+      const incoming = { ...DEFAULT_SETTINGS, ...event.payload };
+      const fingerprint = settingsFingerprint(incoming);
+      const echoIndex = localEchoesRef.current.indexOf(fingerprint);
+
+      if (echoIndex >= 0) {
+        localEchoesRef.current.splice(echoIndex, 1);
+        backendSnapshotRef.current = incoming;
+        lastFromBackendRef.current = fingerprint;
+        return;
+      }
+
+      const merged = mergeRendererSettings(
+        backendSnapshotRef.current,
+        settingsRef.current,
+        incoming,
+        Object.keys(DEFAULT_SETTINGS),
+      );
+      backendSnapshotRef.current = incoming;
+      lastFromBackendRef.current = fingerprint;
+      settingsRef.current = merged;
+      setSettings(merged);
     });
-    return off;
   }, []);
 
-  // Тема: применяем после загрузки настроек и мгновенно при каждой смене.
-  // applyTheme заодно обновляет localStorage-кэш "vf-theme" — его читает
-  // main.tsx до рендера (без вспышки) и ловит overlay через storage-событие.
-  // До loaded не трогаем: иначе дефолт "system" затёр бы кэш реального выбора.
   useEffect(() => {
     if (!loaded) return;
     applyTheme(normalizeTheme(settings.theme));
   }, [loaded, settings.theme]);
 
-  // Автопроверка GitHub Releases после загрузки настроек. Скачивание/запуск —
-  // только по явному нажатию в тосте: установщик unsigned, поэтому без silent-run.
   useEffect(() => {
     if (!loaded || !settings.auto_update_check) return;
     let alive = true;
-    const t = setTimeout(async () => {
+    const timer = window.setTimeout(async () => {
       const info = await checkForUpdate();
       if (!alive || !info?.available) return;
       setNotice({
@@ -200,57 +197,47 @@ export default function App() {
     }, 1600);
     return () => {
       alive = false;
-      clearTimeout(t);
+      window.clearTimeout(timer);
     };
   }, [loaded, settings.auto_update_check]);
 
-  // B3: предупреждения от движка. no_model — баннер с кнопкой на вкладку «Модель»;
-  // error/norecog раньше никто не слушал (тихие провалы) — теперь показываем тост.
   useEffect(() => {
-    // Race-safe подписки (subscribe): под StrictMode эффект монтируется дважды;
-    // обёртка гарантирует, что слушатель, чей listen() резолвится после cleanup,
-    // тут же снимается — без утечек и дублей.
     const offs = [
-      subscribe<NoModelEvent>("no_model", (e) => {
+      subscribe<NoModelEvent>("no_model", (event) => {
         setNotice({
-          message: e.payload?.message || "Выберите модель во вкладке «Модель»",
+          message: event.payload?.message || "Выберите локальную модель распознавания.",
           variant: "warning",
-          actionLabel: "Открыть вкладку «Модель»",
-          action: "models",
+          actionLabel: "Открыть модели",
+          route: { tab: "settings", settingsPage: "models" },
         });
       }),
-      subscribe<VoxErrorEvent>("error", (e) => {
-        const msg = e.payload?.message;
-        if (msg) setNotice({ message: msg, variant: "error" });
+      subscribe<VoxErrorEvent>("error", (event) => {
+        if (event.payload?.message) {
+          setNotice({ message: event.payload.message, variant: "error" });
+        }
       }),
-      subscribe<NoRecogEvent>("norecog", (e) => {
-        const msg = e.payload?.message;
-        if (msg) setNotice({ message: msg, variant: "warning" });
+      subscribe<NoRecogEvent>("norecog", (event) => {
+        if (event.payload?.message) {
+          setNotice({ message: event.payload.message, variant: "warning" });
+        }
       }),
     ];
     return () => offs.forEach((off) => off());
   }, []);
 
-  // Debounced persistence whenever settings change (after initial load).
   useEffect(() => {
     if (!loadedRef.current) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      const ser = stableSerialize(settings);
-      // Эхо-подавление: состояние не отличается от последнего полученного с
-      // бэкенда (initial load / settings_changed) — писать нечего.
-      if (ser === lastFromBackendRef.current) return;
-      lastSentRef.current = ser;
-      saveSettings(settings);
-    }, 400);
+      const snapshot = settingsRef.current;
+      if (settingsFingerprint(snapshot) === lastFromBackendRef.current) return;
+      void enqueueSave(snapshot);
+    }, 300);
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
-  }, [settings]);
+  }, [settings, enqueueSave]);
 
-  // B4: окно настроек прячется в трей (а не закрывается), и debounce-save в пределах
-  // 400 мс перед сокрытием раньше отменялся. При visibilitychange/pagehide flush'им
-  // последнее значение немедленно, чтобы правка не потерялась.
   useEffect(() => {
     const flush = () => {
       if (!loadedRef.current) return;
@@ -258,31 +245,33 @@ export default function App() {
         clearTimeout(saveTimer.current);
         saveTimer.current = null;
       }
-      const cur = settingsRef.current;
-      const ser = stableSerialize(cur);
-      // Не отличаемся от бэкенда — flush не нужен. Именно этот безусловный сейв
-      // раньше откатывал смену языка из трея устаревшим снапшотом окна.
-      if (ser === lastFromBackendRef.current) return;
-      lastSentRef.current = ser;
-      saveSettings(cur);
+      const snapshot = settingsRef.current;
+      if (settingsFingerprint(snapshot) !== lastFromBackendRef.current) {
+        void enqueueSave(snapshot);
+      }
     };
-    const onVis = () => {
+    const onVisibility = () => {
       if (document.visibilityState === "hidden") flush();
     };
-    document.addEventListener("visibilitychange", onVis);
+    document.addEventListener("visibilitychange", onVisibility);
     window.addEventListener("pagehide", flush);
     return () => {
-      document.removeEventListener("visibilitychange", onVis);
+      document.removeEventListener("visibilitychange", onVisibility);
       window.removeEventListener("pagehide", flush);
     };
-  }, []);
+  }, [enqueueSave]);
 
   function update(patch: Partial<Settings>) {
-    setSettings((prev) => ({ ...prev, ...patch }));
+    setSettings((previous) => ({ ...previous, ...patch }));
+  }
+
+  function openSettings(page: SettingsPageId) {
+    setSettingsPage(page);
+    setTab("settings");
   }
 
   return (
-    <div className="app">
+    <div className={`app app-v2${loaded ? " is-ready" : " is-loading"}`}>
       <FpsMeter />
       {notice && (
         <div className="toast-stack">
@@ -292,89 +281,90 @@ export default function App() {
             actionLabel={notice.actionLabel}
             onAction={
               notice.onAction
-                ? () => {
-                    notice.onAction?.();
-                  }
-                : notice.action
-                ? () => {
-                    setTab(notice.action!);
-                    setNotice(null);
-                  }
-                : undefined
+                ? notice.onAction
+                : notice.route
+                  ? () => {
+                      goTo(notice.route!);
+                      setNotice(null);
+                    }
+                  : undefined
             }
             onClose={() => setNotice(null)}
           />
         </div>
       )}
+
       <aside className="sidebar">
         <div className="brand">
-          <div className="brand-mark">
-            <Icon.Mic className="" />
+          <div className="brand-wave" aria-hidden="true">
+            {[8, 18, 28, 18, 10].map((height, index) => (
+              <span key={index} style={{ height }} />
+            ))}
           </div>
           <div>
-            <div className="brand-name">VoxFlow</div>
-            <div className="brand-sub">Бесплатная локальная диктовка</div>
+            <div className="brand-name">VoxFlow <span>2.0</span></div>
+            <div className="brand-sub">Локальная диктовка</div>
           </div>
         </div>
 
-        <nav className="nav">
-          {NAV.map((n) => {
-            const ActiveIcon = n.icon;
+        <nav className="nav" aria-label="Основная навигация">
+          {NAV.map((item) => {
+            const NavIcon = item.icon;
+            const active = tab === item.id;
             return (
-              <div
-                key={n.id}
-                className={`nav-item ${tab === n.id ? "active" : ""}`}
-                // div — не кнопка: даём роль/таб-фокус и Enter/Space, чтобы по
-                // вкладкам можно было ходить с клавиатуры (focus-visible-кольцо
-                // в styles.css).
-                role="button"
-                tabIndex={0}
-                onClick={() => setTab(n.id)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" || e.key === " ") {
-                    e.preventDefault();
-                    setTab(n.id);
-                  }
-                }}
+              <button
+                type="button"
+                key={item.id}
+                className={`nav-item${active ? " active" : ""}`}
+                aria-current={active ? "page" : undefined}
+                onClick={() => setTab(item.id)}
               >
-                <ActiveIcon className="ico" />
-                {n.label}
-              </div>
+                <NavIcon className="ico" />
+                <span>{item.label}</span>
+              </button>
             );
           })}
         </nav>
 
-        <div className="sidebar-foot">
-          <span className="dot-ok" />
-          {loaded ? "Бесплатная диктовка · локально" : "Загрузка…"}
+        <div className="sidebar-bottom">
+          <button
+            type="button"
+            className={`nav-item settings-entry${tab === "settings" ? " active" : ""}`}
+            aria-current={tab === "settings" ? "page" : undefined}
+            onClick={() => setTab("settings")}
+          >
+            <Icon.Sliders className="ico" />
+            <span>Настройки</span>
+          </button>
+          <div className="sidebar-foot">
+            <span className="dot-ok" />
+            <span>{loaded ? "Готово к диктовке" : "Загрузка…"}</span>
+            <span className="sidebar-hotkey">{loaded ? settings.hotkey.replace("Meta", "⌘ ").replace("Control", "Ctrl ") : ""}</span>
+          </div>
         </div>
       </aside>
 
       <main className="content">
-        {/* key={tab} — свежая граница на каждую вкладку: ошибка в одной секции
-            не «залипает» при переходе на другую. */}
-        <ErrorBoundary key={tab}>
-          {/* .tab-fade: мягкий вход контента (fade+rise 160мс) при смене
-              вкладки — ремоунт по key={tab} выше переигрывает CSS-анимацию. */}
-          <div className="tab-fade">
-            {tab === "dashboard" && <Dashboard settings={settings} />}
-            {tab === "models" && <Models settings={settings} update={update} />}
-            {tab === "recognition" && (
-              <Recognition settings={settings} update={update} />
-            )}
-            {tab === "control" && (
-              <Control settings={settings} update={update} />
-            )}
-            {tab === "dictionary" && <Dictionary />}
-            {tab === "snippets" && <Snippets />}
-            {tab === "corrections" && <Corrections />}
-            {tab === "applications" && (
-              <Applications settings={settings} update={update} />
-            )}
-            {tab === "ai" && <Ai settings={settings} update={update} />}
-            {tab === "stt" && <Stt settings={settings} update={update} />}
-            {tab === "history" && <History />}
-          </div>
+        <ErrorBoundary key={`${tab}-${tab === "settings" ? settingsPage : ""}`}>
+          <Suspense fallback={<RouteFallback />}>
+            <div className="tab-fade">
+              {tab === "dashboard" && (
+                <Dashboard settings={settings} onOpenSettings={openSettings} />
+              )}
+              {tab === "history" && <History />}
+              {tab === "dictionary" && <Dictionary />}
+              {tab === "snippets" && <Snippets />}
+              {tab === "settings" && (
+                <SettingsHub
+                  page={settingsPage}
+                  settings={settings}
+                  update={update}
+                  persist={enqueueSave}
+                  onPageChange={setSettingsPage}
+                />
+              )}
+            </div>
+          </Suspense>
         </ErrorBoundary>
       </main>
     </div>

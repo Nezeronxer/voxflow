@@ -1,51 +1,59 @@
-name: Build VoxFlow Installer
-
-# Builds the VoxFlow per-user Inno Setup installer on Windows.
-#
-# Assumptions about what is committed to the repo (NOT produced by this CI):
-#   - The whisper sidecar binaries are committed at
-#       voxflow/src-tauri/resources/whisper/Release/
-#     (ggml-base.dll, ggml-cpu.dll, ggml.dll, whisper.dll, whisper-cli.exe,
-#      whisper-server.exe). They ship as Tauri bundle resources and are copied
-#      next to voxflow.exe by the build into target/release/resources/.
-#   - The Inno Setup script and its assets are committed at the repo-root
-#       installer/  (installer/VoxFlow.iss, installer/assets/).
-#     The compiled installer is emitted to installer/Output/.
-#
-# NOTE: this CI rebuilds voxflow.exe from source. The Tauri app is built WITHOUT
-# the NSIS bundler (`--no-bundle`); packaging is handled exclusively by the Inno
-# Setup script (installer/VoxFlow.iss), which replaces the old NSIS installer.
+name: Build VoxFlow Windows Installer
 
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_call:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-installer:
-    runs-on: windows-latest
+    name: Windows x64 installer
+    runs-on: windows-2025
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: '22'
+          node-version: "22.23.1"
+          cache: npm
+          cache-dependency-path: voxflow/package-lock.json
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
+          toolchain: "1.96.1"
           components: rustfmt, clippy
+
+      - name: Verify release version consistency
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            python script/check_versions.py --tag $env:GITHUB_REF_NAME
+          } else {
+            python script/check_versions.py
+          }
 
       - name: Install frontend dependencies
         working-directory: voxflow
         run: npm ci
+
+      - name: Frontend unit tests
+        working-directory: voxflow
+        run: npm test
 
       - name: Frontend build
         working-directory: voxflow
@@ -55,76 +63,105 @@ jobs:
         working-directory: voxflow
         run: npm audit --audit-level=high
 
+      # Tauri validates bundle globs even during clippy/test. Fetch and verify
+      # every production runtime before the first Rust build command.
+      - name: Fetch verified Windows runtime resources
+        shell: pwsh
+        run: ./script/fetch_windows_runtime.ps1
+
       - name: Rust format check
         working-directory: voxflow
         run: cargo fmt --manifest-path src-tauri\Cargo.toml --all -- --check
 
       - name: Rust clippy
         working-directory: voxflow
-        run: cargo clippy --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
+        run: cargo clippy --locked --manifest-path src-tauri\Cargo.toml --all-targets -- -D warnings
 
       - name: Rust unit tests
         working-directory: voxflow
-        run: cargo test --manifest-path src-tauri\Cargo.toml --lib
+        run: cargo test --locked --manifest-path src-tauri\Cargo.toml --lib
 
-      - name: Verify bundled runtime resources
-        shell: pwsh
-        run: |
-          $required = @(
-            "voxflow/src-tauri/resources/whisper/Release/whisper-cli.exe",
-            "voxflow/src-tauri/resources/whisper/Release/whisper-server.exe",
-            "voxflow/src-tauri/resources/vad/silero_vad.onnx"
-          )
-          $missing = $required | Where-Object { -not (Test-Path $_) }
-          if ($missing) {
-            $missing | ForEach-Object { Write-Error "Missing bundled runtime resource: $_" }
-            throw "Bundled runtime resources are required before building the installer."
-          }
-
-      # Build the Tauri app WITHOUT the NSIS bundler. `--no-bundle` skips Tauri's
-      # own installer packaging (we use Inno Setup instead) and produces:
-      #   voxflow/src-tauri/target/release/voxflow.exe
-      #   voxflow/src-tauri/target/release/resources/   (incl. whisper/Release/*)
-      # The whisper sidecar binaries committed at
-      # voxflow/src-tauri/resources/whisper/Release/ are bundle resources and
-      # land under target/release/resources/whisper/Release/ during this step.
-      - name: Build Tauri app (no bundle)
+      - name: Build Tauri app (Inno packages it separately)
         working-directory: voxflow
         run: npx tauri build --no-bundle
 
-      # Install the Inno Setup 6 compiler (ISCC.exe).
-      # Verify Chocolatey installs Inno Setup 6.7+ (ISCC features used by
-      # VoxFlow.iss assume 6.x). If Chocolatey ships an older build, pin an
-      # explicit version, e.g.:  choco install innosetup --version=6.7.1 -y
-      - name: Install Inno Setup
-        run: choco install innosetup -y
+      - name: Verify packaged Windows prerequisites
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $requiredFiles = @(
+            "voxflow/src-tauri/target/release/voxflow.exe",
+            "voxflow/src-tauri/target/release/resources/whisper/Release/whisper-cli.exe",
+            "voxflow/src-tauri/target/release/resources/whisper/Release/whisper-server.exe",
+            "voxflow/src-tauri/target/release/resources/whisper-cuda/Release/whisper-cli.exe",
+            "voxflow/src-tauri/target/release/resources/whisper-cuda/Release/whisper-server.exe",
+            "voxflow/src-tauri/resources/vad/silero_vad.onnx"
+          )
+          foreach ($path in $requiredFiles) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item $path).Length -eq 0) {
+              throw "Required Windows package file is missing or empty: $path"
+            }
+          }
 
-      # Compile the installer. ISCC.exe lives at the fixed 64-bit-host path.
-      # The leading `&` is PowerShell's call operator (required to invoke a
-      # quoted executable path).
+          $requiredVcRuntime = @(
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "vcomp140.dll"
+          )
+          $vcDestinations = @(
+            "voxflow/src-tauri/resources/windows-redist",
+            "voxflow/src-tauri/target/release/resources/whisper/Release",
+            "voxflow/src-tauri/target/release/resources/whisper-cuda/Release"
+          )
+          foreach ($destination in $vcDestinations) {
+            foreach ($file in $requiredVcRuntime) {
+              $path = Join-Path $destination $file
+              if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item $path).Length -eq 0) {
+                throw "App-local VC CRT/OpenMP file is missing or empty: $path"
+              }
+            }
+          }
+
+          $bootstrapper = "voxflow/src-tauri/resources/windows-prerequisites/MicrosoftEdgeWebview2Setup.exe"
+          if (-not (Test-Path -LiteralPath $bootstrapper -PathType Leaf) -or (Get-Item $bootstrapper).Length -eq 0) {
+            throw "WebView2 bootstrapper is missing or empty: $bootstrapper"
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $bootstrapper
+          $subject = if ($signature.SignerCertificate) { $signature.SignerCertificate.Subject } else { "" }
+          $product = (Get-Item -LiteralPath $bootstrapper).VersionInfo.ProductName
+          if ($signature.Status -ne "Valid" -or $subject -notmatch "(^|,\s*)O=Microsoft Corporation(,|$)") {
+            throw "WebView2 bootstrapper signature is not valid Microsoft Authenticode: status=$($signature.Status), signer=$subject"
+          }
+          if ([string]::IsNullOrWhiteSpace($product) -or $product -notmatch "WebView2") {
+            throw "Unexpected WebView2 bootstrapper product metadata: $product"
+          }
+
+      - name: Install pinned Inno Setup
+        run: choco install innosetup --version=6.7.1 --yes --no-progress
+
       - name: Compile Inno Setup installer
+        shell: pwsh
         run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\VoxFlow.iss'
 
-      - name: Upload installer artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: VoxFlow-Setup
-          path: installer\Output\*.exe
-
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Verify installer name and write checksum
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $installer = Get-ChildItem installer\Output\VoxFlow-Setup-*.exe | Select-Object -First 1
-          if (-not $installer) {
-            throw "Installer artifact was not produced."
+          $version = (Get-Content voxflow/package.json | ConvertFrom-Json).version
+          $installer = Get-Item "installer/Output/VoxFlow-Setup-$version.exe"
+          if ($installer.Length -eq 0) {
+            throw "Installer is empty: $($installer.FullName)"
           }
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag $installer.FullName --clobber
-          } else {
-            gh release create $tag $installer.FullName --title "VoxFlow $tag" --generate-notes
-          }
+          $digest = (Get-FileHash -Algorithm SHA256 $installer.FullName).Hash.ToLowerInvariant()
+          "$digest  $($installer.Name)" | Set-Content -Encoding ascii installer/Output/SHA256SUMS-windows.txt
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: VoxFlow-Windows-x64
+          path: |
+            installer/Output/VoxFlow-Setup-*.exe
+            installer/Output/SHA256SUMS-windows.txt
+          if-no-files-found: error
+          retention-days: 14

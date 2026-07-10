@@ -97,7 +97,92 @@ mod imp {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod imp {
+    use anyhow::{anyhow, Context, Result};
+    use std::process::Command;
+
+    fn run_osascript(script: &str) -> Result<String> {
+        let out = Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output()
+            .context("macOS audio mute: osascript")?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("macOS audio mute: {}", stderr.trim()));
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    }
+
+    fn parse_apple_bool(value: &str) -> Result<bool> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            other => Err(anyhow!("macOS audio mute: unexpected bool {other:?}")),
+        }
+    }
+
+    fn current_mute() -> Result<bool> {
+        let out = run_osascript("output muted of (get volume settings)")?;
+        parse_apple_bool(&out)
+    }
+
+    fn set_mute(mute: bool) -> Result<()> {
+        let value = if mute { "true" } else { "false" };
+        run_osascript(&format!("set volume output muted {value}"))?;
+        Ok(())
+    }
+
+    #[derive(Debug)]
+    pub struct AutoMuteGuard {
+        was_muted: bool,
+        active: bool,
+    }
+
+    impl AutoMuteGuard {
+        pub fn engage() -> Result<Self> {
+            let was_muted = current_mute().context("macOS audio mute: read current state")?;
+            if !was_muted {
+                set_mute(true).context("macOS audio mute: set muted")?;
+            }
+            Ok(Self {
+                was_muted,
+                active: true,
+            })
+        }
+
+        pub fn restore(&mut self) {
+            if !self.active {
+                return;
+            }
+            if let Err(e) = set_mute(self.was_muted) {
+                log::warn!("auto-mute restore failed: {e:#}");
+            }
+            self.active = false;
+        }
+    }
+
+    impl Drop for AutoMuteGuard {
+        fn drop(&mut self) {
+            self.restore();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::parse_apple_bool;
+
+        #[test]
+        fn parses_osascript_booleans() {
+            assert!(parse_apple_bool("true\n").unwrap());
+            assert!(!parse_apple_bool(" false ").unwrap());
+            assert!(parse_apple_bool("missing value").is_err());
+        }
+    }
+}
+
+#[cfg(all(not(windows), not(target_os = "macos")))]
 mod imp {
     use anyhow::Result;
 

@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { listen } from "@tauri-apps/api/event";
-import { listModels, downloadModel, deleteModel } from "../api";
+import { listModels, downloadModel, deleteModel, subscribe } from "../api";
 import { PageHead, Field, Select, Icon } from "../ui";
 import type {
   Settings,
@@ -143,67 +142,61 @@ export default function Models({
 
   useEffect(() => {
     refresh();
-    const unlisteners: Array<() => void> = [];
+    // subscribe снимает listener, даже если async listen() резолвится
+    // уже после cleanup (важно для StrictMode и быстрой смены вкладки).
+    const offs = [
+      subscribe<ModelProgressEvent>("model:progress", (e) => {
+        const p = e.payload;
+        if (!p?.name) return;
+        // Скорость: дельта байт / дельта времени между событиями (~400 мс), EMA 0.3.
+        const now = performance.now();
+        const prev = speedRef.current[p.name];
+        let ema = prev?.ema ?? 0;
+        if (prev && now > prev.t && p.received >= prev.received) {
+          const inst = ((p.received - prev.received) * 1000) / (now - prev.t);
+          ema = ema > 0 ? ema * (1 - SPEED_EMA) + inst * SPEED_EMA : inst;
+        }
+        speedRef.current[p.name] = { received: p.received, t: now, ema };
+        setProgress((prevState) => ({
+          ...prevState,
+          [p.name]: {
+            received: p.received,
+            total: p.total,
+            speed: ema > 0 ? ema : undefined,
+            eta:
+              ema > 0 && p.total > 0 && p.total >= p.received
+                ? (p.total - p.received) / ema
+                : undefined,
+          },
+        }));
+      }),
+      subscribe<ModelDoneEvent>("model:done", (e) => {
+        const name = e.payload?.name;
+        if (!name) return;
+        delete speedRef.current[name];
+        setProgress((prev) => {
+          const next = { ...prev };
+          delete next[name];
+          return next;
+        });
+        refresh();
+      }),
+      subscribe<ModelErrorEvent>("model:error", (e) => {
+        const name = e.payload?.name;
+        if (!name) return;
+        delete speedRef.current[name];
+        setProgress((prev) => ({
+          ...prev,
+          [name]: {
+            received: prev[name]?.received ?? 0,
+            total: prev[name]?.total ?? 0,
+            error: e.payload?.error || "Ошибка загрузки",
+          },
+        }));
+      }),
+    ];
 
-    listen<ModelProgressEvent>("model:progress", (e) => {
-      const p = e.payload;
-      if (!p?.name) return;
-      // Скорость: дельта байт / дельта времени между событиями (~400 мс), EMA 0.3.
-      const now = performance.now();
-      const prev = speedRef.current[p.name];
-      let ema = prev?.ema ?? 0;
-      if (prev && now > prev.t && p.received >= prev.received) {
-        const inst = ((p.received - prev.received) * 1000) / (now - prev.t);
-        ema = ema > 0 ? ema * (1 - SPEED_EMA) + inst * SPEED_EMA : inst;
-      }
-      speedRef.current[p.name] = { received: p.received, t: now, ema };
-      setProgress((prevState) => ({
-        ...prevState,
-        [p.name]: {
-          received: p.received,
-          total: p.total,
-          speed: ema > 0 ? ema : undefined,
-          eta:
-            ema > 0 && p.total > 0 && p.total >= p.received
-              ? (p.total - p.received) / ema
-              : undefined,
-        },
-      }));
-    })
-      .then((fn) => unlisteners.push(fn))
-      .catch(() => {});
-
-    listen<ModelDoneEvent>("model:done", (e) => {
-      const name = e.payload?.name;
-      if (!name) return;
-      delete speedRef.current[name];
-      setProgress((prev) => {
-        const next = { ...prev };
-        delete next[name];
-        return next;
-      });
-      refresh();
-    })
-      .then((fn) => unlisteners.push(fn))
-      .catch(() => {});
-
-    listen<ModelErrorEvent>("model:error", (e) => {
-      const name = e.payload?.name;
-      if (!name) return;
-      delete speedRef.current[name];
-      setProgress((prev) => ({
-        ...prev,
-        [name]: {
-          received: prev[name]?.received ?? 0,
-          total: prev[name]?.total ?? 0,
-          error: e.payload?.error || "Ошибка загрузки",
-        },
-      }));
-    })
-      .then((fn) => unlisteners.push(fn))
-      .catch(() => {});
-
-    return () => unlisteners.forEach((u) => u());
+    return () => offs.forEach((off) => off());
   }, []);
 
   async function onDownload(name: string) {
@@ -422,16 +415,18 @@ export default function Models({
         </Field>
         <Field
           label="Потоки"
-          hint="Число потоков CPU для распознавания (больше — быстрее, выше нагрузка)"
+          hint="0 — автоматически; 1–32 — явное число потоков CPU (больше — быстрее, но выше нагрузка)"
         >
           <input
             type="number"
-            min={1}
+            min={0}
             max={32}
             value={settings.threads}
             onChange={(e) => {
               const n = parseInt(e.currentTarget.value, 10);
-              update({ threads: Number.isFinite(n) ? n : 1 });
+              update({
+                threads: Number.isFinite(n) ? Math.min(32, Math.max(0, n)) : 0,
+              });
             }}
           />
         </Field>

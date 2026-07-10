@@ -4,9 +4,12 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
-pub const DEFAULT_HOTKEY: &str = "MetaRight";
+pub const DEFAULT_HOTKEY: &str = "AltRight";
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULT_HOTKEY: &str = "ControlRight";
+pub const OVERLAY_SCALE_MIN: f64 = 0.75;
+pub const OVERLAY_SCALE_MAX: f64 = 1.50;
+pub const OVERLAY_SCALE_DEFAULT: f64 = 1.0;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(default)]
@@ -27,6 +30,8 @@ pub struct Settings {
     pub engine: String,
     /// Тема интерфейса: "system" | "light" | "dark".
     pub theme: String,
+    /// Масштаб плавающей плашки (0.75..1.50).
+    pub overlay_scale: f64,
     /// Точная расшифровка без улучшений.
     pub verbatim: bool,
     /// Удалять слова-паразиты.
@@ -161,6 +166,7 @@ impl Default for Settings {
             // локальными спец-маршрутами, если пользователь выберет их в UI.
             engine: "whisper_server".into(),
             theme: "system".into(),
+            overlay_scale: OVERLAY_SCALE_DEFAULT,
             verbatim: false,
             remove_fillers: true,
             auto_punct: true,
@@ -173,7 +179,9 @@ impl Default for Settings {
             auto_mute: true,
             autostart: false,
             auto_update_check: true,
-            personalize: true,
+            // Audio/text training pairs are sensitive and persistent. Fresh
+            // installs collect them only after an explicit user opt-in.
+            personalize: false,
             ai_backend: "ollama".into(),
             ai_api_key: String::new(),
             ai_model: "gemini-2.5-flash".into(),
@@ -206,29 +214,13 @@ impl Default for Settings {
 }
 
 impl Settings {
-    pub fn normalize_for_platform(&mut self) {
-        #[cfg(target_os = "macos")]
-        {
-            // До macOS-сборки 1.0.8 свежий default был Windows-style Right Ctrl.
-            // Мигрируем только этот legacy-default; явно выбранные пользователем
-            // клавиши вроде ControlLeft/Alt/F8 остаются как есть.
-            if self.hotkey == "ControlRight" {
-                self.hotkey = DEFAULT_HOTKEY.into();
-            }
-            // Старый macOS default `whisper_server + auto + large-v3-turbo` даёт
-            // слишком медленный финал и почти всегда таймаутит live-preview на
-            // локальной машине. Если быстрый русский GigaAM уже установлен,
-            // переводим только этот дефолтный профиль на GigaAM/RU. Явный выбор
-            // пользователя не трогаем.
-            if self.engine == "whisper_server"
-                && self.language == "auto"
-                && self.model == "ggml-large-v3-turbo-q5_0.bin"
-                && crate::gigaam::dir_ready(&crate::paths::gigaam_dir())
-            {
-                self.engine = "gigaam".into();
-                self.language = "ru".into();
-            }
-        }
+    pub fn normalize_user_values(&mut self) {
+        self.overlay_scale = if self.overlay_scale.is_finite() {
+            self.overlay_scale
+                .clamp(OVERLAY_SCALE_MIN, OVERLAY_SCALE_MAX)
+        } else {
+            OVERLAY_SCALE_DEFAULT
+        };
     }
 
     pub fn redacted_for_renderer(mut self) -> Self {
@@ -383,7 +375,10 @@ pub fn load(conn: &Connection) -> Settings {
         Some(j) => serde_json::from_str(&j).unwrap_or_default(),
         None => Settings::default(),
     };
-    settings.normalize_for_platform();
+    // Value-only hotkey migrations are intentionally avoided: an explicitly
+    // selected Right Control is indistinguishable from an old default and must
+    // survive restart. New installs already receive the platform default.
+    settings.normalize_user_values();
     settings
 }
 
@@ -419,35 +414,58 @@ mod tests {
         let s: Settings = serde_json::from_str(json).expect("legacy settings parse");
         assert_eq!(s.hotkey, "ControlRight");
         assert!(s.auto_update_check);
+        assert!(!s.personalize);
         assert!(s.ai_prompt_rules.is_empty());
+        assert_eq!(s.overlay_scale, OVERLAY_SCALE_DEFAULT);
+    }
+
+    #[test]
+    fn personalization_is_opt_in_but_saved_choice_survives() {
+        assert!(!Settings::default().personalize);
+
+        let enabled: Settings =
+            serde_json::from_str(r#"{"personalize":true}"#).expect("saved settings parse");
+        assert!(enabled.personalize);
     }
 
     #[test]
     fn default_hotkey_matches_platform() {
         #[cfg(target_os = "macos")]
-        assert_eq!(Settings::default().hotkey, "MetaRight");
+        assert_eq!(Settings::default().hotkey, "AltRight");
         #[cfg(not(target_os = "macos"))]
         assert_eq!(Settings::default().hotkey, "ControlRight");
     }
 
     #[test]
-    fn platform_normalization_migrates_only_legacy_default_hotkey() {
-        let mut legacy = Settings {
-            hotkey: "ControlRight".into(),
-            ..Settings::default()
-        };
-        legacy.normalize_for_platform();
-        #[cfg(target_os = "macos")]
-        assert_eq!(legacy.hotkey, "MetaRight");
-        #[cfg(not(target_os = "macos"))]
-        assert_eq!(legacy.hotkey, "ControlRight");
-
+    fn normalization_preserves_explicit_hotkey_and_clamps_overlay_scale() {
         let mut chosen = Settings {
-            hotkey: "ControlLeft".into(),
+            hotkey: "ControlRight".into(),
+            overlay_scale: 9.0,
             ..Settings::default()
         };
-        chosen.normalize_for_platform();
-        assert_eq!(chosen.hotkey, "ControlLeft");
+        chosen.normalize_user_values();
+        assert_eq!(chosen.hotkey, "ControlRight");
+        assert_eq!(chosen.overlay_scale, OVERLAY_SCALE_MAX);
+
+        chosen.overlay_scale = f64::NAN;
+        chosen.normalize_user_values();
+        assert_eq!(chosen.overlay_scale, OVERLAY_SCALE_DEFAULT);
+    }
+
+    #[test]
+    fn platform_normalization_preserves_explicit_whisper_auto_route() {
+        let mut chosen = Settings {
+            engine: "whisper_server".into(),
+            language: "auto".into(),
+            model: "ggml-large-v3-turbo-q5_0.bin".into(),
+            ..Settings::default()
+        };
+
+        chosen.normalize_user_values();
+
+        assert_eq!(chosen.engine, "whisper_server");
+        assert_eq!(chosen.language, "auto");
+        assert_eq!(chosen.model, "ggml-large-v3-turbo-q5_0.bin");
     }
 
     #[test]

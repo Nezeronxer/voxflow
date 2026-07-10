@@ -4,30 +4,89 @@
 //! МОДЕЛИ и временным WAV должны быть ASCII. Их кладём в %LOCALAPPDATA%\VoxFlow
 //! (юзернейм ASCII). Сами exe/DLL грузятся ОС по wide-пути — им кириллица ок.
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 use tauri::{AppHandle, Manager};
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+const STALE_TEMP_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) -> io::Result<()> {
+    // Windows privacy is inherited from the per-user LocalAppData ACL. Unix
+    // mode bits do not have a faithful Windows equivalent in std.
+    Ok(())
+}
+
+fn ensure_private_dir(path: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(path)?;
+    set_mode(path, 0o700)
+}
+
+fn private_dir(path: PathBuf) -> PathBuf {
+    if let Err(e) = ensure_private_dir(&path) {
+        log::warn!("не удалось защитить каталог {}: {e}", path.display());
+    }
+    path
+}
+
+/// Restrict an existing user-data file to the current Unix user. On Windows
+/// the file keeps the ACL inherited from LocalAppData.
+pub fn set_private_file_permissions(path: &Path) -> io::Result<()> {
+    set_mode(path, 0o600)
+}
+
+/// Create or truncate a sensitive file without an umask-dependent exposure
+/// window on Unix. Existing files are tightened as well.
+pub fn create_private_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    set_private_file_permissions(path)?;
+    Ok(file)
+}
+
+/// Open a sensitive append-only diagnostic file with private Unix mode bits.
+pub fn open_private_append(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    set_private_file_permissions(path)?;
+    Ok(file)
+}
+
 /// %LOCALAPPDATA%\VoxFlow (ASCII), создаётся при первом обращении.
 pub fn data_dir() -> PathBuf {
     let base = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
-    let d = base.join("VoxFlow");
-    let _ = std::fs::create_dir_all(&d);
-    d
+    private_dir(base.join("VoxFlow"))
 }
 
 pub fn models_dir() -> PathBuf {
-    let d = data_dir().join("models");
-    let _ = std::fs::create_dir_all(&d);
-    d
+    private_dir(data_dir().join("models"))
 }
 
 pub fn tmp_dir() -> PathBuf {
-    let d = data_dir().join("tmp");
-    let _ = std::fs::create_dir_all(&d);
-    d
+    private_dir(data_dir().join("tmp"))
 }
 
 pub fn unique_tmp_path(prefix: &str, ext: &str) -> PathBuf {
@@ -53,6 +112,50 @@ pub fn unique_tmp_path(prefix: &str, ext: &str) -> PathBuf {
     ))
 }
 
+fn cleanup_stale_temp_files_in(
+    dir: &Path,
+    now: SystemTime,
+    max_age: Duration,
+) -> io::Result<usize> {
+    let mut removed = 0;
+    for entry in std::fs::read_dir(dir)? {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        // Never follow or delete symlinks and never recurse. Cleanup is limited
+        // to regular files created by VoxFlow in its own tmp directory.
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let sensitive_temp = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav") || ext.eq_ignore_ascii_case("json"));
+        if !sensitive_temp {
+            continue;
+        }
+        let Some(age) = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+        else {
+            continue;
+        };
+        if age >= max_age && std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Remove crash leftovers containing speech or request payloads. Files newer
+/// than 24 hours are preserved to avoid racing another process or a long job.
+pub fn cleanup_stale_temp_files() -> io::Result<usize> {
+    cleanup_stale_temp_files_in(&tmp_dir(), SystemTime::now(), STALE_TEMP_MAX_AGE)
+}
+
 pub struct TempFileGuard {
     path: PathBuf,
 }
@@ -75,9 +178,7 @@ impl Drop for TempFileGuard {
 
 /// Каталог датасета персонализации (аудио-сэмплы пользователя).
 pub fn dataset_dir() -> PathBuf {
-    let d = data_dir().join("dataset");
-    let _ = std::fs::create_dir_all(&d);
-    d
+    private_dir(data_dir().join("dataset"))
 }
 
 pub fn db_path() -> PathBuf {
@@ -100,9 +201,7 @@ fn macos_whisper_resource_dir() -> &'static str {
 /// Каталог моделей GigaAM (models/gigaam, ASCII-путь — ort открывает по wide,
 /// но единообразие с whisper-моделями дешевле, чем особые случаи).
 pub fn gigaam_dir() -> PathBuf {
-    let d = models_dir().join(crate::gigaam::GIGAAM_DIR);
-    let _ = std::fs::create_dir_all(&d);
-    d
+    private_dir(models_dir().join(crate::gigaam::GIGAAM_DIR))
 }
 
 /// Каталог моделей Parakeet TDT v3 (models/parakeet). Без create_dir_all:
@@ -245,5 +344,100 @@ pub fn whisper_server_name() -> &'static str {
         "whisper-server.exe"
     } else {
         "whisper-server"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_dir(name: &str) -> PathBuf {
+        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "voxflow-paths-{name}-{}-{nanos}-{seq}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn cleanup_only_removes_old_regular_sensitive_temp_files() {
+        let dir = test_dir("cleanup");
+        ensure_private_dir(&dir).unwrap();
+        let wav = dir.join("utterance.wav");
+        let json = dir.join("payload.json");
+        let keep = dir.join("model.part");
+        std::fs::write(&wav, b"speech").unwrap();
+        std::fs::write(&json, b"private text").unwrap();
+        std::fs::write(&keep, b"download").unwrap();
+        let child = dir.join("nested.wav");
+        std::fs::create_dir(&child).unwrap();
+
+        let removed = cleanup_stale_temp_files_in(
+            &dir,
+            SystemTime::now() + Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(!wav.exists());
+        assert!(!json.exists());
+        assert!(keep.exists());
+        assert!(child.is_dir());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_helpers_tighten_directories_and_files() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = test_dir("permissions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        ensure_private_dir(&dir).unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+
+        let file = dir.join("secret.json");
+        std::fs::write(&file, b"secret").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+        drop(open_private_append(&file).unwrap());
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_does_not_follow_or_delete_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = test_dir("symlink");
+        ensure_private_dir(&dir).unwrap();
+        let target = dir.join("target.txt");
+        let link = dir.join("linked.wav");
+        std::fs::write(&target, b"keep").unwrap();
+        symlink(&target, &link).unwrap();
+
+        let removed = cleanup_stale_temp_files_in(
+            &dir,
+            SystemTime::now() + Duration::from_secs(2),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(link.symlink_metadata().is_ok());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
