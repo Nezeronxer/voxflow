@@ -223,7 +223,12 @@ try {
   Download-Verified -Source $cpuSource -Destination $cpuZip
   Download-Verified -Source $cudaSource -Destination $cudaZip
   Download-Verified -Source $vadSource -Destination $vadModel
-  Download-MicrosoftSigned -Source $webViewSource -Destination $webViewBootstrapper -ExpectedProduct "WebView2"
+  # The official Evergreen bootstrapper is currently versioned as
+  # "Microsoft Edge Update" even though the downloaded payload installs the
+  # WebView2 Runtime. Accept that Microsoft product name as well as older/newer
+  # builds that expose WebView2 directly; Authenticode signer validation above
+  # remains the trust boundary.
+  Download-MicrosoftSigned -Source $webViewSource -Destination $webViewBootstrapper -ExpectedProduct "WebView2|^Microsoft Edge Update$"
 
   $cpuExtract = Join-Path $tempRoot "cpu"
   $cudaExtract = Join-Path $tempRoot "cuda"
@@ -250,7 +255,7 @@ try {
   New-Item -ItemType Directory -Force -Path $prereqDest | Out-Null
   $webViewInstalledPath = Join-Path $prereqDest $webViewSource.File
   Copy-Item -LiteralPath $webViewBootstrapper -Destination $webViewInstalledPath -Force
-  Assert-MicrosoftAuthenticode -Path $webViewInstalledPath -ExpectedProduct "WebView2"
+  Assert-MicrosoftAuthenticode -Path $webViewInstalledPath -ExpectedProduct "WebView2|^Microsoft Edge Update$"
 
   foreach ($required in @(
     (Join-Path $cpuDest "whisper-cli.exe"),

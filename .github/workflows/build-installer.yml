@@ -134,7 +134,7 @@ jobs:
           if ($signature.Status -ne "Valid" -or $subject -notmatch "(^|,\s*)O=Microsoft Corporation(,|$)") {
             throw "WebView2 bootstrapper signature is not valid Microsoft Authenticode: status=$($signature.Status), signer=$subject"
           }
-          if ([string]::IsNullOrWhiteSpace($product) -or $product -notmatch "WebView2") {
+          if ([string]::IsNullOrWhiteSpace($product) -or $product -notmatch "WebView2|^Microsoft Edge Update$") {
             throw "Unexpected WebView2 bootstrapper product metadata: $product"
           }
 
