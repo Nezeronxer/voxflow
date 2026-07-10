@@ -75,10 +75,27 @@ pub fn open_private_append(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+#[cfg(not(test))]
+fn data_dir_path() -> PathBuf {
+    let base = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
+    base.join("VoxFlow")
+}
+
+#[cfg(test)]
+fn data_dir_path() -> PathBuf {
+    // `dirs::data_local_dir()` resolves FOLDERID_LocalAppData through WinAPI
+    // on Windows, so overriding LOCALAPPDATA does not isolate unit tests. Keep
+    // every test binary out of the real user profile by construction instead.
+    std::env::var_os("VOXFLOW_TEST_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!("voxflow-test-data-{}", std::process::id()))
+        })
+}
+
 /// %LOCALAPPDATA%\VoxFlow (ASCII), создаётся при первом обращении.
 pub fn data_dir() -> PathBuf {
-    let base = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
-    private_dir(base.join("VoxFlow"))
+    private_dir(data_dir_path())
 }
 
 pub fn models_dir() -> PathBuf {
@@ -361,6 +378,13 @@ pub fn whisper_server_name() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_data_never_uses_the_production_profile() {
+        let path = data_dir_path();
+        assert_eq!(path, data_dir());
+        assert_ne!(path, dirs::data_local_dir().unwrap().join("VoxFlow"));
+    }
 
     fn test_dir(name: &str) -> PathBuf {
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);

@@ -80,10 +80,11 @@ jobs:
       - name: Rust unit tests
         working-directory: voxflow
         env:
-          # Several path/privacy tests intentionally create VoxFlow data. Keep
-          # that fixture out of the real per-user LocalAppData which the clean
-          # installer smoke test validates later in this job.
-          LOCALAPPDATA: ${{ runner.temp }}\voxflow-rust-test-localappdata
+          # dirs::data_local_dir() uses FOLDERID_LocalAppData on Windows and
+          # ignores a LOCALAPPDATA override. The cfg(test) path hook consumes
+          # this dedicated root so tests cannot contaminate the real profile
+          # which the clean installer smoke validates later in this job.
+          VOXFLOW_TEST_DATA_DIR: ${{ runner.temp }}\voxflow-rust-test-data
         run: cargo test --locked --manifest-path src-tauri\Cargo.toml --lib
 
       - name: Build Tauri app (Inno packages it separately)
