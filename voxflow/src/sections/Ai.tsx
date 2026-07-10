@@ -185,6 +185,7 @@ export default function Ai({
                 const providerIsOpenRouter = provider.value === "openrouter";
                 update({
                   ai_backend: v,
+                  ai_backend_behavior_version: 1,
                   cloud_asr: false,
                   rewrite_base_url: provider.baseUrl,
                   rewrite_model: providerIsOpenRouter
@@ -196,8 +197,12 @@ export default function Ai({
               } else {
                 update(
                   v === "gemini"
-                    ? { ai_backend: v }
-                    : { ai_backend: v, cloud_asr: false },
+                    ? { ai_backend: v, ai_backend_behavior_version: 1 }
+                    : {
+                        ai_backend: v,
+                        ai_backend_behavior_version: 1,
+                        cloud_asr: false,
+                      },
                 );
               }
             }}

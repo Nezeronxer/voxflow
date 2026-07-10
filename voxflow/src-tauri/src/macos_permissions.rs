@@ -131,7 +131,7 @@ mod imp {
             let _ = app.emit(
                 "error",
                 serde_json::json!({
-                    "message": "Разрешите VoxFlow в macOS Privacy & Security: сначала Accessibility для вставки текста, затем Input Monitoring для Right Option"
+                    "message": "Разрешите VoxFlow в macOS Privacy & Security: сначала Input Monitoring для Right Option, затем Accessibility для вставки текста"
                 }),
             );
             engine::dbg_log(&format!(
@@ -139,24 +139,26 @@ mod imp {
                 need_accessibility, need_input
             ));
 
-            if need_accessibility {
-                request_post_event_once();
-                open_accessibility_settings();
+            // Right Option — первое действие онбординга, поэтому не держим
+            // Input Monitoring за 90-секундным ожиданием Accessibility.
+            if need_input {
+                request_input_monitoring_once();
+                open_input_monitoring_settings();
                 for _ in 0..90 {
-                    if post_event_allowed() {
-                        engine::dbg_log("permissions: Accessibility granted during onboarding");
+                    if input_monitoring_allowed() {
+                        engine::dbg_log("permissions: Input Monitoring granted during onboarding");
                         break;
                     }
                     std::thread::sleep(Duration::from_secs(1));
                 }
             }
 
-            if !input_monitoring_allowed() {
-                request_input_monitoring_once();
-                open_input_monitoring_settings();
+            if need_accessibility && !post_event_allowed() {
+                request_post_event_once();
+                open_accessibility_settings();
                 for _ in 0..90 {
-                    if input_monitoring_allowed() {
-                        engine::dbg_log("permissions: Input Monitoring granted during onboarding");
+                    if post_event_allowed() {
+                        engine::dbg_log("permissions: Accessibility granted during onboarding");
                         break;
                     }
                     std::thread::sleep(Duration::from_secs(1));

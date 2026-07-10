@@ -864,32 +864,32 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         let s = ctx.settings.lock();
         (s.input_device.clone(), s.play_sounds, s.auto_mute)
     };
-    // B3: для локального распознавания модель обязательна — без неё НЕ начинаем «запись в
-    // никуда», а сразу показываем предупреждение «Выберите модель». Облачный ASR
-    // (Gemini-транскрипция ИЛИ облачный STT-провайдер) модель не требует, поэтому
-    // проверяем только для чисто локального пути.
-    {
-        let s = ctx.settings.lock();
-        // Облако «активно» только при наличии ключа — иначе провайдер openai_compat/deepgram
-        // de-facto уходит в локальное распознавание (умный фолбэк). Та же проверка, что и в
-        // process_utterance (общий хелпер cloud_stt_active): без ключа провайдер облачный,
-        // но модель нам ВСЁ РАВНО нужна, иначе гард «выберите модель» пропустили бы и юзер
-        // записал бы «в никуда» (баг старта).
-        let use_cloud_stt = s.cloud_stt_active();
-        let use_cloud_gemini =
-            s.cloud_asr && s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key);
-        let use_cloud = use_cloud_stt || use_cloud_gemini;
-        if !use_cloud && no_model_installed(&s) {
-            drop(s);
-            *ctx.active_target.lock() = None;
-            dbg_log("start: модель не установлена — запись не начинаем, предупреждаем");
-            emit_no_model(&ctx.app);
-            set_status(&ctx.app, "idle");
-            return;
-        }
-    }
     match audio::start_capture(&device) {
         Ok(c) => {
+            // Открываем CoreAudio ДО гарда модели. На macOS именно этот
+            // первый доступ запускает TCC-запрос микрофона. На чистой
+            // установке модель ещё может скачиваться; если проверить её
+            // раньше, до микрофона код не доходит и macOS не показывает prompt.
+            // Поток тут же дропается, если локальный ASR пока не готов.
+            {
+                let s = ctx.settings.lock();
+                // Облако «активно» только при наличии ключа — иначе провайдер
+                // openai_compat/deepgram de-facto уходит в локальное распознавание.
+                let use_cloud_stt = s.cloud_stt_active();
+                let use_cloud_gemini = s.cloud_asr
+                    && s.ai_backend == "gemini"
+                    && crate::gemini::available(&s.ai_api_key);
+                let use_cloud = use_cloud_stt || use_cloud_gemini;
+                if !use_cloud && no_model_installed(&s) {
+                    drop(s);
+                    drop(c);
+                    *ctx.active_target.lock() = None;
+                    dbg_log("start: модель не установлена — запись не начинаем, предупреждаем");
+                    emit_no_model(&ctx.app);
+                    set_status(&ctx.app, "idle");
+                    return;
+                }
+            }
             // Пояс безопасности (C2): старт-звук играем ТОЛЬКО на честном переходе
             // «не писали → пишем». Если запись уже шла (Start поверх ещё активной
             // диктовки при rapid-fire) — звук не переигрываем.
@@ -938,6 +938,13 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
 ///
 /// ВАЖНО: для cli живой ИНЖЕКТ клавишами не нужен/опасен, поэтому stream_mode
 /// для петли при cli трактуем как "never" — показываем только серый текст в пилюле.
+fn whisper_preview_requested(stream_mode: &str, is_windows: bool) -> bool {
+    // На Windows CUDA partial конкурирует с финалом за однопоточный server.
+    // Если пользователь выбрал "never" (это и есть clean default), статичная
+    // плашка предпочтительнее 0.7–3 с ожидания, kill и холодного рестарта модели.
+    !is_windows || stream_mode != "never"
+}
+
 fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &TargetFingerprint) {
     // Сбрасываем прошлое состояние на всякий случай (новая диктовка = чистый старт).
     *ctx.partial.lock() = None;
@@ -1072,6 +1079,12 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
             dbg_log("partial: parakeet не загрузился — пробуем whisper-стрим");
         }
         LocalRoute::Whisper => {}
+    }
+    if !whisper_preview_requested(&s.stream_mode, cfg!(windows)) {
+        dbg_log(
+            "partial: Windows stream_mode=never — сохраняем прогретый whisper-server для финала",
+        );
+        return;
     }
     // Живой whisper-стрим на Windows оставляем только для NVIDIA-сборки: CPU
     // сервер там слишком медленный для тиков. На macOS используем native sidecar
@@ -3306,10 +3319,10 @@ fn potentially_remote_rewrite(s: &Settings) -> bool {
         }
         _ => false,
     };
-    let remote_ollama_fallback = s.ai_backend != "off"
+    let remote_ollama = s.ai_backend == "ollama"
         && crate::ollama::configured(&s.ollama_url)
         && !crate::net::is_loopback_base_url(&s.ollama_url);
-    selected_remote || remote_ollama_fallback
+    selected_remote || remote_ollama
 }
 
 /// Сохранить пару (аудио 16 кГц ↔ распознанный текст) в датасет персонализации.
@@ -3725,7 +3738,7 @@ fn final_rewrite_eligible(
     smart_active: bool,
     explicit_smart_instruction: bool,
 ) -> bool {
-    if s.verbatim {
+    if s.verbatim || configured_rewrite_backend(s).is_none() {
         return false;
     }
     match rewrite_tone {
@@ -4352,6 +4365,14 @@ mod seg_tests {
 
         s.engine = "whisper_server".to_string();
         assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Whisper);
+    }
+
+    #[test]
+    fn windows_never_mode_keeps_whisper_server_free_for_final_asr() {
+        assert!(!whisper_preview_requested("never", true));
+        assert!(whisper_preview_requested("auto", true));
+        assert!(whisper_preview_requested("always", true));
+        assert!(whisper_preview_requested("never", false));
     }
 
     #[test]
@@ -5028,6 +5049,26 @@ struct RewriteRequest<'a> {
     force: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RewriteBackendRoute {
+    Gemini,
+    OpenAiCompat,
+    Ollama,
+}
+
+/// Рефайн идёт только в явно выбранный бэкенд. До 2.0.1 любой
+/// недоступный Gemini/OpenAI-compatible незаметно падал в Ollama,
+/// потому что её дефолтный localhost URL считался "configured". Это
+/// запускало Qwen3 на CPU без отдельного opt-in.
+fn configured_rewrite_backend(s: &Settings) -> Option<RewriteBackendRoute> {
+    match s.ai_backend.as_str() {
+        "gemini" if crate::gemini::available(&s.ai_api_key) => Some(RewriteBackendRoute::Gemini),
+        "openai_compat" if crate::rewrite::configured(s) => Some(RewriteBackendRoute::OpenAiCompat),
+        "ollama" if crate::ollama::configured(&s.ollama_url) => Some(RewriteBackendRoute::Ollama),
+        _ => None,
+    }
+}
+
 fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (String, bool) {
     let RewriteRequest {
         actx,
@@ -5062,33 +5103,36 @@ fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (Stri
         return (text.to_string(), false);
     }
 
-    let mut attempts: Vec<Box<dyn Fn() -> anyhow::Result<String>>> = Vec::new();
-    if s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key) {
-        let key = s.ai_api_key.clone();
-        let model = s.ai_model.clone();
-        let instruction =
-            build_tone_instruction(target_tone, smart_instruction, context_hint, corrections);
-        let input = text.to_string();
-        attempts.push(Box::new(move || {
-            crate::gemini::refine(&key, &model, &instruction, &input)
-        }));
-    }
-    if s.ai_backend == "openai_compat" && crate::rewrite::configured(s) {
-        let settings = s.clone();
-        let user =
-            build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
-        attempts.push(Box::new(move || {
-            crate::rewrite::refine(&settings, crate::ollama::SYSTEM_PROMPT, &user)
-        }));
-    }
-    if s.ai_backend != "off" && crate::ollama::configured(&s.ollama_url) {
-        let url = s.ollama_url.clone();
-        let model = s.ollama_model.clone();
-        let user =
-            build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
-        attempts.push(Box::new(move || {
-            crate::ollama::refine(&url, &model, crate::ollama::SYSTEM_PROMPT, &user)
-        }));
+    let mut attempts: Vec<Box<dyn Fn() -> anyhow::Result<String>>> = Vec::with_capacity(1);
+    match configured_rewrite_backend(s) {
+        Some(RewriteBackendRoute::Gemini) => {
+            let key = s.ai_api_key.clone();
+            let model = s.ai_model.clone();
+            let instruction =
+                build_tone_instruction(target_tone, smart_instruction, context_hint, corrections);
+            let input = text.to_string();
+            attempts.push(Box::new(move || {
+                crate::gemini::refine(&key, &model, &instruction, &input)
+            }));
+        }
+        Some(RewriteBackendRoute::OpenAiCompat) => {
+            let settings = s.clone();
+            let user =
+                build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
+            attempts.push(Box::new(move || {
+                crate::rewrite::refine(&settings, crate::ollama::SYSTEM_PROMPT, &user)
+            }));
+        }
+        Some(RewriteBackendRoute::Ollama) => {
+            let url = s.ollama_url.clone();
+            let model = s.ollama_model.clone();
+            let user =
+                build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
+            attempts.push(Box::new(move || {
+                crate::ollama::refine(&url, &model, crate::ollama::SYSTEM_PROMPT, &user)
+            }));
+        }
+        None => {}
     }
 
     for attempt in attempts {
@@ -5355,8 +5399,53 @@ mod smart_prompt_tests {
     }
 
     #[test]
-    fn explicit_ai_rule_opts_back_into_sync_rewrite() {
+    fn clean_defaults_never_schedule_synchronous_rewrite() {
+        let s = Settings::default();
+
+        assert_eq!(s.ai_backend, "off");
+        assert_eq!(configured_rewrite_backend(&s), None);
+        for tone in ["ai", "casual", "very_casual", "work", "formal", "doc"] {
+            assert!(
+                !final_rewrite_eligible(&s, tone, true, true),
+                "clean install must not schedule a blocking LLM for {tone}"
+            );
+        }
+    }
+
+    #[test]
+    fn selected_backend_never_falls_through_to_implicit_ollama() {
+        let unavailable_gemini = Settings {
+            ai_backend: "gemini".into(),
+            ai_api_key: String::new(),
+            ollama_url: "http://localhost:11434".into(),
+            ..Settings::default()
+        };
+        assert_eq!(configured_rewrite_backend(&unavailable_gemini), None);
+
+        let configured_gemini = Settings {
+            ai_api_key: "configured-for-test".into(),
+            ..unavailable_gemini
+        };
+        assert_eq!(
+            configured_rewrite_backend(&configured_gemini),
+            Some(RewriteBackendRoute::Gemini)
+        );
+
+        let explicit_ollama = Settings {
+            ai_backend: "ollama".into(),
+            ollama_url: "http://localhost:11434".into(),
+            ..Settings::default()
+        };
+        assert_eq!(
+            configured_rewrite_backend(&explicit_ollama),
+            Some(RewriteBackendRoute::Ollama)
+        );
+    }
+
+    #[test]
+    fn explicit_ai_rule_with_backend_opts_into_sync_rewrite() {
         let s = Settings {
+            ai_backend: "ollama".into(),
             smart_prompt_enabled: false,
             ai_prompt_rules: vec![crate::settings::AiPromptRule {
                 pattern: "claude".to_string(),

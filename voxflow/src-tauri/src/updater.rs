@@ -297,6 +297,7 @@ fn asset_name_matches_version(name: &str, target: UpdateTarget, version: &str) -
         UpdateTarget::WindowsX64 => name == format!("VoxFlow-Setup-{version}.exe"),
         UpdateTarget::MacosArm64 => [
             format!("VoxFlow-macOS-{version}-arm64.dmg"),
+            format!("VoxFlow-macOS-{version}-arm64-adhoc.dmg"),
             format!("VoxFlow-macOS-{version}-arm64-unsigned.dmg"),
             format!("VoxFlow-macOS-{version}-arm64-signed-unnotarized.dmg"),
         ]
@@ -304,6 +305,7 @@ fn asset_name_matches_version(name: &str, target: UpdateTarget, version: &str) -
         .any(|expected| expected == name),
         UpdateTarget::MacosX64 => [
             format!("VoxFlow-macOS-{version}-x64.dmg"),
+            format!("VoxFlow-macOS-{version}-x64-adhoc.dmg"),
             format!("VoxFlow-macOS-{version}-x64-unsigned.dmg"),
             format!("VoxFlow-macOS-{version}-x64-signed-unnotarized.dmg"),
         ]
@@ -402,10 +404,12 @@ fn is_installer_asset_name_for(name: &str, prefix: &str, suffix: &str) -> bool {
     }
     name.ends_with(suffix)
         || (suffix == "-arm64.dmg"
-            && (name.ends_with("-arm64-unsigned.dmg")
+            && (name.ends_with("-arm64-adhoc.dmg")
+                || name.ends_with("-arm64-unsigned.dmg")
                 || name.ends_with("-arm64-signed-unnotarized.dmg")))
         || (suffix == "-x64.dmg"
-            && (name.ends_with("-x64-unsigned.dmg")
+            && (name.ends_with("-x64-adhoc.dmg")
+                || name.ends_with("-x64-unsigned.dmg")
                 || name.ends_with("-x64-signed-unnotarized.dmg")))
 }
 
@@ -501,12 +505,12 @@ mod tests {
                 .is_ok()
         );
         assert!(validate_asset_name_for(
-            "VoxFlow-macOS-2.0.0-arm64-unsigned.dmg",
+            "VoxFlow-macOS-2.0.1-arm64-adhoc.dmg",
             UpdateTarget::MacosArm64
         )
         .is_ok());
         assert!(validate_asset_name_for(
-            "VoxFlow-macOS-2.0.0-x64-unsigned.dmg",
+            "VoxFlow-macOS-2.0.1-x64-adhoc.dmg",
             UpdateTarget::MacosArm64
         )
         .is_err());
@@ -544,14 +548,14 @@ mod tests {
                     "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-Setup-99.0.0.exe"
                 },
                 {
-                    "name": "VoxFlow-macOS-99.0.0-arm64.dmg",
+                    "name": "VoxFlow-macOS-99.0.0-arm64-adhoc.dmg",
                     "size": 456,
-                    "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-macOS-99.0.0-arm64.dmg"
+                    "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-macOS-99.0.0-arm64-adhoc.dmg"
                 },
                 {
-                    "name": "VoxFlow-macOS-99.0.0-x64.dmg",
+                    "name": "VoxFlow-macOS-99.0.0-x64-adhoc.dmg",
                     "size": 789,
-                    "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-macOS-99.0.0-x64.dmg"
+                    "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-macOS-99.0.0-x64-adhoc.dmg"
                 }
             ]
         });
@@ -563,9 +567,9 @@ mod tests {
         assert!(windows.auto_install);
         assert_eq!(windows.latest_version, "99.0.0");
         assert_eq!(windows.asset_name, "VoxFlow-Setup-99.0.0.exe");
-        assert_eq!(mac_arm.asset_name, "VoxFlow-macOS-99.0.0-arm64.dmg");
+        assert_eq!(mac_arm.asset_name, "VoxFlow-macOS-99.0.0-arm64-adhoc.dmg");
         assert!(!mac_arm.auto_install);
-        assert_eq!(mac_x64.asset_name, "VoxFlow-macOS-99.0.0-x64.dmg");
+        assert_eq!(mac_x64.asset_name, "VoxFlow-macOS-99.0.0-x64-adhoc.dmg");
     }
 
     #[test]

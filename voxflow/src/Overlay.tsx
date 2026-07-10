@@ -4,10 +4,10 @@
 // движение мышью — перенос окна.
 //
 // Состояния пилюли (классы aq-* в overlay.css):
-//   idle   — мини-полоска 55×10, hover → 80×20 + тултип с текущей горячей клавишей;
-//   rec    — 110×37: орб с градиентом и glow от громкости + 12 баров ("level");
-//   stream — пришёл partial с текстом: до 400×~140, посимвольная печать (rAF);
-//   trans  — пилюля scale(.96), кольцо-спиннер поверх орба;
+//   idle   — компактная полоска с горячей клавишей и языком;
+//   rec    — орб с градиентом и glow от громкости + 12 баров ("level");
+//   stream — пришёл partial с текстом: до 360×82, посимвольная печать (rAF);
+//   trans  — компактная пилюля с кольцом-спиннером поверх орба;
 //   final  — короткая вспышка финального preview во время transcribing, без зависания после вставки;
 //   latch  — подтверждение двойного тапа: запись зафиксирована без удержания;
 //   notice — краткое предупреждение (no_model / error) поверх любого состояния.
@@ -24,7 +24,7 @@ import { getSettings, IS_TAURI_RUNTIME, subscribe } from "./api";
 import FpsMeter from "./components/FpsMeter";
 import "./overlay.css";
 import { DEFAULT_HOTKEY, normalizeOverlayScale } from "./types";
-import { IS_APPLE_PLATFORM, prettyHotkey } from "./ui";
+import { prettyHotkey } from "./ui";
 import type {
   OverlayStatus,
   PartialEvent,
@@ -66,16 +66,16 @@ type DragPointer = {
 };
 
 // Желаемый размер overlay-окна под каждый режим (ЛОГИЧЕСКИЕ px): пилюля + поля
-// под glow/тень; для idle — компактный запас под hover-рост (80×20) и тултип
-// сверху, без слишком широкой невидимой drag-зоны вокруг полоски.
+// под glow/тень. Цифры синхронизированы с финальным v2-каскадом overlay.css;
+// небольшой запас не даёт тени/кольцу обрезаться на целом и дробном scale.
 // Сообщается бэкенду командой overlay_box (реализует интегратор).
 const BOX: Record<PillMode, { w: number; h: number }> = {
-  idle: { w: 392, h: 88 },
-  rec: { w: 452, h: 92 },
-  trans: { w: 392, h: 88 },
-  stream: { w: 552, h: 128 },
-  latch: { w: 360, h: 92 },
-  notice: { w: 480, h: 96 },
+  idle: { w: 266, h: 60 },
+  rec: { w: 260, h: 66 },
+  trans: { w: 256, h: 64 },
+  stream: { w: 384, h: 104 },
+  latch: { w: 264, h: 66 },
+  notice: { w: 356, h: 70 },
 };
 const FINAL_PREVIEW_HOLD_MS = 360;
 const DRAG_HIT_PADDING = 6;
@@ -717,6 +717,7 @@ export default function Overlay() {
     if (e.button !== 0) return;
     if (!pointInPillHit(e.clientX, e.clientY)) return;
     const fromPill = !!pillRef.current?.contains(e.target as Node);
+    const pixelRatio = window.devicePixelRatio || 1;
     const state: DragPointer = {
       id: e.pointerId,
       x: e.clientX,
@@ -724,26 +725,27 @@ export default function Overlay() {
       t: performance.now(),
       dragging: false,
       fromPill,
+      // PointerEvent.screen* is synchronous CSS-screen state, while Tauri
+      // window positions are physical pixels. This fallback preserves even a
+      // very fast press→move→release completed before cursorPosition() IPC.
+      cursorStart: { x: e.screenX * pixelRatio, y: e.screenY * pixelRatio },
       raf: null,
       applyChain: null,
     };
     pointerRef.current = state;
     e.currentTarget.setPointerCapture?.(e.pointerId);
-    if (IS_APPLE_PLATFORM) {
-      void cursorPosition()
-        .then((cur) => {
-          if (pointerRef.current === state) state.cursorStart = { x: cur.x, y: cur.y };
-        })
-        .catch(() => {});
-    } else {
-      void cursorPosition()
-        .then((cur) => {
-          if (pointerRef.current !== state) return;
-          state.cursorStart = { x: cur.x, y: cur.y };
-          if (state.dragging) scheduleManualDrag(state);
-        })
-        .catch(() => {});
-    }
+    // Один pointer-путь для macOS и Windows. Tauri cursorPosition +
+    // setPosition не требуют macOS Input Monitoring и, в отличие от
+    // прежнего CGEvent-поллера, не конкурирует с pointer capture WebView.
+    void cursorPosition()
+      .then((cur) => {
+        if (pointerRef.current !== state) return;
+        // Replace the synchronous approximation only while the pointer has
+        // not moved. Otherwise changing the baseline would lose early motion.
+        if (!state.dragging) state.cursorStart = { x: cur.x, y: cur.y };
+        if (state.dragging) scheduleManualDrag(state);
+      })
+      .catch(() => {});
   };
   const onPillPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
     const p = pointerRef.current;
@@ -753,7 +755,7 @@ export default function Overlay() {
     if (!p.dragging && Math.hypot(dx, dy) >= 4) {
       p.dragging = true;
     }
-    if (p.dragging && !IS_APPLE_PLATFORM) {
+    if (p.dragging) {
       e.preventDefault();
       scheduleManualDrag(p);
     }
@@ -776,10 +778,8 @@ export default function Overlay() {
           ? Math.hypot(cursor.x - p.cursorStart.x, cursor.y - p.cursorStart.y)
           : moved;
       if (p.dragging || physicalMoved >= 5) {
-        if (!IS_APPLE_PLATFORM) {
-          await p.applyChain?.catch(() => {});
-          await applyManualDrag(p, false);
-        }
+        await p.applyChain?.catch(() => {});
+        await applyManualDrag(p, false);
         await invoke("overlay_commit_position").catch(() => {});
       } else if (p.fromPill && elapsed < 550) {
         await invoke("overlay_click").catch(() => {});
@@ -793,9 +793,10 @@ export default function Overlay() {
       if (p.raf != null) cancelAnimationFrame(p.raf);
       pointerRef.current = null;
       if (p.dragging) {
-        void (p.applyChain ?? Promise.resolve()).then(() =>
-          invoke("overlay_commit_position").catch(() => {}),
-        );
+        void (p.applyChain ?? Promise.resolve())
+          .catch(() => {})
+          .then(() => applyManualDrag(p, false))
+          .then(() => invoke("overlay_commit_position").catch(() => {}));
       }
     }
   };

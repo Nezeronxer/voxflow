@@ -1041,7 +1041,8 @@ pub fn overlay_box(app: AppHandle, w: f64, h: f64) -> R<()> {
 }
 
 /// Фронт оверлея сообщает прямоугольник пилюли (CSS px относительно вьюпорта
-/// окна). Поллер курсора в lib.rs включает мышь только над этой зоной.
+/// окна). Windows-поллер курсора в lib.rs включает мышь только над этой зоной;
+/// на macOS окно интерактивно, а тот же rect ограничивает pointer-drag в Overlay.tsx.
 #[tauri::command]
 pub fn overlay_hit(state: State<AppState>, x: f64, y: f64, w: f64, h: f64) -> R<()> {
     *state.overlay_hit.lock() = Some((x, y, w, h));

@@ -145,14 +145,14 @@ pub enum Key {
     F12,
 }
 
-/// Дольше — это удержание; короче — тап.
-const HOLD_MIN: Duration = Duration::from_millis(250);
+/// Только такое очень короткое нажатие считаем тапом-кандидатом.
+/// Обычное hold-to-talk, в котором уже можно сказать фразу, на release
+/// всегда стопается сразу и не ждёт 300-мс окно второго тапа.
+const QUICK_TAP_MAX: Duration = Duration::from_millis(180);
 /// Окно между двумя нажатиями для распознавания двойного. Оно же — задержка
 /// ОТЛОЖЕННОГО Stop после короткого тапа (отложенный Stop ждёт ровно это окно).
 ///
-/// Раньше было 450мс → ~450мс тактильного лага на КАЖДОЙ короткой диктовке. Снижено
-/// до 300мс: двойной тап человек делает за <300мс, а одиночный короткий тап теперь
-/// финализируется на ~150мс раньше. ВАЖНО: окно распознавания двойного (on_press) и
+/// ВАЖНО: окно распознавания двойного (on_press) и
 /// задержка отложенного Stop (on_release) — ОДНА И ТА ЖЕ величина, иначе медленный
 /// двойной тап мог бы не успеть отменить уже сработавший Stop. Инвариант C2/C4 цел:
 /// второй press бампает generation раньше, чем сработает Stop → Stop сам себя отменяет.
@@ -523,7 +523,7 @@ fn on_release(state: &Arc<Mutex<HotState>>, tx: &Sender<EngineCmd>, mode: &str) 
         .map(|p| now.duration_since(p))
         .unwrap_or_default();
 
-    if held < HOLD_MIN {
+    if held < QUICK_TAP_MAX {
         // КОРОТКИЙ тап — кандидат на двойное нажатие. НЕ останавливаем запись сразу:
         // если в течение DOUBLE_WINDOW придёт второй тап (защёлка), Stop не нужен.
         // Откладываем Stop на DOUBLE_WINDOW и гейтим его поколением: если за это время
@@ -1111,9 +1111,9 @@ mod tests {
         (Arc::new(Mutex::new(HotState::new())), tx, rx)
     }
 
-    /// Имитирует «держал дольше HOLD_MIN» без реального sleep: откатывает press_at.
+    /// Имитирует «держал дольше QUICK_TAP_MAX» без sleep.
     fn backdate_press(state: &Arc<Mutex<HotState>>) {
-        state.lock().press_at = Some(Instant::now() - HOLD_MIN);
+        state.lock().press_at = Some(Instant::now() - QUICK_TAP_MAX);
     }
 
     fn assert_no_cmd(rx: &Receiver<EngineCmd>) {
@@ -1594,9 +1594,9 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(EngineCmd::ImproveSelection)));
     }
 
-    // Дефолт без защёлки: даже короткий release сразу финализируется.
+    // Явно выключенная защёлка: даже короткий release сразу финализируется.
     #[test]
-    fn single_short_tap_stops_immediately_by_default() {
+    fn explicitly_disabled_latch_stops_short_tap_immediately() {
         let (state, tx, rx) = mk();
         dispatch(
             &state,
@@ -1616,9 +1616,9 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
     }
 
-    // Opt-in защёлка сохраняет прежнее окно двойного тапа.
+    // Быстрый tap с защёлкой ждёт окно второго tap.
     #[test]
-    fn opt_in_latch_defers_single_short_tap_stop() {
+    fn enabled_latch_defers_single_quick_tap_stop() {
         let (state, tx, rx) = mk();
         dispatch_with_latch(
             &state,
@@ -1640,6 +1640,33 @@ mod tests {
         assert_no_cmd(&rx);
         let got = rx.recv_timeout(DOUBLE_WINDOW + Duration::from_millis(300));
         assert!(matches!(got, Ok(EngineCmd::Stop)));
+    }
+
+    // Защёлка включена по умолчанию, но обычная hold-to-talk диктовка не
+    // должна попадать в 300-мс окно или ждать фоновый Stop.
+    #[test]
+    fn enabled_latch_stops_normal_hold_immediately() {
+        let (state, tx, rx) = mk();
+        dispatch_with_latch(
+            &state,
+            &tx,
+            EventType::KeyPress(Key::KeyA),
+            Key::KeyA,
+            "hold",
+            true,
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        backdate_press(&state);
+        dispatch_with_latch(
+            &state,
+            &tx,
+            EventType::KeyRelease(Key::KeyA),
+            Key::KeyA,
+            "hold",
+            true,
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
+        assert_no_cmd(&rx);
     }
 
     // Двойной тап → защёлка: один Start на весь цикл, отложенный Stop отменён,

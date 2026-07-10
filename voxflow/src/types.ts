@@ -5,6 +5,7 @@ export interface Settings {
   improve_hotkey: string;
   mode: string;
   double_tap_latch: boolean;
+  double_tap_behavior_version: number;
   input_device: string;
   language: string;
   model: string;
@@ -28,6 +29,7 @@ export interface Settings {
   personalize: boolean;
   threads: number;
   ai_backend: string; // "off" | "ollama" | "gemini" | "openai_compat"
+  ai_backend_behavior_version: number;
   ai_api_key: string;
   ai_model: string;
   ollama_url: string;
@@ -125,7 +127,8 @@ export const DEFAULT_SETTINGS: Settings = {
   hotkey: DEFAULT_HOTKEY,
   improve_hotkey: "F8",
   mode: "hold",
-  double_tap_latch: false,
+  double_tap_latch: true,
+  double_tap_behavior_version: 1,
   input_device: "",
   language: "auto",
   // Зеркало Rust-дефолтов (settings.rs). Расхождение раньше позволяло UI
@@ -148,7 +151,9 @@ export const DEFAULT_SETTINGS: Settings = {
   auto_update_check: true,
   personalize: false,
   threads: 0,
-  ai_backend: "ollama",
+  // Локальный LLM-rewrite тяжёлый и синхронный: только после opt-in.
+  ai_backend: "off",
+  ai_backend_behavior_version: 1,
   ai_api_key: "",
   ai_model: "gemini-2.5-flash",
   ollama_url: "http://localhost:11434",

@@ -25,7 +25,7 @@ From the repository root:
 cargo fmt --manifest-path voxflow/src-tauri/Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path voxflow/src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path voxflow/src-tauri/Cargo.toml --lib
-python3 script/check_versions.py --tag v2.0.0
+python3 script/check_versions.py --tag v2.0.1
 ```
 
 ## Packaging
@@ -45,9 +45,10 @@ orchestrator verifies both artifact sets and their checksums in a draft, then
 publishes the shared GitHub Release only after the complete set is present.
 
 Windows uses the existing per-user Inno installer after `tauri build
---no-bundle`. macOS produces a DMG. Code signing/notarization and Authenticode
-require owner-provided certificates and are not represented as successful when
-those secrets are absent.
+--no-bundle`. macOS produces a DMG whose complete app bundle is ad-hoc signed
+and strict-verified in secret-free CI. Developer ID/notarization and Windows
+Authenticode still require owner-provided certificates and are not represented
+as successful when those secrets are absent.
 
 ## Recognition routes
 
