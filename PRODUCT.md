@@ -6,11 +6,11 @@ product
 
 ## Users
 
-Windows users who dictate into chat apps, browsers, documents, IDEs and coding tools. They want fast voice input without accidentally sending messages, leaking keys or fighting technical settings.
+macOS and Windows users who dictate into chat apps, browsers, documents, IDEs and coding tools. They want fast voice input without accidentally sending messages, leaking keys or fighting technical settings.
 
 ## Product Purpose
 
-VoxFlow provides practical speech-to-text for everyday desktop work. It should make local dictation feel predictable, private and easy to tune per application, with BYOK cloud options clearly marked as optional.
+VoxFlow provides free-for-personal-use speech-to-text for everyday desktop work. It should make local dictation feel predictable, private and easy to tune per application, with BYOK cloud options clearly marked as optional.
 
 ## Brand Personality
 

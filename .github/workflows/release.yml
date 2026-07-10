@@ -1,0 +1,188 @@
+name: Release VoxFlow
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: voxflow-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Build Windows x64
+    uses: ./.github/workflows/build-installer.yml
+    permissions:
+      contents: read
+
+  build-macos:
+    name: Build macOS ARM64
+    uses: ./.github/workflows/release-macos-arm64.yml
+    permissions:
+      contents: read
+
+  publish:
+    name: Publish complete cross-platform release
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download verified Windows artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: VoxFlow-Windows-x64
+          path: release/windows
+
+      - name: Download verified macOS artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: VoxFlow-macOS-arm64-unsigned-${{ github.sha }}
+          path: release/macos
+
+      - name: Verify artifacts and publish complete release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t installers < <(find release/windows -type f -name 'VoxFlow-Setup-*.exe')
+          mapfile -t windows_checksums < <(find release/windows -type f -name 'SHA256SUMS-windows.txt')
+          mapfile -t dmgs < <(find release/macos -type f -name 'VoxFlow-macOS-*-arm64-unsigned.dmg')
+          mapfile -t zips < <(find release/macos -type f -name 'VoxFlow-macOS-*-arm64-unsigned.app.zip')
+          mapfile -t macos_checksums < <(find release/macos -type f -name 'SHA256SUMS.txt')
+          mapfile -t manifests < <(find release/macos -type f -name 'release-manifest.txt')
+
+          if [[ ${#installers[@]} -ne 1 || ${#windows_checksums[@]} -ne 1 ]]; then
+            echo "Expected exactly one Windows installer and checksum file" >&2
+            exit 1
+          fi
+          if [[ ${#dmgs[@]} -ne 1 || ${#zips[@]} -ne 1 || ${#macos_checksums[@]} -ne 1 || ${#manifests[@]} -ne 1 ]]; then
+            echo "Expected exactly one macOS DMG, app.zip, checksum file, and manifest" >&2
+            exit 1
+          fi
+
+          files=(
+            "${installers[0]}"
+            "${windows_checksums[0]}"
+            "${dmgs[0]}"
+            "${zips[0]}"
+            "${macos_checksums[0]}"
+            "${manifests[0]}"
+          )
+          declare -A seen_names=()
+          for file in "${files[@]}"; do
+            if [[ ! -s "$file" ]]; then
+              echo "Release artifact is missing or empty: $file" >&2
+              exit 1
+            fi
+            name="$(basename "$file")"
+            if [[ -n "${seen_names[$name]+present}" ]]; then
+              echo "Duplicate release asset name: $name" >&2
+              exit 1
+            fi
+            seen_names[$name]=1
+          done
+
+          (
+            cd "$(dirname "${windows_checksums[0]}")"
+            sha256sum --check "$(basename "${windows_checksums[0]}")"
+          )
+          (
+            cd "$(dirname "${macos_checksums[0]}")"
+            sha256sum --check "$(basename "${macos_checksums[0]}")"
+          )
+
+          find_release() {
+            gh api --paginate "repos/${GH_REPO}/releases?per_page=100" --slurp |
+              jq -c --arg tag "$RELEASE_TAG" '
+                [.[][] | select(.tag_name == $tag)] as $matches |
+                if ($matches | length) > 1 then
+                  error("multiple releases found for tag " + $tag)
+                elif ($matches | length) == 1 then
+                  $matches[0]
+                else
+                  null
+                end
+              '
+          }
+
+          release_json="$(find_release)"
+          if [[ "$release_json" != null ]]; then
+            echo "Release $RELEASE_TAG already exists; completing it idempotently."
+          else
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --verify-tag \
+              --title "VoxFlow $RELEASE_TAG" \
+              --generate-notes
+            release_json="$(find_release)"
+            if [[ "$release_json" == null ]]; then
+              echo "Draft release $RELEASE_TAG was created but cannot be read back" >&2
+              exit 1
+            fi
+          fi
+
+          release_id="$(jq -r '.id' <<<"$release_json")"
+          release_endpoint="repos/${GH_REPO}/releases/${release_id}"
+          is_draft="$(jq -r '.draft' <<<"$release_json")"
+          for file in "${files[@]}"; do
+            name="$(basename "$file")"
+            local_size="$(stat -c '%s' "$file")"
+            local_digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            remote_count="$(jq --arg name "$name" '[.assets[] | select(.name == $name)] | length' <<<"$release_json")"
+
+            if [[ "$remote_count" == 0 ]]; then
+              gh release upload "$RELEASE_TAG" "$file"
+            elif [[ "$is_draft" == true ]]; then
+              gh release upload "$RELEASE_TAG" "$file" --clobber
+            else
+              remote_size="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | .size' <<<"$release_json")"
+              remote_digest="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | (.digest // "")' <<<"$release_json")"
+              if [[ "$remote_size" != "$local_size" ]]; then
+                echo "Published asset $name differs in size; refusing to replace it in-place" >&2
+                exit 1
+              fi
+              if [[ "$remote_digest" == sha256:* && "$remote_digest" != "$local_digest" ]]; then
+                echo "Published asset $name differs in SHA-256; refusing to replace it in-place" >&2
+                exit 1
+              fi
+              echo "Published asset already matches: $name"
+            fi
+          done
+
+          release_json="$(gh api "$release_endpoint")"
+          for file in "${files[@]}"; do
+            name="$(basename "$file")"
+            local_size="$(stat -c '%s' "$file")"
+            local_digest="sha256:$(sha256sum "$file" | awk '{print $1}')"
+            if ! jq -e --arg name "$name" --argjson size "$local_size" \
+              'any(.assets[]; .name == $name and .size == $size)' \
+              <<<"$release_json" >/dev/null; then
+              echo "Release verification failed for asset: $name" >&2
+              exit 1
+            fi
+            remote_digest="$(jq -r --arg name "$name" '.assets[] | select(.name == $name) | (.digest // "")' <<<"$release_json")"
+            if [[ "$remote_digest" == sha256:* && "$remote_digest" != "$local_digest" ]]; then
+              echo "Release SHA-256 verification failed for asset: $name" >&2
+              exit 1
+            fi
+          done
+
+          if [[ "$is_draft" == true ]]; then
+            gh release edit "$RELEASE_TAG" --draft=false
+          fi
+
+          release_json="$(gh api "$release_endpoint")"
+          if [[ "$(jq -r '.draft' <<<"$release_json")" != false ]]; then
+            echo "Release $RELEASE_TAG still exists only as a draft" >&2
+            exit 1
+          fi

@@ -12,12 +12,21 @@ import "./styles.css";
 // (так overlay перекрашивается мгновенно при смене темы в настройках).
 initTheme();
 
-// Tauri/WebView2 по умолчанию показывает браузерное контекстное меню на правый
-// клик. Для десктопного UI VoxFlow оно не нужно и выглядит как случайная утечка
-// браузера, поэтому глушим его до монтирования React в главном окне и overlay.
+// На декоративной поверхности браузерное меню WebView не нужно. В полях
+// ввода оно, наоборот, даёт нативные Copy/Paste, замены и spelling-подсказки.
+function keepNativeContextMenu(target: EventTarget | null): boolean {
+  const element = target instanceof Element ? target : null;
+  if (!element) return false;
+  if (element.closest("input, textarea")) return true;
+
+  const editable = element.closest("[contenteditable]");
+  return editable instanceof HTMLElement && editable.isContentEditable;
+}
+
 window.addEventListener(
   "contextmenu",
   (event) => {
+    if (keepNativeContextMenu(event.target)) return;
     event.preventDefault();
     event.stopPropagation();
   },
