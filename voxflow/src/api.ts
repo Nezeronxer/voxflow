@@ -3,6 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import type { EventCallback } from "@tauri-apps/api/event";
 import type {
   Settings,
@@ -470,6 +471,8 @@ export function checkForUpdate(): Promise<UpdateInfo | null> {
 export function installUpdate(
   assetUrl: string,
   assetName: string,
+  assetSize: number,
+  assetDigest: string,
 ): Promise<UpdateInstallResult | null> {
   if (!IS_TAURI_RUNTIME) return Promise.resolve(null);
   return safe<UpdateInstallResult | null>(
@@ -477,9 +480,25 @@ export function installUpdate(
       invoke<UpdateInstallResult>("install_update", {
         assetUrl,
         assetName,
+        assetSize,
+        assetDigest,
       }),
     null,
   );
+}
+
+export async function openReleaseUrl(url: string): Promise<boolean> {
+  if (!url.startsWith("https://github.com/Nezeronxer/voxflow/releases/")) return false;
+  if (!IS_TAURI_RUNTIME) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return true;
+  }
+  try {
+    await openUrl(url);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function correctionsList(): Promise<CorrectionEntry[]> {

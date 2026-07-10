@@ -7,7 +7,14 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { checkForUpdate, getSettings, installUpdate, saveSettings, subscribe } from "./api";
+import {
+  checkForUpdate,
+  getSettings,
+  installUpdate,
+  openReleaseUrl,
+  saveSettings,
+  subscribe,
+} from "./api";
 import { Icon, Toast, applyTheme, normalizeTheme } from "./ui";
 import FpsMeter from "./components/FpsMeter";
 import type {
@@ -124,8 +131,23 @@ export default function App() {
   }, []);
 
   async function handleInstallUpdate(info: UpdateInfo) {
+    if (!info.auto_install) {
+      const opened = await openReleaseUrl(info.release_url);
+      setNotice({
+        message: opened
+          ? "Открыта страница релиза — установите пакет вручную."
+          : "Не удалось открыть страницу релиза.",
+        variant: opened ? "warning" : "error",
+      });
+      return;
+    }
     setNotice({ message: `Скачиваю VoxFlow ${info.latest_version}…`, variant: "warning" });
-    const result = await installUpdate(info.asset_url, info.asset_name);
+    const result = await installUpdate(
+      info.asset_url,
+      info.asset_name,
+      info.asset_size,
+      info.asset_digest,
+    );
     setNotice({
       message: result?.launched
         ? "Установщик обновления запущен. VoxFlow сейчас закроется."
@@ -191,7 +213,7 @@ export default function App() {
       setNotice({
         message: `Доступно обновление VoxFlow ${info.latest_version}.`,
         variant: "warning",
-        actionLabel: "Установить",
+        actionLabel: info.auto_install ? "Установить" : "Открыть релиз",
         onAction: () => void handleInstallUpdate(info),
       });
     }, 1600);

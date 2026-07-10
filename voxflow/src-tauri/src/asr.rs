@@ -4,9 +4,11 @@
 //! одноразовый дочерний процесс (one-shot subprocess). Никаких серверов
 //! и лишних зависимостей: только `std::process` и `std`.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context};
 
@@ -39,6 +41,16 @@ pub struct AsrParams<'a> {
 ///
 /// Возвращает очищенный текст распознавания (строки склеены пробелом).
 pub fn transcribe_cli(p: &AsrParams) -> anyhow::Result<String> {
+    transcribe_cli_inner(p, None)
+}
+
+/// Same CLI path with a hard deadline. Runtime fallback uses it so a wedged
+/// CUDA process cannot prevent trying the bundled CPU runtime.
+pub fn transcribe_cli_with_timeout(p: &AsrParams, timeout: Duration) -> anyhow::Result<String> {
+    transcribe_cli_inner(p, Some(timeout))
+}
+
+fn transcribe_cli_inner(p: &AsrParams, timeout: Option<Duration>) -> anyhow::Result<String> {
     // Имя бинарника зависит от платформы; соседние DLL подхватываются
     // за счёт `current_dir(whisper_dir)`.
     let exe = p.whisper_dir.join(if cfg!(windows) {
@@ -72,7 +84,11 @@ pub fn transcribe_cli(p: &AsrParams) -> anyhow::Result<String> {
 
     log::debug!("запуск whisper-cli: {:?}", exe);
 
-    let out = cmd.output()?;
+    let out = if let Some(timeout) = timeout {
+        command_output_with_timeout(cmd, timeout)?
+    } else {
+        cmd.output()?
+    };
 
     // whisper-cli печатает UTF-8 текст транскрипции в stdout.
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -120,14 +136,89 @@ pub fn transcribe_cli(p: &AsrParams) -> anyhow::Result<String> {
     Ok(text)
 }
 
+fn command_output_with_timeout(mut cmd: Command, timeout: Duration) -> anyhow::Result<Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(anyhow!("child stdout pipe is unavailable"));
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(anyhow!("child stderr pipe is unavailable"));
+    };
+    // Drain both pipes while the process runs. Waiting for exit before reading
+    // can deadlock on Windows once whisper's startup/timing logs fill a pipe.
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(anyhow!(
+                    "whisper-cli exceeded its {}s runtime deadline",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error.into());
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("whisper-cli stdout reader panicked"))??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("whisper-cli stderr reader panicked"))??;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 // ─────────────────────────── whisper-server (persistent) ───────────────────────────
 
 /// Постоянный whisper-server: модель грузится ОДИН раз → быстрые повторные запросы.
 pub struct Server {
     pub child: Child,
     pub model: PathBuf,
+    pub runtime_dir: PathBuf,
     pub port: u16,
 }
+
+#[derive(Debug)]
+pub struct ServerStartTimeout;
+
+impl std::fmt::Display for ServerStartTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("whisper-server readiness timeout")
+    }
+}
+
+impl std::error::Error for ServerStartTimeout {}
 
 pub fn reserve_loopback_port() -> anyhow::Result<u16> {
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
@@ -152,14 +243,91 @@ pub fn start_server(
     port: u16,
     threads: u32,
 ) -> anyhow::Result<Server> {
+    start_server_inner(
+        whisper_dir,
+        model,
+        port,
+        threads,
+        None,
+        Duration::from_secs(60),
+    )
+}
+
+pub fn start_server_with_timeout(
+    whisper_dir: &Path,
+    model: &Path,
+    port: u16,
+    threads: u32,
+    ready_timeout: Duration,
+) -> anyhow::Result<Server> {
+    start_server_inner(whisper_dir, model, port, threads, None, ready_timeout)
+}
+
+/// Start whisper-server while allowing a dictation's Stop flag to abort the
+/// readiness wait. This is used only by live preview/warmup: final ASR keeps the
+/// non-cancellable path above so it can finish after the key is released.
+pub fn start_server_cancellable(
+    whisper_dir: &Path,
+    model: &Path,
+    port: u16,
+    threads: u32,
+    cancel: &AtomicBool,
+    ready_timeout: Duration,
+) -> anyhow::Result<Server> {
+    start_server_inner(
+        whisper_dir,
+        model,
+        port,
+        threads,
+        Some(cancel),
+        ready_timeout,
+    )
+}
+
+fn start_server_inner(
+    whisper_dir: &Path,
+    model: &Path,
+    port: u16,
+    threads: u32,
+    cancel: Option<&AtomicBool>,
+    ready_timeout: Duration,
+) -> anyhow::Result<Server> {
+    if cancellation_requested(cancel) {
+        return Err(anyhow!("whisper-server start cancelled"));
+    }
     // Сначала пробуем с флагами точности; при неудаче — без них (совместимость билда).
-    match try_start_server(whisper_dir, model, port, threads, true) {
+    match try_start_server(
+        whisper_dir,
+        model,
+        port,
+        threads,
+        true,
+        cancel,
+        ready_timeout,
+    ) {
         Ok(srv) => Ok(srv),
         Err(e) => {
+            if cancellation_requested(cancel) || e.downcast_ref::<ServerStartTimeout>().is_some() {
+                return Err(e);
+            }
             log::warn!("whisper-server с флагами точности не поднялся ({e}), откат на минимальные аргументы");
-            try_start_server(whisper_dir, model, port, threads, false)
+            try_start_server(
+                whisper_dir,
+                model,
+                port,
+                threads,
+                false,
+                cancel,
+                ready_timeout,
+            )
         }
     }
+}
+
+fn cancellation_requested(cancel: Option<&AtomicBool>) -> bool {
+    cancel
+        .map(|flag| flag.load(Ordering::Acquire))
+        .unwrap_or(false)
 }
 
 /// Одна попытка запуска whisper-server. `accuracy` — добавить ли beam/best-of.
@@ -169,7 +337,12 @@ fn try_start_server(
     port: u16,
     threads: u32,
     accuracy: bool,
+    cancel: Option<&AtomicBool>,
+    ready_timeout: Duration,
 ) -> anyhow::Result<Server> {
+    if cancellation_requested(cancel) {
+        return Err(anyhow!("whisper-server start cancelled"));
+    }
     let exe = whisper_dir.join(if cfg!(windows) {
         "whisper-server.exe"
     } else {
@@ -202,32 +375,56 @@ fn try_start_server(
     let mut srv = Server {
         child,
         model: model.to_path_buf(),
+        runtime_dir: whisper_dir.to_path_buf(),
         port,
     };
 
-    for _ in 0..120 {
+    let deadline = Instant::now() + ready_timeout;
+    let mut exited = false;
+    while Instant::now() < deadline {
+        if cancellation_requested(cancel) {
+            let _ = srv.child.kill();
+            let _ = srv.child.wait();
+            return Err(anyhow!("whisper-server start cancelled"));
+        }
         std::thread::sleep(Duration::from_millis(500));
+        // Stop may arrive during the readiness sleep. Check again before the
+        // probe so a released hotkey never waits behind curl's timeout while
+        // ensure_server still owns the server mutex.
+        if cancellation_requested(cancel) {
+            let _ = srv.child.kill();
+            let _ = srv.child.wait();
+            return Err(anyhow!("whisper-server start cancelled"));
+        }
         if server_ready(port) {
             return Ok(srv);
         }
         // если процесс уже умер — выходим раньше
         if srv.child.try_wait().map(|o| o.is_some()).unwrap_or(true) {
+            exited = true;
             break;
         }
     }
     let _ = srv.child.kill();
-    Err(anyhow!("whisper-server не поднялся вовремя"))
+    let _ = srv.child.wait();
+    if exited {
+        Err(anyhow!("whisper-server завершился до готовности"))
+    } else {
+        Err(anyhow::Error::new(ServerStartTimeout))
+    }
 }
 
 /// Готов ли сервер (curl к корню отвечает).
 pub fn server_ready(port: u16) -> bool {
     let url = format!("http://127.0.0.1:{port}/");
     let mut cmd = Command::new("curl");
-    cmd.arg("-s")
+    cmd.arg("--noproxy")
+        .arg("*")
+        .arg("-s")
         .arg("-o")
         .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
         .arg("-m")
-        .arg("2")
+        .arg("0.5")
         .arg(&url);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -245,7 +442,9 @@ pub fn transcribe_server(
     let file_arg = format!("file=@{}", wav.display());
     let lang_arg = format!("language={language}");
     let mut cmd = Command::new("curl");
-    cmd.arg("-s")
+    cmd.arg("--noproxy")
+        .arg("*")
+        .arg("-s")
         .arg("-m")
         .arg("45")
         .arg("-F")
@@ -283,7 +482,9 @@ pub fn transcribe_server_partial(port: u16, wav: &Path, language: &str) -> anyho
     let file_arg = format!("file=@{}", wav.display());
     let lang_arg = format!("language={language}");
     let mut cmd = Command::new("curl");
-    cmd.arg("-s")
+    cmd.arg("--noproxy")
+        .arg("*")
+        .arg("-s")
         .arg("-m")
         .arg("2")
         .arg("-F")

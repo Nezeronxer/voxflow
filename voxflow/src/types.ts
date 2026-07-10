@@ -4,6 +4,7 @@ export interface Settings {
   hotkey: string;
   improve_hotkey: string;
   mode: string;
+  double_tap_latch: boolean;
   input_device: string;
   language: string;
   model: string;
@@ -78,6 +79,7 @@ export interface TransformResult {
 
 export interface UpdateInfo {
   available: boolean;
+  auto_install: boolean;
   current_version: string;
   latest_version: string;
   release_name: string;
@@ -85,6 +87,7 @@ export interface UpdateInfo {
   asset_name: string;
   asset_url: string;
   asset_size: number;
+  asset_digest: string;
   published_at: string;
   notes: string;
 }
@@ -122,6 +125,7 @@ export const DEFAULT_SETTINGS: Settings = {
   hotkey: DEFAULT_HOTKEY,
   improve_hotkey: "F8",
   mode: "hold",
+  double_tap_latch: false,
   input_device: "",
   language: "auto",
   // Зеркало Rust-дефолтов (settings.rs). Расхождение раньше позволяло UI

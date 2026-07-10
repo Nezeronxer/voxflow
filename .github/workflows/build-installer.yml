@@ -79,6 +79,11 @@ jobs:
 
       - name: Rust unit tests
         working-directory: voxflow
+        env:
+          # Several path/privacy tests intentionally create VoxFlow data. Keep
+          # that fixture out of the real per-user LocalAppData which the clean
+          # installer smoke test validates later in this job.
+          LOCALAPPDATA: ${{ runner.temp }}\voxflow-rust-test-localappdata
         run: cargo test --locked --manifest-path src-tauri\Cargo.toml --lib
 
       - name: Build Tauri app (Inno packages it separately)
@@ -166,6 +171,299 @@ jobs:
           if ([IO.File]::ReadAllBytes($checksumPath) -contains 13) {
             throw "Windows checksum file contains a carriage return"
           }
+
+      - name: Smoke-test clean install and application lifecycle
+        id: windows_smoke
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $version = (Get-Content voxflow/package.json -Raw | ConvertFrom-Json).version
+          $installer = (Resolve-Path "installer/Output/VoxFlow-Setup-$version.exe").Path
+          $installRoot = Join-Path $env:LOCALAPPDATA "VoxFlow"
+          $exe = Join-Path $installRoot "voxflow.exe"
+          $database = Join-Path $installRoot "voxflow.db"
+          $productKey = "HKCU:\Software\VoxFlow"
+          $uninstallRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+          $startMenuShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\VoxFlow.lnk"
+          $installLog = Join-Path $env:RUNNER_TEMP "voxflow-install.log"
+          $ownershipMarker = Join-Path $env:RUNNER_TEMP "voxflow-smoke-owned"
+
+          function Get-VoxFlowUninstallEntry {
+            @(
+              Get-ChildItem -LiteralPath $uninstallRoot -ErrorAction SilentlyContinue |
+                ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath } |
+                Where-Object { $_.DisplayName -eq "VoxFlow" }
+            ) | Select-Object -First 1
+          }
+
+          function Wait-ForCondition {
+            param(
+              [Parameter(Mandatory = $true)][scriptblock]$Condition,
+              [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+              [Parameter(Mandatory = $true)][string]$FailureMessage
+            )
+            $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+            do {
+              if (& $Condition) {
+                return
+              }
+              Start-Sleep -Milliseconds 500
+            } while ((Get-Date) -lt $deadline)
+            throw $FailureMessage
+          }
+
+          function Wait-ForMainWindow {
+            param(
+              [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+              [Parameter(Mandatory = $true)][string]$FailureMessage
+            )
+            Wait-ForCondition -TimeoutSeconds 60 -FailureMessage $FailureMessage -Condition {
+              if ($Process.HasExited) {
+                return $false
+              }
+              $Process.Refresh()
+              return $Process.MainWindowHandle -ne [IntPtr]::Zero
+            }
+            if (-not $Process.Responding) {
+              throw "VoxFlow created a window but is not responding"
+            }
+          }
+
+          if ((Test-Path -LiteralPath $installRoot) -or (Get-VoxFlowUninstallEntry)) {
+            throw "Windows smoke-test runner is not clean: an existing VoxFlow installation was found"
+          }
+          New-Item -ItemType File -Path $ownershipMarker -Force | Out-Null
+
+          $setup = Start-Process -FilePath $installer -ArgumentList @(
+            "/SP-",
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART",
+            "/LOG=$installLog"
+          ) -PassThru
+          if (-not $setup.WaitForExit(600000)) {
+            Stop-Process -Id $setup.Id -Force -ErrorAction SilentlyContinue
+            throw "VoxFlow installer timed out"
+          }
+          if ($setup.ExitCode -ne 0) {
+            throw "VoxFlow installer failed with exit code $($setup.ExitCode)"
+          }
+
+          # Inno can hand work to a child process, so process exit alone is not
+          # the installation-complete signal. Poll the durable registry/file state.
+          Wait-ForCondition -TimeoutSeconds 120 -FailureMessage "Installed VoxFlow registry entry or executable is missing" -Condition {
+            (Get-VoxFlowUninstallEntry) -and (Test-Path -LiteralPath $exe -PathType Leaf)
+          }
+
+          $uninstallEntry = Get-VoxFlowUninstallEntry
+          if ($uninstallEntry.DisplayVersion -ne $version) {
+            throw "Installed version is $($uninstallEntry.DisplayVersion), expected $version"
+          }
+          $product = Get-ItemProperty -LiteralPath $productKey
+          if ($product.Version -ne $version -or $product.InstallPath -ne $installRoot) {
+            throw "Installed product registry metadata does not match version/path"
+          }
+
+          $requiredInstalledFiles = @(
+            $exe,
+            (Join-Path $installRoot "msvcp140.dll"),
+            (Join-Path $installRoot "msvcp140_1.dll"),
+            (Join-Path $installRoot "vcruntime140.dll"),
+            (Join-Path $installRoot "vcruntime140_1.dll"),
+            (Join-Path $installRoot "vcomp140.dll"),
+            (Join-Path $installRoot "resources\whisper\Release\whisper-cli.exe"),
+            (Join-Path $installRoot "resources\whisper\Release\whisper-server.exe"),
+            (Join-Path $installRoot "resources\whisper-cuda\Release\whisper-cli.exe"),
+            (Join-Path $installRoot "resources\whisper-cuda\Release\whisper-server.exe"),
+            (Join-Path $installRoot "resources\vad\silero_vad.onnx")
+          )
+          foreach ($path in $requiredInstalledFiles) {
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item -LiteralPath $path).Length -eq 0) {
+              throw "Installed package file is missing or empty: $path"
+            }
+          }
+          if (-not (Test-Path -LiteralPath $startMenuShortcut -PathType Leaf)) {
+            throw "VoxFlow Start Menu shortcut was not installed"
+          }
+
+          $productVersion = (Get-Item -LiteralPath $exe).VersionInfo.ProductVersion
+          if ([string]::IsNullOrWhiteSpace($productVersion) -or -not $productVersion.StartsWith($version)) {
+            throw "Installed executable ProductVersion is $productVersion, expected $version"
+          }
+          $installerSignature = Get-AuthenticodeSignature -LiteralPath $installer
+          $appSignature = Get-AuthenticodeSignature -LiteralPath $exe
+          Write-Host "Installer Authenticode: $($installerSignature.Status)"
+          Write-Host "Application Authenticode: $($appSignature.Status)"
+
+          # A fresh launch normally starts the 574 MB default-model download.
+          # Point child curl processes at a closed local port so this smoke test
+          # covers graceful offline startup without consuming the model payload.
+          $env:HTTP_PROXY = "http://127.0.0.1:9"
+          $env:HTTPS_PROXY = "http://127.0.0.1:9"
+          $env:ALL_PROXY = "http://127.0.0.1:9"
+          $env:NO_PROXY = ""
+
+          $app = Start-Process -FilePath $exe -PassThru
+          Wait-ForMainWindow -Process $app -FailureMessage "VoxFlow first launch did not create a responsive main window"
+          Wait-ForCondition -TimeoutSeconds 30 -FailureMessage "VoxFlow did not create its database on first launch" -Condition {
+            Test-Path -LiteralPath $database -PathType Leaf
+          }
+
+          $second = Start-Process -FilePath $exe -PassThru
+          if (-not $second.WaitForExit(20000)) {
+            Stop-Process -Id $second.Id -Force -ErrorAction SilentlyContinue
+            throw "A second VoxFlow instance stayed alive instead of handing off to the first"
+          }
+          if ($app.HasExited) {
+            throw "The primary VoxFlow instance exited during second-instance handoff"
+          }
+          $running = @(Get-Process -Name "voxflow" -ErrorAction SilentlyContinue)
+          if ($running.Count -ne 1 -or $running[0].Id -ne $app.Id) {
+            throw "VoxFlow single-instance invariant failed: found $($running.Count) processes"
+          }
+
+          if (-not $app.CloseMainWindow()) {
+            throw "Could not deliver WM_CLOSE to the VoxFlow main window"
+          }
+          Start-Sleep -Seconds 2
+          $app.Refresh()
+          if ($app.HasExited) {
+            throw "Closing the main window exited VoxFlow instead of keeping the tray process alive"
+          }
+
+          # There is no deterministic command-line hook for the tray's graceful
+          # Quit action. Force-stop only for hosted-runner cleanup, then relaunch;
+          # this still catches startup/SQLite damage after an abrupt termination.
+          Stop-Process -Id $app.Id -Force
+          Wait-ForCondition -TimeoutSeconds 15 -FailureMessage "VoxFlow did not stop during smoke cleanup" -Condition {
+            $app.HasExited
+          }
+
+          $relaunch = Start-Process -FilePath $exe -PassThru
+          Wait-ForMainWindow -Process $relaunch -FailureMessage "VoxFlow did not relaunch after forced termination"
+          Stop-Process -Id $relaunch.Id -Force
+          Wait-ForCondition -TimeoutSeconds 15 -FailureMessage "Relaunched VoxFlow did not stop during smoke cleanup" -Condition {
+            $relaunch.HasExited
+          }
+
+          $uninstallEntry = Get-VoxFlowUninstallEntry
+          $rawUninstall = [string]$uninstallEntry.UninstallString
+          if ([string]::IsNullOrWhiteSpace($rawUninstall)) {
+            throw "VoxFlow uninstall command is missing"
+          }
+          if ($rawUninstall -match '^"([^"]+)"') {
+            $uninstaller = $Matches[1]
+          } else {
+            $uninstaller = $rawUninstall.Split(' ')[0]
+          }
+          if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
+            throw "VoxFlow uninstaller is missing: $uninstaller"
+          }
+
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @(
+            "/VERYSILENT",
+            "/SUPPRESSMSGBOXES",
+            "/NORESTART"
+          ) -PassThru
+          if (-not $uninstall.WaitForExit(300000)) {
+            Stop-Process -Id $uninstall.Id -Force -ErrorAction SilentlyContinue
+            throw "VoxFlow uninstaller timed out"
+          }
+          Wait-ForCondition -TimeoutSeconds 120 -FailureMessage "VoxFlow uninstall registration or executable survived uninstall" -Condition {
+            -not (Get-VoxFlowUninstallEntry) -and -not (Test-Path -LiteralPath $exe)
+          }
+          if (Test-Path -LiteralPath $productKey) {
+            throw "VoxFlow product registry key survived uninstall"
+          }
+          if (Test-Path -LiteralPath $startMenuShortcut) {
+            throw "VoxFlow Start Menu shortcut survived uninstall"
+          }
+          if (-not (Test-Path -LiteralPath $database -PathType Leaf)) {
+            throw "VoxFlow uninstall unexpectedly deleted the user's database"
+          }
+
+          # The installer intentionally preserves user data. The runner is
+          # ephemeral, so remove that verified residue after the assertion.
+          Remove-Item -LiteralPath $installRoot -Recurse -Force
+
+      - name: Clean Windows smoke-test state
+        if: always()
+        shell: pwsh
+        env:
+          SMOKE_OUTCOME: ${{ steps.windows_smoke.outcome }}
+        run: |
+          $ownershipMarker = Join-Path $env:RUNNER_TEMP "voxflow-smoke-owned"
+          if (-not (Test-Path -LiteralPath $ownershipMarker)) {
+            Write-Host "Smoke test did not claim the runner; cleanup skipped."
+            exit 0
+          }
+
+          $installRoot = Join-Path $env:LOCALAPPDATA "VoxFlow"
+          $uninstallRoot = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+          $startMenuShortcut = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\VoxFlow.lnk"
+          if ($env:SMOKE_OUTCOME -ne "success") {
+            $installLog = Join-Path $env:RUNNER_TEMP "voxflow-install.log"
+            $debugLog = Join-Path $installRoot "debug.log"
+            if (Test-Path -LiteralPath $installLog -PathType Leaf) {
+              Write-Host "--- Inno install log (tail) ---"
+              Get-Content -LiteralPath $installLog -Tail 120
+            }
+            if (Test-Path -LiteralPath $debugLog -PathType Leaf) {
+              Write-Host "--- VoxFlow debug log (tail) ---"
+              Get-Content -LiteralPath $debugLog -Tail 120
+            }
+          }
+
+          $entry = @(
+            Get-ChildItem -LiteralPath $uninstallRoot -ErrorAction SilentlyContinue |
+              ForEach-Object { Get-ItemProperty -LiteralPath $_.PSPath } |
+              Where-Object { $_.DisplayName -eq "VoxFlow" }
+          ) | Select-Object -First 1
+
+          $ownedProcesses = @(
+            Get-CimInstance Win32_Process -Filter "Name = 'voxflow.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($installRoot, [StringComparison]::OrdinalIgnoreCase) }
+          )
+          $ownedProcessIds = @($ownedProcesses | ForEach-Object { $_.ProcessId })
+          if ($ownedProcessIds.Count -gt 0) {
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+              Where-Object { $ownedProcessIds -contains $_.ParentProcessId } |
+              ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+            $ownedProcesses |
+              ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+          }
+
+          if ($entry) {
+            $rawUninstall = [string]$entry.UninstallString
+            if ($rawUninstall -match '^"([^"]+)"') {
+              $uninstaller = $Matches[1]
+            } else {
+              $uninstaller = $rawUninstall.Split(' ')[0]
+            }
+            if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
+              try {
+                $process = Start-Process -FilePath $uninstaller -ArgumentList @(
+                  "/VERYSILENT",
+                  "/SUPPRESSMSGBOXES",
+                  "/NORESTART"
+                ) -PassThru
+                if (-not $process.WaitForExit(120000)) {
+                  Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                }
+              } catch {
+                Write-Warning "Best-effort smoke uninstall failed: $_"
+              }
+            }
+          }
+
+          Remove-Item -LiteralPath $installRoot -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath "HKCU:\Software\VoxFlow" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $startMenuShortcut -Force -ErrorAction SilentlyContinue
+          if ($entry -and $entry.PSPath) {
+            Remove-Item -LiteralPath $entry.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+          }
+          Remove-Item -LiteralPath $ownershipMarker -Force -ErrorAction SilentlyContinue
 
       - name: Upload installer artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

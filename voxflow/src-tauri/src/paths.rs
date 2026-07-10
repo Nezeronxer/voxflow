@@ -267,12 +267,32 @@ pub fn has_nvidia() -> bool {
 /// В проде — из resource_dir, в dev — из dev-копий.
 pub fn whisper_dir(app: &AppHandle) -> PathBuf {
     let cli = whisper_cli_name();
-    let gpu = has_nvidia();
     let res = app.path().resource_dir().ok();
     let mut candidates: Vec<PathBuf> = Vec::new();
 
-    // macOS-бандл кладёт native whisper sidecar в resources/whisper-darwin-*.
-    // Ищем его первым, иначе fallback ниже упрётся в Windows .exe/DLL-ресурсы.
+    // GPU-сборки имеют приоритет (и resource, и dev) над CPU.
+    if has_nvidia() {
+        if let Some(r) = &res {
+            candidates.push(r.join("resources").join("whisper-cuda").join("Release"));
+            candidates.push(r.join("whisper-cuda"));
+        }
+        candidates.push(PathBuf::from(DEV_WHISPER_CUDA));
+    }
+    for candidate in candidates {
+        if candidate.join(cli).exists() {
+            return candidate;
+        }
+    }
+    whisper_cpu_dir(app)
+}
+
+/// Заведомо не-CUDA runtime. Используется как рабочий fallback, когда Windows
+/// содержит nvcuda.dll, но установленный драйвер несовместим с bundled CUDA DLL.
+pub fn whisper_cpu_dir(app: &AppHandle) -> PathBuf {
+    let cli = whisper_cli_name();
+    let res = app.path().resource_dir().ok();
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
     #[cfg(target_os = "macos")]
     {
         let dir = macos_whisper_resource_dir();
@@ -287,24 +307,15 @@ pub fn whisper_dir(app: &AppHandle) -> PathBuf {
         );
     }
 
-    // GPU-сборки имеют приоритет (и resource, и dev) над CPU.
-    if gpu {
-        if let Some(r) = &res {
-            candidates.push(r.join("resources").join("whisper-cuda").join("Release"));
-            candidates.push(r.join("whisper-cuda"));
-        }
-        candidates.push(PathBuf::from(DEV_WHISPER_CUDA));
-    }
-    // CPU-сборки.
     if let Some(r) = &res {
         candidates.push(r.join("resources").join("whisper").join("Release"));
         candidates.push(r.join("whisper"));
     }
     candidates.push(PathBuf::from(DEV_WHISPER_CPU));
 
-    for c in candidates {
-        if c.join(cli).exists() {
-            return c;
+    for candidate in candidates {
+        if candidate.join(cli).exists() {
+            return candidate;
         }
     }
     PathBuf::from(DEV_WHISPER_CPU)

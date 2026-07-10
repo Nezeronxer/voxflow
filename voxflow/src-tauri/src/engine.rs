@@ -175,6 +175,10 @@ struct EngineCtx {
     recording: Arc<AtomicBool>,
     /// Постоянный whisper-server (если используется движок whisper_server).
     server: Arc<Mutex<Option<asr::Server>>>,
+    /// A failed bundled CUDA runtime is skipped for the rest of the process.
+    /// This prevents every dictation from paying the same driver/JIT timeout;
+    /// the independently packaged CPU runtime remains available.
+    whisper_accelerated_disabled: Arc<AtomicBool>,
     /// Последний вставленный текст — для авто-захвата исправлений из буфера обмена.
     last_inject: Arc<Mutex<Option<LastInject>>>,
     /// Сериализация ВСЕХ обращений к /inference whisper-server (тики partial + финал).
@@ -252,6 +256,7 @@ pub fn spawn(
         settings,
         recording,
         server: Arc::new(Mutex::new(None)),
+        whisper_accelerated_disabled: Arc::new(AtomicBool::new(false)),
         last_inject: Arc::new(Mutex::new(None)),
         asr_lock: Arc::new(Mutex::new(())),
         inject_lock: Arc::new(Mutex::new(())),
@@ -329,11 +334,52 @@ fn resolve_start_target(ctx: &EngineCtx) -> TargetFingerprint {
 
 fn external_target_watcher(ctx: EngineCtx) {
     loop {
-        if !ctx.recording.load(Ordering::SeqCst) {
+        if external_target_watcher_should_detect(
+            ctx.recording.load(Ordering::SeqCst),
+            ctx.cancel_active.load(Ordering::SeqCst),
+        ) {
             let fp = crate::app_context::detect().target_fingerprint();
             remember_external_target(&ctx, &fp);
         }
-        std::thread::sleep(Duration::from_millis(350));
+        std::thread::sleep(external_target_watcher_interval());
+    }
+}
+
+fn external_target_watcher_should_detect(recording: bool, action_active: bool) -> bool {
+    !recording && !action_active
+}
+
+fn external_target_watcher_interval() -> Duration {
+    // macOS detection launches System Events through osascript. Polling it every
+    // 350 ms caused process contention and hundreds of milliseconds of avoidable
+    // release-to-insert latency. Windows uses direct WinAPI and stays responsive
+    // at the original cadence.
+    if cfg!(target_os = "macos") {
+        Duration::from_millis(1000)
+    } else {
+        Duration::from_millis(350)
+    }
+}
+
+#[cfg(test)]
+mod external_target_watcher_tests {
+    use super::*;
+
+    #[test]
+    fn watcher_only_detects_while_fully_idle() {
+        assert!(external_target_watcher_should_detect(false, false));
+        assert!(!external_target_watcher_should_detect(true, false));
+        assert!(!external_target_watcher_should_detect(false, true));
+        assert!(!external_target_watcher_should_detect(true, true));
+    }
+
+    #[test]
+    fn watcher_uses_platform_appropriate_cadence() {
+        let expected = if cfg!(target_os = "macos") { 1000 } else { 350 };
+        assert_eq!(
+            external_target_watcher_interval(),
+            Duration::from_millis(expected)
+        );
     }
 }
 
@@ -431,10 +477,32 @@ end try"#
 
 #[cfg(target_os = "macos")]
 fn run_osascript_ok(script: &str) -> bool {
-    let out = std::process::Command::new("osascript")
+    let mut child = match std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
-        .output();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    let deadline = Instant::now() + Duration::from_millis(900);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                dbg_log("macOS target activation timed out");
+                return false;
+            }
+        }
+    }
+    let out = child.wait_with_output();
     match out {
         Ok(out) if out.status.success() => {
             let body = String::from_utf8_lossy(&out.stdout);
@@ -444,7 +512,24 @@ fn run_osascript_ok(script: &str) -> bool {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+fn activate_target_for_insert(target_fp: &TargetFingerprint) -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsWindow(hwnd: isize) -> i32;
+        fn SetForegroundWindow(hwnd: isize) -> i32;
+    }
+
+    let Some(hwnd) = target_fp.windows_hwnd() else {
+        return false;
+    };
+    // This path is used when a VoxFlow window owns foreground activation (for
+    // example after clicking Flow Bar), so Windows permits the foreground owner
+    // to hand focus back to the previously captured target HWND.
+    unsafe { IsWindow(hwnd) != 0 && SetForegroundWindow(hwnd) != 0 }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 fn activate_target_for_insert(_target_fp: &TargetFingerprint) -> bool {
     false
 }
@@ -653,22 +738,61 @@ fn warmup(ctx: EngineCtx) {
             return;
         }
     };
-    let whisper_dir = paths::whisper_dir(&ctx.app);
-    dbg_log(&format!("warmup: whisper_dir={whisper_dir:?}"));
     dbg_log(&format!("warmup: model={model:?}"));
     let wav = paths::tmp_dir().join("warmup.wav");
     if let Err(e) = audio::write_wav_16k_mono(&wav, &vec![0.0f32; 8000]) {
         dbg_log(&format!("warmup: wav ОШИБКА: {e}"));
         return;
     }
-    match ensure_server(&ctx, &whisper_dir, &model, s.effective_threads()) {
-        Ok(port) => {
-            dbg_log(&format!("warmup: сервер на {port}, прогрев..."));
-            let language = whisper_language_arg(&s.language);
-            let r = asr::transcribe_server(port, &wav, &language, None);
-            dbg_log(&format!("warmup: прогрет ok={}", r.is_ok()));
+    let language = whisper_language_arg(&s.language);
+    for (index, runtime) in whisper_runtime_dirs(&ctx).iter().enumerate() {
+        if ctx.recording.load(Ordering::Acquire) {
+            dbg_log("warmup: отменён начавшейся диктовкой");
+            break;
         }
-        Err(e) => dbg_log(&format!("warmup: ensure_server ОШИБКА: {e:#}")),
+        dbg_log(&format!("warmup: whisper_dir={runtime:?}"));
+        match ensure_server_cancellable(
+            &ctx,
+            runtime,
+            &model,
+            s.effective_threads(),
+            ctx.recording.as_ref(),
+        ) {
+            Ok(port) => {
+                if ctx.recording.load(Ordering::Acquire) {
+                    dbg_log("warmup: сервер готов, но началась диктовка — прогрев пропущен");
+                    break;
+                }
+                let Some(_asr_guard) = ctx.asr_lock.try_lock() else {
+                    dbg_log("warmup: ASR уже занят — прогрев пропущен");
+                    break;
+                };
+                if ctx.recording.load(Ordering::Acquire) {
+                    dbg_log("warmup: диктовка началась перед inference — прогрев пропущен");
+                    break;
+                }
+                dbg_log(&format!("warmup: сервер на {port}, прогрев..."));
+                let result = asr::transcribe_server(port, &wav, &language, None);
+                if result.is_ok() {
+                    if index > 0 {
+                        dbg_log("warmup: CUDA runtime failed, CPU fallback warmed");
+                    }
+                    dbg_log("warmup: прогрет ok=true");
+                    break;
+                }
+                dbg_log("warmup: тестовая транскрипция не удалась, пробуем fallback");
+            }
+            Err(error) => {
+                if ctx.recording.load(Ordering::Acquire) {
+                    dbg_log("warmup: отменён начавшейся диктовкой");
+                    break;
+                }
+                dbg_log(&format!(
+                    "warmup: runtime {runtime:?} ОШИБКА: {error:#}; пробуем fallback"
+                ));
+                disable_accelerated_runtime(&ctx, runtime, &error);
+            }
+        }
     }
 }
 
@@ -957,11 +1081,20 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
         dbg_log("partial: нет GPU whisper-server — без живого стрима (пилюля статична)");
         return;
     }
+    if cfg!(windows) && ctx.whisper_accelerated_disabled.load(Ordering::Acquire) {
+        dbg_log("partial: CUDA runtime disabled — CPU fallback остаётся для финала");
+        return;
+    }
     #[cfg(target_os = "macos")]
     dbg_log("partial: macOS whisper-server live draft enabled");
 
-    // Прогреваем сервер и получаем порт ДО спавна, чтобы первый тик не ждал JIT.
-    let whisper_dir = paths::whisper_dir(&ctx.app);
+    // Модель и runtime резолвим синхронно, но сам сервер поднимаем
+    // в partial-потоке. Иначе несовместимый CUDA runtime блокирует очередь
+    // EngineCmd и Stop не обрабатывается до истечения startup timeout.
+    let whisper_dir = whisper_runtime_dirs(ctx)
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| paths::whisper_cpu_dir(&ctx.app));
     let model = match resolve_model(&s) {
         Ok(m) => m,
         Err(e) => {
@@ -975,16 +1108,6 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
             return;
         }
     };
-    let port = match ensure_server(ctx, &whisper_dir, &model, s.effective_threads()) {
-        Ok(p) => p,
-        Err(e) => {
-            dbg_log(&format!(
-                "partial: ensure_server ошибка: {e:#} — без стриминга"
-            ));
-            return;
-        }
-    };
-
     // Для cli живой инжект клавишами не выполняем — только показ серого текста в пилюле.
     // При активном облаке (cloud_active) живой инжект тоже выключаем: пилюля показывает
     // черновик, а в поле вставляется только точный облачный финал (один раз).
@@ -1019,15 +1142,37 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
 
     // Клоны Arc для потока (originals остаются в PartialState).
     let t_stop = Arc::clone(&stop);
+    let server_cancel = Arc::clone(&stop);
     let t_abort = Arc::clone(&abort);
     let t_injected = Arc::clone(&injected);
     let t_committed = Arc::clone(&committed);
     let t_fp = start_fp.clone();
     let t_mode = mode.clone();
+    let server_ctx = ctx.clone();
+    let server_threads = s.effective_threads();
 
     let join = std::thread::Builder::new()
         .name("voxflow-partial".into())
         .spawn(move || {
+            let port = match ensure_server_cancellable(
+                &server_ctx,
+                &whisper_dir,
+                &model,
+                server_threads,
+                server_cancel.as_ref(),
+            ) {
+                Ok(port) if !server_cancel.load(Ordering::Acquire) => port,
+                Ok(_) => return,
+                Err(error) => {
+                    if !server_cancel.load(Ordering::Acquire) {
+                        dbg_log(&format!(
+                            "partial: ensure_server ошибка: {error:#} — без стриминга"
+                        ));
+                        disable_accelerated_runtime(&server_ctx, &whisper_dir, &error);
+                    }
+                    return;
+                }
+            };
             partial_loop(PartialLoopArgs {
                 buffer: buf,
                 rate,
@@ -2110,6 +2255,7 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     // продолжить считать partial, а финал будет висеть на "Готово". Поэтому даём
     // петле короткий шанс завершиться, а затем убиваем server-процесс: следующий
     // финал поднимет чистый экземпляр.
+    let partial_stop_started = Instant::now();
     let pstate = ctx.partial.lock().take();
     if let Some(mut st) = pstate {
         st.stop.store(true, Ordering::Release);
@@ -2161,6 +2307,10 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
                 }
             }
         }
+        dbg_log(&format!(
+            "[lat] stop_wait={}мс",
+            partial_stop_started.elapsed().as_millis()
+        ));
         // Переносим живое состояние в финальный проход (для inject_incremental реконсиляции).
         let live = LiveState {
             stream_mode: st.stream_mode,
@@ -2665,6 +2815,7 @@ fn process_utterance(
     let live_inserted = live.as_ref().map(|l| l.live_inserted()).unwrap_or(false);
 
     let t_all = Instant::now();
+    let mut context_ms = 0u64;
     let t_pre = Instant::now();
     let mono16 = audio::resample_to_16k(&samples, rate);
     let trimmed = audio::trim_silence(&mono16, 16000);
@@ -2718,7 +2869,20 @@ fn process_utterance(
     let use_cloud_stt = s.cloud_stt_active();
     let use_cloud_gemini =
         s.cloud_asr && s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key);
-    let Some(asr_actx) = current_or_restored_target(ctx, &mut target_fp, "до ASR") else {
+    // Local recognition can reuse the full target snapshot captured before the
+    // overlay appeared. A fresh query is still mandatory before any remote ASR
+    // or potentially remote rewrite, and always again under inject_lock.
+    let needs_network_context_guard = use_cloud_stt || use_cloud_gemini;
+    let asr_target = if target_fp.is_usable_dictation_target() && !needs_network_context_guard {
+        dbg_log("финал: локальный ASR использует контекст, снятый при нажатии");
+        Some(target_fp.captured_context())
+    } else {
+        let context_started = Instant::now();
+        let detected = current_or_restored_target(ctx, &mut target_fp, "до ASR");
+        context_ms += context_started.elapsed().as_millis() as u64;
+        detected
+    };
+    let Some(asr_actx) = asr_target else {
         erase_live_draft(ctx, live.as_ref(), my_gen);
         let _ = std::fs::remove_file(&wav);
         return Ok(());
@@ -2829,22 +2993,17 @@ fn process_utterance(
 
     // Контекст окна нужен и для тона, и для payload Ollama, и для rule-based
     // продолжения фразы. Детектим один раз после ASR и до постобработки.
-    let Some(actx) = current_or_restored_target(ctx, &mut target_fp, "до постобработки")
-    else {
-        erase_live_draft(ctx, live.as_ref(), my_gen);
-        return Ok(());
-    };
+    // The target was already validated immediately before ASR and is validated
+    // again under inject_lock immediately before insertion. Re-running the same
+    // synchronous macOS AppleScript here added latency without strengthening the
+    // final TOCTOU guard, so reuse the captured context for tone/postprocessing.
+    let mut actx = asr_actx.clone();
     dbg_log(&format!(
         "app: exe={} title_len={} → {}",
         actx.exe,
         actx.title.chars().count(),
         actx.category
     ));
-    // Тон по приложению считаем через category_for — он учитывает пользовательские
-    // app_profile_overrides (ветка B) ПЕРЕД встроенной таблицей классификации.
-    let tone = crate::app_context::category_for(&actx.exe, &actx.title, &s.app_profile_overrides);
-    let previous_context_tail = last_dictation_context(ctx, &actx);
-
     // Постобработка (правила) + выученные исправления.
     let t_post = Instant::now();
     let mut text = postprocess::process(&raw, &s, &dict, &snippets);
@@ -2876,6 +3035,32 @@ fn process_utterance(
     }
 
     text = reconcile_final_with_live_preview(live.as_ref(), &text);
+
+    // A local ASR pass can take seconds. If a configured rewrite backend may
+    // send text off-device, validate the target again immediately before that
+    // possible egress; the earlier cloud-ASR guard is too old by this point.
+    if potentially_remote_rewrite(&s) {
+        if ctx.gen.load(Ordering::SeqCst) != my_gen {
+            dbg_log("финал: поколение устарело до remote rewrite — данные не отправляем");
+            let _ = std::fs::remove_file(&wav);
+            return Ok(());
+        }
+        let context_started = Instant::now();
+        let fresh_target =
+            current_or_restored_target(ctx, &mut target_fp, "перед удалённым rewrite");
+        context_ms += context_started.elapsed().as_millis() as u64;
+        let Some(fresh_actx) = fresh_target else {
+            erase_live_draft(ctx, live.as_ref(), my_gen);
+            let _ = std::fs::remove_file(&wav);
+            return Ok(());
+        };
+        actx = fresh_actx;
+    }
+
+    // Тон по приложению считаем через category_for — он учитывает пользовательские
+    // app_profile_overrides (ветка B) ПЕРЕД встроенной таблицей классификации.
+    let tone = crate::app_context::category_for(&actx.exe, &actx.title, &s.app_profile_overrides);
+    let previous_context_tail = last_dictation_context(ctx, &actx);
 
     // ── «Умный» рерайт под стиль активного приложения (Gemini/Ollama/OpenAI-compatible) ──
     // verbatim/neutral и встроенный AI-профиль LLM не зовут: вставка должна быть
@@ -2938,7 +3123,8 @@ fn process_utterance(
     }
 
     // ── Финальная вставка ──
-    // always/auto (петля была): реконсиляция уже напечатанного → финальный текст
+    // always/auto (и live-текст уже физически вставлен): реконсиляция
+    // напечатанного → финальный текст
     //   КЛАВИШАМИ (inject_incremental) — предыдущее тоже печаталось, диффы валидны.
     //   При смене окна (abort) чужое поле не трогаем.
     // never / без петли: обычная вставка целиком (clipboard/type как раньше).
@@ -2969,8 +3155,10 @@ fn process_utterance(
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
-    let Some(final_target_actx) = current_or_restored_target(ctx, &mut target_fp, "перед вставкой")
-    else {
+    let context_started = Instant::now();
+    let final_target = current_or_restored_target(ctx, &mut target_fp, "перед вставкой");
+    context_ms += context_started.elapsed().as_millis() as u64;
+    let Some(final_target_actx) = final_target else {
         drop(inject_guard);
         let _ = std::fs::remove_file(&wav);
         return Ok(());
@@ -2979,7 +3167,7 @@ fn process_utterance(
     let mut insert_error: Option<String> = None;
     let t_inj = Instant::now();
     match (live.as_ref(), live_mode) {
-        (Some(l), "always") | (Some(l), "auto") => {
+        (Some(l), "always") | (Some(l), "auto") if live_inserted => {
             if l.abort.load(Ordering::Acquire) {
                 dbg_log("финал: окно сменилось — реконсиляцию пропускаем");
             } else if !target_fp.matches(&final_target_actx) {
@@ -3046,10 +3234,7 @@ fn process_utterance(
             dbg_log(&format!(
                 "финал: вставка не выполнена — история/transcript пропущены: {err}"
             ));
-            emit_error(
-                &ctx.app,
-                "Не удалось вставить текст. Разрешите VoxFlow в macOS Privacy & Security -> Accessibility",
-            );
+            emit_error(&ctx.app, insertion_failure_help());
         } else {
             dbg_log("финал: вставка не выполнена — история/transcript пропущены");
         }
@@ -3063,7 +3248,7 @@ fn process_utterance(
     let inject_ms = t_inj.elapsed().as_millis() as u64;
     // Сквозной замер этапов финала: отпускание клавиши → текст в поле.
     dbg_log(&format!(
-        "[lat] gen={my_gen} pre={pre_ms}мс asr={ms}мс post={post_ms}мс llm={llm_ms}мс inject={inject_ms}мс total={}мс",
+        "[lat] gen={my_gen} pre={pre_ms}мс context={context_ms}мс asr={ms}мс post={post_ms}мс llm={llm_ms}мс inject={inject_ms}мс total={}мс",
         t_all.elapsed().as_millis()
     ));
     // Запомнить вставленное — для авто-захвата исправлений из буфера (во всех путях).
@@ -3101,6 +3286,30 @@ fn process_utterance(
         serde_json::json!({ "text": text, "ms": ms, "words": words, "seq": my_gen }),
     );
     Ok(())
+}
+
+fn insertion_failure_help() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Не удалось вставить текст. Разрешите VoxFlow в macOS Privacy & Security -> Accessibility"
+    } else if cfg!(windows) {
+        "Не удалось вставить текст. Верните фокус в целевое поле и попробуйте способ вставки «Буфер обмена»"
+    } else {
+        "Не удалось вставить текст. Верните фокус в целевое поле"
+    }
+}
+
+fn potentially_remote_rewrite(s: &Settings) -> bool {
+    let selected_remote = match s.ai_backend.as_str() {
+        "gemini" => crate::gemini::available(&s.ai_api_key),
+        "openai_compat" => {
+            crate::rewrite::configured(s) && !crate::net::is_loopback_base_url(&s.rewrite_base_url)
+        }
+        _ => false,
+    };
+    let remote_ollama_fallback = s.ai_backend != "off"
+        && crate::ollama::configured(&s.ollama_url)
+        && !crate::net::is_loopback_base_url(&s.ollama_url);
+    selected_remote || remote_ollama_fallback
 }
 
 /// Сохранить пару (аудио 16 кГц ↔ распознанный текст) в датасет персонализации.
@@ -3224,10 +3433,43 @@ fn ensure_server(
     model: &std::path::Path,
     threads: u32,
 ) -> anyhow::Result<u16> {
+    ensure_server_inner(ctx, whisper_dir, model, threads, None)
+}
+
+fn ensure_server_cancellable(
+    ctx: &EngineCtx,
+    whisper_dir: &std::path::Path,
+    model: &std::path::Path,
+    threads: u32,
+    cancel: &AtomicBool,
+) -> anyhow::Result<u16> {
+    ensure_server_inner(ctx, whisper_dir, model, threads, Some(cancel))
+}
+
+fn ensure_server_inner(
+    ctx: &EngineCtx,
+    whisper_dir: &std::path::Path,
+    model: &std::path::Path,
+    threads: u32,
+    cancel: Option<&AtomicBool>,
+) -> anyhow::Result<u16> {
+    if cancel
+        .map(|flag| flag.load(Ordering::Acquire))
+        .unwrap_or(false)
+    {
+        return Err(anyhow::anyhow!("whisper-server start cancelled"));
+    }
     let mut guard = ctx.server.lock();
+    if cancel
+        .map(|flag| flag.load(Ordering::Acquire))
+        .unwrap_or(false)
+    {
+        return Err(anyhow::anyhow!("whisper-server start cancelled"));
+    }
     let need_start = match guard.as_mut() {
         Some(srv) => {
             srv.model.as_path() != model
+                || srv.runtime_dir.as_path() != whisper_dir
                 || srv.child.try_wait().map(|o| o.is_some()).unwrap_or(true)
         }
         None => true,
@@ -3237,14 +3479,52 @@ fn ensure_server(
             let _ = old.child.kill();
         }
         let mut last_err: Option<anyhow::Error> = None;
-        for _ in 0..5 {
+        // reserve_loopback_port already supplies a fresh port. Two attempts cover
+        // the narrow bind race without retrying an incompatible CUDA runtime for
+        // tens of seconds before the caller can fall back to the CPU package.
+        for _ in 0..2 {
+            if cancel
+                .map(|flag| flag.load(Ordering::Acquire))
+                .unwrap_or(false)
+            {
+                return Err(anyhow::anyhow!("whisper-server start cancelled"));
+            }
             let port = asr::reserve_loopback_port()?;
-            match asr::start_server(whisper_dir, model, port, threads) {
+            let ready_timeout = if is_accelerated_runtime(ctx, whisper_dir) {
+                Duration::from_secs(8)
+            } else {
+                Duration::from_secs(60)
+            };
+            let started = match cancel {
+                Some(flag) => asr::start_server_cancellable(
+                    whisper_dir,
+                    model,
+                    port,
+                    threads,
+                    flag,
+                    ready_timeout,
+                ),
+                None => {
+                    asr::start_server_with_timeout(whisper_dir, model, port, threads, ready_timeout)
+                }
+            };
+            match started {
                 Ok(srv) => {
                     *guard = Some(srv);
                     return Ok(port);
                 }
-                Err(e) => last_err = Some(e),
+                Err(error) => {
+                    if cancel
+                        .map(|flag| flag.load(Ordering::Acquire))
+                        .unwrap_or(false)
+                    {
+                        return Err(error);
+                    }
+                    if error.downcast_ref::<asr::ServerStartTimeout>().is_some() {
+                        return Err(error);
+                    }
+                    last_err = Some(error);
+                }
             }
         }
         return Err(last_err.unwrap_or_else(|| anyhow::anyhow!("whisper-server не поднялся")));
@@ -4114,20 +4394,101 @@ fn local_transcribe_cli_only(
     dict: &[postprocess::Dict],
     wav: &std::path::Path,
 ) -> anyhow::Result<String> {
-    let whisper_dir = paths::whisper_dir(&ctx.app);
     let model = resolve_model(s)?;
     let language = whisper_language_arg(&s.language);
     let base_prompt = whisper_base_prompt(&s.language);
     let prompt = postprocess::dict_bias_prompt(dict, base_prompt);
-    let params = AsrParams {
-        whisper_dir: &whisper_dir,
-        model_path: &model,
-        wav_path: wav,
-        language: &language,
-        threads: s.effective_threads(),
-        initial_prompt: prompt.as_deref(),
-    };
-    asr::transcribe_cli(&params)
+    transcribe_cli_with_runtime_fallback(
+        ctx,
+        &model,
+        wav,
+        &language,
+        s.effective_threads(),
+        prompt.as_deref(),
+    )
+}
+
+fn whisper_runtime_dirs(ctx: &EngineCtx) -> Vec<std::path::PathBuf> {
+    let primary = paths::whisper_dir(&ctx.app);
+    let cpu = paths::whisper_cpu_dir(&ctx.app);
+    if primary == cpu || ctx.whisper_accelerated_disabled.load(Ordering::Acquire) {
+        vec![cpu]
+    } else {
+        vec![primary, cpu]
+    }
+}
+
+fn is_accelerated_runtime(ctx: &EngineCtx, runtime: &std::path::Path) -> bool {
+    runtime != paths::whisper_cpu_dir(&ctx.app)
+}
+
+fn disable_accelerated_runtime(ctx: &EngineCtx, runtime: &std::path::Path, error: &anyhow::Error) {
+    if !is_accelerated_runtime(ctx, runtime) {
+        return;
+    }
+    if !ctx
+        .whisper_accelerated_disabled
+        .swap(true, Ordering::AcqRel)
+    {
+        log::warn!(
+            "accelerated whisper runtime {:?} disabled until restart: {error:#}",
+            runtime
+        );
+        dbg_log("whisper: accelerated runtime disabled; using bundled CPU fallback");
+    }
+}
+
+fn whisper_cli_timeout(wav: &std::path::Path, accelerated: bool) -> Duration {
+    let audio_seconds = hound::WavReader::open(wav)
+        .ok()
+        .map(|reader| {
+            let sample_rate = u64::from(reader.spec().sample_rate.max(1));
+            u64::from(reader.duration()).div_ceil(sample_rate)
+        })
+        .unwrap_or(10);
+    let (multiplier, maximum) = if accelerated { (3, 300) } else { (12, 1200) };
+    Duration::from_secs(
+        15u64
+            .saturating_add(audio_seconds.saturating_mul(multiplier))
+            .clamp(20, maximum),
+    )
+}
+
+fn transcribe_cli_with_runtime_fallback(
+    ctx: &EngineCtx,
+    model: &std::path::Path,
+    wav: &std::path::Path,
+    language: &str,
+    threads: u32,
+    prompt: Option<&str>,
+) -> anyhow::Result<String> {
+    let runtimes = whisper_runtime_dirs(ctx);
+    let mut last_error = None;
+    for (index, runtime) in runtimes.iter().enumerate() {
+        let params = AsrParams {
+            whisper_dir: runtime,
+            model_path: model,
+            wav_path: wav,
+            language,
+            threads,
+            initial_prompt: prompt,
+        };
+        let accelerated = is_accelerated_runtime(ctx, runtime);
+        match asr::transcribe_cli_with_timeout(&params, whisper_cli_timeout(wav, accelerated)) {
+            Ok(text) => {
+                if index > 0 {
+                    dbg_log("whisper: CUDA runtime failed, CPU CLI fallback succeeded");
+                }
+                return Ok(text);
+            }
+            Err(error) => {
+                log::warn!("whisper-cli runtime {:?} failed: {error:#}", runtime);
+                disable_accelerated_runtime(ctx, runtime, &error);
+                last_error = Some(error);
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("whisper runtime не найден")))
 }
 
 fn local_transcribe(
@@ -4136,33 +4497,48 @@ fn local_transcribe(
     dict: &[postprocess::Dict],
     wav: &std::path::Path,
 ) -> anyhow::Result<String> {
-    let whisper_dir = paths::whisper_dir(&ctx.app);
     let model = resolve_model(s)?;
     let language = whisper_language_arg(&s.language);
     // Короткая языковая затравка удерживает whisper в нужном режиме даже при
     // пустом словаре: ru — русский, auto/multi aliases — смешанная речь.
     let base_prompt = whisper_base_prompt(&s.language);
     let prompt = postprocess::dict_bias_prompt(dict, base_prompt);
-    let params = AsrParams {
-        whisper_dir: &whisper_dir,
-        model_path: &model,
-        wav_path: wav,
-        language: &language,
-        threads: s.effective_threads(),
-        initial_prompt: prompt.as_deref(),
-    };
     if s.engine == "whisper_cli" {
-        asr::transcribe_cli(&params)
+        transcribe_cli_with_runtime_fallback(
+            ctx,
+            &model,
+            wav,
+            &language,
+            s.effective_threads(),
+            prompt.as_deref(),
+        )
     } else {
-        match ensure_server(ctx, &whisper_dir, &model, s.effective_threads())
-            .and_then(|port| asr::transcribe_server(port, wav, &language, prompt.as_deref()))
-        {
-            Ok(t) => Ok(t),
-            Err(e) => {
-                log::warn!("whisper-server недоступен ({e}), откат на cli");
-                asr::transcribe_cli(&params)
+        let runtimes = whisper_runtime_dirs(ctx);
+        for (index, runtime) in runtimes.iter().enumerate() {
+            match ensure_server(ctx, runtime, &model, s.effective_threads())
+                .and_then(|port| asr::transcribe_server(port, wav, &language, prompt.as_deref()))
+            {
+                Ok(text) => {
+                    if index > 0 {
+                        dbg_log("whisper: CUDA runtime failed, CPU server fallback succeeded");
+                    }
+                    return Ok(text);
+                }
+                Err(error) => {
+                    log::warn!("whisper-server runtime {:?} failed: {error:#}", runtime);
+                    disable_accelerated_runtime(ctx, runtime, &error);
+                }
             }
         }
+        log::warn!("whisper-server недоступен, откат на cli с CPU fallback");
+        transcribe_cli_with_runtime_fallback(
+            ctx,
+            &model,
+            wav,
+            &language,
+            s.effective_threads(),
+            prompt.as_deref(),
+        )
     }
 }
 
@@ -4811,6 +5187,35 @@ mod smart_prompt_tests {
         assert!(instruction.contains("я объясни мне"));
         assert!(instruction.contains("Не отвечай на диктовку"));
         assert!(!instruction.contains("текст.."));
+    }
+
+    #[test]
+    fn remote_rewrite_guard_ignores_loopback_but_covers_cloud_backends() {
+        let local = Settings::default();
+        assert!(!potentially_remote_rewrite(&local));
+
+        let gemini = Settings {
+            ai_backend: "gemini".into(),
+            ai_api_key: "configured-for-test".into(),
+            ..Settings::default()
+        };
+        assert!(potentially_remote_rewrite(&gemini));
+
+        let remote_compat = Settings {
+            ai_backend: "openai_compat".into(),
+            rewrite_base_url: "https://api.example.test/v1".into(),
+            rewrite_model: "example-model".into(),
+            ..Settings::default()
+        };
+        assert!(potentially_remote_rewrite(&remote_compat));
+
+        let local_compat = Settings {
+            ai_backend: "openai_compat".into(),
+            rewrite_base_url: "http://127.0.0.1:11434/v1".into(),
+            rewrite_model: "local-model".into(),
+            ..Settings::default()
+        };
+        assert!(!potentially_remote_rewrite(&local_compat));
     }
 
     #[test]

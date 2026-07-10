@@ -84,6 +84,19 @@ impl TargetFingerprint {
         !self.exe.is_empty() && !self.is_own_app() && !self.is_transient_system_ui()
     }
 
+    /// Rebuild the context captured at hotkey press without another platform
+    /// query. The final pre-insert guard still performs a fresh detection; this
+    /// cached value only removes redundant synchronous macOS AppleScript work
+    /// before local ASR.
+    pub fn captured_context(&self) -> AppContext {
+        AppContext {
+            exe: self.exe.clone(),
+            title: self.title.clone(),
+            window_id: self.window_id.clone(),
+            category: classify(&self.exe, &self.title.to_ascii_lowercase()),
+        }
+    }
+
     #[cfg(target_os = "macos")]
     pub fn macos_pid(&self) -> Option<u32> {
         value_from_window_id(&self.window_id, "pid=")?.parse().ok()
@@ -97,6 +110,14 @@ impl TargetFingerprint {
         } else {
             Some(bundle.to_string())
         }
+    }
+
+    #[cfg(windows)]
+    pub fn windows_hwnd(&self) -> Option<isize> {
+        self.window_id
+            .parse::<isize>()
+            .ok()
+            .filter(|hwnd| *hwnd != 0)
     }
 
     pub fn matches(&self, current: &AppContext) -> bool {
@@ -144,9 +165,23 @@ fn is_transient_system_ui_parts(exe: &str, window_id: &str) -> bool {
         "system settings",
         "systemsettings",
     ];
+    // Windows shell surfaces can temporarily own foreground focus while a
+    // tray/menu action opens VoxFlow. Match exact process names: substring
+    // matching could reject an unrelated app. Explorer itself is intentionally
+    // not listed because its address/search/rename fields are legitimate targets.
+    const WINDOWS_EXES: &[&str] = &[
+        "startmenuexperiencehost.exe",
+        "shellexperiencehost.exe",
+        "searchhost.exe",
+        "searchui.exe",
+        "textinputhost.exe",
+        "lockapp.exe",
+        "dwm.exe",
+    ];
     let exe = exe.trim().to_ascii_lowercase();
     BUNDLES.iter().any(|b| window_id.contains(b))
         || EXES.iter().any(|name| exe == *name || exe.contains(name))
+        || WINDOWS_EXES.iter().any(|name| exe == *name)
 }
 
 #[cfg(target_os = "macos")]
@@ -465,6 +500,50 @@ mod tests {
         assert!(start.matches(&ctx("chrome.exe", "ChatGPT", "")));
         assert!(!start.matches(&ctx("chrome.exe", "ChatGPT - updated", "")));
     }
+
+    #[test]
+    fn windows_shell_surfaces_are_not_dictation_targets() {
+        for exe in [
+            "StartMenuExperienceHost.exe",
+            "ShellExperienceHost.exe",
+            "SearchHost.exe",
+            "TextInputHost.exe",
+        ] {
+            let context = ctx(exe, "Windows shell", "12345");
+            assert!(context.is_transient_system_ui(), "{exe}");
+            assert!(!context.is_usable_dictation_target(), "{exe}");
+            assert!(
+                context.target_fingerprint().is_transient_system_ui(),
+                "{exe}"
+            );
+        }
+
+        let explorer = ctx("explorer.exe", "Documents", "23456");
+        assert!(explorer.is_usable_dictation_target());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn target_fingerprint_exposes_valid_windows_hwnd() {
+        assert_eq!(
+            ctx("notepad.exe", "Note", "12345")
+                .target_fingerprint()
+                .windows_hwnd(),
+            Some(12345)
+        );
+        assert_eq!(
+            ctx("notepad.exe", "Note", "0")
+                .target_fingerprint()
+                .windows_hwnd(),
+            None
+        );
+        assert_eq!(
+            ctx("notepad.exe", "Note", "invalid")
+                .target_fingerprint()
+                .windows_hwnd(),
+            None
+        );
+    }
 }
 
 // ===========================================================================
@@ -718,11 +797,29 @@ tell application "System Events"
   return appName & linefeed & appPid & linefeed & bundleId & linefeed & winTitle & linefeed & winRole & linefeed & winSubrole & linefeed & winPos & linefeed & winSize
 end tell
 "#;
-    let out = std::process::Command::new("osascript")
+    let mut child = std::process::Command::new("osascript")
         .arg("-e")
         .arg(script)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(900);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) | Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                log::warn!("macOS active-window detection timed out");
+                return None;
+            }
+        }
+    }
+    let out = child.wait_with_output().ok()?;
     if !out.status.success() {
         return None;
     }

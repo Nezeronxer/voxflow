@@ -33,6 +33,9 @@ jobs:
       contents: write
 
     steps:
+      - name: Checkout release notes
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
       - name: Download verified Windows artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -56,8 +59,8 @@ jobs:
 
           mapfile -t installers < <(find release/windows -type f -name 'VoxFlow-Setup-*.exe')
           mapfile -t windows_checksums < <(find release/windows -type f -name 'SHA256SUMS-windows.txt')
-          mapfile -t dmgs < <(find release/macos -type f -name 'VoxFlow-macOS-*-arm64-unsigned.dmg')
-          mapfile -t zips < <(find release/macos -type f -name 'VoxFlow-macOS-*-arm64-unsigned.app.zip')
+          mapfile -t dmgs < <(find release/macos -type f -name 'VoxFlow-macOS-*-arm64*.dmg')
+          mapfile -t zips < <(find release/macos -type f -name 'VoxFlow-macOS-*-arm64*.app.zip')
           mapfile -t macos_checksums < <(find release/macos -type f -name 'SHA256SUMS.txt')
           mapfile -t manifests < <(find release/macos -type f -name 'release-manifest.txt')
 
@@ -123,7 +126,7 @@ jobs:
               --draft \
               --verify-tag \
               --title "VoxFlow $RELEASE_TAG" \
-              --generate-notes
+              --notes-file RELEASE_NOTES.md
             release_json="$(find_release)"
             if [[ "$release_json" == null ]]; then
               echo "Draft release $RELEASE_TAG was created but cannot be read back" >&2

@@ -898,10 +898,18 @@ pub fn install_update(
     state: State<AppState>,
     asset_url: String,
     asset_name: String,
+    asset_size: u64,
+    asset_digest: String,
 ) -> R<crate::updater::UpdateInstallResult> {
     let proxy = state.settings.lock().proxy_url.clone();
-    let result =
-        crate::updater::download_and_launch(&asset_url, &asset_name, &proxy).map_err(err)?;
+    let result = crate::updater::download_and_launch(
+        &asset_url,
+        &asset_name,
+        asset_size,
+        &asset_digest,
+        &proxy,
+    )
+    .map_err(err)?;
 
     state.engine.restore_auto_mute();
     let _ = state.engine_tx.lock().send(EngineCmd::Shutdown);

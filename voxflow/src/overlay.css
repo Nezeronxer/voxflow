@@ -634,25 +634,27 @@
 }
 
 .aq-orbwrap {
-  width: 28px;
-  height: 28px;
+  /* Keep the Aqua geometry that the RMS glow math in Overlay.tsx uses:
+     radius 6.5px, with a 26px glow fading at radius 9.1px. */
+  width: 13px;
+  height: 13px;
 }
 
 .aq-orb {
   background: radial-gradient(circle at 35% 28%, #9cacff 0%, #6f83ff 54%, #5369f2 100%);
-  filter: drop-shadow(0 0 7px rgba(111, 131, 255, 0.42));
+  filter: drop-shadow(0 0 2px rgba(111, 131, 255, 0.42));
 }
 
 .aq-orb-glow {
-  width: 38px;
-  height: 38px;
-  margin: -19px 0 0 -19px;
+  width: 26px;
+  height: 26px;
+  margin: -13px 0 0 -13px;
 }
 
 .aq-ring {
-  width: 31px;
-  height: 31px;
-  margin: -15.5px 0 0 -15.5px;
+  width: 14.5px;
+  height: 14.5px;
+  margin: -7.25px 0 0 -7.25px;
   border-width: 2px;
 }
 
