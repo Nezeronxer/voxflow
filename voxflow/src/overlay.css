@@ -513,6 +513,15 @@
   color: rgba(255, 255, 255, 0.96);
   font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   backdrop-filter: none;
+  transition:
+    width 90ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    height 90ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    padding 90ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    background-color 80ms ease-out,
+    border-color 80ms ease-out,
+    box-shadow 80ms ease-out,
+    opacity 80ms ease-out,
+    transform 80ms ease-out;
 }
 
 .aq-tip {
@@ -520,16 +529,29 @@
 }
 
 .aq-idle {
-  width: 244px;
-  height: 38px;
-  padding: 0 10px;
-  opacity: 1;
+  width: 78px;
+  height: 14px;
+  padding: 0;
+  overflow: hidden;
+  opacity: 0.78;
+  background: rgba(17, 19, 24, 0.48);
+  border: 1.5px solid rgba(184, 188, 198, 0.72);
+  border-radius: 999px;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.18);
 }
 
 .aq-idle:hover {
   width: 244px;
   height: 38px;
+  padding: 0 10px;
+  opacity: 1;
+  overflow: hidden;
+  background: rgba(22, 25, 32, 0.985);
   border-color: rgba(111, 131, 255, 0.68);
+  border-radius: 14px;
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.045);
 }
 
 .aq-idle-copy {
@@ -540,6 +562,16 @@
   align-items: center;
   gap: 7px;
   pointer-events: none;
+  opacity: 0;
+  transform: scale(0.96);
+  transition:
+    opacity 70ms ease-out,
+    transform 90ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.aq-idle:hover .aq-idle-copy {
+  opacity: 1;
+  transform: scale(1);
 }
 
 .aq-idle-copy strong {
@@ -619,9 +651,10 @@
 }
 
 .aq-latch {
-  width: 238px;
+  width: 236px;
   height: 44px;
   padding: 6px 11px;
+  animation: none;
 }
 
 .aq-notice {
@@ -649,6 +682,7 @@
   width: 26px;
   height: 26px;
   margin: -13px 0 0 -13px;
+  will-change: transform, opacity;
 }
 
 .aq-ring {
@@ -656,6 +690,7 @@
   height: 14.5px;
   margin: -7.25px 0 0 -7.25px;
   border-width: 2px;
+  will-change: transform;
 }
 
 .aq-rec-copy {
@@ -675,6 +710,7 @@
 .aq-bar {
   width: 2.5px;
   background: linear-gradient(180deg, #91a0ff, #5e74f7);
+  will-change: transform, opacity;
 }
 
 .aq-text {
@@ -724,7 +760,23 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .aq-pill,
+  .aq-scale-stage,
+  .aq-idle-copy,
+  .aq-ring,
+  .aq-caret,
+  .aq-bar,
+  .aq-orb-glow,
+  .aq-reduced-motion-sentinel {
+    transition: none !important;
+    animation: none !important;
+  }
+
   .aq-chunk {
     transition: none;
+  }
+
+  .aq-text {
+    scroll-behavior: auto;
   }
 }

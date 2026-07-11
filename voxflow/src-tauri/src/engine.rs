@@ -62,11 +62,16 @@ mod sound {
 /// Команды движку (из хоткея, трея, UI).
 pub enum EngineCmd {
     Start,
+    /// Второй down быстрого double-tap: показать latch-подтверждение до
+    /// синхронного открытия микрофона/снятия контекста, затем начать запись.
+    StartLatched,
     Stop,
+    /// Первый короткий tap возможного double-tap. Запись завершается и
+    /// отбрасывается без запуска финального ASR.
+    StopTap,
     Toggle,
     Cancel,
     ImproveSelection,
-    HotkeyLatch,
     /// Фоновый прогрев движков под ТЕКУЩИЕ настройки (шлётся после смены
     /// языка из трея/UI): без него первый Start после переключения на en/auto
     /// синхронно грузит ~650 МБ Parakeet и подвешивает поток движка.
@@ -847,18 +852,21 @@ fn engine_loop(rx: Receiver<EngineCmd>, ctx: EngineCtx) {
     let mut capture: Option<Capture> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            EngineCmd::Start => start_capture_into(&mut capture, &ctx),
+            EngineCmd::Start => start_capture_into(&mut capture, &ctx, false),
+            EngineCmd::StartLatched => {
+                start_capture_into(&mut capture, &ctx, true);
+            }
             EngineCmd::Stop => stop_and_process(&mut capture, &ctx),
+            EngineCmd::StopTap => stop_tap_and_process(&mut capture, &ctx),
             EngineCmd::Toggle => {
                 if capture.is_some() {
                     stop_and_process(&mut capture, &ctx);
                 } else {
-                    start_capture_into(&mut capture, &ctx);
+                    start_capture_into(&mut capture, &ctx, false);
                 }
             }
             EngineCmd::Cancel => cancel_current(&mut capture, &ctx),
             EngineCmd::ImproveSelection => improve_selection(&ctx),
-            EngineCmd::HotkeyLatch => notify_hotkey_latch(&ctx, capture.is_some()),
             EngineCmd::Warmup => {
                 // В отдельном потоке: warmup сам спит и грузит модели —
                 // канал команд блокировать нельзя (Start/Stop должны жить).
@@ -878,11 +886,7 @@ fn engine_loop(rx: Receiver<EngineCmd>, ctx: EngineCtx) {
     }
 }
 
-fn notify_hotkey_latch(ctx: &EngineCtx, active: bool) {
-    if !active {
-        dbg_log("hotkey: double-press latch ignored because capture is not active");
-        return;
-    }
+fn notify_hotkey_latch(ctx: &EngineCtx) {
     if ctx.settings.lock().play_sounds {
         sound::latch();
     }
@@ -909,17 +913,36 @@ fn macos_insertion_preflight(ctx: &EngineCtx) -> bool {
         &ctx.app,
         "Разрешите VoxFlow в macOS Privacy & Security -> Accessibility для вставки текста, затем повторите диктовку",
     );
-    set_status(&ctx.app, "idle");
+    set_status(ctx, "idle");
     false
 }
 
-fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
+fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx, latched: bool) {
     if capture.is_some() {
         return;
+    }
+    // Новое физическое нажатие должно мгновенно инвалидировать финал прошлой
+    // диктовки. Раньше generation менялся только ПОСЛЕ медленного macOS
+    // context lookup; за эти 150–650 мс старый финал успевал вставить чужую
+    // фразу уже после нового нажатия.
+    let start_gen = {
+        let _activity = ctx.cancel_activity_lock.lock();
+        let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
+        ctx.cancel_active.store(true, Ordering::SeqCst);
+        next
+    };
+    // Визуальный отклик также не ждёт CoreAudio/platform context. Overlay не получает
+    // фокус, поэтому цель всё равно снимается с внешнего приложения ниже.
+    set_status_with_latch(ctx, "recording", latched);
+    if latched {
+        // The generation-aware status above atomically prevents a rec→latch
+        // flash. Keep the dedicated event for its confirmation sound/message.
+        notify_hotkey_latch(ctx);
     }
     #[cfg(target_os = "macos")]
     if !macos_insertion_preflight(ctx) {
         *ctx.active_target.lock() = None;
+        clear_cancel_active_if_current(ctx, start_gen);
         return;
     }
     let (device, play, auto_mute) = {
@@ -948,7 +971,8 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
                     *ctx.active_target.lock() = None;
                     dbg_log("start: модель не установлена — запись не начинаем, предупреждаем");
                     emit_no_model(&ctx.app);
-                    set_status(&ctx.app, "idle");
+                    set_status(ctx, "idle");
+                    clear_cancel_active_if_current(ctx, start_gen);
                     return;
                 }
             }
@@ -964,13 +988,6 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             // «не писали → пишем». Если запись уже шла (Start поверх ещё активной
             // диктовки при rapid-fire) — звук не переигрываем.
             let was_recording = ctx.recording.swap(true, Ordering::SeqCst);
-            {
-                let _activity = ctx.cancel_activity_lock.lock();
-                // Новая диктовка → новое поколение (C4): осиротевшие финал-потоки
-                // прошлых диктовок не смогут очистить её activity-флаг или вставить текст.
-                ctx.gen.fetch_add(1, Ordering::SeqCst);
-                ctx.cancel_active.store(true, Ordering::SeqCst);
-            }
             if auto_mute && !was_recording {
                 match AutoMuteGuard::engage() {
                     Ok(guard) => {
@@ -983,7 +1000,6 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             if play && !was_recording {
                 sound::play(true);
             }
-            set_status(&ctx.app, "recording");
             // Запускаем петлю живого стриминга, если GPU whisper-server доступен —
             // пилюля показывает живой текст и при whisper_cli (живой инжект при этом
             // выключен, см. maybe_start_partial_loop). Без GPU/модели — статичное «Слушаю…».
@@ -996,7 +1012,8 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             *ctx.active_target.lock() = None;
             log::error!("start_capture: {err:#}");
             emit_error(&ctx.app, &format!("Не удалось открыть микрофон: {err}"));
-            set_status(&ctx.app, "idle");
+            set_status(ctx, "idle");
+            clear_cancel_active_if_current(ctx, start_gen);
         }
     }
 }
@@ -1008,11 +1025,11 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
 ///
 /// ВАЖНО: для cli живой ИНЖЕКТ клавишами не нужен/опасен, поэтому stream_mode
 /// для петли при cli трактуем как "never" — показываем только серый текст в пилюле.
-fn local_preview_requested(stream_mode: &str) -> bool {
-    // `never` is the clean latency-first default on both platforms. A preview
-    // still consumed GigaAM/Whisper and made every macOS release wait 35–125 ms
-    // before final ASR (and up to seconds when a model was cold), even though no
-    // live text was requested. auto/always retain the full preview pipeline.
+fn whisper_preview_requested(stream_mode: &str) -> bool {
+    // Preview-only (`never`) is intentionally supported by the already-resident
+    // GigaAM/Parakeet routes below: it emits text to the overlay but never types
+    // into the target field. Do not start the heavier Whisper sidecar in that
+    // mode, because it can still contend with final ASR.
     stream_mode != "never"
 }
 
@@ -1048,10 +1065,6 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
     if use_cloud {
         return; // облачный путь: без живых частичных результатов.
     }
-    if !local_preview_requested(&s.stream_mode) {
-        dbg_log("partial: stream_mode=never — сохраняем ресурсы для финального ASR");
-        return;
-    }
     // Локальные резидентные движки: живые партиалы на CPU, GPU не нужен.
     // Сегментная схема: VAD находит паузы; завершённые сегменты фиксируются
     // (committed растёт монотонно по построению), активный сегмент
@@ -1072,7 +1085,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                 Arc::clone(&ctx.gigaam),
                 LocalLoopTuning {
                     tick_ms: 220,
-                    max_seg_samples: 25 * 16000,
+                    max_seg_samples: 8 * 16000,
                     fixed_lang: Some("ru"),
                 },
             );
@@ -1101,7 +1114,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
             Arc::clone(&ctx.gigaam),
             LocalLoopTuning {
                 tick_ms: 260,
-                max_seg_samples: 25 * 16000,
+                max_seg_samples: 8 * 16000,
                 fixed_lang: Some("ru"),
             },
         );
@@ -1123,8 +1136,8 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                 target_fp,
                 Arc::clone(&ctx.gigaam),
                 LocalLoopTuning {
-                    tick_ms: 350,
-                    max_seg_samples: 25 * 16000,
+                    tick_ms: 220,
+                    max_seg_samples: 8 * 16000,
                     fixed_lang: Some("ru"),
                 },
             );
@@ -1154,6 +1167,10 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
             dbg_log("partial: parakeet не загрузился — пробуем whisper-стрим");
         }
         LocalRoute::Whisper => {}
+    }
+    if !whisper_preview_requested(&s.stream_mode) {
+        dbg_log("partial: preview-only mode has no resident local route — whisper preview skipped");
+        return;
     }
     // Живой whisper-стрим на Windows оставляем только для NVIDIA-сборки: CPU
     // сервер там слишком медленный для тиков. На macOS используем native sidecar
@@ -1714,8 +1731,8 @@ fn spawn_level_loop(capture: &Capture, ctx: &EngineCtx) {
         });
 }
 
-/// Каденс/лимиты петли локальных партиалов: GigaAM — тик 350 мс и кап сегмента
-/// 25 c (лимит pos_emb модели), Parakeet — тик 500 мс и кап 20 c.
+/// Каденс/лимиты петли локальных партиалов: GigaAM — быстрый первый тик 220 мс
+/// и кап сегмента 8 c, Parakeet — тик 500 мс и кап 20 c.
 struct LocalLoopTuning {
     tick_ms: u64,
     max_seg_samples: usize,
@@ -1841,7 +1858,17 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
     let mut mono16: Vec<f32> = Vec::new();
 
     loop {
-        std::thread::sleep(Duration::from_millis(tick_ms));
+        // Fast first words, then lower the inference cadence for a long
+        // uninterrupted phrase. Together with the 8 s segment cap this keeps
+        // preview work bounded and leaves the shared resident model available
+        // to final ASR soon after key-up.
+        let active_samples = mono16.len().saturating_sub(seg_start);
+        let cadence_ms = if tick_ms < 400 && active_samples >= 4 * 16000 {
+            420
+        } else {
+            tick_ms
+        };
+        std::thread::sleep(Duration::from_millis(cadence_ms));
         if a.stop.load(Ordering::Acquire) {
             break;
         }
@@ -1955,9 +1982,8 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             break; // не показываем партиал поверх идущего финала
         }
         if a.stream_mode == "never" {
-            // В режиме «только плашка» это не поле ввода, а последний текст,
-            // который пользователь реально видел. Финал использует его как
-            // страховку против редких ASR-галлюцинаций/старого хвоста.
+            // В режиме «только плашка» храним показанный текст только для
+            // UI/state; точный финал всегда берём из финального ASR.
             *a.committed_field.lock() = full.clone();
         }
         // Бейдж языка (контракт overlay): фиксированный "ru" у GigaAM-маршрута,
@@ -2310,6 +2336,37 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     let Some(c) = capture.take() else {
         return;
     };
+    finish_capture_and_process(c, ctx);
+}
+
+fn stop_tap_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
+    let Some(c) = capture.take() else {
+        return;
+    };
+    // A sub-180 ms press is the first half of the double-tap gesture, not a
+    // useful dictation. Discard it instead of launching VAD/final ASR: that
+    // removes model contention and makes the second press truly immediate.
+    let _ = c.finish();
+    let my_gen = ctx.gen.load(Ordering::SeqCst);
+    ctx.recording.store(false, Ordering::SeqCst);
+    restore_auto_mute(ctx);
+    *ctx.active_target.lock() = None;
+    if let Some(mut st) = ctx.partial.lock().take() {
+        st.stop.store(true, Ordering::Release);
+        st.abort.store(true, Ordering::Release);
+        if let Some(join) = st.join.take() {
+            finish_partial_without_blocking(join, st.kind);
+        }
+    }
+    if ctx.settings.lock().play_sounds {
+        sound::play(false);
+    }
+    set_status(ctx, "idle");
+    clear_cancel_active_if_current(ctx, my_gen);
+    dbg_log("hotkey: quick tap discarded as a double-tap gesture candidate");
+}
+
+fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
     let rate = c.sample_rate();
     // Переполнение буфера записи (audio P2-1): хвост диктовки отброшен —
     // честно предупреждаем (хотя бы раз за запись), текст будет неполным.
@@ -2330,7 +2387,7 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     // UX: как только пользователь завершил запись, оверлей должен сразу уйти из
     // текстовой плашки в AquaVoice-style spinner, пока мы останавливаем partial-loop
     // и готовим финальный ASR.
-    set_status(&ctx.app, "transcribing");
+    set_status(ctx, "transcribing");
 
     // Останавливаем петлю частичных результатов, но НИКОГДА не ждём её на
     // единственном engine command thread. Иначе быстрый следующий Start стоит
@@ -2370,7 +2427,7 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             // Статус idle эмитим только если новая диктовка ещё не началась —
             // иначе перетёрли бы «recording» свежей диктовки (C3/C4).
             if ctx2.gen.load(Ordering::SeqCst) == my_gen {
-                set_status(&ctx2.app, "idle");
+                set_status(&ctx2, "idle");
             }
             clear_cancel_active_if_current(&ctx2, my_gen);
         });
@@ -2397,7 +2454,7 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             report_process_err(&ctx2.app, &err);
         }
         if ctx2.gen.load(Ordering::SeqCst) == my_gen {
-            set_status(&ctx2.app, "idle");
+            set_status(&ctx2, "idle");
         }
         clear_cancel_active_if_current(&ctx2, my_gen);
     });
@@ -2457,7 +2514,7 @@ fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             ctx.gen.fetch_add(1, Ordering::SeqCst);
             ctx.cancel_active.store(false, Ordering::SeqCst);
         }
-        set_status(&ctx.app, "idle");
+        set_status(ctx, "idle");
         dbg_log("cancel: активная диктовка отменена Esc");
         return;
     }
@@ -2474,7 +2531,7 @@ fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     if ctx.improve_busy.load(Ordering::SeqCst) {
         emit_improve_status(&ctx.app, "cancelled", "Отменено");
     }
-    set_status(&ctx.app, "idle");
+    set_status(ctx, "idle");
     dbg_log("cancel: текущее действие инвалидировано Esc");
 }
 
@@ -2588,12 +2645,13 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let cur = crate::app_context::detect();
     let _inj = ctx.inject_lock.lock();
+    let _commit = ctx.cancel_activity_lock.lock();
     if ctx.gen.load(Ordering::SeqCst) != my_gen {
         return Ok(());
     }
     let target_fp = actx.target_fingerprint();
-    let cur = crate::app_context::detect();
     if !target_fp.matches(&cur) {
         emit_improve_status(&ctx.app, "cancelled", "Окно изменилось, вставка отменена");
         return Ok(());
@@ -2637,10 +2695,6 @@ impl LiveState {
             "auto" => !self.committed.lock().is_empty(),
             _ => false,
         }
-    }
-
-    fn visible_preview(&self) -> String {
-        self.committed.lock().clone()
     }
 }
 
@@ -2731,66 +2785,12 @@ fn compact_speech_for_final_asr(
     out
 }
 
-fn reconcile_final_with_live_preview(live: Option<&LiveState>, final_text: &str) -> String {
-    let Some(live) = live else {
-        return final_text.to_string();
-    };
-    if live.stream_mode != "never" {
-        return final_text.to_string();
-    }
-    let preview = live.visible_preview();
-    if looks_like_stale_final(&preview, final_text) {
-        dbg_log(&format!(
-            "финал: текст почти не совпал с live-preview (preview_len={}, final_len={}) — берём то, что видел пользователь",
-            preview.chars().count(),
-            final_text.chars().count()
-        ));
-        return preview;
-    }
-    final_text.to_string()
-}
-
-fn looks_like_stale_final(preview: &str, final_text: &str) -> bool {
-    let preview = preview.trim();
-    let final_text = final_text.trim();
-    if preview.is_empty() || final_text.is_empty() {
-        return false;
-    }
-
-    let p_tokens = lexical_tokens(preview);
-    let f_tokens = lexical_tokens(final_text);
-    if p_tokens.len() < 3 || f_tokens.len() < 4 {
-        return false;
-    }
-
-    let overlap = p_tokens.intersection(&f_tokens).count();
-    let overlap_ratio = overlap as f32 / p_tokens.len().min(f_tokens.len()) as f32;
-    let p_chars = preview.chars().count();
-    let f_chars = final_text.chars().count();
-    let final_has_big_tail = f_chars > p_chars + 40 || f_tokens.len() > p_tokens.len() + 8;
-
-    final_has_big_tail && overlap_ratio < 0.25
-}
-
 fn generation_is_current(current: u64, expected: u64) -> bool {
     current == expected
 }
 
 fn final_generation_is_current(ctx: &EngineCtx, expected: u64) -> bool {
     generation_is_current(ctx.gen.load(Ordering::Acquire), expected)
-}
-
-fn lexical_tokens(text: &str) -> HashSet<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter_map(|t| {
-            let t = t.trim();
-            if t.chars().count() < 2 {
-                None
-            } else {
-                Some(t.to_lowercase())
-            }
-        })
-        .collect()
 }
 
 /// Стереть уже напечатанный живой черновик (режимы always/auto): голосовая
@@ -2809,7 +2809,9 @@ fn erase_live_draft(ctx: &EngineCtx, live: Option<&LiveState>, my_gen: u64) {
     if !l.live_inserted() {
         return; // живой вставки не было — стирать нечего
     }
+    let cur = crate::app_context::detect();
     let _inj = ctx.inject_lock.lock();
+    let _commit = ctx.cancel_activity_lock.lock();
     if ctx.gen.load(Ordering::SeqCst) != my_gen {
         dbg_log("отмена: поколение устарело — черновик не трогаем");
         return;
@@ -2818,7 +2820,6 @@ fn erase_live_draft(ctx: &EngineCtx, live: Option<&LiveState>, my_gen: u64) {
         dbg_log("отмена: живая вставка была прервана — черновик не трогаем");
         return;
     }
-    let cur = crate::app_context::detect();
     if !l.start_fp.matches(&cur) {
         dbg_log("отмена: окно сменилось — чужое поле не трогаем");
         return;
@@ -2942,7 +2943,9 @@ fn process_utterance(
     let asr_tone =
         crate::app_context::category_for(&asr_actx.exe, &asr_actx.title, &s.app_profile_overrides);
     let asr_prompt = if use_cloud_stt {
-        let asr_previous_context_tail = last_dictation_context(ctx, &asr_actx);
+        let asr_previous_context_tail = asr_actx
+            .focused_text_tail(ASR_PROMPT_PREVIOUS_CHARS)
+            .or_else(|| last_dictation_context(ctx, &asr_actx));
         build_asr_prompt(
             &asr_actx,
             &asr_tone,
@@ -3029,7 +3032,7 @@ fn process_utterance(
         if ctx.gen.load(Ordering::SeqCst) == my_gen {
             let _ = ctx.app.emit(
                 "status",
-                serde_json::json!({ "status": "transcribing", "lang": l }),
+                serde_json::json!({ "status": "transcribing", "lang": l, "seq": my_gen }),
             );
         }
     }
@@ -3102,8 +3105,6 @@ fn process_utterance(
         return Ok(());
     }
 
-    text = reconcile_final_with_live_preview(live.as_ref(), &text);
-
     // A local ASR pass can take seconds. If a configured rewrite backend may
     // send text off-device, validate the target again immediately before that
     // possible egress; the earlier cloud-ASR guard is too old by this point.
@@ -3122,13 +3123,23 @@ fn process_utterance(
             let _ = std::fs::remove_file(&wav);
             return Ok(());
         };
+        if ctx.gen.load(Ordering::SeqCst) != my_gen {
+            dbg_log("финал: поколение устарело во время target-check перед rewrite");
+            let _ = std::fs::remove_file(&wav);
+            return Ok(());
+        }
         actx = fresh_actx;
     }
 
     // Тон по приложению считаем через category_for — он учитывает пользовательские
     // app_profile_overrides (ветка B) ПЕРЕД встроенной таблицей классификации.
     let tone = crate::app_context::category_for(&actx.exe, &actx.title, &s.app_profile_overrides);
-    let previous_context_tail = last_dictation_context(ctx, &actx);
+    // Prefer what is already in the focused field over VoxFlow's own memory.
+    // This keeps sentence casing/punctuation continuous even when the existing
+    // text was typed manually or inserted by another application.
+    let previous_context_tail = actx
+        .focused_text_tail(600)
+        .or_else(|| last_dictation_context(ctx, &actx));
 
     // ── «Умный» рерайт под стиль активного приложения (Gemini/Ollama/OpenAI-compatible) ──
     // verbatim/neutral и встроенный AI-профиль LLM не зовут: вставка должна быть
@@ -3200,37 +3211,33 @@ fn process_utterance(
         .as_ref()
         .map(|l| l.stream_mode.as_str())
         .unwrap_or("never");
-    // Замок эмиссии клавиш на всю финальную вставку — чтобы нажатия этой диктовки не
-    // пересеклись с тиками/финалом следующей при быстром рестарте. Дропается в конце
-    // блока (или раньше — при ? в never-ветке, через RAII).
-    let inject_guard = ctx.inject_lock.lock();
-    // C4 (TOCTOU): пока ждали inject_lock, могла стартовать НОВАЯ диктовка.
-    // Перепроверяем поколение уже ПОД замком — иначе осиротевший поток всё равно
-    // вставит устаревший/перекрывающийся текст (остаточная многократная вставка при rapid-fire).
-    if ctx.gen.load(Ordering::SeqCst) != my_gen {
-        dbg_log("финал: поколение устарело под inject_lock — вставку пропускаем");
-        drop(inject_guard);
-        let _ = std::fs::remove_file(&wav);
-        return Ok(());
-    }
-    // Идемпотентность вставки (пояс поверх gen-guard): одно поколение вставляется РОВНО
-    // один раз. Если этот gen уже вставлялся (теоретически — два detached-потока финала
-    // совпали по gen), второй проход НЕ дублирует текст в поле. swap атомарно фиксирует
-    // «этот gen вставлен» и возвращает прежнее значение.
-    if ctx.last_injected_gen.swap(my_gen, Ordering::SeqCst) == my_gen {
-        dbg_log("финал: это поколение уже вставлено — пропускаем (идемпотентность)");
-        drop(inject_guard);
-        let _ = std::fs::remove_file(&wav);
-        return Ok(());
-    }
+    // Target detection may call platform accessibility APIs. Keep it outside
+    // the keyboard lock so a new hotkey can invalidate this generation while
+    // detection is running instead of waiting behind it.
     let context_started = Instant::now();
     let final_target = current_or_restored_target(ctx, &mut target_fp, "перед вставкой");
     context_ms += context_started.elapsed().as_millis() as u64;
     let Some(final_target_actx) = final_target else {
-        drop(inject_guard);
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     };
+    // Commit protocol: inject_lock serializes key emission; cancel_activity_lock
+    // makes generation-check + paste atomic with Start's generation bump. The
+    // slow target query above is deliberately outside both locks.
+    let inject_guard = ctx.inject_lock.lock();
+    let commit_guard = ctx.cancel_activity_lock.lock();
+    if ctx.gen.load(Ordering::SeqCst) != my_gen {
+        dbg_log("финал: поколение устарело после target-check — вставку пропускаем");
+        drop(inject_guard);
+        let _ = std::fs::remove_file(&wav);
+        return Ok(());
+    }
+    if ctx.last_injected_gen.swap(my_gen, Ordering::SeqCst) == my_gen {
+        dbg_log("финал: это поколение уже вставлено — пропускаем");
+        drop(inject_guard);
+        let _ = std::fs::remove_file(&wav);
+        return Ok(());
+    }
     let mut final_inserted = false;
     let mut insert_error: Option<String> = None;
     let t_inj = Instant::now();
@@ -3297,6 +3304,7 @@ fn process_utterance(
         }
     }
     drop(inject_guard); // освобождаем замок клавиш сразу после вставки
+    drop(commit_guard); // новый Start блокируется только на самом paste
     if !final_inserted {
         if let Some(err) = insert_error {
             dbg_log(&format!(
@@ -3743,8 +3751,19 @@ fn load_snippets(conn: &Connection) -> Vec<postprocess::Snippet> {
     out
 }
 
-fn set_status(app: &AppHandle, status: &str) {
-    let _ = app.emit("status", status);
+fn set_status(ctx: &EngineCtx, status: &str) {
+    set_status_with_latch(ctx, status, false);
+}
+
+fn set_status_with_latch(ctx: &EngineCtx, status: &str, latched: bool) {
+    let _ = ctx.app.emit(
+        "status",
+        serde_json::json!({
+            "status": status,
+            "seq": ctx.gen.load(Ordering::SeqCst),
+            "latched": latched,
+        }),
+    );
 }
 
 fn live_partial_payload(
@@ -4367,22 +4386,6 @@ mod seg_tests {
     }
 
     #[test]
-    fn stale_final_guard_rejects_unseen_big_tail() {
-        assert!(looks_like_stale_final(
-            "Исправьте пожалуйста этот текст",
-            "Прошлая длинная фраза вообще из другой диктовки и старого сообщения которое пользователь сейчас не говорил"
-        ));
-    }
-
-    #[test]
-    fn stale_final_guard_accepts_same_dictation_with_more_words() {
-        assert!(!looks_like_stale_final(
-            "Исправьте пожалуйста этот текст",
-            "Исправьте пожалуйста этот текст и сделайте его немного понятнее"
-        ));
-    }
-
-    #[test]
     fn local_route_respects_explicit_whisper_engine() {
         let mut s = Settings {
             engine: "whisper_server".to_string(),
@@ -4436,10 +4439,10 @@ mod seg_tests {
     }
 
     #[test]
-    fn clean_default_keeps_all_local_preview_work_off_the_final_asr_lane() {
-        assert!(!local_preview_requested("never"));
-        assert!(local_preview_requested("auto"));
-        assert!(local_preview_requested("always"));
+    fn preview_only_mode_skips_heavy_whisper_but_opt_in_modes_allow_it() {
+        assert!(!whisper_preview_requested("never"));
+        assert!(whisper_preview_requested("auto"));
+        assert!(whisper_preview_requested("always"));
     }
 
     #[test]
@@ -4863,6 +4866,12 @@ fn rewrite_context_hint(
             "Готовый/выделенный текст для правки: {}",
             compact_context_tail(doc, 1200)
         ));
+    }
+
+    if current_document.is_none() {
+        if let Some(field_tail) = actx.focused_text_tail(600) {
+            parts.push(format!("Хвост текста в активном поле: {field_tail}"));
+        }
     }
 
     let memory = ctx.dictation_memory.lock();
@@ -5347,6 +5356,11 @@ mod smart_prompt_tests {
             title: title.to_string(),
             window_id: "test-window".to_string(),
             category: "ai".to_string(),
+            field_role: String::new(),
+            field_subrole: String::new(),
+            field_id: String::new(),
+            field_text: String::new(),
+            selected_text: String::new(),
         }
     }
 
@@ -5500,6 +5514,11 @@ mod smart_prompt_tests {
             title: "Codex".to_string(),
             window_id: "test-window".to_string(),
             category: "ai".to_string(),
+            field_role: String::new(),
+            field_subrole: String::new(),
+            field_id: String::new(),
+            field_text: String::new(),
+            selected_text: String::new(),
         };
 
         let (instruction, is_ai) = effective_smart_instruction_for_app(&s, &actx, "work");

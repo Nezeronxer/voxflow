@@ -313,10 +313,11 @@ export interface LevelEvent {
 
 export type OverlayStatus = "idle" | "recording" | "transcribing";
 
-// Событие "status": legacy-строка (как раньше) ЛИБО объект { status, lang } —
-// бэкенд шлёт объект, когда знает язык диктовки (бейдж в пилюле). На
+// Событие "status": legacy-строка ЛИБО атомарный объект. seq — поколение
+// диктовки для отсечения запоздалых partial/level; latched подтверждает
+// double-tap без промежуточной hold-анимации. На
 // status=="recording" фронт сначала сбрасывает lang в null (новая диктовка),
 // затем применяет lang из этого же события, если оно объект и поле прислано.
 export type StatusPayload =
   | string
-  | { status?: string; lang?: DetectedLang };
+  | { status?: string; lang?: DetectedLang; seq?: number; latched?: boolean };
