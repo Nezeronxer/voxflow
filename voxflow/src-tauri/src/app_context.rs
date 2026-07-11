@@ -805,7 +805,9 @@ mod tests {
 
 #[cfg(windows)]
 mod platform {
-    use super::{classify, is_sensitive_focused_field, tail_chars, AppContext};
+    use super::{
+        classify, is_sensitive_focused_field, is_textual_focused_field, tail_chars, AppContext,
+    };
     use windows::core::Result as WinResult;
     use windows::Win32::Foundation::{RECT, RPC_E_CHANGED_MODE};
     use windows::Win32::System::Com::{
@@ -1169,9 +1171,6 @@ mod platform {
             unsafe { element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId) }
                 .ok();
         let pattern_backed_text = text_pattern.is_some();
-        let textual = control_type == UIA_EditControlTypeId
-            || control_type == UIA_DocumentControlTypeId
-            || (control_type == UIA_TextControlTypeId && pattern_backed_text);
         let subrole = subrole_metadata(
             &localized_type,
             &class_name,
@@ -1179,6 +1178,7 @@ mod platform {
             pattern_backed_text,
             password,
         );
+        let textual = is_textual_focused_field(&role, &subrole);
         let id = field_identity(&automation_id, &role, &class_name, &framework, rect);
 
         if !textual {

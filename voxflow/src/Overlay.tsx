@@ -96,9 +96,20 @@ const BAR_COUNT = BAR_WEIGHTS.length;
 // атака быстрая, спад чуть мягче — волна следует голосу без рывка/«догоняния».
 const LEVEL_ATTACK_S = 0.045;
 const LEVEL_RELEASE_S = 0.11;
-// Высота бара: 2..22 px по кривой 2+20·v^1.5; CSS-высота фиксирована 22 px,
+// Высота бара: 2..18 px по кривой 2+16·v^1.5; CSS-высота фиксирована 18 px,
 // анимируем transform:scaleY (компосит, без layout на кадр).
-const BAR_MAX_H = 22;
+const BAR_MAX_H = 18;
+
+function compactHotkeyLabel(label: string) {
+  const normalized = label.trim().toLowerCase().replace(/^(right|left)\s+/, "");
+  if (normalized === "option") return "⌥";
+  if (normalized === "control" || normalized === "ctrl") return "Ctrl";
+  if (normalized === "command" || normalized === "cmd") return "⌘";
+  if (normalized === "shift") return "Shift";
+  if (normalized === "alt") return "Alt";
+  if (normalized === "win") return "Win";
+  return label;
+}
 
 const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
 
@@ -385,8 +396,8 @@ export default function Overlay() {
         const el = barEls.current[i];
         if (el) {
           const v = clamp01(barPos[i]);
-          // Высота 2+20·v^1.5 (2..22 px) через scaleY от фиксированных 22 px.
-          el.style.transform = `scaleY(${(2 + 20 * Math.pow(v, 1.5)) / BAR_MAX_H})`;
+          // Высота 2+16·v^1.5 (2..18 px) через scaleY от фиксированных 18 px.
+          el.style.transform = `scaleY(${(2 + 16 * Math.pow(v, 1.5)) / BAR_MAX_H})`;
           el.style.opacity = String(0.75 + 0.25 * v);
         }
       }
@@ -433,7 +444,7 @@ export default function Overlay() {
     };
     const showLatch = (payload?: HotkeyLatchEvent) => {
       setLatchNotice({
-        message: payload?.message || "Режим без удержания",
+        message: payload?.message || "Без удержания",
         detail: payload?.detail || "Двойное нажатие",
       });
       if (latchTimer.current) clearTimeout(latchTimer.current);
@@ -672,6 +683,7 @@ export default function Overlay() {
               ? "stream"
               : "rec"
             : "idle";
+  const compactHotkeyTip = compactHotkeyLabel(hotkeyTip);
 
   const pillHitRect = () => {
     const rect = pillRef.current?.getBoundingClientRect();
@@ -914,7 +926,7 @@ export default function Overlay() {
         {mode === "idle" ? (
           <span className="aq-idle-copy">
             <span className="aq-logo-wave" aria-hidden><i /><i /><i /><i /><i /></span>
-            <strong>{hotkeyTip} — говорить</strong>
+            <strong>{compactHotkeyTip} — говорить</strong>
             <span className="aq-idle-lang">Авто</span>
           </span>
         ) : mode === "notice" ? (
@@ -925,7 +937,7 @@ export default function Overlay() {
               2×
             </span>
             <span>
-              <strong>{latchNotice?.message || "Режим без удержания"}</strong>
+              <strong>{latchNotice?.message || "Без удержания"}</strong>
               <small>{latchNotice?.detail || "Двойное нажатие"}</small>
             </span>
           </span>

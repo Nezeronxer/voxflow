@@ -115,17 +115,17 @@ test("floating bar remains compact and every CSS state fits its Tauri window box
     );
   }
 
-  assert.equal(declaration(finalRule(".aq-idle"), "width"), "78px");
-  assert.equal(declaration(finalRule(".aq-idle"), "height"), "14px");
-  assert.equal(declaration(finalRule(".aq-idle:hover"), "width"), "244px");
-  assert.equal(declaration(finalRule(".aq-idle:hover"), "height"), "38px");
+  assert.equal(declaration(finalRule(".aq-idle"), "width"), "56px");
+  assert.equal(declaration(finalRule(".aq-idle"), "height"), "10px");
+  assert.equal(declaration(finalRule(".aq-idle:hover"), "width"), "172px");
+  assert.equal(declaration(finalRule(".aq-idle:hover"), "height"), "30px");
   assert.ok(
     px(declaration(finalRule(".aq-idle:hover"), "width")) + stageHorizontal <=
       expectedBoxes.idle.w,
     "expanded idle hover must fit the fixed idle Tauri window",
   );
-  assert.equal(declaration(finalRule(".aq-stream"), "max-width"), "360px");
-  assert.equal(declaration(finalRule(".aq-notice"), "max-width"), "330px");
+  assert.equal(declaration(finalRule(".aq-stream"), "max-width"), "270px");
+  assert.equal(declaration(finalRule(".aq-notice"), "max-width"), "270px");
 });
 
 test("idle is a tiny outlined capsule and reveals the rich controls only on hover", () => {

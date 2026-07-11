@@ -893,7 +893,7 @@ fn notify_hotkey_latch(ctx: &EngineCtx) {
     let _ = ctx.app.emit(
         "hotkey_latch",
         serde_json::json!({
-            "message": "Режим без удержания",
+            "message": "Без удержания",
             "detail": "Двойное нажатие"
         }),
     );
