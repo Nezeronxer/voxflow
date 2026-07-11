@@ -165,6 +165,24 @@ enum ClipSnapshot {
     Image(arboard::ImageData<'static>),
 }
 
+/// Отложенное восстановление clipboard. `expected_text` — текст,
+/// который VoxFlow сам положил в буфер. Если за время settle-паузы
+/// буфер уже изменился, старый снимок возвращать нельзя: это затрёт
+/// новое копирование пользователя/целевого приложения.
+struct DeferredRestore {
+    previous: ClipSnapshot,
+    expected_text: String,
+}
+
+impl DeferredRestore {
+    fn if_unchanged(previous: ClipSnapshot, expected_text: String) -> Self {
+        Self {
+            previous,
+            expected_text,
+        }
+    }
+}
+
 /// Ленивая инициализация: первый вызов поднимает воркер "voxflow-inject".
 /// Режим dry фиксируется здесь же и не меняется до конца процесса.
 fn injector() -> &'static Injector {
@@ -253,9 +271,11 @@ fn worker_loop(rx: mpsc::Receiver<Job>, dry: bool) {
         // слота воркера: порядок заданий сохранён, следующий job не начнётся,
         // пока прежний буфер не возвращён. PENDING держим >0 — clipboard_monitor
         // в это окно в буфер не лезет.
-        if let Some(prev) = restore {
+        if let Some(restore) = restore {
             thread::sleep(Duration::from_millis(115));
-            let _ = clipboard_restore_retry(&prev);
+            if let Err(e) = clipboard_restore_deferred(&restore) {
+                log::warn!("deferred clipboard restore failed: {e}");
+            }
             PENDING.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -279,7 +299,7 @@ fn run_dry(cmd: &Cmd) -> Result<CmdResult> {
 
 /// Боевое исполнение задания (только из воркера). Второй элемент — снимок
 /// прежнего буфера обмена, который надо восстановить ПОСЛЕ ack (см. worker_loop).
-fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<ClipSnapshot>) {
+fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<DeferredRestore>) {
     match cmd {
         Cmd::Full {
             text,
@@ -326,7 +346,16 @@ fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<
         Cmd::Incr { prev, next } => {
             #[cfg(target_os = "macos")]
             {
-                let restore = clipboard_snapshot();
+                let (_, suffix) = incremental_edit(prev, next);
+                // Backspace-only reconciliation never changes the clipboard.
+                // When a suffix is pasted, restore only if it is still our
+                // suffix after the target app has consumed Cmd+V.
+                let restore = if suffix.is_empty() {
+                    None
+                } else {
+                    clipboard_snapshot()
+                        .map(|previous| DeferredRestore::if_unchanged(previous, suffix))
+                };
                 (
                     macos_incremental_keys(prev, next).map(|_| CmdResult::Done),
                     restore,
@@ -477,21 +506,21 @@ fn type_text(e: &mut Enigo, text: &str) -> Result<()> {
 /// Сведение prev → next клавишами. Счёт ведём по СИМВОЛАМ (chars), не по байтам —
 /// для кириллицы один Backspace удаляет одну букву. Общий префикс ищем zip-ом
 /// итераторов char, без срезов байт.
+fn incremental_edit(prev: &str, next: &str) -> (usize, String) {
+    let common = prev
+        .chars()
+        .zip(next.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    (
+        prev.chars().count().saturating_sub(common),
+        next.chars().skip(common).collect(),
+    )
+}
+
 #[cfg(not(target_os = "macos"))]
 fn incremental_keys(e: &mut Enigo, prev: &str, next: &str) -> Result<()> {
-    // Длина общего префикса в символах.
-    let mut common = 0usize;
-    for (a, b) in prev.chars().zip(next.chars()) {
-        if a == b {
-            common += 1;
-        } else {
-            break;
-        }
-    }
-
-    let prev_len = prev.chars().count();
-    let backspaces = prev_len - common;
-    let suffix: String = next.chars().skip(common).collect();
+    let (backspaces, suffix) = incremental_edit(prev, next);
 
     // Нечего делать (теоретически невозможно при prev != next, но защитимся).
     if backspaces == 0 && suffix.is_empty() {
@@ -512,18 +541,7 @@ fn incremental_keys(e: &mut Enigo, prev: &str, next: &str) -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn macos_incremental_keys(prev: &str, next: &str) -> Result<()> {
-    let mut common = 0usize;
-    for (a, b) in prev.chars().zip(next.chars()) {
-        if a == b {
-            common += 1;
-        } else {
-            break;
-        }
-    }
-
-    let prev_len = prev.chars().count();
-    let backspaces = prev_len - common;
-    let suffix: String = next.chars().skip(common).collect();
+    let (backspaces, suffix) = incremental_edit(prev, next);
 
     for _ in 0..backspaces {
         macos_keys::click_key(macos_keys::KEY_BACKSPACE)?;
@@ -607,6 +625,23 @@ fn clipboard_restore_retry(snap: &ClipSnapshot) -> Result<()> {
     })
 }
 
+/// Вернуть снимок, только если clipboard всё ещё содержит нашу
+/// временную строку. Ошибка чтения (например, там уже новая
+/// картинка) тоже означает «не трогать». Так отложенный restore не
+/// откатывает более свежее копирование.
+fn clipboard_restore_deferred(restore: &DeferredRestore) -> Result<()> {
+    let current = clipboard_get_text_retry().ok();
+    if !clipboard_still_ours(&restore.expected_text, current.as_deref()) {
+        log::info!("clipboard changed after injection; skipping stale restore");
+        return Ok(());
+    }
+    clipboard_restore_retry(&restore.previous)
+}
+
+fn clipboard_still_ours(expected: &str, current: Option<&str>) -> bool {
+    current == Some(expected)
+}
+
 /// Вставка через буфер обмена (Ctrl+V / Cmd+V). Сохранение прежнего буфера и его
 /// восстановление ПОСЛЕ паузы чтения целевым приложением — внутри одного задания,
 /// поэтому ничей чужой clipboard-доступ между этими шагами не вклинится.
@@ -621,7 +656,7 @@ fn clipboard_restore_retry(snap: &ClipSnapshot) -> Result<()> {
 fn paste_text(
     enigo_slot: &mut Option<Enigo>,
     text: &str,
-    restore_out: &mut Option<ClipSnapshot>,
+    restore_out: &mut Option<DeferredRestore>,
     restore_previous: bool,
 ) -> Result<()> {
     #[cfg(target_os = "macos")]
@@ -630,17 +665,32 @@ fn paste_text(
     // clipboard. Финальная диктовка оставляет свой текст в буфере, поэтому
     // пропускает этот лишний и иногда дорогой шаг.
     let prev = if restore_previous {
-        clipboard_snapshot().or_else(|| Some(ClipSnapshot::Text(String::new())))
+        // Не подменяем нечитаемый arboard-формат пустой строкой:
+        // файлы/HTML мы восстановить не умеем, но и затирать их позже
+        // заведомо неверным «снимком» нельзя.
+        clipboard_snapshot()
     } else {
         None
     };
 
     // Положить наш текст (с ретраями ×3 по 30мс — см. clipboard_set_retry).
     clipboard_set_retry(text)?;
-    // Дать ОС увидеть новый буфер до Ctrl+V. На macOS set_text синхронен, поэтому
-    // длинная пауза здесь только замедляет финальную вставку.
+    // План restore фиксируем СРАЗУ после записи: если Cmd+V не удастся
+    // отправить (например, отозван Accessibility), мы всё равно вернём
+    // прежний clipboard и не оставим после ошибки нашу временную строку.
+    if let Some(previous) = prev {
+        *restore_out = Some(DeferredRestore {
+            previous,
+            expected_text: text.to_string(),
+        });
+    }
+
+    // Дать pasteboard-server опубликовать новый owner до Cmd+V. В 2.0
+    // паузу сократили до 2 мс — почти до одного scheduler tick. Возвращаем
+    // прежний консервативный margin 8 мс; наблюдавшийся первый отказ
+    // отдельно закрывается Accessibility-preflight до старта диктовки.
     #[cfg(target_os = "macos")]
-    thread::sleep(Duration::from_millis(2));
+    thread::sleep(Duration::from_millis(8));
     #[cfg(not(target_os = "macos"))]
     thread::sleep(Duration::from_millis(25));
 
@@ -684,23 +734,23 @@ fn paste_text(
 
     // Короткий settle нужен только перед восстановлением старого clipboard.
     // Когда keep_clipboard=true, текст остаётся в буфере и ждать нечего.
-    if restore_previous {
+    if restore_out.is_some() {
         thread::sleep(Duration::from_millis(15));
-    }
-    if restore_previous {
-        *restore_out = prev;
     }
     Ok(())
 }
 
-fn run_copy_selection(enigo_slot: &mut Option<Enigo>) -> (Result<CmdResult>, Option<ClipSnapshot>) {
+fn run_copy_selection(
+    enigo_slot: &mut Option<Enigo>,
+) -> (Result<CmdResult>, Option<DeferredRestore>) {
     static COPY_SEQ: AtomicUsize = AtomicUsize::new(0);
     let seq = COPY_SEQ.fetch_add(1, Ordering::SeqCst);
     let sentinel = format!("__VOXFLOW_EMPTY_SELECTION_{seq}__");
     let prev = clipboard_snapshot().unwrap_or(ClipSnapshot::Text(String::new()));
 
     if let Err(e) = clipboard_set_retry(&sentinel) {
-        return (Err(e), Some(prev));
+        // set failed, so our code did not replace the previous clipboard.
+        return (Err(e), None);
     }
     thread::sleep(Duration::from_millis(25));
 
@@ -712,20 +762,24 @@ fn run_copy_selection(enigo_slot: &mut Option<Enigo>) -> (Result<CmdResult>, Opt
     #[cfg(not(target_os = "macos"))]
     let copy_res = enigo_of(enigo_slot).and_then(send_copy_chord);
     if let Err(e) = copy_res {
-        return (Err(e), Some(prev));
+        return (Err(e), Some(DeferredRestore::if_unchanged(prev, sentinel)));
     }
     thread::sleep(Duration::from_millis(90));
 
     let text = match clipboard_get_text_retry() {
         Ok(t) => t,
-        Err(e) => return (Err(e), Some(prev)),
+        Err(e) => return (Err(e), Some(DeferredRestore::if_unchanged(prev, sentinel))),
     };
+    let expected_text = text.clone();
     let selected = if text == sentinel || text.trim().is_empty() {
         None
     } else {
         Some(text)
     };
-    (Ok(CmdResult::Selection(selected)), Some(prev))
+    (
+        Ok(CmdResult::Selection(selected)),
+        Some(DeferredRestore::if_unchanged(prev, expected_text)),
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -907,6 +961,19 @@ mod tests {
                 "clip|готовый текст".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn deferred_restore_never_overwrites_newer_clipboard_content() {
+        assert!(clipboard_still_ours("temporary", Some("temporary")));
+        assert!(!clipboard_still_ours("temporary", Some("copied later")));
+        assert!(!clipboard_still_ours("temporary", None));
+    }
+
+    #[test]
+    fn incremental_edit_does_not_touch_clipboard_for_deletion_only() {
+        assert_eq!(incremental_edit("привет!", "привет"), (1, String::new()));
+        assert_eq!(incremental_edit("hello", "help"), (2, "p".to_string()));
     }
 
     /// Тест №3 (регрессия P1-2): в буфере КАРТИНКА (скриншот) — снимок обязан

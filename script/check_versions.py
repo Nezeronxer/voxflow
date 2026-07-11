@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fail when VoxFlow package, Cargo, Tauri, Inno, or tag versions diverge."""
+"""Fail when VoxFlow package, UI, docs, bundle, installer, or tag versions diverge."""
 
 from __future__ import annotations
 
@@ -39,6 +39,11 @@ def collect_versions() -> tuple[dict[str, str], str]:
         (ROOT / "voxflow/src-tauri/Cargo.toml").read_text(encoding="utf-8")
     )
     inno_text = (ROOT / "installer/VoxFlow.iss").read_text(encoding="utf-8-sig")
+    settings_hub = (ROOT / "voxflow/src/sections/SettingsHub.tsx").read_text(
+        encoding="utf-8"
+    )
+    app_readme = (ROOT / "voxflow/README.md").read_text(encoding="utf-8")
+    release_notes = (ROOT / "RELEASE_NOTES.md").read_text(encoding="utf-8")
 
     cargo_package = str(cargo.get("package", {}).get("version", ""))
     inno_version = capture(
@@ -59,6 +64,19 @@ def collect_versions() -> tuple[dict[str, str], str]:
         "Cargo.toml": cargo_package,
         "tauri.conf.json": str(tauri.get("version", "")),
         "VoxFlow.iss": inno_version,
+        "SettingsHub.tsx": capture(
+            r"VoxFlow\s+(\d+\.\d+\.\d+)", settings_hub, "visible UI version"
+        ),
+        "voxflow/README.md": capture(
+            r"check_versions\.py\s+--tag\s+v(\d+\.\d+\.\d+)",
+            app_readme,
+            "app README version",
+        ),
+        "RELEASE_NOTES.md": capture(
+            r"^#\s+VoxFlow\s+v(\d+\.\d+\.\d+)",
+            release_notes,
+            "release notes version",
+        ),
     }
     return versions, inno_file_version
 

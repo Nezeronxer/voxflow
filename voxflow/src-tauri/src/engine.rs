@@ -130,7 +130,8 @@ impl Drop for EngineHandle {
 struct PartialState {
     /// Флаг остановки петли частичных результатов.
     stop: Arc<AtomicBool>,
-    /// Хэндл потока петли — чтобы дождаться его в stop (ни один тик не идёт во время финала).
+    /// Хэндл потока петли: завершившийся join забираем, занятый безопасно детачим,
+    /// чтобы Stop никогда не блокировал следующий Start.
     join: Option<JoinHandle<()>>,
     /// Что физически НАПЕЧАТАНО в поле за эту диктовку (always: prev для inject_incremental).
     injected: Arc<Mutex<String>>,
@@ -152,6 +153,36 @@ enum PartialKind {
     WhisperServer,
     Local,
     Cloud,
+}
+
+fn finish_partial_without_blocking(join: JoinHandle<()>, kind: PartialKind) {
+    if join.is_finished() {
+        let _ = join.join();
+        return;
+    }
+    dbg_log(match kind {
+        PartialKind::WhisperServer => {
+            "stop: whisper partial ещё занят — детачим без блокировки следующего Start"
+        }
+        PartialKind::Local | PartialKind::Cloud => {
+            "stop: preview ещё занят — детачим без блокировки следующего Start"
+        }
+    });
+    // Dropping JoinHandle detaches; the stop flag makes the worker exit at its
+    // next cancellation point without holding the engine command queue.
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn insertion_permission_blocks_capture(is_macos: bool, post_event_allowed: bool) -> bool {
+    is_macos && !post_event_allowed
+}
+
+const NORECOG_FEEDBACK_MIN_CAPTURE_MS: u64 = 500;
+
+fn should_emit_norecog(capture_ms: u64) -> bool {
+    // Первый tap double-tap жеста обычно даёт 150–400 мс буфера (включая
+    // macOS target lookup). Это управляющий жест, а не неудачная диктовка.
+    capture_ms >= NORECOG_FEEDBACK_MIN_CAPTURE_MS
 }
 
 #[derive(Default)]
@@ -552,6 +583,18 @@ impl LocalStt for crate::parakeet::Parakeet {
     }
 }
 
+/// Preview startup must never wait for a resident model to load. `Start` runs
+/// on the single engine command thread; blocking here also delays a queued
+/// `Stop`, which is especially visible during rapid key presses. Background
+/// warmup/final ASR may own the mutex, so use `try_lock` and skip this optional
+/// preview for the current utterance when the model is not already resident.
+fn resident_model_ready<T>(engine: &Arc<Mutex<Option<T>>>) -> bool {
+    engine
+        .try_lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false)
+}
+
 /// Маршрут локального распознавания по настройкам (роутер языков, PLAN §2).
 /// Считается заново на каждый старт/финал — установка модели Parakeet
 /// подхватывается без перезапуска.
@@ -655,7 +698,10 @@ fn whisper_language_arg(language: &str) -> String {
 /// Заранее поднять и прогреть резидентные модели (GigaAM/Parakeet/VAD или
 /// whisper-server), чтобы первая диктовка не ждала загрузку/JIT.
 fn warmup(ctx: EngineCtx) {
-    std::thread::sleep(Duration::from_millis(1200));
+    // This already runs off the engine command thread. Delaying it by 1.2 s
+    // widened the interval in which the first dictation collided with a cold
+    // model/JIT warmup; start immediately so the resident server is useful by
+    // the time the user reaches the hotkey.
     let s = ctx.settings.lock().clone();
     dbg_log(&format!("warmup: engine={}, model={}", s.engine, s.model));
     // VAD грузим всегда (2 МБ, мгновенно) — гейт тишины нужен во всех режимах.
@@ -850,16 +896,32 @@ fn notify_hotkey_latch(ctx: &EngineCtx, active: bool) {
     dbg_log("hotkey: double-press latch enabled");
 }
 
+#[cfg(target_os = "macos")]
+fn macos_insertion_preflight(ctx: &EngineCtx) -> bool {
+    let allowed = crate::macos_permissions::post_event_allowed();
+    if !insertion_permission_blocks_capture(true, allowed) {
+        return true;
+    }
+    dbg_log("start: Accessibility/Post Event missing — capture blocked before microphone open");
+    crate::macos_permissions::request_post_event_once();
+    crate::macos_permissions::open_accessibility_settings();
+    emit_error(
+        &ctx.app,
+        "Разрешите VoxFlow в macOS Privacy & Security -> Accessibility для вставки текста, затем повторите диктовку",
+    );
+    set_status(&ctx.app, "idle");
+    false
+}
+
 fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     if capture.is_some() {
         return;
     }
-    // Снимаем целевое окно ДО любых status/overlay событий VoxFlow. На macOS
-    // System Events легко начинает видеть уже нашу floating-панель как frontmost,
-    // из-за чего финал раньше сам отменял ASR/вставку.
-    let target_fp = resolve_start_target(ctx);
-    dbg_log(&format!("start: target {}", target_fp.describe()));
-    *ctx.active_target.lock() = Some(target_fp.clone());
+    #[cfg(target_os = "macos")]
+    if !macos_insertion_preflight(ctx) {
+        *ctx.active_target.lock() = None;
+        return;
+    }
     let (device, play, auto_mute) = {
         let s = ctx.settings.lock();
         (s.input_device.clone(), s.play_sounds, s.auto_mute)
@@ -890,6 +952,14 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
                     return;
                 }
             }
+            // Capture is already running while we resolve the target. Target
+            // discovery can synchronously consult macOS accessibility APIs, so
+            // doing it before opening CoreAudio clipped the beginning of short
+            // utterances. It still happens before every status/overlay event,
+            // which preserves the original anti-focus-steal guarantee.
+            let target_fp = resolve_start_target(ctx);
+            dbg_log(&format!("start: target {}", target_fp.describe()));
+            *ctx.active_target.lock() = Some(target_fp.clone());
             // Пояс безопасности (C2): старт-звук играем ТОЛЬКО на честном переходе
             // «не писали → пишем». Если запись уже шла (Start поверх ещё активной
             // диктовки при rapid-fire) — звук не переигрываем.
@@ -938,11 +1008,12 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx) {
 ///
 /// ВАЖНО: для cli живой ИНЖЕКТ клавишами не нужен/опасен, поэтому stream_mode
 /// для петли при cli трактуем как "never" — показываем только серый текст в пилюле.
-fn whisper_preview_requested(stream_mode: &str, is_windows: bool) -> bool {
-    // На Windows CUDA partial конкурирует с финалом за однопоточный server.
-    // Если пользователь выбрал "never" (это и есть clean default), статичная
-    // плашка предпочтительнее 0.7–3 с ожидания, kill и холодного рестарта модели.
-    !is_windows || stream_mode != "never"
+fn local_preview_requested(stream_mode: &str) -> bool {
+    // `never` is the clean latency-first default on both platforms. A preview
+    // still consumed GigaAM/Whisper and made every macOS release wait 35–125 ms
+    // before final ASR (and up to seconds when a model was cold), even though no
+    // live text was requested. auto/always retain the full preview pipeline.
+    stream_mode != "never"
 }
 
 fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &TargetFingerprint) {
@@ -977,12 +1048,16 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
     if use_cloud {
         return; // облачный путь: без живых частичных результатов.
     }
+    if !local_preview_requested(&s.stream_mode) {
+        dbg_log("partial: stream_mode=never — сохраняем ресурсы для финального ASR");
+        return;
+    }
     // Локальные резидентные движки: живые партиалы на CPU, GPU не нужен.
     // Сегментная схема: VAD находит паузы; завершённые сегменты фиксируются
     // (committed растёт монотонно по построению), активный сегмент
     // перераспознаётся каждый тик (volatile, серый). По тишине ASR не гоняем.
     if s.language == "auto" && s.engine == "gigaam" {
-        if ensure_gigaam(ctx, &s).is_ok() {
+        if resident_model_ready(&ctx.gigaam) {
             // Auto сохраняет все языки в финале, но русскому live-preview нужен
             // быстрый и сильный движок. Whisper auto слишком медленно обновлял
             // кружок, а Parakeet давал мусор по русской речи. Поэтому в auto
@@ -1009,7 +1084,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
     if s.engine == "whisper_server"
         && (s.language.eq_ignore_ascii_case("ru") || is_auto_language_alias(&s.language))
         && crate::gigaam::dir_ready(&paths::gigaam_dir())
-        && ensure_gigaam(ctx, &s).is_ok()
+        && resident_model_ready(&ctx.gigaam)
     {
         // macOS UX: универсальный Whisper large слишком медленный для живых
         // partial-ов на CPU/Metal и часто упирается в короткий live timeout.
@@ -1034,7 +1109,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
     }
     match local_route(&s) {
         LocalRoute::GigaAm => {
-            if ensure_gigaam(ctx, &s).is_err() {
+            if !resident_model_ready(&ctx.gigaam) {
                 // Модели ещё нет (первый запуск, докачка) — пилюля статична,
                 // предупреждение по-старому отработает финал/гард старта.
                 dbg_log("partial: gigaam не готов — без живого стрима");
@@ -1056,7 +1131,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
             return;
         }
         LocalRoute::Parakeet => {
-            if ensure_parakeet(ctx, &s).is_ok() {
+            if resident_model_ready(&ctx.parakeet) {
                 // en/auto: партиалы гонит Parakeet БЕЗ двойного прогона (RU-перегон
                 // кириллических сегментов — только в финале); язык бейджа
                 // определяется по скрипту текущего текста.
@@ -1079,12 +1154,6 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
             dbg_log("partial: parakeet не загрузился — пробуем whisper-стрим");
         }
         LocalRoute::Whisper => {}
-    }
-    if !whisper_preview_requested(&s.stream_mode, cfg!(windows)) {
-        dbg_log(
-            "partial: Windows stream_mode=never — сохраняем прогретый whisper-server для финала",
-        );
-        return;
     }
     // Живой whisper-стрим на Windows оставляем только для NVIDIA-сборки: CPU
     // сервер там слишком медленный для тиков. На macOS используем native sidecar
@@ -1343,7 +1412,7 @@ fn cloud_partial_loop(
         if stop.load(Ordering::Acquire) {
             break;
         }
-        let text = match crate::cloud_stt::transcribe(&s, &wav) {
+        let text = match crate::cloud_stt::transcribe_partial(&s, &wav) {
             Ok(t) => t,
             Err(_) => continue, // 429/таймаут/сеть — best-effort, пропускаем тик
         };
@@ -2263,62 +2332,17 @@ fn stop_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     // и готовим финальный ASR.
     set_status(&ctx.app, "transcribing");
 
-    // Останавливаем петлю частичных результатов. Если она уже вошла в
-    // whisper-server /inference, детачить её нельзя: single-thread сервер может
-    // продолжить считать partial, а финал будет висеть на "Готово". Поэтому даём
-    // петле короткий шанс завершиться, а затем убиваем server-процесс: следующий
-    // финал поднимет чистый экземпляр.
+    // Останавливаем петлю частичных результатов, но НИКОГДА не ждём её на
+    // единственном engine command thread. Иначе быстрый следующий Start стоит
+    // за Stop до 120 мс (local) или 2 с (whisper) и теряет начало речи.
+    // Detached final сам сериализуется через asr_lock; устаревшее поколение
+    // отсекается до дорогого ASR и перед вставкой.
     let partial_stop_started = Instant::now();
     let pstate = ctx.partial.lock().take();
     if let Some(mut st) = pstate {
         st.stop.store(true, Ordering::Release);
         if let Some(j) = st.join.take() {
-            match st.kind {
-                PartialKind::WhisperServer => {
-                    let t0 = Instant::now();
-                    loop {
-                        if j.is_finished() {
-                            let _ = j.join();
-                            break;
-                        }
-                        if t0.elapsed() >= Duration::from_millis(700) {
-                            dbg_log(
-                                "stop: петля партиалов занята >700 мс — перезапускаем whisper-server перед финалом",
-                            );
-                            restart_whisper_server(ctx, "partial busy before final");
-                            let t1 = Instant::now();
-                            loop {
-                                if j.is_finished() {
-                                    let _ = j.join();
-                                    break;
-                                }
-                                if t1.elapsed() >= Duration::from_millis(1300) {
-                                    dbg_log(
-                                        "stop: петля партиалов не завершилась после kill — детачим, финал уйдёт в fallback при занятом asr_lock",
-                                    );
-                                    break;
-                                }
-                                std::thread::sleep(Duration::from_millis(20));
-                            }
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                }
-                PartialKind::Local | PartialKind::Cloud => {
-                    let t0 = Instant::now();
-                    while !j.is_finished() && t0.elapsed() < Duration::from_millis(120) {
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    if j.is_finished() {
-                        let _ = j.join();
-                    } else {
-                        dbg_log(
-                            "stop: локальная петля партиалов ещё занята — детачим, финал стартует сразу",
-                        );
-                    }
-                }
-            }
+            finish_partial_without_blocking(j, st.kind);
         }
         dbg_log(&format!(
             "[lat] stop_wait={}мс",
@@ -2748,6 +2772,14 @@ fn looks_like_stale_final(preview: &str, final_text: &str) -> bool {
     final_has_big_tail && overlap_ratio < 0.25
 }
 
+fn generation_is_current(current: u64, expected: u64) -> bool {
+    current == expected
+}
+
+fn final_generation_is_current(ctx: &EngineCtx, expected: u64) -> bool {
+    generation_is_current(ctx.gen.load(Ordering::Acquire), expected)
+}
+
 fn lexical_tokens(text: &str) -> HashSet<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter_map(|t| {
@@ -2815,12 +2847,14 @@ fn process_utterance(
     my_gen: u64,
     mut target_fp: TargetFingerprint,
 ) -> anyhow::Result<()> {
+    if !final_generation_is_current(ctx, my_gen) {
+        dbg_log("финал: поколение устарело до препроцессинга — ASR пропущен");
+        return Ok(());
+    }
     if samples.is_empty() {
-        dbg_log("финал: запись пустая — нечего распознавать");
-        let _ = ctx.app.emit(
-            "norecog",
-            serde_json::json!({ "message": "Запись пустая — проверьте микрофон" }),
-        );
+        // Первый tap double-tap жеста может завершиться до первого CoreAudio
+        // callback. Это управляющий жест, поэтому не мигаем ложным norecog.
+        dbg_log("финал: пустой короткий tap — нечего распознавать, norecog подавлен");
         return Ok(());
     }
     let s = ctx.settings.lock().clone();
@@ -2834,9 +2868,10 @@ fn process_utterance(
     let trimmed = audio::trim_silence(&mono16, 16000);
     let speech_trimmed = compact_speech_for_final_asr(&ctx.vad_final, &trimmed);
     let pre_ms = t_pre.elapsed().as_millis() as u64;
+    let capture_ms = samples.len().saturating_mul(1000) as u64 / rate.max(1) as u64;
     dbg_log(&format!(
         "финал: audio raw={}мс mono={}мс trimmed={}мс speech={}мс",
-        samples.len().saturating_mul(1000) as u64 / rate.max(1) as u64,
+        capture_ms,
         mono16.len().saturating_mul(1000) as u64 / 16000,
         trimmed.len().saturating_mul(1000) as u64 / 16000,
         speech_trimmed.len().saturating_mul(1000) as u64 / 16000
@@ -2844,10 +2879,14 @@ fn process_utterance(
     if speech_trimmed.len() < 16000 / 5 {
         // < ~0.2 c полезного звука — считаем, что речи не было
         dbg_log("финал: VAD не нашёл речь — распознавание пропущено");
-        let _ = ctx.app.emit(
-            "norecog",
-            serde_json::json!({ "message": "Не услышал речь — проверьте микрофон" }),
-        );
+        if should_emit_norecog(capture_ms) {
+            let _ = ctx.app.emit(
+                "norecog",
+                serde_json::json!({ "message": "Не услышал речь — проверьте микрофон" }),
+            );
+        } else {
+            dbg_log("финал: короткий управляющий tap — norecog подавлен");
+        }
         return Ok(());
     }
 
@@ -2915,6 +2954,10 @@ fn process_utterance(
     } else {
         None
     };
+    if !final_generation_is_current(ctx, my_gen) {
+        dbg_log("финал: поколение устарело перед ASR — дорогой вызов пропущен");
+        return Ok(());
+    }
     let t0 = Instant::now();
     // Язык диктовки для бейджа overlay: Some("ru"/"en") у локальных резидентных
     // маршрутов, None (бейдж скрыт) у облака/whisper.
@@ -2935,9 +2978,13 @@ fn process_utterance(
                     Ok(_) => log::warn!("облачный STT ({}) вернул пусто", s.stt_provider),
                 }
                 if s.stt_fallback_local {
+                    if !final_generation_is_current(ctx, my_gen) {
+                        dbg_log("финал: облачный запрос устарел — local fallback не запускаем");
+                        return Ok(());
+                    }
                     log::warn!("облачный STT недоступен — откат на локальное распознавание");
                     emit_stt_mode(&ctx.app, "local", true);
-                    let (text, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed)?;
+                    let (text, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed, my_gen)?;
                     lang_badge = lang;
                     text
                 } else {
@@ -2955,18 +3002,26 @@ fn process_utterance(
         match crate::gemini::transcribe(&s.ai_api_key, &s.ai_model, &wav, &s.language) {
             Ok(t) => postprocess::dedup_repeated_ngrams(&t),
             Err(e) => {
+                if !final_generation_is_current(ctx, my_gen) {
+                    dbg_log("финал: Gemini ASR устарел — local fallback не запускаем");
+                    return Ok(());
+                }
                 log::warn!("облачный ASR (Gemini) ошибка: {e}; откат на локальное распознавание");
-                let (text, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed)?;
+                let (text, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed, my_gen)?;
                 lang_badge = lang;
                 text
             }
         }
     } else {
-        let (t, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed)?;
+        let (t, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed, my_gen)?;
         lang_badge = lang;
         t
     };
     let ms = t0.elapsed().as_millis() as u64;
+    if !final_generation_is_current(ctx, my_gen) {
+        dbg_log("финал: ASR завершился для устаревшего поколения — постобработку пропускаем");
+        return Ok(());
+    }
     // Бейдж языка в пилюле: статус-объект { status, lang } по контракту overlay
     // (legacy-строки "idle"/"recording"/"transcribing" остаются как были).
     // Только если эта диктовка ещё актуальна — не перетираем статус следующей.
@@ -3503,11 +3558,8 @@ fn ensure_server_inner(
                 return Err(anyhow::anyhow!("whisper-server start cancelled"));
             }
             let port = asr::reserve_loopback_port()?;
-            let ready_timeout = if is_accelerated_runtime(ctx, whisper_dir) {
-                Duration::from_secs(8)
-            } else {
-                Duration::from_secs(60)
-            };
+            let ready_timeout =
+                whisper_server_ready_timeout(is_accelerated_runtime(ctx, whisper_dir));
             let started = match cancel {
                 Some(flag) => asr::start_server_cancellable(
                     whisper_dir,
@@ -3546,6 +3598,19 @@ fn ensure_server_inner(
         Ok(srv.port)
     } else {
         Err(anyhow::anyhow!("whisper-server не инициализирован"))
+    }
+}
+
+fn whisper_server_ready_timeout(accelerated: bool) -> Duration {
+    if accelerated {
+        Duration::from_secs(8)
+    } else if cfg!(target_os = "macos") {
+        // The bundled arm64 Metal server is ready in <7 s even on the observed
+        // slow mounted-DMG path. A broken sidecar should reach CLI fallback in
+        // 20 s, not hold the final pipeline for the generic 60 s CPU budget.
+        Duration::from_secs(20)
+    } else {
+        Duration::from_secs(60)
     }
 }
 
@@ -3825,6 +3890,7 @@ fn local_asr(
     dict: &[postprocess::Dict],
     wav: &std::path::Path,
     samples_16k: &[f32],
+    my_gen: u64,
 ) -> anyhow::Result<(String, Option<&'static str>)> {
     let route = local_route(s);
     if route != LocalRoute::Whisper {
@@ -3987,7 +4053,9 @@ fn local_asr(
             Err(e) => log::warn!("auto-fallback GigaAM недоступен ({e})"),
         }
     }
-    let whisper_text = { local_transcribe_guarded(ctx, s, dict, wav)? };
+    let Some(whisper_text) = local_transcribe_guarded(ctx, s, dict, wav, my_gen)? else {
+        return Ok((String::new(), None));
+    };
     if s.language == "auto"
         && s.engine == "gigaam"
         && crate::gigaam::dir_ready(&paths::gigaam_dir())
@@ -4368,11 +4436,60 @@ mod seg_tests {
     }
 
     #[test]
-    fn windows_never_mode_keeps_whisper_server_free_for_final_asr() {
-        assert!(!whisper_preview_requested("never", true));
-        assert!(whisper_preview_requested("auto", true));
-        assert!(whisper_preview_requested("always", true));
-        assert!(whisper_preview_requested("never", false));
+    fn clean_default_keeps_all_local_preview_work_off_the_final_asr_lane() {
+        assert!(!local_preview_requested("never"));
+        assert!(local_preview_requested("auto"));
+        assert!(local_preview_requested("always"));
+    }
+
+    #[test]
+    fn resident_preview_probe_never_waits_for_model_initialization() {
+        let model = Arc::new(Mutex::new(Some(7u8)));
+        assert!(resident_model_ready(&model));
+        let loading = model.lock();
+        assert!(!resident_model_ready(&model));
+        drop(loading);
+        *model.lock() = None;
+        assert!(!resident_model_ready(&model));
+    }
+
+    #[test]
+    fn stale_generation_is_rejected_before_expensive_fallbacks() {
+        assert!(generation_is_current(9, 9));
+        assert!(!generation_is_current(10, 9));
+    }
+
+    #[test]
+    fn macos_capture_requires_insertion_permission() {
+        assert!(insertion_permission_blocks_capture(true, false));
+        assert!(!insertion_permission_blocks_capture(true, true));
+        assert!(!insertion_permission_blocks_capture(false, false));
+    }
+
+    #[test]
+    fn quick_double_tap_candidate_does_not_flash_false_norecog() {
+        assert!(!should_emit_norecog(0));
+        assert!(!should_emit_norecog(180));
+        assert!(!should_emit_norecog(499));
+        assert!(should_emit_norecog(500));
+    }
+
+    #[test]
+    fn busy_partial_never_blocks_the_next_engine_command() {
+        let join = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(200)));
+        let started = Instant::now();
+        finish_partial_without_blocking(join, PartialKind::Local);
+        assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn server_start_deadline_is_tight_on_macos_but_keeps_cpu_budget_elsewhere() {
+        assert_eq!(whisper_server_ready_timeout(true), Duration::from_secs(8));
+        let expected = if cfg!(target_os = "macos") { 20 } else { 60 };
+        assert_eq!(
+            whisper_server_ready_timeout(false),
+            Duration::from_secs(expected)
+        );
     }
 
     #[test]
@@ -4397,16 +4514,39 @@ fn local_transcribe_guarded(
     s: &Settings,
     dict: &[postprocess::Dict],
     wav: &std::path::Path,
-) -> anyhow::Result<String> {
-    if let Some(_g) = ctx.asr_lock.try_lock_for(Duration::from_secs(3)) {
-        return local_transcribe(ctx, s, dict, wav);
+    expected_gen: u64,
+) -> anyhow::Result<Option<String>> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if !final_generation_is_current(ctx, expected_gen) {
+            dbg_log("финал: поколение устарело в ожидании asr_lock — Whisper пропущен");
+            return Ok(None);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            break;
+        }
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(50));
+        if let Some(_g) = ctx.asr_lock.try_lock_for(wait) {
+            if !final_generation_is_current(ctx, expected_gen) {
+                dbg_log("финал: поколение устарело после asr_lock — Whisper пропущен");
+                return Ok(None);
+            }
+            return local_transcribe(ctx, s, dict, wav).map(Some);
+        }
     }
 
+    if !final_generation_is_current(ctx, expected_gen) {
+        dbg_log("финал: поколение устарело до Whisper fallback — перезапуск пропущен");
+        return Ok(None);
+    }
     dbg_log(
         "финал: asr_lock занят >3 с — сбрасываем whisper-server и используем whisper-cli fallback",
     );
     restart_whisper_server(ctx, "final asr_lock timeout");
-    local_transcribe_cli_only(ctx, s, dict, wav)
+    local_transcribe_cli_only(ctx, s, dict, wav).map(Some)
 }
 
 fn local_transcribe_cli_only(
@@ -4460,13 +4600,7 @@ fn disable_accelerated_runtime(ctx: &EngineCtx, runtime: &std::path::Path, error
 }
 
 fn whisper_cli_timeout(wav: &std::path::Path, accelerated: bool) -> Duration {
-    let audio_seconds = hound::WavReader::open(wav)
-        .ok()
-        .map(|reader| {
-            let sample_rate = u64::from(reader.spec().sample_rate.max(1));
-            u64::from(reader.duration()).div_ceil(sample_rate)
-        })
-        .unwrap_or(10);
+    let audio_seconds = audio::wav_duration_secs_ceil(wav).unwrap_or(10);
     let (multiplier, maximum) = if accelerated { (3, 300) } else { (12, 1200) };
     Duration::from_secs(
         15u64
