@@ -150,8 +150,15 @@ pub enum Key {
 /// всегда уходит сразу.
 const QUICK_TAP_MAX: Duration = Duration::from_millis(180);
 /// Окно между release первого tap и press второго. Оно не влияет на
-/// скорость Stop: второй press запускает новую запись и сразу защёлкивает её.
+/// скорость StopTap: второй press атомарно запускает новую запись и
+/// сигнализирует UI о защёлке через StartLatched.
 const DOUBLE_WINDOW: Duration = Duration::from_millis(300);
+
+#[derive(Clone, Copy, Debug)]
+struct TapCandidate {
+    key: Key,
+    released_at: Instant,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PressMode {
@@ -197,7 +204,10 @@ struct HotState {
     /// физического нажатия не менял семантику посереди цикла.
     pressed_double_tap_latch: Option<bool>,
     press_at: Option<Instant>,
-    last_tap_release: Option<Instant>,
+    /// Кандидат на первый tap привязан к физической клавише. Если настройку
+    /// хоткея сменили между tap-ами, новая клавиша не должна подхватывать
+    /// старое окно и неожиданно включать latch.
+    tap_candidate: Option<TapCandidate>,
     latched: bool,
     ignore_release: bool,
 }
@@ -212,7 +222,7 @@ impl HotState {
             pressed_mode: None,
             pressed_double_tap_latch: None,
             press_at: None,
-            last_tap_release: None,
+            tap_candidate: None,
             latched: false,
             ignore_release: false,
         }
@@ -333,7 +343,7 @@ fn dispatch(
                 // Сбрасываем защёлку и окно двойного тапа.
                 // Если основная клавиша ещё физически удерживается, её release
                 // только очистит state и не отправит лишний Stop после Cancel.
-                st.last_tap_release = None;
+                st.tap_candidate = None;
                 st.latched = false;
                 st.ignore_release = st.key_down;
                 st.press_at = None;
@@ -414,6 +424,20 @@ fn on_press(
     key: Key,
     double_tap_latch: bool,
 ) {
+    on_press_at(state, tx, mode, key, double_tap_latch, Instant::now());
+}
+
+/// Purely clocked part of key-down handling. Production passes `Instant::now()`,
+/// while tests pass an explicit monotonic instant so rapid sequences never need
+/// sleeps and cannot become scheduler-dependent.
+fn on_press_at(
+    state: &Arc<Mutex<HotState>>,
+    tx: &Sender<EngineCmd>,
+    mode: &str,
+    key: Key,
+    double_tap_latch: bool,
+    now: Instant,
+) {
     let mut st = state.lock();
     if st.key_down {
         return; // авто-повтор удержания — игнор
@@ -423,13 +447,12 @@ fn on_press(
     let press_mode = PressMode::from_setting(mode);
     st.pressed_mode = Some(press_mode);
     st.pressed_double_tap_latch = Some(double_tap_latch);
-    let now = Instant::now();
 
     // Режим toggle: каждое нажатие — переключение.
     if press_mode == PressMode::Toggle {
         // Не переносим состояние hold-защёлки через смену режима.
         st.press_at = None;
-        st.last_tap_release = None;
+        st.tap_candidate = None;
         st.latched = false;
         st.ignore_release = false;
         let _ = tx.send(EngineCmd::Toggle);
@@ -441,30 +464,34 @@ fn on_press(
         // Уже защёлкнуто — это нажатие выключает запись.
         st.latched = false;
         st.ignore_release = true;
+        st.tap_candidate = None;
         let _ = tx.send(EngineCmd::Stop);
         return;
     }
     if !double_tap_latch {
         // Не оставляем окно от ранее включённой защёлки: после opt-out
         // следующий press всегда обычный hold-start.
-        st.last_tap_release = None;
+        st.tap_candidate = None;
     }
     // Двойное нажатие: второе нажатие вскоре после тап-отпускания → ЗАЩЁЛКА ВКЛ.
     if double_tap_latch {
-        if let Some(rel) = st.last_tap_release {
-            if now.duration_since(rel) <= DOUBLE_WINDOW {
-                // Первый release уже немедленно послал Stop, поэтому второй press
-                // честно начинает новую запись, а затем защёлкивает её. Порядок команд
-                // в одном Sender гарантирует Start перед HotkeyLatch.
+        if let Some(candidate) = st.tap_candidate {
+            let inside_window = now
+                .checked_duration_since(candidate.released_at)
+                .is_some_and(|elapsed| elapsed <= DOUBLE_WINDOW);
+            if candidate.key == key && inside_window {
+                // Первый release уже немедленно послал StopTap. Второй press
+                // посылает одну команду: движок сначала показывает latch-UI,
+                // затем запускает микрофон. Так синхронная часть Start не
+                // может отложить анимацию двойного нажатия.
                 st.latched = true;
                 st.ignore_release = true;
-                st.last_tap_release = None;
+                st.tap_candidate = None;
                 st.press_at = Some(now);
-                let _ = tx.send(EngineCmd::Start);
-                let _ = tx.send(EngineCmd::HotkeyLatch);
+                let _ = tx.send(EngineCmd::StartLatched);
                 return;
             }
-            st.last_tap_release = None;
+            st.tap_candidate = None;
         }
     }
     // Обычный старт удержания.
@@ -473,6 +500,10 @@ fn on_press(
 }
 
 fn on_release(state: &Arc<Mutex<HotState>>, tx: &Sender<EngineCmd>, mode: &str) {
+    on_release_at(state, tx, mode, Instant::now());
+}
+
+fn on_release_at(state: &Arc<Mutex<HotState>>, tx: &Sender<EngineCmd>, mode: &str, now: Instant) {
     let mut st = state.lock();
     // dispatch допускает сюда только release отслеженного press. Защищаемся
     // и здесь, чтобы прямой вызов не мог породить duplicate Stop.
@@ -480,7 +511,7 @@ fn on_release(state: &Arc<Mutex<HotState>>, tx: &Sender<EngineCmd>, mode: &str) 
         return;
     }
     st.key_down = false;
-    st.pressed_key = None;
+    let released_key = st.pressed_key.take().expect("tracked key checked above");
     let press_mode = st
         .pressed_mode
         .take()
@@ -498,7 +529,6 @@ fn on_release(state: &Arc<Mutex<HotState>>, tx: &Sender<EngineCmd>, mode: &str) 
     if st.latched {
         return; // защёлкнуто — запись продолжается
     }
-    let now = Instant::now();
     let held = st
         .press_at
         .take()
@@ -506,13 +536,18 @@ fn on_release(state: &Arc<Mutex<HotState>>, tx: &Sender<EngineCmd>, mode: &str) 
         .unwrap_or_default();
 
     if double_tap_latch && held < QUICK_TAP_MAX {
-        // Запоминаем tap для возможного второго press, но ничего не откладываем:
-        // физический release всегда немедленно завершает текущую запись.
-        st.last_tap_release = Some(now);
+        // StopTap не откладывает физический release, но не даёт короткому
+        // первому tap мигнуть обычной transcribing-анимацией. Кандидат
+        // привязан к той же физической клавише.
+        st.tap_candidate = Some(TapCandidate {
+            key: released_key,
+            released_at: now,
+        });
+        let _ = tx.send(EngineCmd::StopTap);
     } else {
-        st.last_tap_release = None;
+        st.tap_candidate = None;
+        let _ = tx.send(EngineCmd::Stop);
     }
-    let _ = tx.send(EngineCmd::Stop);
 }
 
 /// Сопоставление KeyboardEvent.code (из вебвью) → rdev::Key (rdev 0.5.3).
@@ -787,22 +822,12 @@ mod macos {
         capture_active: Arc<AtomicBool>,
     ) {
         let mut requested_permission = false;
-        let mut reported_onboarding_wait = false;
+        let mut reported_tap_failure = false;
         loop {
-            // Onboarding может ещё ждать Accessibility, когда Input Monitoring
-            // уже разрешён. Не поднимаем event tap до завершения всего onboarding:
-            // иначе первая диктовка стартует до появления права на вставку.
-            if crate::macos_permissions::onboarding_active() {
-                if !reported_onboarding_wait {
-                    crate::engine::dbg_log(
-                        "hotkey: waiting while macOS permissions onboarding is active",
-                    );
-                    reported_onboarding_wait = true;
-                }
-                std::thread::sleep(Duration::from_millis(250));
-                continue;
-            }
-            reported_onboarding_wait = false;
+            // Input Monitoring — единственное разрешение, нужное для event tap.
+            // Accessibility может ещё ожидать в onboarding: это не повод
+            // оставлять хоткей неактивным. Engine отдельно делает insertion
+            // preflight перед открытием микрофона и не даст потерять текст.
             if !listen_event_allowed() {
                 if !requested_permission {
                     crate::engine::dbg_log(
@@ -815,9 +840,12 @@ mod macos {
                     }
                     requested_permission = true;
                 } else {
-                    crate::engine::dbg_log("hotkey: waiting for macOS Input Monitoring permission");
+                    log::trace!("hotkey: waiting for macOS Input Monitoring permission");
                 }
-                std::thread::sleep(Duration::from_secs(2));
+                // TCC не даёт callback о смене доступа. Короткий polling позволяет
+                // первому press сработать максимум через 100 ms после выдачи права,
+                // а не через прежние две секунды.
+                std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
 
@@ -844,13 +872,16 @@ mod macos {
                 )
             };
             if tap.is_null() {
-                crate::engine::dbg_log(
-                    "hotkey: CGEventTapCreate failed; grant Input Monitoring permission",
-                );
-                log::error!(
-                    "macOS hotkey listener is unavailable; grant VoxFlow Input Monitoring permission"
-                );
-                emit_permission_error(&app);
+                if !reported_tap_failure {
+                    crate::engine::dbg_log(
+                        "hotkey: CGEventTapCreate failed; grant Input Monitoring permission",
+                    );
+                    log::error!(
+                        "macOS hotkey listener is unavailable; grant VoxFlow Input Monitoring permission"
+                    );
+                    emit_permission_error(&app);
+                    reported_tap_failure = true;
+                }
                 if !requested_permission && !crate::macos_permissions::onboarding_active() {
                     open_input_monitoring_settings();
                     requested_permission = true;
@@ -858,7 +889,10 @@ mod macos {
                 unsafe {
                     drop(Box::from_raw(ctx));
                 }
-                std::thread::sleep(Duration::from_secs(2));
+                // IOHIDCheckAccess can turn positive slightly before event-tap
+                // creation starts succeeding. Retry promptly, without flooding
+                // the log/error overlay on every attempt.
+                std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
 
@@ -1111,9 +1145,24 @@ mod tests {
         (Arc::new(Mutex::new(HotState::new())), tx, rx)
     }
 
-    /// Имитирует «держал дольше QUICK_TAP_MAX» без sleep.
+    /// Имитирует «держал не меньше QUICK_TAP_MAX» без sleep.
     fn backdate_press(state: &Arc<Mutex<HotState>>) {
         state.lock().press_at = Some(Instant::now() - QUICK_TAP_MAX);
+    }
+
+    fn press_at(
+        state: &Arc<Mutex<HotState>>,
+        tx: &Sender<EngineCmd>,
+        key: Key,
+        mode: &str,
+        double_tap_latch: bool,
+        now: Instant,
+    ) {
+        super::on_press_at(state, tx, mode, key, double_tap_latch, now);
+    }
+
+    fn release_at(state: &Arc<Mutex<HotState>>, tx: &Sender<EngineCmd>, mode: &str, now: Instant) {
+        super::on_release_at(state, tx, mode, now);
     }
 
     fn assert_no_cmd(rx: &Receiver<EngineCmd>) {
@@ -1536,14 +1585,10 @@ mod tests {
                 "hold",
                 true,
             );
-            assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
+            assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
             // Отделяем быстрые hold-циклы от жеста double-tap latch.
-            state.lock().last_tap_release = None;
+            state.lock().tap_candidate = None;
         }
-        assert_no_cmd(&rx);
-
-        // Фоновых Stop из прошлых release больше нет.
-        std::thread::sleep(DOUBLE_WINDOW + Duration::from_millis(25));
         assert_no_cmd(&rx);
     }
 
@@ -1623,6 +1668,66 @@ mod tests {
         assert!(down.is_empty());
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_left_and_right_modifiers_are_tracked_independently() {
+        let mut down = Vec::new();
+
+        assert_eq!(
+            super::macos::normalize_modifier_transition(&mut down, Key::Alt, true),
+            Some(EventType::KeyPress(Key::Alt))
+        );
+        assert_eq!(
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true),
+            Some(EventType::KeyPress(Key::AltGr))
+        );
+        assert_eq!(down, vec![Key::Alt, Key::AltGr]);
+
+        // Releasing the left key must not synthesize an up for Right Option,
+        // which is the common dictation binding on macOS.
+        assert_eq!(
+            super::macos::normalize_modifier_transition(&mut down, Key::Alt, false),
+            Some(EventType::KeyRelease(Key::Alt))
+        );
+        assert_eq!(down, vec![Key::AltGr]);
+        assert_eq!(
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true),
+            None
+        );
+        assert_eq!(
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, false),
+            Some(EventType::KeyRelease(Key::AltGr))
+        );
+        assert!(down.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_rapid_modifier_cycles_preserve_exact_event_order() {
+        let mut down = Vec::new();
+        let mut normalized = Vec::new();
+        for physically_down in [true, true, false, false, true, false] {
+            if let Some(event) = super::macos::normalize_modifier_transition(
+                &mut down,
+                Key::ControlRight,
+                physically_down,
+            ) {
+                normalized.push(event);
+            }
+        }
+
+        assert_eq!(
+            normalized,
+            vec![
+                EventType::KeyPress(Key::ControlRight),
+                EventType::KeyRelease(Key::ControlRight),
+                EventType::KeyPress(Key::ControlRight),
+                EventType::KeyRelease(Key::ControlRight),
+            ]
+        );
+        assert!(down.is_empty());
+    }
+
     #[test]
     fn right_option_hotkey_starts_hold_to_talk() {
         assert!(matches!(parse_key("AltRight"), Some(Key::AltGr)));
@@ -1667,7 +1772,10 @@ mod tests {
         {
             let mut st = state.lock();
             st.latched = true;
-            st.last_tap_release = Some(Instant::now());
+            st.tap_candidate = Some(TapCandidate {
+                key: Key::KeyA,
+                released_at: Instant::now(),
+            });
         }
         dispatch_custom(
             &state,
@@ -1681,7 +1789,7 @@ mod tests {
         let st = state.lock();
         assert!(!st.key_down);
         assert!(!st.latched);
-        assert!(st.last_tap_release.is_none());
+        assert!(st.tap_candidate.is_none());
     }
 
     #[test]
@@ -1782,6 +1890,43 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
     }
 
+    #[test]
+    fn latch_setting_is_captured_on_press_and_opt_out_clears_stale_candidate() {
+        let t0 = Instant::now();
+
+        // Enabled when the physical press began: its quick release remains a
+        // tap candidate even if UI settings are changed before key-up.
+        let (state, tx, rx) = mk();
+        press_at(&state, &tx, Key::KeyA, "hold", true, t0);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        release_at(&state, &tx, "hold", t0 + Duration::from_millis(20));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
+
+        // The next press observes latch=false, clears the old window, and is a
+        // normal hold start even though it is physically inside DOUBLE_WINDOW.
+        press_at(
+            &state,
+            &tx,
+            Key::KeyA,
+            "hold",
+            false,
+            t0 + Duration::from_millis(40),
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        assert!(state.lock().tap_candidate.is_none());
+        assert_no_cmd(&rx);
+
+        // Disabled when another physical press began: enabling the setting
+        // before release cannot retroactively convert it to StopTap.
+        let (state, tx, rx) = mk();
+        press_at(&state, &tx, Key::KeyA, "hold", false, t0);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        release_at(&state, &tx, "hold", t0 + Duration::from_millis(20));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
+        assert!(state.lock().tap_candidate.is_none());
+        assert_no_cmd(&rx);
+    }
+
     // Даже короткий tap с включённой защёлкой не задерживает release.
     #[test]
     fn enabled_latch_stops_single_quick_tap_immediately() {
@@ -1803,9 +1948,9 @@ mod tests {
             "hold",
             true,
         );
-        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
         assert_no_cmd(&rx);
-        assert!(state.lock().last_tap_release.is_some());
+        assert!(state.lock().tap_candidate.is_some());
     }
 
     // Защёлка включена по умолчанию, но обычная hold-to-talk диктовка не
@@ -1835,8 +1980,184 @@ mod tests {
         assert_no_cmd(&rx);
     }
 
-    // Двойной тап → первый release немедленно Stop, второй press даёт
-    // новый Start + защёлку; release в защёлке игнорируется.
+    #[test]
+    fn tap_and_double_window_boundaries_are_deterministic() {
+        let (state, tx, rx) = mk();
+        let t0 = Instant::now();
+        let first_release = t0 + QUICK_TAP_MAX - Duration::from_nanos(1);
+
+        press_at(&state, &tx, Key::KeyA, "hold", true, t0);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        release_at(&state, &tx, "hold", first_release);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
+
+        // Inclusive outer boundary: exactly DOUBLE_WINDOW is still a double tap.
+        press_at(
+            &state,
+            &tx,
+            Key::KeyA,
+            "hold",
+            true,
+            first_release + DOUBLE_WINDOW,
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StartLatched)));
+        assert_no_cmd(&rx);
+    }
+
+    #[test]
+    fn quick_tap_threshold_is_exclusive_and_long_press_never_latches() {
+        let (state, tx, rx) = mk();
+        let t0 = Instant::now();
+
+        press_at(&state, &tx, Key::KeyA, "hold", true, t0);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        release_at(&state, &tx, "hold", t0 + QUICK_TAP_MAX);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
+        assert!(state.lock().tap_candidate.is_none());
+
+        press_at(
+            &state,
+            &tx,
+            Key::KeyA,
+            "hold",
+            true,
+            t0 + QUICK_TAP_MAX + Duration::from_nanos(1),
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        assert_no_cmd(&rx);
+    }
+
+    #[test]
+    fn expired_tap_candidate_starts_plain_hold_without_late_commands() {
+        let (state, tx, rx) = mk();
+        let t0 = Instant::now();
+        let first_release = t0 + Duration::from_millis(20);
+
+        press_at(&state, &tx, Key::KeyA, "hold", true, t0);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        release_at(&state, &tx, "hold", first_release);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
+
+        press_at(
+            &state,
+            &tx,
+            Key::KeyA,
+            "hold",
+            true,
+            first_release + DOUBLE_WINDOW + Duration::from_nanos(1),
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        assert!(state.lock().tap_candidate.is_none());
+        assert_no_cmd(&rx);
+    }
+
+    #[test]
+    fn tap_candidate_never_crosses_to_a_new_physical_hotkey() {
+        let (state, tx, rx) = mk();
+        let t0 = Instant::now();
+        let first_release = t0 + Duration::from_millis(20);
+
+        press_at(&state, &tx, Key::KeyA, "hold", true, t0);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        release_at(&state, &tx, "hold", first_release);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
+
+        // Settings changed A -> B inside the double-tap window. This is a new
+        // binding, not the second half of A's gesture.
+        press_at(
+            &state,
+            &tx,
+            Key::KeyB,
+            "hold",
+            true,
+            first_release + Duration::from_millis(20),
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        let st = state.lock();
+        assert!(!st.latched);
+        assert!(st.tap_candidate.is_none());
+        assert_eq!(st.pressed_key, Some(Key::KeyB));
+        drop(st);
+        assert_no_cmd(&rx);
+    }
+
+    #[test]
+    fn out_of_order_clock_input_cannot_revive_a_stale_tap() {
+        let (state, tx, rx) = mk();
+        let t0 = Instant::now();
+        {
+            state.lock().tap_candidate = Some(TapCandidate {
+                key: Key::KeyA,
+                released_at: t0 + Duration::from_secs(1),
+            });
+        }
+
+        // `checked_duration_since` makes even a synthetic backwards timestamp
+        // a plain Start rather than a panic or a false latch.
+        press_at(&state, &tx, Key::KeyA, "hold", true, t0);
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        assert!(!state.lock().latched);
+        assert_no_cmd(&rx);
+    }
+
+    #[test]
+    fn zero_interval_double_tap_and_unlatch_have_no_deferred_actions() {
+        let (state, tx, rx) = mk();
+        let now = Instant::now();
+
+        press_at(&state, &tx, Key::KeyA, "hold", true, now);
+        release_at(&state, &tx, "hold", now);
+        press_at(&state, &tx, Key::KeyA, "hold", true, now);
+        release_at(&state, &tx, "hold", now);
+        press_at(&state, &tx, Key::KeyA, "hold", true, now);
+        release_at(&state, &tx, "hold", now);
+
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StartLatched)));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
+        assert_no_cmd(&rx);
+        let st = state.lock();
+        assert!(!st.key_down);
+        assert!(!st.latched);
+        assert!(st.pressed_key.is_none());
+        assert!(st.tap_candidate.is_none());
+    }
+
+    #[test]
+    fn duplicate_down_and_up_do_not_break_a_double_tap_candidate() {
+        let (state, tx, rx) = mk();
+        let t0 = Instant::now();
+        let release = t0 + Duration::from_millis(20);
+
+        press_at(&state, &tx, Key::KeyA, "hold", true, t0);
+        press_at(&state, &tx, Key::KeyA, "hold", true, t0); // auto-repeat
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
+        assert_no_cmd(&rx);
+
+        release_at(&state, &tx, "hold", release);
+        release_at(&state, &tx, "hold", release); // duplicate/orphan up
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
+        assert_no_cmd(&rx);
+        assert_eq!(
+            state.lock().tap_candidate.map(|candidate| candidate.key),
+            Some(Key::KeyA)
+        );
+
+        press_at(
+            &state,
+            &tx,
+            Key::KeyA,
+            "hold",
+            true,
+            release + Duration::from_millis(20),
+        );
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StartLatched)));
+        assert_no_cmd(&rx);
+    }
+
+    // Двойной тап → первый release немедленно StopTap, второй press
+    // даёт единую StartLatched; release в защёлке игнорируется.
     #[test]
     fn double_tap_latch_then_press_unlatches() {
         let (state, tx, rx) = mk();
@@ -1857,7 +2178,7 @@ mod tests {
             "hold",
             true,
         );
-        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
         // Второй tap внутри окна снова запускает запись и защёлкивает её.
         dispatch_with_latch(
             &state,
@@ -1867,8 +2188,8 @@ mod tests {
             "hold",
             true,
         );
-        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
-        assert!(matches!(rx.try_recv(), Ok(EngineCmd::HotkeyLatch)));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StartLatched)));
+        assert_no_cmd(&rx);
         dispatch_with_latch(
             &state,
             &tx,
@@ -1925,7 +2246,7 @@ mod tests {
             "hold",
             true,
         );
-        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StopTap)));
         dispatch_with_latch(
             &state,
             &tx,
@@ -1934,8 +2255,8 @@ mod tests {
             "hold",
             true,
         );
-        assert!(matches!(rx.try_recv(), Ok(EngineCmd::Start)));
-        assert!(matches!(rx.try_recv(), Ok(EngineCmd::HotkeyLatch)));
+        assert!(matches!(rx.try_recv(), Ok(EngineCmd::StartLatched)));
+        assert_no_cmd(&rx);
         dispatch_with_latch(
             &state,
             &tx,

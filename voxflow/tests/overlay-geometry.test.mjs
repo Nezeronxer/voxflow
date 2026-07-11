@@ -12,7 +12,9 @@ const [css, overlaySource, rustSource, capabilitySource, tauriConfigSource] = aw
 
 function finalRule(selector) {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const matches = [...css.matchAll(new RegExp(`${escaped}\\s*\\{([^}]*)\\}`, "g"))];
+  const matches = [
+    ...css.matchAll(new RegExp(`(?:^|\\n)\\s*${escaped}\\s*\\{([^}]*)\\}`, "g")),
+  ];
   assert.ok(matches.length > 0, `missing CSS rule for ${selector}`);
   return matches.at(-1)[1];
 }
@@ -113,11 +115,63 @@ test("floating bar remains compact and every CSS state fits its Tauri window box
     );
   }
 
-  assert.equal(declaration(finalRule(".aq-idle"), "width"), "244px");
-  assert.equal(declaration(finalRule(".aq-idle"), "height"), "38px");
-  assert.equal(declaration(finalRule(".aq-idle:hover"), "width"), "244px");
-  assert.equal(declaration(finalRule(".aq-stream"), "max-width"), "360px");
-  assert.equal(declaration(finalRule(".aq-notice"), "max-width"), "330px");
+  assert.equal(declaration(finalRule(".aq-idle"), "width"), "56px");
+  assert.equal(declaration(finalRule(".aq-idle"), "height"), "10px");
+  assert.equal(declaration(finalRule(".aq-idle:hover"), "width"), "172px");
+  assert.equal(declaration(finalRule(".aq-idle:hover"), "height"), "30px");
+  assert.ok(
+    px(declaration(finalRule(".aq-idle:hover"), "width")) + stageHorizontal <=
+      expectedBoxes.idle.w,
+    "expanded idle hover must fit the fixed idle Tauri window",
+  );
+  assert.equal(declaration(finalRule(".aq-stream"), "max-width"), "270px");
+  assert.equal(declaration(finalRule(".aq-notice"), "max-width"), "270px");
+});
+
+test("idle is a tiny outlined capsule and reveals the rich controls only on hover", () => {
+  const idle = finalRule(".aq-idle");
+  assert.equal(declaration(idle, "border-radius"), "999px");
+  assert.equal(declaration(idle, "overflow"), "hidden");
+
+  const idleCopy = finalRule(".aq-idle-copy");
+  assert.equal(declaration(idleCopy, "opacity"), "0");
+  assert.equal(declaration(finalRule(".aq-idle:hover .aq-idle-copy"), "opacity"), "1");
+});
+
+test("live preview survives transcribing and frame updates bypass React state", () => {
+  const transcribingBranch = /else if \(v === "transcribing"\) \{([\s\S]*?)\n\s*\} else \{/.exec(
+    overlaySource,
+  );
+  assert.ok(transcribingBranch, "missing transcribing status branch");
+  assert.doesNotMatch(transcribingBranch[1], /resetTextEngine\(\)/);
+  assert.match(transcribingBranch[1], /setShownDirect\(targetCharsRef\.current\.length\)/);
+  assert.match(overlaySource, /status === "transcribing"[\s\S]*?hasPreview[\s\S]*?"stream"/);
+  assert.doesNotMatch(overlaySource, /const \[shown,\s*setShown\]/);
+  assert.match(overlaySource, /committedTextRef\.current\.textContent/);
+  assert.match(overlaySource, /el\.style\.transform = `scaleY/);
+  assert.match(overlaySource, /seq\?: number/);
+  assert.match(overlaySource, /p\?\.latched === true/);
+  assert.match(overlaySource, /if \(seq > currentSeqRef\.current\) currentSeqRef\.current = seq/);
+});
+
+test("recording and double-tap latch share geometry without a second pop animation", () => {
+  const recording = finalRule(".aq-rec");
+  const latch = finalRule(".aq-latch");
+  assert.equal(declaration(latch, "width"), declaration(recording, "width"));
+  assert.equal(declaration(latch, "height"), declaration(recording, "height"));
+  assert.equal(declaration(latch, "animation"), "none");
+});
+
+test("overlay honors reduced motion for both CSS and rAF-driven animation", () => {
+  assert.match(overlaySource, /matchMedia\("\(prefers-reduced-motion: reduce\)"\)/);
+  assert.match(overlaySource, /if \(reducedMotionRef\.current\)/);
+  assert.doesNotMatch(overlaySource, /SPRING_[KC]/);
+  assert.match(overlaySource, /1 - Math\.exp\(-dt \/ tau\)/);
+  const reducedMotion = /@media \(prefers-reduced-motion: reduce\) \{([\s\S]*)\}\s*$/.exec(css);
+  assert.ok(reducedMotion, "missing final reduced-motion cascade");
+  assert.match(reducedMotion[1], /\.aq-bar/);
+  assert.match(reducedMotion[1], /\.aq-orb-glow/);
+  assert.match(reducedMotion[1], /animation:\s*none !important/);
 });
 
 test("overlay drag uses one captured-pointer path without a macOS CGEvent poller", () => {
