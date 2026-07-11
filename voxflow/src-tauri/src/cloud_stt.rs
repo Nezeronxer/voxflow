@@ -14,8 +14,9 @@ use anyhow::{anyhow, Result};
 use crate::net;
 use crate::settings::Settings;
 
-/// Таймаут curl на облачный запрос (секунды).
-const TIMEOUT_SECS: &str = "60";
+/// A dead route/proxy must fail over quickly instead of consuming the whole
+/// transcription deadline before local STT can start.
+const CONNECT_TIMEOUT_SECS: &str = "3";
 /// Максимальный размер ASR-prompt для OpenAI-compatible STT.
 ///
 /// Это не rewrite-инструкция, а короткий bias-подсказчик для имён, терминов,
@@ -32,6 +33,13 @@ pub fn transcribe(s: &Settings, wav: &Path) -> Result<String> {
     transcribe_with_prompt(s, wav, None)
 }
 
+/// Best-effort cloud preview. It intentionally has a much shorter deadline
+/// than the final request: after key release its result is stale and the final
+/// transcription must not remain coupled to a detached preview process.
+pub fn transcribe_partial(s: &Settings, wav: &Path) -> Result<String> {
+    transcribe_with_profile(s, wav, None, RequestProfile::LiveDraft)
+}
+
 /// Распознать WAV с необязательным ASR-prompt.
 ///
 /// Prompt используется только там, где провайдер поддерживает biasing напрямую
@@ -39,16 +47,62 @@ pub fn transcribe(s: &Settings, wav: &Path) -> Result<String> {
 /// путь. Deepgram оставлен без prompt, потому что у него другой механизм biasing
 /// (keywords/keyterms) и его нельзя слепо подменять текстовой подсказкой.
 pub fn transcribe_with_prompt(s: &Settings, wav: &Path, prompt: Option<&str>) -> Result<String> {
+    transcribe_with_profile(s, wav, prompt, RequestProfile::Final)
+}
+
+fn transcribe_with_profile(
+    s: &Settings,
+    wav: &Path,
+    prompt: Option<&str>,
+    profile: RequestProfile,
+) -> Result<String> {
     match s.stt_provider.as_str() {
-        "openai_compat" => transcribe_openai_compat(s, wav, prompt),
-        "deepgram" => transcribe_deepgram(s, wav),
+        "openai_compat" => match profile {
+            RequestProfile::Final => transcribe_openai_compat(s, wav, prompt),
+            RequestProfile::LiveDraft => transcribe_openai_compat_inner(s, wav, prompt, profile),
+        },
+        "deepgram" => match profile {
+            RequestProfile::Final => transcribe_deepgram(s, wav),
+            RequestProfile::LiveDraft => transcribe_deepgram_inner(s, wav, profile),
+        },
         other => Err(anyhow!("неизвестный облачный STT-провайдер: {other}")),
     }
+}
+
+#[derive(Clone, Copy)]
+enum RequestProfile {
+    Final,
+    LiveDraft,
+}
+
+fn request_timeout_for_audio(audio_seconds: u64, profile: RequestProfile) -> u64 {
+    match profile {
+        RequestProfile::LiveDraft => 8,
+        RequestProfile::Final => 15u64
+            .saturating_add(audio_seconds.saturating_mul(2))
+            .clamp(20, 60),
+    }
+}
+
+fn request_timeout_secs(wav: &Path, profile: RequestProfile) -> u64 {
+    request_timeout_for_audio(
+        crate::audio::wav_duration_secs_ceil(wav).unwrap_or(10),
+        profile,
+    )
 }
 
 /// OpenAI-совместимый STT (Avalon/OpenAI/Groq): multipart POST на
 /// `{base}/audio/transcriptions`. Ответ — JSON `{"text":"..."}`.
 pub fn transcribe_openai_compat(s: &Settings, wav: &Path, prompt: Option<&str>) -> Result<String> {
+    transcribe_openai_compat_inner(s, wav, prompt, RequestProfile::Final)
+}
+
+fn transcribe_openai_compat_inner(
+    s: &Settings,
+    wav: &Path,
+    prompt: Option<&str>,
+    profile: RequestProfile,
+) -> Result<String> {
     let key = s.resolve_oai_key();
     if key.trim().is_empty() {
         return Err(anyhow!("ключ не задан"));
@@ -65,8 +119,10 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path, prompt: Option<&str>) 
 
     let mut cmd = net::curl();
     cmd.arg("-s")
+        .arg("--connect-timeout")
+        .arg(CONNECT_TIMEOUT_SECS)
         .arg("-m")
-        .arg(TIMEOUT_SECS)
+        .arg(request_timeout_secs(wav, profile).to_string())
         .arg("-F")
         .arg(&file_arg)
         .arg("-F")
@@ -121,6 +177,10 @@ pub fn transcribe_openai_compat(s: &Settings, wav: &Path, prompt: Option<&str>) 
 /// Deepgram: бинарный POST на `{base}/v1/listen?...`. Ответ — JSON, транскрипт
 /// в `results.channels[0].alternatives[0].transcript`.
 pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
+    transcribe_deepgram_inner(s, wav, RequestProfile::Final)
+}
+
+fn transcribe_deepgram_inner(s: &Settings, wav: &Path, profile: RequestProfile) -> Result<String> {
     let key = s.resolve_deepgram_key();
     if key.trim().is_empty() {
         return Err(anyhow!("ключ не задан"));
@@ -141,8 +201,10 @@ pub fn transcribe_deepgram(s: &Settings, wav: &Path) -> Result<String> {
 
     let mut cmd = net::curl();
     cmd.arg("-s")
+        .arg("--connect-timeout")
+        .arg(CONNECT_TIMEOUT_SECS)
         .arg("-m")
-        .arg(TIMEOUT_SECS)
+        .arg(request_timeout_secs(wav, profile).to_string())
         // Content-Type не секрет — остаётся в argv.
         .arg("-H")
         .arg("Content-Type: audio/wav")
@@ -239,5 +301,14 @@ mod tests {
         let long = "я".repeat(MAX_STT_PROMPT_CHARS + 50);
         let capped = sanitized_stt_prompt(Some(&long)).unwrap();
         assert_eq!(capped.chars().count(), MAX_STT_PROMPT_CHARS);
+    }
+
+    #[test]
+    fn cloud_deadlines_keep_final_quality_budget_but_bound_stale_drafts() {
+        assert_eq!(request_timeout_for_audio(1, RequestProfile::Final), 20);
+        assert_eq!(request_timeout_for_audio(5, RequestProfile::Final), 25);
+        assert_eq!(request_timeout_for_audio(30, RequestProfile::Final), 60);
+        assert_eq!(request_timeout_for_audio(600, RequestProfile::Final), 60);
+        assert_eq!(request_timeout_for_audio(600, RequestProfile::LiveDraft), 8);
     }
 }

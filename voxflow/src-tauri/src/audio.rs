@@ -12,6 +12,7 @@
 //! потребляется на одном и том же рабочем потоке, без `Send`/`Sync`-границ
 //! и без перемещения между потоками.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -491,6 +492,18 @@ pub fn write_wav_16k_mono(path: &std::path::Path, samples: &[f32]) -> Result<()>
     Ok(())
 }
 
+/// Duration of a PCM WAV rounded up to whole seconds.
+///
+/// ASR transports use this to derive bounded request deadlines from the actual
+/// utterance length instead of applying one large timeout to every short tap.
+/// A malformed/non-WAV file returns `None`; callers keep their conservative
+/// fallback deadline in that case.
+pub(crate) fn wav_duration_secs_ceil(path: &Path) -> Option<u64> {
+    let reader = hound::WavReader::open(path).ok()?;
+    let sample_rate = u64::from(reader.spec().sample_rate.max(1));
+    Some(u64::from(reader.duration()).div_ceil(sample_rate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -559,6 +572,21 @@ mod tests {
 
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wav_duration_rounds_up_for_request_deadlines() {
+        let path = std::env::temp_dir().join(format!(
+            "voxflow-duration-{}-{}.wav",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        write_wav_16k_mono(&path, &vec![0.0; 16001]).unwrap();
+        assert_eq!(wav_duration_secs_ceil(&path), Some(2));
         let _ = std::fs::remove_file(path);
     }
 

@@ -387,15 +387,10 @@ fn try_start_server(
             let _ = srv.child.wait();
             return Err(anyhow!("whisper-server start cancelled"));
         }
-        std::thread::sleep(Duration::from_millis(500));
-        // Stop may arrive during the readiness sleep. Check again before the
-        // probe so a released hotkey never waits behind curl's timeout while
-        // ensure_server still owns the server mutex.
-        if cancellation_requested(cancel) {
-            let _ = srv.child.kill();
-            let _ = srv.child.wait();
-            return Err(anyhow!("whisper-server start cancelled"));
-        }
+        // Probe immediately, then at a short cadence. The previous fixed 500 ms
+        // sleep was paid even when a warm macOS model became ready almost at
+        // once, and made Stop cancellation sluggish while ensure_server held
+        // the shared server mutex.
         if server_ready(port) {
             return Ok(srv);
         }
@@ -404,6 +399,7 @@ fn try_start_server(
             exited = true;
             break;
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
     let _ = srv.child.kill();
     let _ = srv.child.wait();
@@ -423,8 +419,10 @@ pub fn server_ready(port: u16) -> bool {
         .arg("-s")
         .arg("-o")
         .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
+        .arg("--connect-timeout")
+        .arg("0.1")
         .arg("-m")
-        .arg("0.5")
+        .arg("0.25")
         .arg(&url);
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -446,7 +444,7 @@ pub fn transcribe_server(
         .arg("*")
         .arg("-s")
         .arg("-m")
-        .arg("45")
+        .arg(server_request_timeout_secs(wav).to_string())
         .arg("-F")
         .arg(&file_arg)
         .arg("-F")
@@ -468,6 +466,19 @@ pub fn transcribe_server(
     }
     let raw = String::from_utf8_lossy(&out.stdout);
     Ok(parse_verbose(&raw, language))
+}
+
+fn server_request_timeout_for_audio(audio_seconds: u64) -> u64 {
+    // Warm macOS inference is normally far below this. Short clips should not
+    // hold the final-ASR lane for the old fixed 45 seconds if a sidecar wedges;
+    // longer dictations retain the full historical budget.
+    10u64
+        .saturating_add(audio_seconds.saturating_mul(3))
+        .clamp(15, 45)
+}
+
+fn server_request_timeout_secs(wav: &Path) -> u64 {
+    server_request_timeout_for_audio(crate::audio::wav_duration_secs_ceil(wav).unwrap_or(10))
 }
 
 /// Транскрибировать WAV через whisper-server БЕЗ гейта уверенности.
@@ -746,5 +757,13 @@ mod tests {
         let listener = std::net::TcpListener::bind(("127.0.0.1", port))
             .expect("reserved port should be reusable after listener drop");
         drop(listener);
+    }
+
+    #[test]
+    fn final_server_timeout_scales_without_penalizing_short_taps() {
+        assert_eq!(server_request_timeout_for_audio(0), 15);
+        assert_eq!(server_request_timeout_for_audio(1), 15);
+        assert_eq!(server_request_timeout_for_audio(5), 25);
+        assert_eq!(server_request_timeout_for_audio(30), 45);
     }
 }

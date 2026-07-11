@@ -82,6 +82,18 @@ pub fn run() {
                 Err(e) => log::warn!("не удалось очистить временные файлы: {e}"),
             }
 
+            // A drag-installed macOS update can coexist with renamed copies of
+            // older releases (including the pre-1.0.8 legacy bundle id). Remove
+            // only verified, strictly older bundles in Applications; user data
+            // under Application Support is never part of this scan.
+            match updater::cleanup_old_macos_app_bundles() {
+                Ok(removed) if removed > 0 => {
+                    log::info!("удалено старых копий VoxFlow: {removed}");
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("не удалось очистить старые копии VoxFlow: {e}"),
+            }
+
             // БД + настройки. P2-7: не молчаливый краш через .expect, а понятное
             // окно (permission denied / занятый файл / диск) и корректный выход.
             let conn = match db::open() {

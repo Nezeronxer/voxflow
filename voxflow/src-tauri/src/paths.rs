@@ -146,11 +146,19 @@ fn cleanup_stale_temp_files_in(
         if !metadata.file_type().is_file() {
             continue;
         }
-        let sensitive_temp = path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("wav") || ext.eq_ignore_ascii_case("json"));
-        if !sensitive_temp {
+        let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+        let sensitive_temp =
+            extension.eq_ignore_ascii_case("wav") || extension.eq_ignore_ascii_case("json");
+        // Custom updater downloads into this private tmp directory. Interrupted
+        // or already-launched installers used to survive forever (hundreds of
+        // megabytes each). Match only our fixed updater prefix; never treat an
+        // arbitrary .exe in the directory as disposable.
+        let stale_windows_installer = extension.eq_ignore_ascii_case("exe")
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("VoxFlow-Setup-"));
+        if !sensitive_temp && !stale_windows_installer {
             continue;
         }
         let Some(age) = metadata
@@ -167,8 +175,9 @@ fn cleanup_stale_temp_files_in(
     Ok(removed)
 }
 
-/// Remove crash leftovers containing speech or request payloads. Files newer
-/// than 24 hours are preserved to avoid racing another process or a long job.
+/// Remove crash leftovers containing speech/request payloads and completed or
+/// interrupted updater installers. Files newer than 24 hours are preserved to
+/// avoid racing another process, a long job, or an installer still in use.
 pub fn cleanup_stale_temp_files() -> io::Result<usize> {
     cleanup_stale_temp_files_in(&tmp_dir(), SystemTime::now(), STALE_TEMP_MAX_AGE)
 }
@@ -404,9 +413,13 @@ mod tests {
         ensure_private_dir(&dir).unwrap();
         let wav = dir.join("utterance.wav");
         let json = dir.join("payload.json");
+        let installer = dir.join("VoxFlow-Setup-1_0_8-123.exe");
+        let foreign_exe = dir.join("keep-me.exe");
         let keep = dir.join("model.part");
         std::fs::write(&wav, b"speech").unwrap();
         std::fs::write(&json, b"private text").unwrap();
+        std::fs::write(&installer, b"old installer").unwrap();
+        std::fs::write(&foreign_exe, b"not owned by updater").unwrap();
         std::fs::write(&keep, b"download").unwrap();
         let child = dir.join("nested.wav");
         std::fs::create_dir(&child).unwrap();
@@ -418,9 +431,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(removed, 2);
+        assert_eq!(removed, 3);
         assert!(!wav.exists());
         assert!(!json.exists());
+        assert!(!installer.exists());
+        assert!(foreign_exe.exists());
         assert!(keep.exists());
         assert!(child.is_dir());
         let _ = std::fs::remove_dir_all(dir);

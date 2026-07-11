@@ -10,9 +10,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 #[cfg(windows)]
 use std::io::Read;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos"))]
 use std::process::Command;
 
 const OWNER: &str = "Nezeronxer";
@@ -20,6 +20,14 @@ const REPO: &str = "voxflow";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Nezeronxer/voxflow/releases/latest";
 const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/Nezeronxer/voxflow/releases/download/";
 const USER_AGENT: &str = "VoxFlow-Updater";
+
+#[cfg(target_os = "macos")]
+const MACOS_BUNDLE_IDS: [&str; 2] = [
+    "com.nezeronxer.voxflow.macos",
+    // Releases through 1.0.7 used this identifier. Keeping it in the exact
+    // allow-list lets a current install remove those stale copies as well.
+    "com.voxflow.app",
+];
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,6 +194,206 @@ pub fn download_and_launch(
         "автоустановка обновлений для {} отключена: откройте релиз вручную",
         current_update_target().label()
     ))
+}
+
+/// Remove older VoxFlow application bundles from normal macOS install roots.
+///
+/// Safety boundaries are intentionally strict:
+/// - cleanup runs only when the current executable itself lives directly in
+///   `/Applications` or `~/Applications`;
+/// - only direct child `.app` directories are considered (no recursive scan);
+/// - bundle id, name, executable and a strictly older semantic version must all
+///   match;
+/// - the current bundle and symlinks are never removed;
+/// - Application Support / models / database are outside the scanned roots.
+#[cfg(target_os = "macos")]
+pub fn cleanup_old_macos_app_bundles() -> Result<usize> {
+    let exe = std::env::current_exe().map_err(|e| anyhow!("current executable: {e}"))?;
+    let Some(current_bundle) = enclosing_macos_app_bundle(&exe) else {
+        // `cargo run`, tests and standalone tools are not installed app bundles.
+        return Ok(0);
+    };
+
+    let mut roots = vec![PathBuf::from("/Applications")];
+    if let Some(home) = dirs::home_dir() {
+        roots.push(home.join("Applications"));
+    }
+
+    let Some(current_parent) = current_bundle.parent() else {
+        return Ok(0);
+    };
+    if !roots
+        .iter()
+        .any(|root| paths_refer_to_same_location(root, current_parent))
+    {
+        // Never clean Downloads, mounted DMGs, build output or arbitrary trees.
+        return Ok(0);
+    }
+
+    cleanup_old_macos_app_bundles_in(&current_bundle, &roots, env!("CARGO_PKG_VERSION"))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn cleanup_old_macos_app_bundles() -> Result<usize> {
+    Ok(0)
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+struct MacosBundleIdentity {
+    identifier: String,
+    name: String,
+    executable: String,
+    version: String,
+}
+
+#[cfg(target_os = "macos")]
+fn enclosing_macos_app_bundle(executable: &Path) -> Option<PathBuf> {
+    executable
+        .ancestors()
+        .find(|ancestor| {
+            ancestor
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+                && ancestor.join("Contents/MacOS").is_dir()
+        })
+        .map(Path::to_path_buf)
+}
+
+#[cfg(target_os = "macos")]
+fn paths_refer_to_same_location(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_plist_value(bundle: &Path, key: &str) -> Result<String> {
+    let plist = bundle.join("Contents/Info.plist");
+    let output = Command::new("/usr/libexec/PlistBuddy")
+        .arg("-c")
+        .arg(format!("Print :{key}"))
+        .arg(&plist)
+        .output()
+        .map_err(|e| anyhow!("cannot inspect {}: {e}", plist.display()))?;
+    if !output.status.success() {
+        return Err(anyhow!("cannot read {key} from {}", plist.display()));
+    }
+    let value = String::from_utf8(output.stdout)
+        .map_err(|_| anyhow!("{key} in {} is not UTF-8", plist.display()))?;
+    Ok(value.trim().to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_identity(bundle: &Path) -> Result<MacosBundleIdentity> {
+    let metadata = std::fs::symlink_metadata(bundle)
+        .map_err(|e| anyhow!("cannot stat {}: {e}", bundle.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(anyhow!("bundle is not a real directory"));
+    }
+    let executable = bundle.join("Contents/MacOS/voxflow");
+    let executable_meta = std::fs::symlink_metadata(&executable)
+        .map_err(|e| anyhow!("missing VoxFlow executable: {e}"))?;
+    if !executable_meta.file_type().is_file() {
+        return Err(anyhow!("VoxFlow executable is not a regular file"));
+    }
+    Ok(MacosBundleIdentity {
+        identifier: macos_plist_value(bundle, "CFBundleIdentifier")?,
+        name: macos_plist_value(bundle, "CFBundleName")?,
+        executable: macos_plist_value(bundle, "CFBundleExecutable")?,
+        version: macos_plist_value(bundle, "CFBundleShortVersionString")?,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn is_known_voxflow_bundle(identity: &MacosBundleIdentity) -> bool {
+    identity.name == "VoxFlow"
+        && identity.executable == "voxflow"
+        && MACOS_BUNDLE_IDS
+            .iter()
+            .any(|known| identity.identifier == *known)
+}
+
+#[cfg(target_os = "macos")]
+fn cleanup_old_macos_app_bundles_in(
+    current_bundle: &Path,
+    roots: &[PathBuf],
+    current_version: &str,
+) -> Result<usize> {
+    let current_identity = macos_bundle_identity(current_bundle)?;
+    if !is_known_voxflow_bundle(&current_identity)
+        || version_cmp(&current_identity.version, current_version)? != std::cmp::Ordering::Equal
+    {
+        return Err(anyhow!(
+            "current app bundle identity/version does not match this VoxFlow build"
+        ));
+    }
+    let current_canonical = current_bundle
+        .canonicalize()
+        .map_err(|e| anyhow!("cannot resolve current app bundle: {e}"))?;
+    let mut removed = 0usize;
+
+    for root in roots {
+        let entries = match std::fs::read_dir(root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                log::warn!("cannot scan app directory {}: {e}", root.display());
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if !candidate
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("app"))
+            {
+                continue;
+            }
+            let Ok(metadata) = std::fs::symlink_metadata(&candidate) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                continue;
+            }
+            let Ok(candidate_canonical) = candidate.canonicalize() else {
+                continue;
+            };
+            if candidate_canonical == current_canonical {
+                continue;
+            }
+            let Ok(identity) = macos_bundle_identity(&candidate) else {
+                continue;
+            };
+            if !is_known_voxflow_bundle(&identity)
+                || !matches!(
+                    version_cmp(&identity.version, current_version),
+                    Ok(std::cmp::Ordering::Less)
+                )
+            {
+                continue;
+            }
+
+            match std::fs::remove_dir_all(&candidate) {
+                Ok(()) => {
+                    removed += 1;
+                    log::info!(
+                        "removed stale VoxFlow app bundle version {} from {}",
+                        identity.version,
+                        candidate.display()
+                    );
+                }
+                Err(e) => log::warn!(
+                    "cannot remove stale VoxFlow app bundle {}: {e}",
+                    candidate.display()
+                ),
+            }
+        }
+    }
+    Ok(removed)
 }
 
 fn update_info_from_release_for(
@@ -606,5 +814,140 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("автоустановка"));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_cleanup_test_root() -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "voxflow-app-cleanup-{}-{nanos}",
+            std::process::id()
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn write_test_macos_bundle(
+        root: &Path,
+        file_name: &str,
+        identifier: &str,
+        name: &str,
+        version: &str,
+    ) -> PathBuf {
+        let bundle = root.join(file_name);
+        let macos = bundle.join("Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        std::fs::write(macos.join("voxflow"), b"test binary").unwrap();
+        let plist = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>{identifier}</string>
+<key>CFBundleName</key><string>{name}</string>
+<key>CFBundleExecutable</key><string>voxflow</string>
+<key>CFBundleShortVersionString</key><string>{version}</string>
+</dict></plist>"#
+        );
+        std::fs::write(bundle.join("Contents/Info.plist"), plist).unwrap();
+        bundle
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cleanup_removes_only_strictly_older_verified_bundles() {
+        use std::os::unix::fs::symlink;
+
+        let root = macos_cleanup_test_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let current = write_test_macos_bundle(
+            &root,
+            "VoxFlow.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "2.0.1",
+        );
+        let old_current_id = write_test_macos_bundle(
+            &root,
+            "VoxFlow 1.0.8.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "1.0.8",
+        );
+        let old_legacy_id = write_test_macos_bundle(
+            &root,
+            "VoxFlow 1.0.7.app",
+            "com.voxflow.app",
+            "VoxFlow",
+            "1.0.7",
+        );
+        let same_version = write_test_macos_bundle(
+            &root,
+            "VoxFlow Copy.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "2.0.1",
+        );
+        let newer = write_test_macos_bundle(
+            &root,
+            "VoxFlow Beta.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "3.0.0",
+        );
+        let foreign =
+            write_test_macos_bundle(&root, "Foreign.app", "example.foreign", "VoxFlow", "1.0.0");
+        let wrong_name = write_test_macos_bundle(
+            &root,
+            "Lookalike.app",
+            "com.nezeronxer.voxflow.macos",
+            "Not VoxFlow",
+            "1.0.0",
+        );
+        let link = root.join("VoxFlow Linked Old.app");
+        symlink(&old_current_id, &link).unwrap();
+
+        let removed =
+            cleanup_old_macos_app_bundles_in(&current, std::slice::from_ref(&root), "2.0.1")
+                .unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(
+            current.exists(),
+            "the running/current bundle is never removed"
+        );
+        assert!(!old_current_id.exists());
+        assert!(!old_legacy_id.exists());
+        assert!(same_version.exists(), "same-version copies are not stale");
+        assert!(
+            newer.exists(),
+            "a newer bundle must never be downgraded away"
+        );
+        assert!(foreign.exists());
+        assert!(wrong_name.exists());
+        assert!(
+            link.symlink_metadata().is_ok(),
+            "symlinks are never followed"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn finds_enclosing_app_bundle_but_not_standalone_binary() {
+        let root = macos_cleanup_test_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let app = write_test_macos_bundle(
+            &root,
+            "VoxFlow.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "2.0.2",
+        );
+        let app_exe = app.join("Contents/MacOS/voxflow");
+        assert_eq!(enclosing_macos_app_bundle(&app_exe), Some(app.clone()));
+        assert_eq!(enclosing_macos_app_bundle(&root.join("voxflow")), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
