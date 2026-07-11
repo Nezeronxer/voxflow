@@ -936,11 +936,18 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn finds_enclosing_app_bundle_but_not_standalone_binary() {
-        let app_exe = Path::new("/Applications/VoxFlow.app/Contents/MacOS/voxflow");
-        assert_eq!(
-            enclosing_macos_app_bundle(app_exe),
-            Some(PathBuf::from("/Applications/VoxFlow.app"))
+        let root = macos_cleanup_test_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let app = write_test_macos_bundle(
+            &root,
+            "VoxFlow.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "2.0.2",
         );
-        assert_eq!(enclosing_macos_app_bundle(Path::new("/tmp/voxflow")), None);
+        let app_exe = app.join("Contents/MacOS/voxflow");
+        assert_eq!(enclosing_macos_app_bundle(&app_exe), Some(app.clone()));
+        assert_eq!(enclosing_macos_app_bundle(&root.join("voxflow")), None);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
