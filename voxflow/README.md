@@ -25,7 +25,7 @@ From the repository root:
 cargo fmt --manifest-path voxflow/src-tauri/Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path voxflow/src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path voxflow/src-tauri/Cargo.toml --lib
-python3 script/check_versions.py --tag v2.0.1
+python3 script/check_versions.py --tag v2.0.2
 ```
 
 ## Packaging

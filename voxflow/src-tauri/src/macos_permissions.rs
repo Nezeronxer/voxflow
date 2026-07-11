@@ -114,8 +114,18 @@ mod imp {
         ONBOARDING_ACTIVE.load(Ordering::SeqCst)
     }
 
+    fn onboarding_needed(post_event: bool, input_monitoring: bool) -> bool {
+        !post_event || !input_monitoring
+    }
+
     pub fn onboard_on_launch(app: AppHandle) {
         if ONBOARDING_STARTED.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // Не создаём искусственное окно без хоткея на каждом обычном запуске.
+        // Если оба разрешения уже выданы, listener может стартовать немедленно;
+        // 700-мс пауза нужна только реальному first-run onboarding.
+        if !onboarding_needed(post_event_allowed(), input_monitoring_allowed()) {
             return;
         }
         ONBOARDING_ACTIVE.store(true, Ordering::SeqCst);
@@ -166,6 +176,18 @@ mod imp {
             }
             ONBOARDING_ACTIVE.store(false, Ordering::SeqCst);
         });
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::onboarding_needed;
+
+        #[test]
+        fn granted_permissions_do_not_create_a_startup_hotkey_gap() {
+            assert!(!onboarding_needed(true, true));
+            assert!(onboarding_needed(false, true));
+            assert!(onboarding_needed(true, false));
+        }
     }
 }
 
