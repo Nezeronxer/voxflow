@@ -12,10 +12,10 @@
 //   latch  — подтверждение двойного тапа: запись зафиксирована без удержания;
 //   notice — краткое предупреждение (no_model / error) поверх любого состояния.
 //
-// Переходы геометрии — CSS-«пружина» cubic-bezier(0.22,1.2,0.36,1) 140 мс:
+// Переходы геометрии — короткая CSS-анимация:
 // анимируются transform/opacity; width/height меняются ОДИН раз на смену
-// состояния (одиночный layout — допустимо). Громкость — JS-спринги на rAF,
-// пишем style баров/glow напрямую через ref'ы, БЕЗ setState на кадр (60 fps).
+// состояния (одиночный layout — допустимо). Громкость и live-текст обновляются
+// через ref'ы/rAF напрямую, БЕЗ setState на кадр (60 fps).
 
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -51,8 +51,17 @@ type PartialWithLang = PartialEvent & {
   settled?: boolean;
   processed?: boolean;
 };
-// "status": legacy-строка (текущий бэкенд) ЛИБО объект { status, lang }.
-type StatusPayload = string | { status?: string; lang?: DetectedLang };
+// "status": legacy-строка ЛИБО атомарный объект. seq отсекает late partial
+// прошлой диктовки ещё до первого partial новой; latched не даёт кратко показать
+// обычное удержание перед подтверждением двойного нажатия.
+type StatusPayload =
+  | string
+  | {
+      status?: string;
+      lang?: DetectedLang;
+      seq?: number;
+      latched?: boolean;
+    };
 type DragPointer = {
   id: number;
   x: number;
@@ -83,12 +92,24 @@ const DRAG_HIT_PADDING = 6;
 // Раскладка громкости по 12 барам: центр громче краёв (сглаженный «холм» Aqua).
 const BAR_WEIGHTS = [0.5, 0.5, 0.7, 0.7, 1, 1, 1, 1, 0.8, 0.8, 0.6, 0.6];
 const BAR_COUNT = BAR_WEIGHTS.length;
-// Спринг громкости: установление ≈120 мс, лёгкий овершут (живость без дрожи).
-const SPRING_K = 420;
-const SPRING_C = 30;
-// Высота бара: 2..22 px по кривой 2+20·v^1.5; CSS-высота фиксирована 22 px,
+// Экспоненциальное сглаживание устойчиво даже после пропущенного кадра WebView:
+// атака быстрая, спад чуть мягче — волна следует голосу без рывка/«догоняния».
+const LEVEL_ATTACK_S = 0.045;
+const LEVEL_RELEASE_S = 0.11;
+// Высота бара: 2..18 px по кривой 2+16·v^1.5; CSS-высота фиксирована 18 px,
 // анимируем transform:scaleY (компосит, без layout на кадр).
-const BAR_MAX_H = 22;
+const BAR_MAX_H = 18;
+
+function compactHotkeyLabel(label: string) {
+  const normalized = label.trim().toLowerCase().replace(/^(right|left)\s+/, "");
+  if (normalized === "option") return "⌥";
+  if (normalized === "control" || normalized === "ctrl") return "Ctrl";
+  if (normalized === "command" || normalized === "cmd") return "⌘";
+  if (normalized === "shift") return "Shift";
+  if (normalized === "alt") return "Alt";
+  if (normalized === "win") return "Win";
+  return label;
+}
 
 const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
 
@@ -124,7 +145,8 @@ export default function Overlay() {
   const targetCharsRef = useRef<string[]>([]);
   const committedLenRef = useRef(0);
   const shownRef = useRef(0);
-  const [shown, setShown] = useState(0);
+  const hasPreviewRef = useRef(false);
+  const [hasPreview, setHasPreview] = useState(false);
   const [previewVersion, setPreviewVersion] = useState(0);
   const [typing, setTyping] = useState(false);
   // Дедуп по seq: МОНОТОННЫЙ счётчик (НЕ сбрасывается между диктовками). partial старее
@@ -143,6 +165,8 @@ export default function Overlay() {
   const lastFrameRef = useRef(0);
   // Скролл-контейнер: держим показанным «хвост» (последнее надиктованное).
   const scrollRef = useRef<HTMLDivElement>(null);
+  const committedTextRef = useRef<HTMLSpanElement>(null);
+  const volatileTextRef = useRef<HTMLSpanElement>(null);
   // Корневой узел пилюли — для замеров hit-rect (см. sendHit ниже).
   const pillRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -153,19 +177,18 @@ export default function Overlay() {
   const needScrollRef = useRef(false);
   const scrollRafRef = useRef<number | null>(null);
 
-  // --- Громкость ("level", ~33 мс): спринги баров + glow орба. Состояние спрингов
-  // живёт в ref'ах (переживает StrictMode remount), значения пишутся в DOM напрямую.
+  // --- Громкость ("level", ~33 мс): сглаженные бары + glow орба. Анимационное
+  // состояние живёт в ref'ах, значения пишутся в DOM напрямую.
   const rmsRef = useRef(0); // последний rms с бэкенда (0..1)
   const lastLevelAtRef = useRef(0); // performance.now() последнего "level"
   const levelSeqRef = useRef(-1); // дедуп level отдельным счётчиком (не смешиваем с partial)
   const barPosRef = useRef(new Float64Array(BAR_COUNT));
-  const barVelRef = useRef(new Float64Array(BAR_COUNT));
   const glowPosRef = useRef(0);
-  const glowVelRef = useRef(0);
   const barEls = useRef<(HTMLSpanElement | null)[]>(new Array(BAR_COUNT).fill(null));
   const glowEl = useRef<HTMLSpanElement | null>(null);
   const levelRafRef = useRef<number | null>(null);
   const levelLastRef = useRef(0);
+  const reducedMotionRef = useRef(false);
 
   useEffect(() => {
     if (IS_TAURI_RUNTIME) return;
@@ -181,13 +204,13 @@ export default function Overlay() {
       if (demo === "recording" || demo === "stream") {
         statusRef.current = "recording";
         setStatus("recording");
-      } else if (demo === "processing") {
+      } else if (demo === "processing" || demo === "stream-processing") {
         statusRef.current = "transcribing";
         setStatus("transcribing");
       } else if (demo === "error") {
         setNotice("Не удалось вставить текст");
       }
-      if (demo === "stream") {
+      if (demo === "stream" || demo === "stream-processing") {
         const text = "Добавь автоматические тесты для Windows";
         const chars = Array.from(text);
         targetTextRef.current = text;
@@ -195,7 +218,8 @@ export default function Overlay() {
         committedLenRef.current = Array.from("Добавь автоматические тесты").length;
         shownFloatRef.current = chars.length;
         shownRef.current = chars.length;
-        setShown(chars.length);
+        hasPreviewRef.current = true;
+        setHasPreview(true);
         setLang("ru");
       }
     }, 60);
@@ -206,6 +230,12 @@ export default function Overlay() {
     document.body.classList.add("overlay-body");
     const unlisteners: Array<() => void> = [];
     let alive = true;
+    const motionQuery = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const syncMotionPreference = () => {
+      reducedMotionRef.current = motionQuery.matches;
+    };
+    syncMotionPreference();
+    motionQuery.addEventListener("change", syncMotionPreference);
 
     getSettings().then((s) => {
       if (!alive) return;
@@ -241,9 +271,26 @@ export default function Overlay() {
       needScrollRef.current = false;
     };
 
-    const setShownBoth = (n: number) => {
+    // PERF: посимвольный preview не должен перерисовывать весь Overlay. React
+    // получает только булев переход «текст появился/исчез», а сами две текстовые
+    // ноды и data-shown обновляются напрямую максимум один раз за rAF.
+    const setShownDirect = (n: number) => {
       shownRef.current = n;
-      setShown(n);
+      const chars = targetCharsRef.current;
+      const visible = Math.min(n, chars.length);
+      const cut = Math.min(committedLenRef.current, visible);
+      if (committedTextRef.current) {
+        committedTextRef.current.textContent = chars.slice(0, cut).join("");
+      }
+      if (volatileTextRef.current) {
+        volatileTextRef.current.textContent = chars.slice(cut, visible).join("");
+      }
+      if (pillRef.current) pillRef.current.dataset.shown = String(visible);
+      const nextHasPreview = visible > 0;
+      if (hasPreviewRef.current !== nextHasPreview) {
+        hasPreviewRef.current = nextHasPreview;
+        setHasPreview(nextHasPreview);
+      }
       requestScroll();
     };
     // PERF: typing-стейт пишем в React ТОЛЬКО при реальной смене значения. Иначе
@@ -275,7 +322,7 @@ export default function Overlay() {
       committedLenRef.current = 0;
       shownFloatRef.current = 0;
       lastFrameRef.current = 0;
-      setShownBoth(0);
+      setShownDirect(0);
       setTypingOnce(false);
       clearFinalHold();
     };
@@ -303,10 +350,17 @@ export default function Overlay() {
       const cps = Math.max(180, Math.min(900, pending * 18));
       shownFloatRef.current = Math.min(total, shownFloatRef.current + (cps * dt) / 1000);
       const next = Math.floor(shownFloatRef.current);
-      if (next !== shownRef.current) setShownBoth(next);
+      if (next !== shownRef.current) setShownDirect(next);
       rafRef.current = requestAnimationFrame(tick);
     };
     const kick = () => {
+      if (reducedMotionRef.current) {
+        stopRaf();
+        shownFloatRef.current = targetCharsRef.current.length;
+        setShownDirect(targetCharsRef.current.length);
+        setTypingOnce(false);
+        return;
+      }
       setTypingOnce(true); // печать началась — один setState на смену
       if (rafRef.current == null) {
         lastFrameRef.current = 0; // первый кадр после простоя не делает скачок dt
@@ -314,50 +368,53 @@ export default function Overlay() {
       }
     };
 
-    // --- rAF-цикл громкости: спринг на каждый бар + спринг glow орба. Работает,
-    // только пока есть свежие "level" или спринги не успокоились; в покое НЕ крутится
+    // --- rAF-цикл громкости: устойчивое экспоненциальное сглаживание баров/glow.
+    // Работает,
+    // только пока есть свежие "level" или уровни не успокоились; в покое НЕ крутится
     // (нет события — бары на CSS-минимуме, без фейковой анимации). Все записи — только
     // transform/opacity (компосит), ни одного setState на кадр.
     const levelTick = (now: number) => {
-      const dt = Math.min(0.064, levelLastRef.current ? (now - levelLastRef.current) / 1000 : 0.0167);
+      const dt = Math.min(0.05, levelLastRef.current ? (now - levelLastRef.current) / 1000 : 0.0167);
       levelLastRef.current = now;
       // «Свежо» = поток level живой (<250 мс) и идёт запись; иначе цель 0 — опадаем.
       const fresh =
         statusRef.current === "recording" && now - lastLevelAtRef.current < 250;
       const rms = fresh ? rmsRef.current : 0;
       const barPos = barPosRef.current;
-      const barVel = barVelRef.current;
+      const reducedMotion = reducedMotionRef.current;
       let busy = false;
       // Шиммер ДЕТЕРМИНИРОВАННЫЙ: sin с фазой по индексу бара, период 500 мс,
       // амплитуда 0.08 — никакой случайности; гасится вместе с потоком level.
       const ph = (now / 500) * Math.PI * 2;
       for (let i = 0; i < BAR_COUNT; i++) {
-        const shimmer = fresh ? 0.08 * Math.sin(ph + i * 0.9) : 0;
+        const shimmer = fresh ? 0.08 * rms * Math.sin(ph + i * 0.9) : 0;
         const target = clamp01(rms * BAR_WEIGHTS[i] + shimmer);
-        barVel[i] += (SPRING_K * (target - barPos[i]) - SPRING_C * barVel[i]) * dt;
-        barPos[i] += barVel[i] * dt;
-        if (Math.abs(target - barPos[i]) > 0.002 || Math.abs(barVel[i]) > 0.002) busy = true;
+        const tau = target > barPos[i] ? LEVEL_ATTACK_S : LEVEL_RELEASE_S;
+        const alpha = reducedMotion ? 1 : 1 - Math.exp(-dt / tau);
+        barPos[i] += (target - barPos[i]) * alpha;
+        if (!reducedMotion && Math.abs(target - barPos[i]) > 0.002) busy = true;
         const el = barEls.current[i];
         if (el) {
           const v = clamp01(barPos[i]);
-          // Высота 2+20·v^1.5 (2..22 px) через scaleY от фиксированных 22 px.
-          el.style.transform = `scaleY(${(2 + 20 * Math.pow(v, 1.5)) / BAR_MAX_H})`;
+          // Высота 2+16·v^1.5 (2..18 px) через scaleY от фиксированных 18 px.
+          el.style.transform = `scaleY(${(2 + 16 * Math.pow(v, 1.5)) / BAR_MAX_H})`;
           el.style.opacity = String(0.75 + 0.25 * v);
         }
       }
       // Glow орба: радиус 0.5+5.5·log10(1+3v) px поверх орба радиусом 6.5 px.
       // Элемент glow — круг 26 px (радиус 13, градиент гаснет к 70% ≈ 9.1 px),
       // масштабируем так, чтобы видимый радиус был 6.5+g.
-      glowVelRef.current += (SPRING_K * (rms - glowPosRef.current) - SPRING_C * glowVelRef.current) * dt;
-      glowPosRef.current += glowVelRef.current * dt;
-      if (Math.abs(rms - glowPosRef.current) > 0.002 || Math.abs(glowVelRef.current) > 0.002) busy = true;
+      const glowTau = rms > glowPosRef.current ? LEVEL_ATTACK_S : LEVEL_RELEASE_S;
+      const glowAlpha = reducedMotion ? 1 : 1 - Math.exp(-dt / glowTau);
+      glowPosRef.current += (rms - glowPosRef.current) * glowAlpha;
+      if (!reducedMotion && Math.abs(rms - glowPosRef.current) > 0.002) busy = true;
       const g = 0.5 + 5.5 * Math.log10(1 + 3 * clamp01(glowPosRef.current));
       const gl = glowEl.current;
       if (gl) {
         gl.style.transform = `scale(${(6.5 + g) / 9.1})`;
         gl.style.opacity = String(clamp01((g - 0.5) / 3.3) * 0.85);
       }
-      if (busy || fresh) {
+      if (!reducedMotion && (busy || fresh)) {
         levelRafRef.current = requestAnimationFrame(levelTick);
       } else {
         levelRafRef.current = null; // успокоились — спим до следующего "level"
@@ -385,6 +442,17 @@ export default function Overlay() {
       }
       setLatchNotice(null);
     };
+    const showLatch = (payload?: HotkeyLatchEvent) => {
+      setLatchNotice({
+        message: payload?.message || "Без удержания",
+        detail: payload?.detail || "Двойное нажатие",
+      });
+      if (latchTimer.current) clearTimeout(latchTimer.current);
+      latchTimer.current = setTimeout(() => {
+        latchTimer.current = null;
+        setLatchNotice(null);
+      }, 1150);
+    };
     const holdFinalPreview = () => {
       if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
       finalHoldRef.current = true;
@@ -406,45 +474,53 @@ export default function Overlay() {
 
     const offStatus = subscribe<StatusPayload>("status", (e) => {
       // Совместимость: текущий бэкенд шлёт строку, следующая волна МОЖЕТ слать
-      // объект { status, lang } — принимаем оба варианта (см. StatusPayload).
+      // объект { status, lang, seq?, latched? } — принимаем оба варианта.
       const p = e.payload;
       const v = typeof p === "string" ? p : p?.status;
       if (v !== "recording" && v !== "transcribing" && v !== "idle") return;
+      if (typeof p === "object" && p !== null && Number.isFinite(p.seq)) {
+        const seq = p.seq as number;
+        if (seq > currentSeqRef.current) currentSeqRef.current = seq;
+        if (seq > levelSeqRef.current) levelSeqRef.current = seq;
+      }
+      if (v === "recording" && typeof p === "object" && p?.latched === true) {
+        showLatch();
+      }
       const prev = statusRef.current;
       statusRef.current = v;
-      setStatus(v);
+      if (prev !== v) setStatus(v);
 
       if (v === "recording") {
-        // Новая диктовка: сбрасываем метку «оффлайн» и поток печати прошлой записи.
-        setOffline(false);
-        // Язык прошлой диктовки не «бликует» в новой: бейдж скрыт до первого lang.
-        setLang(null);
-        // Дедуп по seq порог здесь НЕ трогаем (счётчик монотонный): у новой диктовки
-        // seq строго больше, её партиалы пройдут сами, а эхо прошлой отфильтруется.
-        resetTextEngine();
-        // Уровень прошлой записи не должен «бликовать» в новой.
-        rmsRef.current = 0;
-        lastLevelAtRef.current = 0;
+        // Повторный status=recording внутри одной диктовки не имеет права стирать
+        // уже показанный partial. Полный сброс делаем только на реальном входе.
+        if (prev !== "recording") {
+          setOffline(false);
+          setLang(null);
+          // Дедуп по seq порог здесь НЕ трогаем (счётчик монотонный): у новой
+          // диктовки seq строго больше, а эхо прошлой отфильтруется.
+          resetTextEngine();
+          rmsRef.current = 0;
+          lastLevelAtRef.current = 0;
+        }
       } else if (v === "transcribing") {
-        // Финальная обработка/вставка началась: старое settled-«готово» больше
-        // не должно висеть на экране. Пока backend готовит и вставляет текст,
-        // показываем только явный spinner «Готовлю».
-        resetTextEngine();
+        // Не стираем live-preview во время финального распознавания: пользователь
+        // продолжает видеть сказанное, а кольцо на орбе показывает обработку.
+        stopRaf();
+        shownFloatRef.current = targetCharsRef.current.length;
+        setShownDirect(targetCharsRef.current.length);
+        setTypingOnce(false);
         kickLevel();
       } else {
-        // idle. После финальной обработки не возвращаем старую текстовую плашку:
-        // текст уже вставлен в целевое приложение, overlay должен свернуться.
+        // Короткий final-preview остаётся видимым до своего таймера; обычный текст
+        // сворачивается сразу после успешной вставки.
         clearLatch();
-        if (prev === "transcribing") {
-          clearFinalHold();
-          resetTextEngine();
-        } else if (finalHoldRef.current) {
-          clearFinalHold();
-          resetTextEngine();
+        if (finalHoldRef.current) {
+          stopRaf();
+          setTypingOnce(false);
         } else {
           resetTextEngine();
         }
-        kickLevel(); // дать спрингам опасть, цикл сам заснёт
+        kickLevel(); // дать уровням опасть, цикл сам заснёт
       }
       // lang из самого события (если бэкенд прислал) — ПОСЛЕ сброса на recording,
       // чтобы lang, пришедший вместе со стартом записи, не был тут же затёрт.
@@ -462,7 +538,11 @@ export default function Overlay() {
       }
       const isFinalPreview = e.payload?.final === true;
       const isSettledPreview = e.payload?.settled === true;
-      if (statusRef.current === "transcribing" && !isFinalPreview) {
+      if (
+        statusRef.current === "transcribing" &&
+        !isFinalPreview &&
+        !isSettledPreview
+      ) {
         return;
       }
       if (
@@ -497,7 +577,7 @@ export default function Overlay() {
       if (previewChanged) setPreviewVersion((v) => v + 1);
       // Хвост укоротился (whisper переписал короче) — подрезаем показанное, без скачка.
       if (shownFloatRef.current > chars.length) shownFloatRef.current = chars.length;
-      if (shownRef.current > chars.length) setShownBoth(chars.length);
+      if (shownRef.current > chars.length) setShownDirect(chars.length);
       // Если ASR прислал большой новый кусок, не заставляем пользователя ждать
       // посимвольную анимацию всей фразы: держим максимум небольшой live-lag.
       if (previewChanged) {
@@ -505,7 +585,14 @@ export default function Overlay() {
         const lag = chars.length - shownFloatRef.current;
         if (lag > maxLiveLag) {
           shownFloatRef.current = Math.max(0, chars.length - maxLiveLag);
-          setShownBoth(Math.floor(shownFloatRef.current));
+          setShownDirect(Math.floor(shownFloatRef.current));
+        } else if (chars.length > 0 && shownFloatRef.current < 1) {
+          // Первая буква появляется в тот же event-turn, без пустого кадра.
+          shownFloatRef.current = 1;
+          setShownDirect(1);
+        } else {
+          // committed/volatile мог измениться при той же длине строки.
+          setShownDirect(shownRef.current);
         }
       }
       if (isFinalPreview || isSettledPreview) holdFinalPreview();
@@ -543,16 +630,7 @@ export default function Overlay() {
     });
 
     const offHotkeyLatch = subscribe<HotkeyLatchEvent>("hotkey_latch", (e) => {
-      const payload = e.payload ?? {};
-      setLatchNotice({
-        message: payload.message || "Режим без удержания",
-        detail: payload.detail || "Двойное нажатие",
-      });
-      if (latchTimer.current) clearTimeout(latchTimer.current);
-      latchTimer.current = setTimeout(() => {
-        latchTimer.current = null;
-        setLatchNotice(null);
-      }, 1150);
+      showLatch(e.payload);
     });
 
     // D: какой STT реально отработал диктовку. offline=true → облако было недоступно
@@ -582,6 +660,7 @@ export default function Overlay() {
       if (latchTimer.current) clearTimeout(latchTimer.current);
       if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
       for (const fn of unlisteners) fn();
+      motionQuery.removeEventListener("change", syncMotionPreference);
     };
   }, []);
 
@@ -593,15 +672,18 @@ export default function Overlay() {
       ? "notice"
       : latchNotice != null
         ? "latch"
-        : finalHold && shown > 0
+        : finalHold && hasPreview
         ? "stream"
         : status === "transcribing"
-        ? "trans"
+        ? hasPreview
+          ? "stream"
+          : "trans"
         : status === "recording"
-            ? shown > 0
+            ? hasPreview
               ? "stream"
               : "rec"
             : "idle";
+  const compactHotkeyTip = compactHotkeyLabel(hotkeyTip);
 
   const pillHitRect = () => {
     const rect = pillRef.current?.getBoundingClientRect();
@@ -681,6 +763,7 @@ export default function Overlay() {
   // условный рендер корня (иначе transition не сыграет и пилюля «мигнёт»).
   const showBars = mode === "rec" || mode === "trans";
   const showOrb = showBars || mode === "stream";
+  const isProcessing = status === "transcribing";
   const applyManualDrag = async (p: DragPointer, requireActive = true) => {
     if (!p.cursorStart) return;
     const overlayWindow = getCurrentWindow();
@@ -820,9 +903,10 @@ export default function Overlay() {
           className={`aq-pill aq-${mode}`}
           ref={pillRef}
           data-mode={mode}
-          data-shown={shown}
+          data-status={status}
+          data-shown={shownRef.current}
           title={
-            offline && mode === "trans"
+            offline && isProcessing
               ? "Облако недоступно — локальное распознавание"
               : undefined
           }
@@ -842,7 +926,7 @@ export default function Overlay() {
         {mode === "idle" ? (
           <span className="aq-idle-copy">
             <span className="aq-logo-wave" aria-hidden><i /><i /><i /><i /><i /></span>
-            <strong>{hotkeyTip} — говорить</strong>
+            <strong>{compactHotkeyTip} — говорить</strong>
             <span className="aq-idle-lang">Авто</span>
           </span>
         ) : mode === "notice" ? (
@@ -853,7 +937,7 @@ export default function Overlay() {
               2×
             </span>
             <span>
-              <strong>{latchNotice?.message || "Режим без удержания"}</strong>
+              <strong>{latchNotice?.message || "Без удержания"}</strong>
               <small>{latchNotice?.detail || "Двойное нажатие"}</small>
             </span>
           </span>
@@ -864,12 +948,12 @@ export default function Overlay() {
             <span className="aq-orbwrap" aria-hidden>
               <span className="aq-orb-glow" ref={glowEl} />
               <span className="aq-orb" />
-              {mode === "trans" && <span className="aq-ring" />}
+              {isProcessing && <span className="aq-ring" />}
             </span>
             {mode === "stream" ? (
               (() => {
                 const chars = targetCharsRef.current;
-                const vis = Math.min(shown, chars.length);
+                const vis = Math.min(shownRef.current, chars.length);
                 // Граница committed — не дальше показанного.
                 const cut = Math.min(committedLenRef.current, vis);
                 const committedText = chars.slice(0, cut).join("");
@@ -880,8 +964,12 @@ export default function Overlay() {
                     ref={scrollRef}
                     data-preview-version={previewVersion}
                   >
-                    <span className="aq-chunk committed">{committedText}</span>
-                    <span className="aq-chunk volatile">{volatileText}</span>
+                    <span className="aq-chunk committed" ref={committedTextRef}>
+                      {committedText}
+                    </span>
+                    <span className="aq-chunk volatile" ref={volatileTextRef}>
+                      {volatileText}
+                    </span>
                     {/* Каретка-кружок — последний inline-элемент: всегда вплотную за
                         текстом и переносится вместе с ним. Пульс при печати, мигание в покое. */}
                     <span

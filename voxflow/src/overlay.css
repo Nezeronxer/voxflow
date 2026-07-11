@@ -513,6 +513,15 @@
   color: rgba(255, 255, 255, 0.96);
   font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   backdrop-filter: none;
+  transition:
+    width 90ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    height 90ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    padding 90ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    background-color 80ms ease-out,
+    border-color 80ms ease-out,
+    box-shadow 80ms ease-out,
+    opacity 80ms ease-out,
+    transform 80ms ease-out;
 }
 
 .aq-tip {
@@ -520,32 +529,55 @@
 }
 
 .aq-idle {
-  width: 244px;
-  height: 38px;
-  padding: 0 10px;
-  opacity: 1;
+  width: 56px;
+  height: 10px;
+  padding: 0;
+  overflow: hidden;
+  opacity: 0.78;
+  background: rgba(17, 19, 24, 0.48);
+  border: 1px solid rgba(184, 188, 198, 0.72);
+  border-radius: 999px;
+  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.18);
 }
 
 .aq-idle:hover {
-  width: 244px;
-  height: 38px;
+  width: 172px;
+  height: 30px;
+  padding: 0 8px;
+  opacity: 1;
+  overflow: hidden;
+  background: rgba(22, 25, 32, 0.985);
   border-color: rgba(111, 131, 255, 0.68);
+  border-radius: 12px;
+  box-shadow:
+    0 8px 24px rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.045);
 }
 
 .aq-idle-copy {
   width: 100%;
   min-width: 0;
   display: grid;
-  grid-template-columns: 22px minmax(0, 1fr) auto;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 7px;
+  gap: 5px;
   pointer-events: none;
+  opacity: 0;
+  transform: scale(0.96);
+  transition:
+    opacity 70ms ease-out,
+    transform 90ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.aq-idle:hover .aq-idle-copy {
+  opacity: 1;
+  transform: scale(1);
 }
 
 .aq-idle-copy strong {
   overflow: hidden;
   color: rgba(255, 255, 255, 0.92);
-  font-size: 11.5px;
+  font-size: 10px;
   font-weight: 590;
   letter-spacing: -0.005em;
   text-overflow: ellipsis;
@@ -553,83 +585,84 @@
 }
 
 .aq-logo-wave {
-  height: 22px;
+  height: 16px;
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 2px;
+  gap: 1.5px;
   color: #6f83ff;
 }
 
 .aq-logo-wave i {
-  width: 2.5px;
+  width: 2px;
   border-radius: 999px;
   background: currentColor;
   box-shadow: 0 0 8px rgba(111, 131, 255, 0.42);
 }
 
 .aq-logo-wave i:nth-child(1),
-.aq-logo-wave i:nth-child(5) { height: 7px; }
+.aq-logo-wave i:nth-child(5) { height: 5px; }
 .aq-logo-wave i:nth-child(2),
-.aq-logo-wave i:nth-child(4) { height: 14px; }
-.aq-logo-wave i:nth-child(3) { height: 22px; }
+.aq-logo-wave i:nth-child(4) { height: 10px; }
+.aq-logo-wave i:nth-child(3) { height: 16px; }
 
 .aq-idle-lang {
-  min-width: 39px;
-  padding-left: 8px;
+  min-width: 30px;
+  padding-left: 5px;
   border-left: 1px solid rgba(255, 255, 255, 0.12);
   color: rgba(255, 255, 255, 0.62);
-  font-size: 10.5px;
+  font-size: 9px;
   font-weight: 550;
 }
 
 .aq-idle-lang::after {
   content: "⌄";
-  margin-left: 5px;
+  margin-left: 3px;
   color: rgba(255, 255, 255, 0.42);
 }
 
 .aq-rec {
-  width: 236px;
-  height: 44px;
-  padding: 0 14px;
+  width: 148px;
+  height: 34px;
+  padding: 0 10px;
   justify-content: flex-start;
-  gap: 10px;
+  gap: 7px;
   border-color: rgba(111, 131, 255, 0.72);
 }
 
 .aq-trans {
-  width: 232px;
-  height: 42px;
-  padding: 0 14px;
+  width: 148px;
+  height: 34px;
+  padding: 0 10px;
   justify-content: flex-start;
-  gap: 10px;
+  gap: 7px;
   transform: none;
 }
 
 .aq-stream {
   width: auto;
-  min-width: 240px;
-  max-width: 360px;
-  min-height: 54px;
-  max-height: 82px;
-  padding: 9px 14px;
-  gap: 10px;
+  min-width: 180px;
+  max-width: 270px;
+  min-height: 42px;
+  max-height: 66px;
+  padding: 7px 10px;
+  gap: 7px;
   border-color: rgba(111, 131, 255, 0.58);
 }
 
 .aq-latch {
-  width: 238px;
-  height: 44px;
-  padding: 6px 11px;
+  width: 148px;
+  height: 34px;
+  padding: 4px 8px;
+  animation: none;
 }
 
 .aq-notice {
   width: auto;
-  min-width: 220px;
-  max-width: 330px;
-  min-height: 46px;
-  padding: 8px 12px;
+  min-width: 180px;
+  max-width: 270px;
+  min-height: 38px;
+  padding: 6px 9px;
   border-color: rgba(255, 107, 107, 0.62);
 }
 
@@ -649,6 +682,7 @@
   width: 26px;
   height: 26px;
   margin: -13px 0 0 -13px;
+  will-change: transform, opacity;
 }
 
 .aq-ring {
@@ -656,32 +690,35 @@
   height: 14.5px;
   margin: -7.25px 0 0 -7.25px;
   border-width: 2px;
+  will-change: transform;
 }
 
 .aq-rec-copy {
   color: rgba(255, 255, 255, 0.82);
-  font-size: 11.5px;
+  font-size: 10.5px;
   font-weight: 620;
   white-space: nowrap;
   pointer-events: none;
 }
 
 .aq-bars {
-  height: 24px;
-  gap: 2.5px;
+  height: 18px;
+  gap: 1.5px;
   margin-left: auto;
 }
 
 .aq-bar {
-  width: 2.5px;
+  width: 2px;
+  height: 18px;
   background: linear-gradient(180deg, #91a0ff, #5e74f7);
+  will-change: transform, opacity;
 }
 
 .aq-text {
-  max-height: 56px;
+  max-height: 46px;
   scroll-behavior: auto;
   color: rgba(255, 255, 255, 0.95);
-  font-size: 12.5px;
+  font-size: 11.25px;
   line-height: 1.38;
   font-weight: 480;
 }
@@ -699,14 +736,14 @@
 }
 
 .aq-caret {
-  width: 6px;
-  height: 6px;
+  width: 5px;
+  height: 5px;
   background: #7f91ff;
 }
 
 .aq-trans-copy {
   color: rgba(255, 255, 255, 0.9);
-  font-size: 11.5px;
+  font-size: 10.5px;
   font-weight: 590;
 }
 
@@ -719,12 +756,50 @@
 }
 
 .aq-msg {
-  font-size: 11.5px;
+  font-size: 10.5px;
   line-height: 1.35;
 }
 
+.aq-latch-copy {
+  gap: 6px;
+}
+
+.aq-latch-copy strong {
+  overflow: hidden;
+  font-size: 9.5px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.aq-latch-copy small {
+  font-size: 8.5px;
+  white-space: nowrap;
+}
+
+.aq-latch-mark {
+  width: 22px;
+  height: 22px;
+  font-size: 9px;
+}
+
 @media (prefers-reduced-motion: reduce) {
+  .aq-pill,
+  .aq-scale-stage,
+  .aq-idle-copy,
+  .aq-ring,
+  .aq-caret,
+  .aq-bar,
+  .aq-orb-glow,
+  .aq-reduced-motion-sentinel {
+    transition: none !important;
+    animation: none !important;
+  }
+
   .aq-chunk {
     transition: none;
+  }
+
+  .aq-text {
+    scroll-behavior: auto;
   }
 }
