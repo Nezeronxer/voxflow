@@ -776,6 +776,10 @@ mod macos {
     const K_CG_EVENT_FLAGS_CHANGED: u32 = 12;
     const K_CG_KEYBOARD_EVENT_KEYCODE: u32 = 9;
     const K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE: i32 = 1;
+    const K_CG_EVENT_FLAG_MASK_SHIFT: u64 = 1 << 17;
+    const K_CG_EVENT_FLAG_MASK_CONTROL: u64 = 1 << 18;
+    const K_CG_EVENT_FLAG_MASK_ALTERNATE: u64 = 1 << 19;
+    const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
@@ -788,6 +792,7 @@ mod macos {
             user_info: *mut c_void,
         ) -> CFMachPortRef;
         fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
+        fn CGEventGetFlags(event: CGEventRef) -> u64;
         fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
     }
 
@@ -959,14 +964,16 @@ mod macos {
             K_CG_EVENT_KEY_DOWN => Some(EventType::KeyPress(key)),
             K_CG_EVENT_KEY_UP => Some(EventType::KeyRelease(key)),
             K_CG_EVENT_FLAGS_CHANGED => {
-                // flagsChanged сам по себе не говорит down это или up. Простое
-                // переключение локального bool ломается на дубле/потерянном callback.
-                // Читаем фактическое HID-состояние именно этого keycode, что также сохраняет
-                // различие левого/правого Option, Control, Shift и Command.
+                // Обычно точное left/right-состояние берём из HID. Но системное
+                // переназначение модификатора и некоторые внешние клавиатуры могут
+                // прислать корректный flagsChanged с logical flag, не выставив
+                // физический state для итогового keycode. Без fallback Right Cmd
+                // сохранялся в настройках, но его первый press молча отбрасывался.
                 let physically_down = unsafe {
                     CGEventSourceKeyState(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM_STATE, keycode as u16)
                 };
-                modifier_event(ctx, key, physically_down)
+                let flags = unsafe { CGEventGetFlags(event) };
+                modifier_event(ctx, key, physically_down, modifier_flag_active(key, flags))
             }
             _ => None,
         };
@@ -1001,23 +1008,42 @@ mod macos {
         dispatch(&ctx.state, &ctx.tx, event_type, snapshot);
     }
 
-    fn modifier_event(ctx: &ListenerCtx, key: Key, physically_down: bool) -> Option<EventType> {
+    fn modifier_event(
+        ctx: &ListenerCtx,
+        key: Key,
+        physically_down: bool,
+        logical_down: bool,
+    ) -> Option<EventType> {
         let mut down = ctx.modifier_down.lock();
-        normalize_modifier_transition(&mut down, key, physically_down)
+        normalize_modifier_transition(&mut down, key, physically_down, logical_down)
+    }
+
+    fn modifier_flag_active(key: Key, flags: u64) -> bool {
+        let mask = match key {
+            Key::ShiftLeft | Key::ShiftRight => K_CG_EVENT_FLAG_MASK_SHIFT,
+            Key::ControlLeft | Key::ControlRight => K_CG_EVENT_FLAG_MASK_CONTROL,
+            Key::Alt | Key::AltGr => K_CG_EVENT_FLAG_MASK_ALTERNATE,
+            Key::MetaLeft | Key::MetaRight => K_CG_EVENT_FLAG_MASK_COMMAND,
+            // Caps/Num Lock are toggles, so their persistent logical flag cannot
+            // serve as a press fallback. Their exact HID state remains authoritative.
+            _ => 0,
+        };
+        mask != 0 && flags & mask != 0
     }
 
     pub(super) fn normalize_modifier_transition(
         down: &mut Vec<Key>,
         key: Key,
         physically_down: bool,
+        logical_down: bool,
     ) -> Option<EventType> {
         let position = down.iter().position(|tracked| *tracked == key);
-        match (physically_down, position) {
+        match (physically_down || logical_down, position) {
             (true, None) => {
                 down.push(key);
                 Some(EventType::KeyPress(key))
             }
-            (false, Some(pos)) => {
+            (_, Some(pos)) if !physically_down => {
                 down.swap_remove(pos);
                 Some(EventType::KeyRelease(key))
             }
@@ -1642,27 +1668,27 @@ mod tests {
     fn macos_modifier_normalization_uses_physical_state_and_deduplicates() {
         let mut down = Vec::new();
         assert_eq!(
-            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true),
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true, true),
             Some(EventType::KeyPress(Key::AltGr))
         );
         assert_eq!(down, vec![Key::AltGr]);
 
         // Duplicate flagsChanged/auto-repeat cannot invert a held modifier to up.
         assert_eq!(
-            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true),
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true, true),
             None
         );
         assert_eq!(down, vec![Key::AltGr]);
 
         assert_eq!(
-            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, false),
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, false, false),
             Some(EventType::KeyRelease(Key::AltGr))
         );
         assert!(down.is_empty());
 
         // Duplicate/orphan release stays inert instead of becoming a fresh press.
         assert_eq!(
-            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, false),
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, false, false),
             None
         );
         assert!(down.is_empty());
@@ -1674,11 +1700,11 @@ mod tests {
         let mut down = Vec::new();
 
         assert_eq!(
-            super::macos::normalize_modifier_transition(&mut down, Key::Alt, true),
+            super::macos::normalize_modifier_transition(&mut down, Key::Alt, true, true),
             Some(EventType::KeyPress(Key::Alt))
         );
         assert_eq!(
-            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true),
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true, true),
             Some(EventType::KeyPress(Key::AltGr))
         );
         assert_eq!(down, vec![Key::Alt, Key::AltGr]);
@@ -1686,16 +1712,16 @@ mod tests {
         // Releasing the left key must not synthesize an up for Right Option,
         // which is the common dictation binding on macOS.
         assert_eq!(
-            super::macos::normalize_modifier_transition(&mut down, Key::Alt, false),
+            super::macos::normalize_modifier_transition(&mut down, Key::Alt, false, true),
             Some(EventType::KeyRelease(Key::Alt))
         );
         assert_eq!(down, vec![Key::AltGr]);
         assert_eq!(
-            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true),
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, true, true),
             None
         );
         assert_eq!(
-            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, false),
+            super::macos::normalize_modifier_transition(&mut down, Key::AltGr, false, false),
             Some(EventType::KeyRelease(Key::AltGr))
         );
         assert!(down.is_empty());
@@ -1711,6 +1737,7 @@ mod tests {
                 &mut down,
                 Key::ControlRight,
                 physically_down,
+                physically_down,
             ) {
                 normalized.push(event);
             }
@@ -1724,6 +1751,23 @@ mod tests {
                 EventType::KeyPress(Key::ControlRight),
                 EventType::KeyRelease(Key::ControlRight),
             ]
+        );
+        assert!(down.is_empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_remapped_modifier_uses_logical_flag_when_hid_state_is_missing() {
+        let mut down = Vec::new();
+
+        assert_eq!(
+            super::macos::normalize_modifier_transition(&mut down, Key::MetaRight, false, true,),
+            Some(EventType::KeyPress(Key::MetaRight))
+        );
+        assert_eq!(down, vec![Key::MetaRight]);
+        assert_eq!(
+            super::macos::normalize_modifier_transition(&mut down, Key::MetaRight, false, false,),
+            Some(EventType::KeyRelease(Key::MetaRight))
         );
         assert!(down.is_empty());
     }
