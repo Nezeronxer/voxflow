@@ -142,6 +142,10 @@ impl TargetFingerprint {
         !self.exe.is_empty() && !self.is_own_app() && !self.is_transient_system_ui()
     }
 
+    pub fn is_unknown(&self) -> bool {
+        self.exe.trim().is_empty() && self.window_id.trim().is_empty()
+    }
+
     /// Rebuild the context captured at hotkey press without another platform
     /// query. The final pre-insert guard still performs a fresh detection; this
     /// cached value only removes redundant synchronous macOS Accessibility work
@@ -184,6 +188,12 @@ impl TargetFingerprint {
     }
 
     pub fn matches(&self, current: &AppContext) -> bool {
+        // Two failed platform queries are not evidence that the same window is
+        // still focused. The old empty==empty fallback could blindly paste on
+        // first launch when macOS temporarily omitted AXFocusedApplication.
+        if self.is_unknown() || current.is_unknown() {
+            return false;
+        }
         let same_window = if !self.window_id.is_empty() && !current.window_id.is_empty() {
             self.exe == current.exe && self.window_id == current.window_id
         } else {
@@ -270,6 +280,10 @@ impl AppContext {
 
     pub fn is_usable_dictation_target(&self) -> bool {
         !self.exe.is_empty() && !self.is_own_app() && !self.is_transient_system_ui()
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.exe.trim().is_empty() && self.window_id.trim().is_empty()
     }
 }
 
@@ -648,6 +662,18 @@ mod tests {
 
         assert!(start.matches(&ctx("chrome.exe", "ChatGPT", "")));
         assert!(!start.matches(&ctx("chrome.exe", "ChatGPT - updated", "")));
+    }
+
+    #[test]
+    fn unknown_fingerprints_never_match() {
+        let unknown = ctx("", "", "");
+        let known = ctx("chrome.exe", "ChatGPT", "123");
+
+        assert!(unknown.is_unknown());
+        assert!(unknown.target_fingerprint().is_unknown());
+        assert!(!unknown.target_fingerprint().matches(&unknown));
+        assert!(!unknown.target_fingerprint().matches(&known));
+        assert!(!known.target_fingerprint().matches(&unknown));
     }
 
     #[test]
@@ -1415,6 +1441,7 @@ mod macos {
     use super::{
         classify, is_sensitive_focused_field, is_textual_focused_field, tail_chars, AppContext,
     };
+    use objc2_app_kit::NSWorkspace;
     use std::ffi::{c_char, c_void, CStr, CString};
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
@@ -1464,6 +1491,7 @@ mod macos {
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
         fn AXUIElementCreateSystemWide() -> AXUIElementRef;
+        fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
         fn AXUIElementCopyAttributeValue(
             element: AXUIElementRef,
             attribute: CFStringRef,
@@ -1785,17 +1813,41 @@ mod macos {
         }
     }
 
+    /// NSWorkspace defines the frontmost application as the app that receives
+    /// key events. That is the identity required by the insertion guard and,
+    /// unlike system-wide AXFocusedApplication, it does not intermittently
+    /// disappear while focus is otherwise stable.
+    fn workspace_frontmost_pid() -> Option<i32> {
+        let application = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+        let pid = application.processIdentifier();
+        (pid > 0).then_some(pid)
+    }
+
+    unsafe fn focused_application() -> Option<(OwnedCf, i32)> {
+        if let Some(pid) = workspace_frontmost_pid() {
+            if let Some(application) = OwnedCf::new(AXUIElementCreateApplication(pid)) {
+                return Some((application, pid));
+            }
+        }
+
+        // Compatibility fallback for unusual sessions where AppKit has no
+        // frontmost application (login/transition state).
+        let system = OwnedCf::new(AXUIElementCreateSystemWide())?;
+        let application = copy_element(system.as_ptr() as AXUIElementRef, "AXFocusedApplication")?;
+        let mut pid = 0i32;
+        if AXUIElementGetPid(application.as_ptr() as AXUIElementRef, &mut pid) != AX_SUCCESS
+            || pid <= 0
+        {
+            return None;
+        }
+        Some((application, pid))
+    }
+
     fn native_snapshot() -> Option<MacContextSnapshot> {
         unsafe {
-            let system = OwnedCf::new(AXUIElementCreateSystemWide())?;
-            let app = copy_element(system.as_ptr() as AXUIElementRef, "AXFocusedApplication")?;
+            let (app, pid) = focused_application()?;
             let app_ref = app.as_ptr() as AXUIElementRef;
             let _ = AXUIElementSetMessagingTimeout(app_ref, AX_TIMEOUT_SECONDS);
-
-            let mut pid = 0i32;
-            if AXUIElementGetPid(app_ref, &mut pid) != AX_SUCCESS || pid <= 0 {
-                return None;
-            }
             let executable = process_path(pid);
             let process_name = executable
                 .as_deref()

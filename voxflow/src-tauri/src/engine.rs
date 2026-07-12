@@ -347,8 +347,39 @@ fn remember_external_target(ctx: &EngineCtx, fp: &TargetFingerprint) {
     }
 }
 
+fn detect_context_with_retry(
+    mut detect: impl FnMut() -> crate::app_context::AppContext,
+    attempts: usize,
+    retry_delay: Duration,
+) -> crate::app_context::AppContext {
+    let attempts = attempts.max(1);
+    let mut current = detect();
+    for _ in 1..attempts {
+        if !current.is_unknown() {
+            break;
+        }
+        if !retry_delay.is_zero() {
+            std::thread::sleep(retry_delay);
+        }
+        current = detect();
+    }
+    current
+}
+
+fn detect_current_context() -> crate::app_context::AppContext {
+    // AppKit normally gives us a stable frontmost PID. During a macOS focus
+    // transition it may still briefly return nil; do not interpret one empty
+    // sample as proof that the user changed windows.
+    let attempts = if cfg!(target_os = "macos") { 3 } else { 1 };
+    detect_context_with_retry(
+        crate::app_context::detect,
+        attempts,
+        Duration::from_millis(15),
+    )
+}
+
 fn resolve_start_target(ctx: &EngineCtx) -> TargetFingerprint {
-    let detected = crate::app_context::detect().target_fingerprint();
+    let detected = detect_current_context().target_fingerprint();
     if detected.is_usable_dictation_target() {
         remember_external_target(ctx, &detected);
         return detected;
@@ -401,6 +432,20 @@ fn external_target_watcher_interval() -> Duration {
 mod external_target_watcher_tests {
     use super::*;
 
+    fn context(exe: &str, window_id: &str) -> crate::app_context::AppContext {
+        crate::app_context::AppContext {
+            exe: exe.into(),
+            title: exe.into(),
+            window_id: window_id.into(),
+            category: "neutral".into(),
+            field_role: String::new(),
+            field_subrole: String::new(),
+            field_id: String::new(),
+            field_text: String::new(),
+            selected_text: String::new(),
+        }
+    }
+
     #[test]
     fn watcher_only_detects_while_fully_idle() {
         assert!(external_target_watcher_should_detect(false, false));
@@ -417,6 +462,54 @@ mod external_target_watcher_tests {
             Duration::from_millis(expected)
         );
     }
+
+    #[test]
+    fn transient_empty_detection_is_retried() {
+        let mut sequence = vec![context("", ""), context("telegram", "pid=42")].into_iter();
+        let detected = detect_context_with_retry(
+            || sequence.next().expect("enough samples"),
+            3,
+            Duration::ZERO,
+        );
+
+        assert_eq!(detected.exe, "telegram");
+        assert!(
+            sequence.next().is_none(),
+            "stops after the first known target"
+        );
+    }
+
+    #[test]
+    fn confirmed_different_target_is_not_retried() {
+        let mut calls = 0;
+        let detected = detect_context_with_retry(
+            || {
+                calls += 1;
+                context("chrome", "pid=99")
+            },
+            3,
+            Duration::ZERO,
+        );
+
+        assert_eq!(detected.exe, "chrome");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn repeated_empty_detection_stays_unknown_after_bound() {
+        let mut calls = 0;
+        let detected = detect_context_with_retry(
+            || {
+                calls += 1;
+                context("", "")
+            },
+            3,
+            Duration::ZERO,
+        );
+
+        assert!(detected.is_unknown());
+        assert_eq!(calls, 3);
+    }
 }
 
 fn current_or_restored_target(
@@ -424,7 +517,7 @@ fn current_or_restored_target(
     target_fp: &mut TargetFingerprint,
     stage: &str,
 ) -> Option<crate::app_context::AppContext> {
-    let mut cur = crate::app_context::detect();
+    let mut cur = detect_current_context();
     let mut cur_fp = cur.target_fingerprint();
     if target_fp.matches(&cur) {
         remember_external_target(ctx, target_fp);
@@ -441,20 +534,31 @@ fn current_or_restored_target(
         return Some(cur);
     }
 
-    if (cur.is_own_app() || cur.is_transient_system_ui())
+    if (cur.is_own_app() || cur.is_transient_system_ui() || cur.is_unknown())
         && target_fp.is_usable_dictation_target()
         && activate_target_for_insert(target_fp)
     {
-        std::thread::sleep(Duration::from_millis(160));
-        cur = crate::app_context::detect();
-        cur_fp = cur.target_fingerprint();
-        if target_fp.matches(&cur) {
-            dbg_log(&format!(
-                "финал: восстановили фокус целевого окна ({stage}) {}",
-                target_fp.describe()
-            ));
-            remember_external_target(ctx, target_fp);
-            return Some(cur);
+        // Activation APIs only acknowledge the request; they do not guarantee
+        // that the app is already frontmost. Poll the actual keyboard target
+        // instead of racing it with one fixed sleep.
+        let deadline = Instant::now() + Duration::from_millis(650);
+        loop {
+            std::thread::sleep(Duration::from_millis(25));
+            cur = detect_current_context();
+            cur_fp = cur.target_fingerprint();
+            if target_fp.matches(&cur) {
+                dbg_log(&format!(
+                    "финал: восстановили фокус целевого окна ({stage}) {}",
+                    target_fp.describe()
+                ));
+                remember_external_target(ctx, target_fp);
+                return Some(cur);
+            }
+            if Instant::now() >= deadline
+                || (!cur.is_unknown() && !cur.is_own_app() && !cur.is_transient_system_ui())
+            {
+                break;
+            }
         }
     }
 
@@ -481,18 +585,14 @@ fn current_or_restored_target(
 #[cfg(target_os = "macos")]
 fn activate_target_for_insert(target_fp: &TargetFingerprint) -> bool {
     if let Some(pid) = target_fp.macos_pid() {
-        let script = format!(
-            r#"tell application "System Events"
-  try
-    set frontmost of first application process whose unix id is {pid} to true
-    return "ok"
-  on error
-    return "err"
-  end try
-end tell"#
-        );
-        if run_osascript_ok(&script) {
-            return true;
+        if let Some(application) =
+            objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32)
+        {
+            if application
+                .activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::empty())
+            {
+                return true;
+            }
         }
     }
 
@@ -3218,6 +3318,19 @@ fn process_utterance(
     let final_target = current_or_restored_target(ctx, &mut target_fp, "перед вставкой");
     context_ms += context_started.elapsed().as_millis() as u64;
     let Some(final_target_actx) = final_target else {
+        // Never lose a completed recognition merely because foreground
+        // identity stayed indeterminate. Do not press keys without a verified
+        // target, but leave exactly this text ready for a manual Cmd+V.
+        if let Err(error) = inject::set_clipboard_text(&text) {
+            dbg_log(&format!(
+                "финал: не удалось сохранить текст в clipboard: {error:#}"
+            ));
+        } else {
+            emit_error(
+                &ctx.app,
+                "Активное окно не удалось подтвердить. Текст сохранён в буфере обмена",
+            );
+        }
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     };
