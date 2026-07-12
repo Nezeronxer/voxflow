@@ -8,6 +8,7 @@ import {
   type ReactNode,
 } from "react";
 import { setHotkeyCaptureActive } from "./api";
+import { createSerializedCaptureSetter } from "./hotkeyCapture";
 
 /* ---------- Тема (light / dark / system) ----------
    Источник истины — Settings.theme в БД. localStorage "vf-theme" — только кэш:
@@ -223,24 +224,38 @@ export function HotkeyCapture({
   excludeLabel,
 }: {
   value: string;
-  onChange: (code: string) => void;
+  onChange: (code: string) => boolean | void | Promise<boolean | void>;
   exclude?: string;
   excludeLabel?: string;
 }) {
   const [capturing, setCapturing] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const ref = useRef<HTMLButtonElement>(null);
   const activationCodeRef = useRef<string | null>(null);
+  const captureCodeRef = useRef<(code: string) => void>(() => undefined);
+  const savingRef = useRef(false);
+  // Tauri commands may complete out of order. Serializing capture transitions
+  // guarantees that a late `true` can never overwrite the final `false` and
+  // leave the global listener permanently paused after reassignment.
+  const nativeCaptureSetterRef = useRef<ReturnType<typeof createSerializedCaptureSetter> | null>(
+    null,
+  );
+  if (!nativeCaptureSetterRef.current) {
+    nativeCaptureSetterRef.current = createSerializedCaptureSetter(setHotkeyCaptureActive);
+  }
+  const setNativeCapture = nativeCaptureSetterRef.current;
 
   function beginCapture(activationCode: string | null = null) {
     activationCodeRef.current = activationCode;
     setError(null);
-    // Стартуем нативную паузу до следующего физического нажатия, не ожидая effect.
-    void setHotkeyCaptureActive(true);
+    // Стартуем нативную паузу до следующего физического нажатия. Это
+    // единственный `true`: effect ниже только подписывается и снимает паузу.
+    void setNativeCapture(true);
     setCapturing(true);
   }
 
-  function captureCode(code: string) {
+  async function captureCode(code: string) {
     if (code === "Escape") {
       setError(null);
       setCapturing(false);
@@ -262,15 +277,34 @@ export function HotkeyCapture({
       );
       return;
     }
-    onChange(code);
-    setError(null);
-    setCapturing(false);
-    ref.current?.blur();
+    if (savingRef.current) return;
+
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      // Держим глобальный listener на паузе, пока backend не принял
+      // новую binding. Иначе первое быстрое нажатие матчилось ещё
+      // со старой клавишей и выглядело как тихий отказ.
+      const saved = await onChange(code);
+      if (saved === false) {
+        setError("Не удалось сохранить клавишу — повторите назначение.");
+        return;
+      }
+      setError(null);
+      setCapturing(false);
+      ref.current?.blur();
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   }
+
+  captureCodeRef.current = (code) => {
+    void captureCode(code);
+  };
 
   useEffect(() => {
     if (!capturing) return;
-    void setHotkeyCaptureActive(true);
     const onWindowKeyDown = (e: globalThis.KeyboardEvent) => {
       // WebKit на macOS иногда не отдаёт modifier-key keydown именно кнопке,
       // даже если она была сфокусирована кликом. Глобальный capture-слушатель
@@ -279,7 +313,7 @@ export function HotkeyCapture({
       e.stopPropagation();
       // Назначение фиксируем на keyup: нативный listener остаётся выключенным
       // до физического отпускания и не примет release без соответствующего press.
-      if (e.code === "Escape") captureCode(e.code);
+      if (e.code === "Escape") captureCodeRef.current(e.code);
     };
     const onWindowKeyUp = (e: globalThis.KeyboardEvent) => {
       e.preventDefault();
@@ -288,7 +322,7 @@ export function HotkeyCapture({
         activationCodeRef.current = null;
         return;
       }
-      captureCode(e.code);
+      captureCodeRef.current(e.code);
     };
     window.addEventListener("keydown", onWindowKeyDown, { capture: true });
     window.addEventListener("keyup", onWindowKeyUp, { capture: true });
@@ -296,9 +330,9 @@ export function HotkeyCapture({
       window.removeEventListener("keydown", onWindowKeyDown, { capture: true });
       window.removeEventListener("keyup", onWindowKeyUp, { capture: true });
       activationCodeRef.current = null;
-      void setHotkeyCaptureActive(false);
+      void setNativeCapture(false);
     };
-  }, [capturing, onChange, exclude, excludeLabel]);
+  }, [capturing]);
 
   function onKeyDown(e: ReactKeyboardEvent<HTMLButtonElement>) {
     if (!capturing) {
@@ -326,7 +360,7 @@ export function HotkeyCapture({
         onBlur={() => setCapturing(false)}
         aria-label="Назначить горячую клавишу"
       >
-        {capturing ? "Нажмите любую клавишу…" : prettyHotkey(value)}
+        {saving ? "Сохраняю…" : capturing ? "Нажмите любую клавишу…" : prettyHotkey(value)}
       </button>
       {error ? (
         <div className="hotkey-error">{error}</div>
