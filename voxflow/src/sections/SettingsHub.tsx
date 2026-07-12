@@ -70,7 +70,9 @@ export default function SettingsHub({
       </aside>
 
       <section className="settings-stage">
-        {page === "general" && <Control settings={settings} update={update} />}
+        {page === "general" && (
+          <Control settings={settings} update={update} persist={persist} />
+        )}
         {page === "dictation" && (
           <Recognition settings={settings} update={update} />
         )}
@@ -88,7 +90,7 @@ export default function SettingsHub({
           <Icon.Check className="ico" />
           Локальный режим · данные не покидают устройство
         </span>
-        <span>VoxFlow 2.0.3</span>
+        <span>VoxFlow 2.0.4</span>
       </footer>
     </div>
   );

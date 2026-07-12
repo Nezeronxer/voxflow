@@ -30,9 +30,11 @@ const THEME_OPTIONS = [
 export default function Control({
   settings,
   update,
+  persist,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
+  persist: (settings: Settings) => Promise<boolean>;
 }) {
   const [devices, setDevices] = useState<string[]>([]);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -41,6 +43,14 @@ export default function Control({
   const [installingUpdate, setInstallingUpdate] = useState(false);
   const overlayScale = normalizeOverlayScale(settings.overlay_scale);
   const overlayPercent = Math.round(overlayScale * 100);
+
+  async function updateHotkey(patch: Pick<Settings, "hotkey"> | Pick<Settings, "improve_hotkey">) {
+    const next = { ...settings, ...patch };
+    update(patch);
+    // Hotkeys are operational settings: commit them before HotkeyCapture
+    // re-enables the native listener instead of waiting for the generic debounce.
+    return persist(next);
+  }
 
   useEffect(() => {
     let alive = true;
@@ -120,7 +130,7 @@ export default function Control({
         >
           <HotkeyCapture
             value={settings.hotkey}
-            onChange={(code) => update({ hotkey: code })}
+            onChange={(code) => updateHotkey({ hotkey: code })}
             exclude={settings.improve_hotkey}
             excludeLabel="улучшения выделенного"
           />
@@ -132,7 +142,7 @@ export default function Control({
         >
           <HotkeyCapture
             value={settings.improve_hotkey}
-            onChange={(code) => update({ improve_hotkey: code })}
+            onChange={(code) => updateHotkey({ improve_hotkey: code })}
             exclude={settings.hotkey}
             excludeLabel="диктовки"
           />
