@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 #[cfg(any(windows, target_os = "macos"))]
 use std::path::{Path, PathBuf};
-#[cfg(any(windows, target_os = "macos"))]
+#[cfg(windows)]
 use std::process::Command;
 
 const OWNER: &str = "Nezeronxer";
@@ -271,19 +271,17 @@ fn paths_refer_to_same_location(a: &Path, b: &Path) -> bool {
 
 #[cfg(target_os = "macos")]
 fn macos_plist_value(bundle: &Path, key: &str) -> Result<String> {
-    let plist = bundle.join("Contents/Info.plist");
-    let output = Command::new("/usr/libexec/PlistBuddy")
-        .arg("-c")
-        .arg(format!("Print :{key}"))
-        .arg(&plist)
-        .output()
-        .map_err(|e| anyhow!("cannot inspect {}: {e}", plist.display()))?;
-    if !output.status.success() {
-        return Err(anyhow!("cannot read {key} from {}", plist.display()));
-    }
-    let value = String::from_utf8(output.stdout)
-        .map_err(|_| anyhow!("{key} in {} is not UTF-8", plist.display()))?;
-    Ok(value.trim().to_string())
+    let plist_path = bundle.join("Contents/Info.plist");
+    let plist = plist::Value::from_file(&plist_path)
+        .map_err(|e| anyhow!("cannot inspect {}: {e}", plist_path.display()))?;
+    let dictionary = plist
+        .as_dictionary()
+        .ok_or_else(|| anyhow!("{} is not a plist dictionary", plist_path.display()))?;
+    dictionary
+        .get(key)
+        .and_then(plist::Value::as_string)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("cannot read string {key} from {}", plist_path.display()))
 }
 
 #[cfg(target_os = "macos")]
