@@ -50,30 +50,76 @@ CREATE TABLE IF NOT EXISTS corrections (
 );
 "#;
 
-/// Записать выученное исправление (распознано → правильно). Дубликаты усиливают вес.
+fn normalize_inline(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalized_key(value: &str) -> String {
+    normalize_inline(value).to_lowercase()
+}
+
+fn snippet_key(value: &str) -> String {
+    normalize_inline(value)
+        .trim_start_matches('/')
+        .trim()
+        .to_lowercase()
+}
+
+/// Записать выученное исправление (распознано → правильно). Unicode/пробельные
+/// дубликаты усиливают вес одной строки; новое исправление того же `wrong`
+/// заменяет старое неоднозначное правило.
 pub fn add_correction(conn: &Connection, wrong: &str, right: &str) -> Result<()> {
-    let wrong = wrong.trim();
-    let right = right.trim();
-    if wrong.is_empty() || right.is_empty() || wrong.eq_ignore_ascii_case(right) {
+    let wrong = normalize_inline(wrong);
+    let right = normalize_inline(right);
+    if wrong.is_empty() || right.is_empty() || wrong == right {
         return Ok(());
     }
-    // если такая пара уже есть — увеличить вес, иначе вставить
-    let existing: Option<i64> = conn
-        .query_row(
-            "SELECT id FROM corrections WHERE lower(wrong)=lower(?1) AND lower(right)=lower(?2)",
-            rusqlite::params![wrong, right],
-            |r| r.get(0),
-        )
-        .ok();
-    match existing {
-        Some(id) => {
-            conn.execute("UPDATE corrections SET hits=hits+1 WHERE id=?1", [id])?;
+
+    let wrong_key = normalized_key(&wrong);
+    let right_key = normalized_key(&right);
+    let mut stmt = conn.prepare("SELECT id,wrong,right,hits FROM corrections ORDER BY id")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    let mut same_wrong = Vec::new();
+    for row in rows {
+        let (id, stored_wrong, stored_right, hits) = row?;
+        if normalized_key(&stored_wrong) == wrong_key {
+            same_wrong.push((id, normalized_key(&stored_right), hits));
         }
-        None => {
-            conn.execute(
-                "INSERT INTO corrections(wrong,right) VALUES(?1,?2)",
-                rusqlite::params![wrong, right],
-            )?;
+    }
+    drop(stmt);
+
+    if same_wrong.is_empty() {
+        conn.execute(
+            "INSERT INTO corrections(wrong,right) VALUES(?1,?2)",
+            rusqlite::params![wrong, right],
+        )?;
+        return Ok(());
+    }
+
+    let keep = same_wrong
+        .iter()
+        .find(|(_, stored_right, _)| *stored_right == right_key)
+        .unwrap_or(&same_wrong[0]);
+    let (keep_id, keep_right, keep_hits) = (keep.0, keep.1.clone(), keep.2);
+    let next_hits = if keep_right == right_key {
+        keep_hits + 1
+    } else {
+        1
+    };
+    conn.execute(
+        "UPDATE corrections SET wrong=?1,right=?2,hits=?3 WHERE id=?4",
+        rusqlite::params![wrong, right, next_hits, keep_id],
+    )?;
+    for (id, _, _) in same_wrong {
+        if id != keep_id {
+            conn.execute("DELETE FROM corrections WHERE id=?1", [id])?;
         }
     }
     Ok(())
@@ -216,6 +262,183 @@ pub fn kv_set(conn: &Connection, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Save a dictionary preference. An empty replacement means "prefer this
+/// spelling", never "delete this word". Unicode/case duplicates are folded
+/// into the oldest row so the UI cannot create ambiguous entries.
+pub fn upsert_dictionary(
+    conn: &Connection,
+    id: Option<i64>,
+    term: &str,
+    replacement: &str,
+) -> Result<()> {
+    let term = normalize_inline(term);
+    if term.is_empty() {
+        anyhow::bail!("Термин словаря не может быть пустым");
+    }
+    let replacement = normalize_inline(replacement);
+    let replacement = if replacement.is_empty() {
+        term.clone()
+    } else {
+        replacement
+    };
+    let tx = conn.unchecked_transaction()?;
+
+    if let Some(id) = id {
+        let exists = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM dictionary WHERE id=?1)",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !exists {
+            anyhow::bail!("Запись словаря не найдена");
+        }
+        // Editing an existing row can rename it onto another Unicode/case
+        // variant. Keep the row the UI edited and remove the now-ambiguous
+        // siblings just as the insert path does.
+        let key = normalized_key(&term);
+        let mut stmt = tx.prepare("SELECT id,term FROM dictionary WHERE id<>?1 ORDER BY id")?;
+        let rows = stmt.query_map([id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut duplicates = Vec::new();
+        for row in rows {
+            let (existing_id, existing_term) = row?;
+            if normalized_key(&existing_term) == key {
+                duplicates.push(existing_id);
+            }
+        }
+        drop(stmt);
+        // Delete normalized siblings before UPDATE: one of them may already
+        // have the exact target spelling protected by SQL UNIQUE.
+        for duplicate in duplicates {
+            tx.execute("DELETE FROM dictionary WHERE id=?1", [duplicate])?;
+        }
+        tx.execute(
+            "UPDATE dictionary SET term=?1,replacement=?2 WHERE id=?3",
+            rusqlite::params![&term, &replacement, id],
+        )?;
+        tx.commit()?;
+        return Ok(());
+    }
+
+    let key = normalized_key(&term);
+    let mut stmt = tx.prepare("SELECT id,term FROM dictionary ORDER BY id")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut matching_ids = Vec::new();
+    for row in rows {
+        let (existing_id, existing_term) = row?;
+        if normalized_key(&existing_term) == key {
+            matching_ids.push(existing_id);
+        }
+    }
+    drop(stmt);
+
+    if let Some((&keep, duplicates)) = matching_ids.split_first() {
+        for duplicate in duplicates {
+            tx.execute("DELETE FROM dictionary WHERE id=?1", [duplicate])?;
+        }
+        tx.execute(
+            "UPDATE dictionary SET term=?1,replacement=?2 WHERE id=?3",
+            rusqlite::params![term, replacement, keep],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO dictionary(term,replacement) VALUES(?1,?2)",
+            rusqlite::params![term, replacement],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// `/адрес` and `адрес` are the same spoken trigger. Repeated saves update one
+/// row; empty bodies are rejected before reaching SQLite.
+pub fn upsert_snippet(
+    conn: &Connection,
+    id: Option<i64>,
+    trigger: &str,
+    content: &str,
+    is_template: bool,
+) -> Result<()> {
+    let trigger = normalize_inline(trigger);
+    if snippet_key(&trigger).is_empty() {
+        anyhow::bail!("Триггер сниппета не может быть пустым");
+    }
+    if content.trim().is_empty() {
+        anyhow::bail!("Содержимое сниппета не может быть пустым");
+    }
+    let flag = i64::from(is_template);
+    let tx = conn.unchecked_transaction()?;
+
+    if let Some(id) = id {
+        let exists = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM snippets WHERE id=?1)",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if !exists {
+            anyhow::bail!("Сниппет не найден");
+        }
+        let key = snippet_key(&trigger);
+        let mut stmt = tx.prepare("SELECT id,trigger FROM snippets WHERE id<>?1 ORDER BY id")?;
+        let rows = stmt.query_map([id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut duplicates = Vec::new();
+        for row in rows {
+            let (existing_id, existing_trigger) = row?;
+            if snippet_key(&existing_trigger) == key {
+                duplicates.push(existing_id);
+            }
+        }
+        drop(stmt);
+        // A normalized sibling may already own this exact trigger under the
+        // SQL UNIQUE constraint. Remove conflicts first, then update atomically.
+        for duplicate in duplicates {
+            tx.execute("DELETE FROM snippets WHERE id=?1", [duplicate])?;
+        }
+        tx.execute(
+            "UPDATE snippets SET trigger=?1,content=?2,is_template=?3 WHERE id=?4",
+            rusqlite::params![&trigger, content, flag, id],
+        )?;
+        tx.commit()?;
+        return Ok(());
+    }
+
+    let key = snippet_key(&trigger);
+    let mut stmt = tx.prepare("SELECT id,trigger FROM snippets ORDER BY id")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut matching_ids = Vec::new();
+    for row in rows {
+        let (existing_id, existing_trigger) = row?;
+        if snippet_key(&existing_trigger) == key {
+            matching_ids.push(existing_id);
+        }
+    }
+    drop(stmt);
+
+    if let Some((&keep, duplicates)) = matching_ids.split_first() {
+        for duplicate in duplicates {
+            tx.execute("DELETE FROM snippets WHERE id=?1", [duplicate])?;
+        }
+        tx.execute(
+            "UPDATE snippets SET trigger=?1,content=?2,is_template=?3 WHERE id=?4",
+            rusqlite::params![trigger, content, flag, keep],
+        )?;
+    } else {
+        tx.execute(
+            "INSERT INTO snippets(trigger,content,is_template) VALUES(?1,?2,?3)",
+            rusqlite::params![trigger, content, flag],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Записать диктовку в историю и обновить дневную статистику.
 pub fn record_dictation(
     conn: &Connection,
@@ -339,6 +562,150 @@ mod tests {
         let conn2 = open_at(&p).expect("повторное открытие");
         assert_eq!(kv_get(&conn2, "keep").as_deref(), Some("me"));
         assert!(!has_corrupt_sibling(&p), "здоровую БД унесло в карантин");
+    }
+
+    #[test]
+    fn repeated_unicode_correction_is_one_weighted_rule() {
+        let p = tmp_db("correction-dedupe");
+        let conn = open_at(&p).expect("создать БД");
+        add_correction(&conn, "  Виспа   Фолл ", "Wispr Flow").unwrap();
+        add_correction(&conn, "виспа фолл", "wispr flow").unwrap();
+
+        let row: (i64, i64) = conn
+            .query_row("SELECT count(*),max(hits) FROM corrections", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, (1, 2));
+    }
+
+    #[test]
+    fn case_only_brand_correction_is_not_discarded() {
+        let p = tmp_db("correction-case");
+        let conn = open_at(&p).expect("создать БД");
+        add_correction(&conn, "wispr flow", "Wispr Flow").unwrap();
+
+        let row: (String, String) = conn
+            .query_row("SELECT wrong,right FROM corrections", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("wispr flow".into(), "Wispr Flow".into()));
+    }
+
+    #[test]
+    fn dictionary_upsert_preserves_blank_replacement_and_dedupes_unicode() {
+        let p = tmp_db("dictionary-upsert");
+        let conn = open_at(&p).expect("создать БД");
+        upsert_dictionary(&conn, None, "  виспр   флоу  ", "").unwrap();
+        upsert_dictionary(&conn, None, "ВИСПР ФЛОУ", "Wispr Flow").unwrap();
+
+        let row: (i64, String) = conn
+            .query_row("SELECT count(*),replacement FROM dictionary", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(row, (1, "Wispr Flow".into()));
+    }
+
+    #[test]
+    fn dictionary_edit_cannot_create_a_duplicate_key() {
+        let p = tmp_db("dictionary-edit-dedupe");
+        let conn = open_at(&p).expect("создать БД");
+        upsert_dictionary(&conn, None, "Alpha", "A").unwrap();
+        upsert_dictionary(&conn, None, "Beta", "B").unwrap();
+        let beta_id: i64 = conn
+            .query_row("SELECT id FROM dictionary WHERE term='Beta'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        upsert_dictionary(&conn, Some(beta_id), "  Alpha ", "Preferred").unwrap();
+
+        let row: (i64, i64, String) = conn
+            .query_row(
+                "SELECT count(*),max(id),replacement FROM dictionary",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (1, beta_id, "Preferred".into()));
+    }
+
+    #[test]
+    fn snippet_upsert_dedupes_spoken_slash_and_rejects_empty_body() {
+        let p = tmp_db("snippet-upsert");
+        let conn = open_at(&p).expect("создать БД");
+        upsert_snippet(&conn, None, "/Адрес", "Москва", false).unwrap();
+        upsert_snippet(&conn, None, "адрес", "Казань", true).unwrap();
+
+        let row: (i64, String, i64) = conn
+            .query_row(
+                "SELECT count(*),content,is_template FROM snippets",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (1, "Казань".into(), 1));
+        assert!(upsert_snippet(&conn, None, "/пусто", "  ", false).is_err());
+    }
+
+    #[test]
+    fn snippet_upsert_resolves_legacy_exact_unique_collision_in_any_order() {
+        for (name, first, second) in [
+            ("plain-first", "foo", "/foo"),
+            ("slash-first", "/foo", "foo"),
+        ] {
+            let p = tmp_db(&format!("snippet-legacy-collision-{name}"));
+            let conn = open_at(&p).expect("создать БД");
+            conn.execute(
+                "INSERT INTO snippets(trigger,content,is_template) VALUES(?1,'old-1',0)",
+                [first],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO snippets(trigger,content,is_template) VALUES(?1,'old-2',0)",
+                [second],
+            )
+            .unwrap();
+
+            upsert_snippet(&conn, None, "/foo", "updated", true).unwrap();
+
+            let row: (i64, String, String, i64) = conn
+                .query_row(
+                    "SELECT count(*),trigger,content,is_template FROM snippets",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .unwrap();
+            assert_eq!(row, (1, "/foo".into(), "updated".into(), 1), "{name}");
+        }
+    }
+
+    #[test]
+    fn snippet_edit_cannot_create_a_spoken_trigger_duplicate() {
+        let p = tmp_db("snippet-edit-dedupe");
+        let conn = open_at(&p).expect("создать БД");
+        upsert_snippet(&conn, None, "/address", "First", false).unwrap();
+        upsert_snippet(&conn, None, "/email", "Second", false).unwrap();
+        let email_id: i64 = conn
+            .query_row(
+                "SELECT id FROM snippets WHERE trigger='/email'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        upsert_snippet(&conn, Some(email_id), "/address", "Updated", true).unwrap();
+
+        let row: (i64, i64, String, i64) = conn
+            .query_row(
+                "SELECT count(*),max(id),content,is_template FROM snippets",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (1, email_id, "Updated".into(), 1));
     }
 
     #[cfg(unix)]

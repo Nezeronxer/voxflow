@@ -25,7 +25,7 @@ From the repository root:
 cargo fmt --manifest-path voxflow/src-tauri/Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path voxflow/src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path voxflow/src-tauri/Cargo.toml --lib
-python3 script/check_versions.py --tag v2.0.4
+python3 script/check_versions.py --tag v2.0.5
 ```
 
 ## Packaging
@@ -45,16 +45,19 @@ orchestrator verifies both artifact sets and their checksums in a draft, then
 publishes the shared GitHub Release only after the complete set is present.
 
 Windows uses the existing per-user Inno installer after `tauri build
---no-bundle`. macOS produces a DMG whose complete app bundle is ad-hoc signed
-and strict-verified in secret-free CI. Developer ID/notarization and Windows
-Authenticode still require owner-provided certificates and are not represented
-as successful when those secrets are absent.
+--no-bundle`. macOS produces a thin ARM64 app/DMG with checksum-pinned Whisper
+and VAD resources. With no Apple secrets it is completely ad-hoc sealed and
+strict-verified. With a Developer ID certificate plus one complete Apple ID or
+App Store Connect notarization credential set, the same workflow produces and
+verifies Developer ID signed, notarized, and stapled artifacts. Partial secret
+sets fail instead of silently publishing an untrusted artifact.
 
 ## Recognition routes
 
-- Russian: GigaAM v3.
-- Auto/25 supported languages: Parakeet TDT v3 when installed.
-- Universal fallback: Whisper Tiny, Base, Small, Medium, Large v3 Turbo
-  Q5/Q8/full, or Large v3.
+- Explicit Russian: GigaAM v3.
+- Explicit English: Parakeet TDT v3 when installed.
+- Auto/mixed language and universal fallback: Whisper, with Large v3 Turbo Q5
+  recommended. Medium, Turbo Q8/full, and Large v3 remain available;
+  Tiny/Base/Small are hidden legacy choices unless already installed or active.
 - Cloud STT/rewrite: optional BYOK; local fallback preserves the selected local
   router.

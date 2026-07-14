@@ -1,7 +1,7 @@
 //! Глобальный слушатель клавиш: hold-to-talk + двойное-нажатие-защёлка.
-//! Windows/Linux используют rdev; macOS использует CGEventTap без перевода
-//! keycode → Unicode, потому что HIToolbox требует main-thread queue и падает
-//! при таком вызове из event tap callback на новых macOS.
+//! Windows/Linux используют rdev; macOS использует CGEventTap. Unicode из
+//! CGEvent читается только как boolean «есть печатный текст» внутри короткого
+//! post-insert окна; символы никогда не сохраняются и не передаются движку.
 //!
 //! Поведение в режиме "hold":
 //! - зажал и держишь → запись, пока держишь (отпустил — стоп);
@@ -229,14 +229,144 @@ impl HotState {
     }
 }
 
+/// Превратить layout-aware ввод в privacy-safe сигнал «поле редактируют».
+/// В EngineCmd не попадает ни символ, ни Key; этот helper решает только boolean.
+fn key_can_signal_manual_edit(
+    key: Key,
+    has_layout_text: bool,
+    target: Key,
+    improve: Option<Key>,
+) -> bool {
+    if key == target || Some(key) == improve {
+        return false;
+    }
+    match key {
+        Key::Backspace | Key::Delete => true,
+        Key::Alt
+        | Key::AltGr
+        | Key::CapsLock
+        | Key::ControlLeft
+        | Key::ControlRight
+        | Key::End
+        | Key::Escape
+        | Key::F1
+        | Key::F2
+        | Key::F3
+        | Key::F4
+        | Key::F5
+        | Key::F6
+        | Key::F7
+        | Key::F8
+        | Key::F9
+        | Key::F10
+        | Key::F11
+        | Key::F12
+        | Key::Home
+        | Key::Insert
+        | Key::KpReturn
+        | Key::MetaLeft
+        | Key::MetaRight
+        | Key::NumLock
+        | Key::PageDown
+        | Key::PageUp
+        | Key::Pause
+        | Key::PrintScreen
+        | Key::Return
+        | Key::ScrollLock
+        | Key::ShiftLeft
+        | Key::ShiftRight
+        | Key::Tab
+        | Key::DownArrow
+        | Key::LeftArrow
+        | Key::RightArrow
+        | Key::UpArrow => false,
+        _ => has_layout_text,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+#[derive(Default)]
+struct EditModifierState {
+    down: Vec<Key>,
+}
+
+#[cfg(not(target_os = "macos"))]
+impl EditModifierState {
+    fn observe(&mut self, event_type: &EventType) {
+        let (key, pressed) = match event_type {
+            EventType::KeyPress(key) => (*key, true),
+            EventType::KeyRelease(key) => (*key, false),
+            _ => return,
+        };
+        if !matches!(
+            key,
+            Key::Alt
+                | Key::AltGr
+                | Key::ControlLeft
+                | Key::ControlRight
+                | Key::MetaLeft
+                | Key::MetaRight
+        ) {
+            return;
+        }
+        let position = self.down.iter().position(|tracked| *tracked == key);
+        match (pressed, position) {
+            (true, None) => self.down.push(key),
+            (false, Some(index)) => {
+                self.down.swap_remove(index);
+            }
+            _ => {}
+        }
+    }
+
+    fn shortcut_active(&self) -> bool {
+        let held = |key| self.down.contains(&key);
+        let meta = held(Key::MetaLeft) || held(Key::MetaRight);
+        let control = held(Key::ControlLeft) || held(Key::ControlRight);
+        let plain_alt = held(Key::Alt);
+        let alt_gr = held(Key::AltGr);
+        // Windows представляет AltGr как Ctrl+RightAlt. Пока AltGr удерживается,
+        // это layout input, а не Ctrl-shortcut; обычные Ctrl/Meta/Alt chords режем.
+        meta || plain_alt || (control && !alt_gr)
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn rdev_event_signals_manual_edit(
+    event_type: &EventType,
+    event_name: Option<&str>,
+    target: Key,
+    improve: Option<Key>,
+    shortcut_modifier_down: bool,
+) -> bool {
+    if shortcut_modifier_down {
+        return false;
+    }
+    let EventType::KeyPress(key) = event_type else {
+        return false;
+    };
+    // Control-комбинации могут быть представлены управляющим Unicode. Считаем
+    // текстом только хотя бы один печатный code point; пробел остаётся печатным.
+    let has_layout_text = event_name.is_some_and(|name| name.chars().any(|c| !c.is_control()));
+    key_can_signal_manual_edit(*key, has_layout_text, target, improve)
+}
+
 pub fn spawn(
     tx: Sender<EngineCmd>,
     settings: Arc<Mutex<Settings>>,
     app: AppHandle,
     cancel_active: Arc<AtomicBool>,
     capture_active: Arc<AtomicBool>,
+    correction_capture: Arc<AtomicBool>,
 ) {
-    spawn_platform(tx, settings, app, cancel_active, capture_active);
+    spawn_platform(
+        tx,
+        settings,
+        app,
+        cancel_active,
+        capture_active,
+        correction_capture,
+    );
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -246,18 +376,27 @@ fn spawn_platform(
     app: AppHandle,
     cancel_active: Arc<AtomicBool>,
     capture_active: Arc<AtomicBool>,
+    correction_capture: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("voxflow-hotkey".into())
         .spawn(move || {
             let state = Arc::new(Mutex::new(HotState::new()));
             loop {
+                let edit_modifiers = Arc::new(Mutex::new(EditModifierState::default()));
                 let callback_state = Arc::clone(&state);
                 let callback_tx = tx.clone();
                 let callback_settings = Arc::clone(&settings);
                 let callback_cancel = Arc::clone(&cancel_active);
                 let callback_capture = Arc::clone(&capture_active);
+                let callback_correction = Arc::clone(&correction_capture);
+                let callback_edit_modifiers = Arc::clone(&edit_modifiers);
                 let callback = move |event: Event| {
+                    let shortcut_modifier_down = {
+                        let mut modifiers = callback_edit_modifiers.lock();
+                        modifiers.observe(&event.event_type);
+                        modifiers.shortcut_active()
+                    };
                     if callback_capture.load(Ordering::SeqCst) {
                         dispatch_release_during_capture(
                             &callback_state,
@@ -278,6 +417,19 @@ fn spawn_platform(
                     let Some(target) = target else {
                         return;
                     };
+                    if callback_correction.load(Ordering::Acquire)
+                        && rdev_event_signals_manual_edit(
+                            &event.event_type,
+                            event.name.as_deref(),
+                            target,
+                            improve,
+                            shortcut_modifier_down,
+                        )
+                    {
+                        // Важно: сигнал без payload. Hook не хранит и не логирует
+                        // глобальный ввод даже внутри короткого capture-окна.
+                        let _ = callback_tx.send(EngineCmd::ManualEdit);
+                    }
                     let snapshot = DispatchSnapshot {
                         target,
                         improve,
@@ -313,10 +465,20 @@ fn spawn_platform(
     app: AppHandle,
     cancel_active: Arc<AtomicBool>,
     capture_active: Arc<AtomicBool>,
+    correction_capture: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("voxflow-hotkey".into())
-        .spawn(move || macos::listen(tx, settings, app, cancel_active, capture_active))
+        .spawn(move || {
+            macos::listen(
+                tx,
+                settings,
+                app,
+                cancel_active,
+                capture_active,
+                correction_capture,
+            )
+        })
         .expect("spawn hotkey thread");
 }
 
@@ -744,8 +906,8 @@ pub fn repair_bindings(settings: &mut Settings) -> bool {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{
-        dispatch, dispatch_release_during_capture, parse_key, DispatchSnapshot, EventType,
-        HotState, Key,
+        dispatch, dispatch_release_during_capture, key_can_signal_manual_edit, parse_key,
+        DispatchSnapshot, EventType, HotState, Key,
     };
     use crate::engine::EngineCmd;
     use crate::settings::Settings;
@@ -793,6 +955,12 @@ mod macos {
         ) -> CFMachPortRef;
         fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
         fn CGEventGetFlags(event: CGEventRef) -> u64;
+        fn CGEventKeyboardGetUnicodeString(
+            event: CGEventRef,
+            max_string_length: usize,
+            actual_string_length: *mut usize,
+            unicode_string: *mut u16,
+        );
         fn CGEventSourceKeyState(state_id: i32, key: u16) -> bool;
     }
 
@@ -816,6 +984,7 @@ mod macos {
         settings: Arc<Mutex<Settings>>,
         cancel_active: Arc<AtomicBool>,
         capture_active: Arc<AtomicBool>,
+        correction_capture: Arc<AtomicBool>,
         modifier_down: Mutex<Vec<Key>>,
     }
 
@@ -825,6 +994,7 @@ mod macos {
         app: AppHandle,
         cancel_active: Arc<AtomicBool>,
         capture_active: Arc<AtomicBool>,
+        correction_capture: Arc<AtomicBool>,
     ) {
         let mut requested_permission = false;
         let mut reported_tap_failure = false;
@@ -860,6 +1030,7 @@ mod macos {
                 settings: settings.clone(),
                 cancel_active: cancel_active.clone(),
                 capture_active: capture_active.clone(),
+                correction_capture: correction_capture.clone(),
                 modifier_down: Mutex::new(Vec::new()),
             }));
 
@@ -956,6 +1127,7 @@ mod macos {
     }
 
     fn handle_event(ctx: &ListenerCtx, event_type: u32, event: CGEventRef) {
+        let raw_event_type = event_type;
         let keycode = unsafe { CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) };
         let Some(key) = key_from_keycode(keycode as u16) else {
             return;
@@ -998,6 +1170,17 @@ mod macos {
         let Some(target) = target else {
             return;
         };
+        if ctx.correction_capture.load(Ordering::Acquire) && raw_event_type == K_CG_EVENT_KEY_DOWN {
+            let EventType::KeyPress(key) = event_type else {
+                return;
+            };
+            // Unicode остаётся в маленьком stack-buffer ровно на время boolean-
+            // проверки; ни символ, ни keycode не уходят в EngineCmd.
+            let has_layout_text = macos_event_has_layout_text(event);
+            if key_can_signal_manual_edit(key, has_layout_text, target, improve) {
+                let _ = ctx.tx.send(EngineCmd::ManualEdit);
+            }
+        }
         let snapshot = DispatchSnapshot {
             target,
             improve,
@@ -1006,6 +1189,23 @@ mod macos {
             cancel_active: ctx.cancel_active.load(Ordering::SeqCst),
         };
         dispatch(&ctx.state, &ctx.tx, event_type, snapshot);
+    }
+
+    fn macos_event_has_layout_text(event: CGEventRef) -> bool {
+        let flags = unsafe { CGEventGetFlags(event) };
+        // Command/Control chords are actions, not text edits. Shift/Option may
+        // legitimately produce layout-aware Unicode and remain allowed.
+        if flags & (K_CG_EVENT_FLAG_MASK_COMMAND | K_CG_EVENT_FLAG_MASK_CONTROL) != 0 {
+            return false;
+        }
+        let mut units = [0_u16; 8];
+        let mut actual = 0usize;
+        unsafe {
+            CGEventKeyboardGetUnicodeString(event, units.len(), &mut actual, units.as_mut_ptr());
+        }
+        units[..actual.min(units.len())]
+            .iter()
+            .any(|unit| !matches!(*unit, 0x0000..=0x001f | 0x007f))
     }
 
     fn modifier_event(
@@ -1205,6 +1405,105 @@ mod tests {
             ..Settings::default()
         };
         assert!(validate_bindings(&aliases).is_err());
+    }
+
+    #[test]
+    fn manual_edit_signal_has_no_payload_and_only_accepts_mutating_keys() {
+        let target = Key::ControlRight;
+        let improve = Some(Key::F8);
+        assert!(key_can_signal_manual_edit(Key::KeyA, true, target, improve));
+        assert!(key_can_signal_manual_edit(
+            Key::Space,
+            true,
+            target,
+            improve
+        ));
+        assert!(key_can_signal_manual_edit(
+            Key::Backspace,
+            false,
+            target,
+            improve
+        ));
+        assert!(key_can_signal_manual_edit(
+            Key::Delete,
+            false,
+            target,
+            improve
+        ));
+
+        assert!(!key_can_signal_manual_edit(target, true, target, improve));
+        assert!(!key_can_signal_manual_edit(Key::F8, true, target, improve));
+        assert!(!key_can_signal_manual_edit(
+            Key::KeyA,
+            false,
+            target,
+            improve
+        ));
+        for key in [
+            Key::Escape,
+            Key::Return,
+            Key::Tab,
+            Key::LeftArrow,
+            Key::ShiftLeft,
+            Key::MetaLeft,
+        ] {
+            assert!(!key_can_signal_manual_edit(key, true, target, improve));
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn rdev_manual_edit_uses_layout_text_without_retaining_it() {
+        let target = Key::ControlRight;
+        assert!(rdev_event_signals_manual_edit(
+            &EventType::KeyPress(Key::KeyA),
+            Some("ф"),
+            target,
+            Some(Key::F8),
+            false,
+        ));
+        assert!(!rdev_event_signals_manual_edit(
+            &EventType::KeyPress(Key::KeyA),
+            Some("\u{3}"),
+            target,
+            Some(Key::F8),
+            false,
+        ));
+        assert!(!rdev_event_signals_manual_edit(
+            &EventType::KeyRelease(Key::KeyA),
+            Some("ф"),
+            target,
+            Some(Key::F8),
+            false,
+        ));
+        assert!(!rdev_event_signals_manual_edit(
+            &EventType::KeyPress(Key::KeyV),
+            Some("v"),
+            target,
+            Some(Key::F8),
+            true,
+        ));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn edit_modifier_state_blocks_shortcuts_but_preserves_altgr_layout_input() {
+        let mut modifiers = EditModifierState::default();
+        modifiers.observe(&EventType::KeyPress(Key::ControlLeft));
+        assert!(modifiers.shortcut_active());
+
+        modifiers.observe(&EventType::KeyPress(Key::AltGr));
+        assert!(!modifiers.shortcut_active());
+
+        modifiers.observe(&EventType::KeyRelease(Key::AltGr));
+        assert!(modifiers.shortcut_active());
+        modifiers.observe(&EventType::KeyRelease(Key::ControlLeft));
+        assert!(!modifiers.shortcut_active());
+
+        modifiers.observe(&EventType::KeyPress(Key::MetaLeft));
+        assert!(modifiers.shortcut_active());
+        modifiers.observe(&EventType::KeyRelease(Key::MetaLeft));
+        assert!(!modifiers.shortcut_active());
     }
 
     #[test]

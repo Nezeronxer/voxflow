@@ -508,6 +508,7 @@ fn asset_name_matches_version(name: &str, target: UpdateTarget, version: &str) -
             format!("VoxFlow-macOS-{version}-arm64-adhoc.dmg"),
             format!("VoxFlow-macOS-{version}-arm64-unsigned.dmg"),
             format!("VoxFlow-macOS-{version}-arm64-signed-unnotarized.dmg"),
+            format!("VoxFlow-macOS-{version}-arm64-developer-id-notarized.dmg"),
         ]
         .iter()
         .any(|expected| expected == name),
@@ -516,6 +517,7 @@ fn asset_name_matches_version(name: &str, target: UpdateTarget, version: &str) -
             format!("VoxFlow-macOS-{version}-x64-adhoc.dmg"),
             format!("VoxFlow-macOS-{version}-x64-unsigned.dmg"),
             format!("VoxFlow-macOS-{version}-x64-signed-unnotarized.dmg"),
+            format!("VoxFlow-macOS-{version}-x64-developer-id-notarized.dmg"),
         ]
         .iter()
         .any(|expected| expected == name),
@@ -614,11 +616,13 @@ fn is_installer_asset_name_for(name: &str, prefix: &str, suffix: &str) -> bool {
         || (suffix == "-arm64.dmg"
             && (name.ends_with("-arm64-adhoc.dmg")
                 || name.ends_with("-arm64-unsigned.dmg")
-                || name.ends_with("-arm64-signed-unnotarized.dmg")))
+                || name.ends_with("-arm64-signed-unnotarized.dmg")
+                || name.ends_with("-arm64-developer-id-notarized.dmg")))
         || (suffix == "-x64.dmg"
             && (name.ends_with("-x64-adhoc.dmg")
                 || name.ends_with("-x64-unsigned.dmg")
-                || name.ends_with("-x64-signed-unnotarized.dmg")))
+                || name.ends_with("-x64-signed-unnotarized.dmg")
+                || name.ends_with("-x64-developer-id-notarized.dmg")))
 }
 
 #[cfg(windows)]
@@ -717,6 +721,16 @@ mod tests {
             UpdateTarget::MacosArm64
         )
         .is_ok());
+        assert!(validate_asset_name_for(
+            "VoxFlow-macOS-2.0.5-arm64-developer-id-notarized.dmg",
+            UpdateTarget::MacosArm64
+        )
+        .is_ok());
+        assert!(asset_name_matches_version(
+            "VoxFlow-macOS-2.0.5-arm64-developer-id-notarized.dmg",
+            UpdateTarget::MacosArm64,
+            "2.0.5"
+        ));
         assert!(validate_asset_name_for(
             "VoxFlow-macOS-2.0.1-x64-adhoc.dmg",
             UpdateTarget::MacosArm64

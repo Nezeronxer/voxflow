@@ -560,13 +560,22 @@ export default function Overlay() {
       applyLang(e.payload?.lang);
       const committed = (e.payload.committed ?? "").trim();
       const volatileTail = (e.payload.volatile ?? "").trim();
-      // Фоллбэк для старого бэкенда без committed/volatile: весь text как volatile.
-      const text =
-        committed || volatileTail
-          ? (committed + " " + volatileTail).trim()
-          : (e.payload.text ?? "").trim();
+      const combinedFallback = (committed + " " + volatileTail).trim();
+      const payloadText =
+        typeof e.payload.text === "string" ? e.payload.text : undefined;
+      // `text` — полный текст по контракту бэкенда. Для final=true это ровно та
+      // строка, которую уже успешно вставили в целевое поле, поэтому не собираем
+      // её заново из committed/volatile и не trim'им (это меняло пробелы/абзацы).
+      // Сборка из частей остаётся только совместимостью со старым payload без text.
+      const text = isFinalPreview
+        ? (payloadText ?? combinedFallback)
+        : (payloadText || combinedFallback).trim();
       const chars = Array.from(text);
-      const nextCommittedLen = Math.min(Array.from(committed).length, chars.length);
+      // Array.from считает Unicode code points, поэтому не разрезает surrogate pair
+      // в эмодзи и использует ту же шкалу индексов, что targetCharsRef ниже.
+      const nextCommittedLen = isFinalPreview
+        ? chars.length
+        : Math.min(Array.from(committed).length, chars.length);
       const previewChanged =
         targetTextRef.current !== text ||
         committedLenRef.current !== nextCommittedLen;

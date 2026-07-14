@@ -22,6 +22,18 @@ jobs:
   build-macos:
     name: Build macOS ARM64
     uses: ./.github/workflows/release-macos-arm64.yml
+    with:
+      release_build: true
+    secrets:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+      APPLE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
     permissions:
       contents: read
 
@@ -45,7 +57,7 @@ jobs:
       - name: Download verified macOS artifact
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: VoxFlow-macOS-arm64-adhoc-${{ github.sha }}
+          name: VoxFlow-macOS-arm64-${{ github.sha }}
           path: release/macos
 
       - name: Verify artifacts and publish complete release

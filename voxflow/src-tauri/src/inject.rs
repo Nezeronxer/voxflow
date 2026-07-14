@@ -148,7 +148,7 @@ static INJECTOR: OnceLock<Injector> = OnceLock::new();
 
 /// Задания «в полёте» (в очереди + исполняется). Именно СЧЁТЧИК, а не AtomicBool:
 /// bool давал бы ложное «свободен» в зазоре между двумя заданиями очереди, а
-/// clipboard_monitor по is_busy() должен пережидать ВСЮ пачку вставок целиком.
+/// диагностика должна видеть ВСЮ пачку вставок занятой целиком.
 static PENDING: AtomicUsize = AtomicUsize::new(0);
 
 /// Dry-журнал для тестов (VOXFLOW_INJECT_DRY=1): воркер пишет сюда вместо
@@ -203,7 +203,7 @@ fn injector() -> &'static Injector {
 /// блокируются публичные обёртки через wait_ack (а тест порядка — нарочно нет).
 fn enqueue(cmd: Cmd) -> mpsc::Receiver<Result<CmdResult>> {
     let (ack_tx, ack_rx) = mpsc::channel();
-    // Счётчик ДО send: is_busy() обязан стать true раньше, чем воркер возьмёт job.
+    // Счётчик ДО send: состояние очереди меняется раньше, чем воркер возьмёт job.
     PENDING.fetch_add(1, Ordering::SeqCst);
     let job = Job {
         cmd,
@@ -212,7 +212,7 @@ fn enqueue(cmd: Cmd) -> mpsc::Receiver<Result<CmdResult>> {
     };
     if injector().tx.lock().send(job).is_err() {
         // Воркер умер — job дропнут вместе с ack_tx, recv() у вызывающего вернёт
-        // ошибку; счётчик откатываем, чтобы is_busy() не залип в true.
+        // ошибку; счётчик откатываем, чтобы состояние не залипло в busy.
         PENDING.fetch_sub(1, Ordering::SeqCst);
     }
     ack_rx
@@ -262,15 +262,15 @@ fn worker_loop(rx: mpsc::Receiver<Job>, dry: bool) {
         log::info!("[inject] len={len} method={method} wait={wait_ms}мс exec={exec_ms}мс");
         if restore.is_none() {
             // Снимаем «занят» ДО ack: проснувшийся вызывающий сразу видит
-            // is_busy()==false (если очередь пуста).
+            // пустую очередь, если следующих заданий нет.
             PENDING.fetch_sub(1, Ordering::SeqCst);
         }
         let _ = job.ack.send(res);
         // Отложенное восстановление буфера — УЖЕ ПОСЛЕ ack (вызывающий не ждёт
         // эти ~115мс; текст в поле появился сразу после Ctrl+V). Всё ещё внутри
         // слота воркера: порядок заданий сохранён, следующий job не начнётся,
-        // пока прежний буфер не возвращён. PENDING держим >0 — clipboard_monitor
-        // в это окно в буфер не лезет.
+        // пока прежний буфер не возвращён. PENDING держим >0, чтобы диагностика
+        // очереди не объявляла её свободной посреди deferred restore.
         if let Some(restore) = restore {
             thread::sleep(Duration::from_millis(115));
             if let Err(e) = clipboard_restore_deferred(&restore) {
@@ -484,8 +484,9 @@ pub fn copy_selection_text() -> Result<Option<String>> {
     wait_selection(enqueue(Cmd::CopySelection))
 }
 
-/// true, пока есть задания в очереди или исполняется текущее. Для clipboard_monitor:
-/// пережидать вставку и не трогать буфер, пока инжектор им жонглирует.
+/// true, пока есть задания в очереди или исполняется текущее. Оставлено как
+/// диагностический инвариант очереди и используется regression-тестами.
+#[allow(dead_code)]
 pub fn is_busy() -> bool {
     PENDING.load(Ordering::SeqCst) > 0
 }

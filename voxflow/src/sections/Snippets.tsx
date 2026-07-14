@@ -8,28 +8,67 @@ export default function Snippets() {
   const [trigger, setTrigger] = useState("");
   const [content, setContent] = useState("");
   const [isTemplate, setIsTemplate] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<{
+    kind: "success" | "error";
+    text: string;
+  } | null>(null);
 
-  async function refresh() {
-    setEntries(await snippetList());
+  async function refresh(): Promise<boolean> {
+    try {
+      setEntries(await snippetList());
+      return true;
+    } catch (error) {
+      setStatus({
+        kind: "error",
+        text: errorText(error, "Не удалось загрузить сниппеты"),
+      });
+      return false;
+    }
   }
 
   useEffect(() => {
-    refresh();
+    void refresh();
   }, []);
 
   async function onAdd() {
     const t = trigger.trim();
-    if (!t) return;
-    await snippetUpsert(null, t, content, isTemplate);
-    setTrigger("");
-    setContent("");
-    setIsTemplate(false);
-    refresh();
+    if (!t || !content.trim() || busy) return;
+    setBusy(true);
+    setStatus(null);
+    try {
+      await snippetUpsert(null, t, content, isTemplate);
+      if (!(await refresh())) return;
+      setTrigger("");
+      setContent("");
+      setIsTemplate(false);
+      setStatus({ kind: "success", text: "Сниппет сохранён и готов к диктовке" });
+    } catch (error) {
+      setStatus({
+        kind: "error",
+        text: errorText(error, "Не удалось сохранить сниппет"),
+      });
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function onDelete(id: number) {
-    await snippetDelete(id);
-    refresh();
+    if (busy) return;
+    setBusy(true);
+    setStatus(null);
+    try {
+      await snippetDelete(id);
+      if (!(await refresh())) return;
+      setStatus({ kind: "success", text: "Сниппет удалён" });
+    } catch (error) {
+      setStatus({
+        kind: "error",
+        text: errorText(error, "Не удалось удалить сниппет"),
+      });
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -43,9 +82,18 @@ export default function Snippets() {
         <div className="card-head">
           <div className="card-title">Сниппеты</div>
           <div className="sub">
-            Скажите триггер — вставится содержимое. Шаблоны поддерживают переменные.
+            Триггер /адрес можно сказать как «адрес», «слэш адрес» или «сниппет адрес».
           </div>
         </div>
+
+        {status && (
+          <div
+            className={`toast toast-${status.kind}`}
+            role={status.kind === "error" ? "alert" : "status"}
+          >
+            <span className="toast-msg">{status.text}</span>
+          </div>
+        )}
 
         {entries.length === 0 ? (
           <div className="empty">Пока нет ни одного сниппета</div>
@@ -76,6 +124,7 @@ export default function Snippets() {
                       className="btn btn-sm btn-danger btn-ghost"
                       onClick={() => onDelete(s.id)}
                       title="Удалить"
+                      disabled={busy}
                     >
                       <Icon.Trash className="ico" />
                     </button>
@@ -94,9 +143,15 @@ export default function Snippets() {
               value={trigger}
               onChange={(e) => setTrigger(e.currentTarget.value)}
               style={{ flex: "0 0 220px" }}
+              disabled={busy}
             />
             <label className="row-flex" style={{ gap: 8, fontSize: 13 }}>
-              <Switch checked={isTemplate} onChange={setIsTemplate} />
+              <Switch
+                checked={isTemplate}
+                onChange={(value) => {
+                  if (!busy) setIsTemplate(value);
+                }}
+              />
               Шаблон
             </label>
           </div>
@@ -104,19 +159,32 @@ export default function Snippets() {
             placeholder="Содержимое сниппета…"
             value={content}
             onChange={(e) => setContent(e.currentTarget.value)}
+            disabled={busy}
           />
+          {isTemplate && (
+            <div className="sub" style={{ width: "100%" }}>
+              Переменные: {"{date}"} / {"{дата}"}, {"{time}"} / {"{время}"},{" "}
+              {"{clipboard}"} / {"{буфер}"}.
+            </div>
+          )}
           <div className="row-flex" style={{ width: "100%", justifyContent: "flex-end" }}>
             <button
               className="btn btn-primary"
               onClick={onAdd}
-              disabled={!trigger.trim()}
+              disabled={busy || !trigger.trim() || !content.trim()}
             >
               <Icon.Plus className="ico" />
-              Добавить сниппет
+              {busy ? "Сохранение…" : "Добавить сниппет"}
             </button>
           </div>
         </div>
       </div>
     </div>
   );
+}
+
+function errorText(error: unknown, fallback: string): string {
+  if (typeof error === "string" && error.trim()) return error;
+  if (error instanceof Error && error.message.trim()) return error.message;
+  return fallback;
 }

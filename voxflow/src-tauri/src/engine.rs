@@ -72,6 +72,11 @@ pub enum EngineCmd {
     Toggle,
     Cancel,
     ImproveSelection,
+    /// Privacy-safe signal from the global keyboard hook: the user changed
+    /// text shortly after a VoxFlow insertion. The actual key/character is
+    /// deliberately not carried or logged; the engine reads the focused field
+    /// through Accessibility/UIA after a short debounce.
+    ManualEdit,
     /// Фоновый прогрев движков под ТЕКУЩИЕ настройки (шлётся после смены
     /// языка из трея/UI): без него первый Start после переключения на en/auto
     /// синхронно грузит ~650 МБ Parakeet и подвешивает поток движка.
@@ -89,6 +94,10 @@ const ASR_PROMPT_PREVIOUS_CHARS: usize = 280;
 const ASR_PROMPT_TERM_LIMIT: usize = 36;
 const ASR_PROMPT_SNIPPET_LIMIT: usize = 12;
 const ASR_PROMPT_CORRECTION_LIMIT: usize = 16;
+const TYPED_CORRECTION_WINDOW: Duration = Duration::from_secs(120);
+const TYPED_CORRECTION_DEBOUNCE: Duration = Duration::from_millis(700);
+const TYPED_CORRECTION_CONFIRM: Duration = Duration::from_millis(300);
+const TYPED_CORRECTION_FIELD_LIMIT: usize = 1600;
 const BUILTIN_ASR_TERMS: &[&str] = &[
     "VoxFlow",
     "Wispr Flow",
@@ -108,6 +117,7 @@ const BUILTIN_ASR_TERMS: &[&str] = &[
 pub struct EngineHandle {
     auto_mute: Arc<Mutex<Option<AutoMuteGuard>>>,
     cancel_active: Arc<AtomicBool>,
+    correction_capture_active: Arc<AtomicBool>,
 }
 
 impl EngineHandle {
@@ -119,6 +129,12 @@ impl EngineHandle {
     /// финальная обработка или улучшение выделения.
     pub fn cancel_active_flag(&self) -> Arc<AtomicBool> {
         self.cancel_active.clone()
+    }
+
+    /// Shared with the keyboard hook. It is true only during the short,
+    /// post-insert learning window, so ordinary global typing is ignored.
+    pub fn correction_capture_flag(&self) -> Arc<AtomicBool> {
+        self.correction_capture_active.clone()
     }
 }
 
@@ -197,10 +213,31 @@ struct DictationMemory {
     recent: VecDeque<String>,
 }
 
-#[derive(Clone)]
 struct LastInject {
     text: String,
     at: Instant,
+    target_fp: TargetFingerprint,
+    field_id: String,
+    field_role: String,
+    field_subrole: String,
+    field_before: String,
+    manual_edit_at: Option<Instant>,
+    pending_observation: Option<TypedCorrectionObservation>,
+}
+
+struct TypedCorrectionObservation {
+    field_text: String,
+    edit_epoch: Instant,
+    observed_at: Instant,
+}
+
+impl LastInject {
+    fn mark_manual_edit(&mut self, now: Instant) {
+        self.manual_edit_at = Some(now);
+        // Any new mutating key invalidates snapshots captured for the previous
+        // typing epoch. The hook intentionally retains no key or character.
+        self.pending_observation = None;
+    }
 }
 
 #[derive(Clone)]
@@ -217,6 +254,9 @@ struct EngineCtx {
     whisper_accelerated_disabled: Arc<AtomicBool>,
     /// Последний вставленный текст — для авто-захвата исправлений из буфера обмена.
     last_inject: Arc<Mutex<Option<LastInject>>>,
+    /// Keyboard hook is active only after our own successful insertion. The
+    /// signal contains no key data and is closed on timeout/window change.
+    correction_capture_active: Arc<AtomicBool>,
     /// Сериализация ВСЕХ обращений к /inference whisper-server (тики partial + финал).
     /// Один на движок, переиспользуется каждую диктовку.
     asr_lock: Arc<Mutex<()>>,
@@ -227,6 +267,10 @@ struct EngineCtx {
     inject_lock: Arc<Mutex<()>>,
     /// Состояние живого стриминга текущей диктовки (None, если петля не запущена).
     partial: Arc<Mutex<Option<PartialState>>>,
+    /// Physical live text transferred to a detached final. The slot is an
+    /// ownership token: a final commit/reject, a new Start, or Esc may claim it
+    /// exactly once while holding the keyboard + generation locks.
+    pending_live_draft: Arc<Mutex<Option<PendingLiveDraft>>>,
     /// Целевое окно текущей записи, снятое ДО показа overlay/status.
     active_target: Arc<Mutex<Option<TargetFingerprint>>>,
     /// Последнее внешнее окно, куда можно безопасно возвращать фокус для вставки.
@@ -286,6 +330,7 @@ pub fn spawn(
 ) -> EngineHandle {
     let auto_mute = Arc::new(Mutex::new(None));
     let cancel_active = Arc::new(AtomicBool::new(false));
+    let correction_capture_active = Arc::new(AtomicBool::new(false));
     let ctx = EngineCtx {
         app,
         db,
@@ -294,9 +339,11 @@ pub fn spawn(
         server: Arc::new(Mutex::new(None)),
         whisper_accelerated_disabled: Arc::new(AtomicBool::new(false)),
         last_inject: Arc::new(Mutex::new(None)),
+        correction_capture_active: correction_capture_active.clone(),
         asr_lock: Arc::new(Mutex::new(())),
         inject_lock: Arc::new(Mutex::new(())),
         partial: Arc::new(Mutex::new(None)),
+        pending_live_draft: Arc::new(Mutex::new(None)),
         active_target: Arc::new(Mutex::new(None)),
         last_external_target: Arc::new(Mutex::new(None)),
         gen: Arc::new(AtomicU64::new(0)),
@@ -314,9 +361,6 @@ pub fn spawn(
     // Прогрев whisper-server в фоне (CUDA JIT один раз → первая диктовка тоже быстрая).
     let warm = ctx.clone();
     std::thread::spawn(move || warmup(warm));
-    // Монитор буфера обмена — авто-захват исправлений пользователя.
-    let mon = ctx.clone();
-    std::thread::spawn(move || clipboard_monitor(mon));
     // Память внешнего окна: помогает диктовать из фона, даже если собственная
     // панель или macOS privacy-alert коротко перехватили frontmost.
     let target_watch = ctx.clone();
@@ -328,6 +372,7 @@ pub fn spawn(
     EngineHandle {
         auto_mute,
         cancel_active,
+        correction_capture_active,
     }
 }
 
@@ -347,8 +392,39 @@ fn remember_external_target(ctx: &EngineCtx, fp: &TargetFingerprint) {
     }
 }
 
-fn resolve_start_target(ctx: &EngineCtx) -> TargetFingerprint {
-    let detected = crate::app_context::detect().target_fingerprint();
+fn detect_context_with_retry(
+    mut detect: impl FnMut() -> crate::app_context::AppContext,
+    attempts: usize,
+    retry_delay: Duration,
+) -> crate::app_context::AppContext {
+    let attempts = attempts.max(1);
+    let mut current = detect();
+    for _ in 1..attempts {
+        if !current.is_unknown() {
+            break;
+        }
+        if !retry_delay.is_zero() {
+            std::thread::sleep(retry_delay);
+        }
+        current = detect();
+    }
+    current
+}
+
+fn detect_current_context() -> crate::app_context::AppContext {
+    let attempts = if cfg!(target_os = "macos") { 3 } else { 1 };
+    detect_context_with_retry(
+        crate::app_context::detect,
+        attempts,
+        Duration::from_millis(15),
+    )
+}
+
+fn resolve_start_target_from_context(
+    ctx: &EngineCtx,
+    detected_context: &crate::app_context::AppContext,
+) -> TargetFingerprint {
+    let detected = detected_context.target_fingerprint();
     if detected.is_usable_dictation_target() {
         remember_external_target(ctx, &detected);
         return detected;
@@ -374,7 +450,9 @@ fn external_target_watcher(ctx: EngineCtx) {
             ctx.recording.load(Ordering::SeqCst),
             ctx.cancel_active.load(Ordering::SeqCst),
         ) {
-            let fp = crate::app_context::detect().target_fingerprint();
+            let current = detect_current_context();
+            maybe_learn_typed_correction(&ctx, &current);
+            let fp = current.target_fingerprint();
             remember_external_target(&ctx, &fp);
         }
         std::thread::sleep(external_target_watcher_interval());
@@ -401,6 +479,20 @@ fn external_target_watcher_interval() -> Duration {
 mod external_target_watcher_tests {
     use super::*;
 
+    fn context(exe: &str, window_id: &str) -> crate::app_context::AppContext {
+        crate::app_context::AppContext {
+            exe: exe.into(),
+            title: exe.into(),
+            window_id: window_id.into(),
+            category: "neutral".into(),
+            field_role: String::new(),
+            field_subrole: String::new(),
+            field_id: String::new(),
+            field_text: String::new(),
+            selected_text: String::new(),
+        }
+    }
+
     #[test]
     fn watcher_only_detects_while_fully_idle() {
         assert!(external_target_watcher_should_detect(false, false));
@@ -417,6 +509,48 @@ mod external_target_watcher_tests {
             Duration::from_millis(expected)
         );
     }
+
+    #[test]
+    fn transient_empty_detection_is_retried() {
+        let mut sequence = vec![context("", ""), context("telegram", "pid=42")].into_iter();
+        let detected = detect_context_with_retry(
+            || sequence.next().expect("enough samples"),
+            3,
+            Duration::ZERO,
+        );
+        assert_eq!(detected.exe, "telegram");
+        assert!(sequence.next().is_none());
+    }
+
+    #[test]
+    fn confirmed_target_is_not_retried() {
+        let mut calls = 0;
+        let detected = detect_context_with_retry(
+            || {
+                calls += 1;
+                context("chrome", "pid=99")
+            },
+            3,
+            Duration::ZERO,
+        );
+        assert_eq!(detected.exe, "chrome");
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn repeated_empty_detection_stays_unknown_after_bound() {
+        let mut calls = 0;
+        let detected = detect_context_with_retry(
+            || {
+                calls += 1;
+                context("", "")
+            },
+            3,
+            Duration::ZERO,
+        );
+        assert!(detected.is_unknown());
+        assert_eq!(calls, 3);
+    }
 }
 
 fn current_or_restored_target(
@@ -424,7 +558,7 @@ fn current_or_restored_target(
     target_fp: &mut TargetFingerprint,
     stage: &str,
 ) -> Option<crate::app_context::AppContext> {
-    let mut cur = crate::app_context::detect();
+    let mut cur = detect_current_context();
     let mut cur_fp = cur.target_fingerprint();
     if target_fp.matches(&cur) {
         remember_external_target(ctx, target_fp);
@@ -441,20 +575,28 @@ fn current_or_restored_target(
         return Some(cur);
     }
 
-    if (cur.is_own_app() || cur.is_transient_system_ui())
+    if (cur.is_own_app() || cur.is_transient_system_ui() || cur.is_unknown())
         && target_fp.is_usable_dictation_target()
         && activate_target_for_insert(target_fp)
     {
-        std::thread::sleep(Duration::from_millis(160));
-        cur = crate::app_context::detect();
-        cur_fp = cur.target_fingerprint();
-        if target_fp.matches(&cur) {
-            dbg_log(&format!(
-                "финал: восстановили фокус целевого окна ({stage}) {}",
-                target_fp.describe()
-            ));
-            remember_external_target(ctx, target_fp);
-            return Some(cur);
+        let deadline = Instant::now() + Duration::from_millis(650);
+        loop {
+            std::thread::sleep(Duration::from_millis(25));
+            cur = detect_current_context();
+            cur_fp = cur.target_fingerprint();
+            if target_fp.matches(&cur) {
+                dbg_log(&format!(
+                    "финал: восстановили фокус целевого окна ({stage}) {}",
+                    target_fp.describe()
+                ));
+                remember_external_target(ctx, target_fp);
+                return Some(cur);
+            }
+            if Instant::now() >= deadline
+                || (!cur.is_unknown() && !cur.is_own_app() && !cur.is_transient_system_ui())
+            {
+                break;
+            }
         }
     }
 
@@ -481,18 +623,14 @@ fn current_or_restored_target(
 #[cfg(target_os = "macos")]
 fn activate_target_for_insert(target_fp: &TargetFingerprint) -> bool {
     if let Some(pid) = target_fp.macos_pid() {
-        let script = format!(
-            r#"tell application "System Events"
-  try
-    set frontmost of first application process whose unix id is {pid} to true
-    return "ok"
-  on error
-    return "err"
-  end try
-end tell"#
-        );
-        if run_osascript_ok(&script) {
-            return true;
+        if let Some(application) =
+            objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier(pid as i32)
+        {
+            if application
+                .activateWithOptions(objc2_app_kit::NSApplicationActivationOptions::empty())
+            {
+                return true;
+            }
         }
     }
 
@@ -607,7 +745,7 @@ fn resident_model_ready<T>(engine: &Arc<Mutex<Option<T>>>) -> bool {
 enum LocalRoute {
     /// ru + движок gigaam — как раньше.
     GigaAm,
-    /// en/auto при установленном Parakeet.
+    /// Явный en при установленном Parakeet.
     Parakeet,
     /// Всё остальное (auto/прочие языки/whisper-движки).
     Whisper,
@@ -632,7 +770,6 @@ fn local_route_with_parakeet(s: &Settings, parakeet_ready: bool) -> LocalRoute {
     match s.language.trim().to_ascii_lowercase().as_str() {
         "ru" | "russian" => LocalRoute::GigaAm,
         "en" | "english" if parakeet_ready => LocalRoute::Parakeet,
-        _ if is_auto_language_alias(&s.language) && parakeet_ready => LocalRoute::Parakeet,
         _ => LocalRoute::Whisper,
     }
 }
@@ -675,11 +812,31 @@ fn prefer_gigaam_for_auto(whisper_text: &str, gigaam_text: &str) -> bool {
     let gw = word_count(g);
     let ww = word_count(w);
     if crate::parakeet::is_mostly_cyrillic(w) {
-        return gw + 2 >= ww;
+        // A coherent multilingual Whisper result must not be replaced merely
+        // because GigaAM produced a similarly long Russian string. Use GigaAM
+        // only when Whisper is clearly truncated.
+        return ww <= 2 && gw >= 4 && gw >= ww.saturating_mul(2);
     }
     // Типичный сбой whisper auto на русской речи: короткая латинская фраза
     // вроде "After" / "Państwo, unze" вместо полноценной русской диктовки.
     !has_cyrillic(w) && gw >= 3 && (ww <= 2 || gw >= ww.saturating_mul(2))
+}
+
+fn should_probe_gigaam_for_auto(whisper_text: &str) -> bool {
+    let whisper = whisper_text.trim();
+    if whisper.is_empty() {
+        return true;
+    }
+    if crate::parakeet::is_mostly_cyrillic(whisper) {
+        // A coherent Russian Whisper phrase can never be replaced by
+        // `prefer_gigaam_for_auto`; do not pay for a guaranteed-unused second
+        // full ASR pass. Only a very short/truncated result remains eligible.
+        return word_count(whisper) <= 2;
+    }
+    // Mixed-script text already contains useful Cyrillic context and also can
+    // never satisfy the fallback selector. Pure Latin gibberish remains the
+    // recoverable failure mode.
+    !has_cyrillic(whisper)
 }
 
 const DEFAULT_MULTILINGUAL_PROMPT: &str = "Multilingual speech recognition. Preserve Russian, English and other language switches. Use punctuation. Keep technical terms such as VoxFlow, Tauri, whisper.cpp and Codex.";
@@ -867,6 +1024,7 @@ fn engine_loop(rx: Receiver<EngineCmd>, ctx: EngineCtx) {
             }
             EngineCmd::Cancel => cancel_current(&mut capture, &ctx),
             EngineCmd::ImproveSelection => improve_selection(&ctx),
+            EngineCmd::ManualEdit => note_manual_edit(&ctx),
             EngineCmd::Warmup => {
                 // В отдельном потоке: warmup сам спит и грузит модели —
                 // канал команд блокировать нельзя (Start/Stop должны жить).
@@ -876,6 +1034,7 @@ fn engine_loop(rx: Receiver<EngineCmd>, ctx: EngineCtx) {
             EngineCmd::Shutdown => {
                 let _activity = ctx.cancel_activity_lock.lock();
                 ctx.cancel_active.store(false, Ordering::SeqCst);
+                close_correction_capture(&ctx);
                 restore_auto_mute(&ctx);
                 if let Some(mut srv) = ctx.server.lock().take() {
                     let _ = srv.child.kill();
@@ -921,16 +1080,15 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx, latched: b
     if capture.is_some() {
         return;
     }
-    // Новое физическое нажатие должно мгновенно инвалидировать финал прошлой
-    // диктовки. Раньше generation менялся только ПОСЛЕ медленного macOS
-    // context lookup; за эти 150–650 мс старый финал успевал вставить чужую
-    // фразу уже после нового нажатия.
-    let start_gen = {
-        let _activity = ctx.cancel_activity_lock.lock();
-        let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
-        ctx.cancel_active.store(true, Ordering::SeqCst);
-        next
-    };
+    // A new dictation ends the previous correction-learning opportunity before
+    // its hotkey can be mistaken for an edit of the last inserted sentence.
+    close_correction_capture(ctx);
+    // Новое физическое нажатие атомарно забирает ownership старого живого
+    // черновика и инвалидирует detached-финал БЕЗ platform context lookup.
+    // Само безопасное стирание выполняется уже после открытия микрофона: на
+    // macOS Accessibility может отвечать 150–650 мс, и ожидание до CoreAudio
+    // обрезало бы начало короткой фразы.
+    let (start_gen, inherited_live_draft) = advance_generation_for_start(ctx);
     // Визуальный отклик также не ждёт CoreAudio/platform context. Overlay не получает
     // фокус, поэтому цель всё равно снимается с внешнего приложения ниже.
     set_status_with_latch(ctx, "recording", latched);
@@ -941,6 +1099,7 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx, latched: b
     }
     #[cfg(target_os = "macos")]
     if !macos_insertion_preflight(ctx) {
+        erase_claimed_live_draft_with_fresh_context(ctx, inherited_live_draft.as_ref(), start_gen);
         *ctx.active_target.lock() = None;
         clear_cancel_active_if_current(ctx, start_gen);
         return;
@@ -968,6 +1127,11 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx, latched: b
                 if !use_cloud && no_model_installed(&s) {
                     drop(s);
                     drop(c);
+                    erase_claimed_live_draft_with_fresh_context(
+                        ctx,
+                        inherited_live_draft.as_ref(),
+                        start_gen,
+                    );
                     *ctx.active_target.lock() = None;
                     dbg_log("start: модель не установлена — запись не начинаем, предупреждаем");
                     emit_no_model(&ctx.app);
@@ -981,7 +1145,22 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx, latched: b
             // doing it before opening CoreAudio clipped the beginning of short
             // utterances. It still happens before every status/overlay event,
             // which preserves the original anti-focus-steal guarantee.
-            let target_fp = resolve_start_target(ctx);
+            let detected_context = detect_current_context();
+            let mut target_fp = resolve_start_target_from_context(ctx, &detected_context);
+            // The microphone is already recording. If the previous detached
+            // final left a physical partial in this same field, remove exactly
+            // that ledger entry before any partial loop for the new generation
+            // can emit keys. Refresh the snapshot only when text was erased so
+            // correction learning sees the actual post-cleanup field contents.
+            if erase_claimed_live_draft_locked_to_generation(
+                ctx,
+                inherited_live_draft.as_ref(),
+                start_gen,
+                &detected_context,
+            ) {
+                let refreshed_context = detect_current_context();
+                target_fp = resolve_start_target_from_context(ctx, &refreshed_context);
+            }
             dbg_log(&format!("start: target {}", target_fp.describe()));
             *ctx.active_target.lock() = Some(target_fp.clone());
             // Пояс безопасности (C2): старт-звук играем ТОЛЬКО на честном переходе
@@ -1009,6 +1188,11 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx, latched: b
             *capture = Some(c);
         }
         Err(err) => {
+            erase_claimed_live_draft_with_fresh_context(
+                ctx,
+                inherited_live_draft.as_ref(),
+                start_gen,
+            );
             *ctx.active_target.lock() = None;
             log::error!("start_capture: {err:#}");
             emit_error(&ctx.app, &format!("Не удалось открыть микрофон: {err}"));
@@ -1600,6 +1784,12 @@ fn clean_live_text(
 ) -> String {
     if text.trim().is_empty() {
         return String::new();
+    }
+    // Exact snippet bodies are authored output, not an ASR hypothesis. Keep the
+    // live pill byte-for-byte aligned with the final insertion: corrections,
+    // capitalization and whitespace normalization must not rewrite the body.
+    if let Some(expanded) = postprocess::expand_matching_snippet(text, snippets) {
+        return expanded;
     }
     let mut t = postprocess::process(text, s, dict, snippets);
     t = postprocess::apply_corrections(&t, corrections);
@@ -2413,6 +2603,7 @@ fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
             abort: st.abort,
             start_fp: st.start_fp,
         };
+        register_pending_live_draft(ctx, my_gen, &live);
         let target_fp = live.start_fp.clone();
         if ctx.settings.lock().play_sounds {
             sound::play(false);
@@ -2518,15 +2709,11 @@ fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         dbg_log("cancel: активная диктовка отменена Esc");
         return;
     }
-    {
-        let _activity = ctx.cancel_activity_lock.lock();
-        if !ctx.cancel_active.load(Ordering::SeqCst) && !ctx.improve_busy.load(Ordering::SeqCst) {
-            dbg_log("cancel: Esc проигнорирован — активной работы нет");
-            return;
-        }
-        ctx.gen.fetch_add(1, Ordering::SeqCst);
-        ctx.cancel_active.store(false, Ordering::SeqCst);
+    if !ctx.cancel_active.load(Ordering::SeqCst) && !ctx.improve_busy.load(Ordering::SeqCst) {
+        dbg_log("cancel: Esc проигнорирован — активной работы нет");
+        return;
     }
+    advance_generation_with_live_cleanup(ctx, false);
     *ctx.active_target.lock() = None;
     if ctx.improve_busy.load(Ordering::SeqCst) {
         emit_improve_status(&ctx.app, "cancelled", "Отменено");
@@ -2679,12 +2866,18 @@ fn report_process_err(app: &AppHandle, err: &anyhow::Error) {
 }
 
 /// Живое состояние диктовки, переданное в финальный проход для реконсиляции.
+#[derive(Clone)]
 struct LiveState {
     stream_mode: String,
     injected: Arc<Mutex<String>>,
     committed: Arc<Mutex<String>>,
     abort: Arc<AtomicBool>,
     start_fp: TargetFingerprint,
+}
+
+struct PendingLiveDraft {
+    generation: u64,
+    live: LiveState,
 }
 
 impl LiveState {
@@ -2793,6 +2986,25 @@ fn final_generation_is_current(ctx: &EngineCtx, expected: u64) -> bool {
     generation_is_current(ctx.gen.load(Ordering::Acquire), expected)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FinalPipelineDecision {
+    Continue,
+    Reject { erase_live_draft: bool },
+}
+
+/// Decide whether a text hypothesis may enter the commit pipeline. History is
+/// written only after that pipeline successfully inserts the final text, so a
+/// `Reject` branch is also an explicit "no history" decision.
+fn decide_final_pipeline(accepted_text: bool, live_inserted: bool) -> FinalPipelineDecision {
+    if accepted_text {
+        FinalPipelineDecision::Continue
+    } else {
+        FinalPipelineDecision::Reject {
+            erase_live_draft: live_inserted,
+        }
+    }
+}
+
 /// Стереть уже напечатанный живой черновик (режимы always/auto): голосовая
 /// «отмена» или команды, съевшие весь текст, не должны оставлять в поле
 /// черновик, набранный петлёй партиалов (включая само слово «отмена»).
@@ -2812,17 +3024,29 @@ fn erase_live_draft(ctx: &EngineCtx, live: Option<&LiveState>, my_gen: u64) {
     let cur = crate::app_context::detect();
     let _inj = ctx.inject_lock.lock();
     let _commit = ctx.cancel_activity_lock.lock();
-    if ctx.gen.load(Ordering::SeqCst) != my_gen {
+    let _ = erase_live_draft_locked(ctx, l, my_gen, &cur);
+}
+
+/// Same operation with keyboard + generation locks already held. Keeping the
+/// generation check and key emission in one critical section lets Start/Esc
+/// safely take ownership of an older detached draft before bumping `gen`.
+fn erase_live_draft_locked(
+    ctx: &EngineCtx,
+    l: &LiveState,
+    expected_current_gen: u64,
+    cur: &crate::app_context::AppContext,
+) -> bool {
+    if ctx.gen.load(Ordering::SeqCst) != expected_current_gen {
         dbg_log("отмена: поколение устарело — черновик не трогаем");
-        return;
+        return false;
     }
     if l.abort.load(Ordering::Acquire) {
         dbg_log("отмена: живая вставка была прервана — черновик не трогаем");
-        return;
+        return false;
     }
-    if !l.start_fp.matches(&cur) {
+    if !l.start_fp.matches(cur) {
         dbg_log("отмена: окно сменилось — чужое поле не трогаем");
-        return;
+        return false;
     }
     // prev = что физически в поле (injected для always, committed для auto).
     let prev_arc = if l.stream_mode == "always" {
@@ -2832,12 +3056,167 @@ fn erase_live_draft(ctx: &EngineCtx, live: Option<&LiveState>, my_gen: u64) {
     };
     let prev = prev_arc.lock().clone();
     if prev.is_empty() {
-        return;
+        return true;
     }
     match inject::inject_incremental(&prev, "") {
-        Ok(()) => *prev_arc.lock() = String::new(),
-        Err(e) => log::warn!("отмена: стирание черновика не удалось: {e}"),
+        Ok(()) => {
+            *prev_arc.lock() = String::new();
+            true
+        }
+        Err(e) => {
+            log::warn!("отмена: стирание черновика не удалось: {e}");
+            false
+        }
     }
+}
+
+fn register_pending_live_draft(ctx: &EngineCtx, generation: u64, live: &LiveState) {
+    // Register the ownership token even when the ledger is still empty: a
+    // partial worker may already be inside inject_lock and update the shared
+    // Arc immediately after Stop. Start/Esc inspect the ledger only after
+    // acquiring that same lock, so a genuinely empty token never triggers a
+    // slow target lookup.
+    if matches!(live.stream_mode.as_str(), "always" | "auto") {
+        *ctx.pending_live_draft.lock() = Some(PendingLiveDraft {
+            generation,
+            live: live.clone(),
+        });
+    }
+}
+
+fn take_pending_live_draft_from_slot(
+    slot: &mut Option<PendingLiveDraft>,
+    generation: u64,
+) -> Option<PendingLiveDraft> {
+    if slot
+        .as_ref()
+        .is_some_and(|pending| pending.generation == generation)
+    {
+        slot.take()
+    } else {
+        None
+    }
+}
+
+fn take_pending_live_draft(ctx: &EngineCtx, generation: u64) -> Option<PendingLiveDraft> {
+    take_pending_live_draft_from_slot(&mut ctx.pending_live_draft.lock(), generation)
+}
+
+fn pending_live_draft_is_registered(ctx: &EngineCtx, generation: u64) -> bool {
+    ctx.pending_live_draft
+        .lock()
+        .as_ref()
+        .is_some_and(|pending| pending.generation == generation)
+}
+
+/// Claim and erase a detached draft as the current generation's terminal
+/// action. The slot claim happens while both commit locks are held, so a new
+/// Start/Esc cannot bump the generation between ownership transfer and erase.
+fn erase_registered_live_draft(ctx: &EngineCtx, generation: u64) {
+    if !pending_live_draft_is_registered(ctx, generation) {
+        return;
+    }
+    let cur = crate::app_context::detect();
+    let _inj = ctx.inject_lock.lock();
+    let _commit = ctx.cancel_activity_lock.lock();
+    if let Some(pending) = take_pending_live_draft(ctx, generation) {
+        let _ = erase_live_draft_locked(ctx, &pending.live, generation, &cur);
+    }
+}
+
+/// Fast phase for a new Start. Claim the old slot and bump generation while
+/// holding the same locks as final commit, but never query Accessibility here.
+/// The returned draft is cleaned only after CoreAudio is already capturing.
+fn advance_generation_for_start(ctx: &EngineCtx) -> (u64, Option<PendingLiveDraft>) {
+    let _inj = ctx.inject_lock.lock();
+    let _activity = ctx.cancel_activity_lock.lock();
+    let current = ctx.gen.load(Ordering::SeqCst);
+    let inherited = take_pending_live_draft(ctx, current);
+    let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
+    ctx.cancel_active.store(true, Ordering::SeqCst);
+    (next, inherited)
+}
+
+/// Erase a slot already claimed by a newer generation. The token was removed
+/// before that generation bump, and both key emission and the generation check
+/// are serialized here, so the stale final cannot race this cleanup and the new
+/// partial loop has not started yet.
+fn erase_claimed_live_draft_locked_to_generation(
+    ctx: &EngineCtx,
+    pending: Option<&PendingLiveDraft>,
+    current_generation: u64,
+    current_context: &crate::app_context::AppContext,
+) -> bool {
+    let Some(pending) = pending else {
+        return false;
+    };
+    if !pending.live.live_inserted() {
+        return false;
+    }
+    let _inj = ctx.inject_lock.lock();
+    let _activity = ctx.cancel_activity_lock.lock();
+    erase_live_draft_locked(ctx, &pending.live, current_generation, current_context)
+}
+
+fn erase_claimed_live_draft_with_fresh_context(
+    ctx: &EngineCtx,
+    pending: Option<&PendingLiveDraft>,
+    current_generation: u64,
+) -> bool {
+    let Some(pending) = pending else {
+        return false;
+    };
+    if !pending.live.live_inserted() {
+        return false;
+    }
+    let current_context = detect_current_context();
+    erase_claimed_live_draft_locked_to_generation(
+        ctx,
+        Some(pending),
+        current_generation,
+        &current_context,
+    )
+}
+
+/// Invalidate an older detached final without orphaning its physical partial.
+/// Whichever side acquires the commit locks first owns the old draft: the final
+/// may commit it, or Start/Esc erases it and advances the generation.
+fn advance_generation_with_live_cleanup(ctx: &EngineCtx, cancel_active: bool) -> u64 {
+    // Esc may afford a synchronous target check; keep inject_lock held so an
+    // in-flight partial finishes its ledger update before we decide whether a
+    // physical draft exists, and a final cannot commit during detection.
+    let _inj = ctx.inject_lock.lock();
+    let current = ctx.gen.load(Ordering::SeqCst);
+    let detected = ctx
+        .pending_live_draft
+        .lock()
+        .as_ref()
+        .filter(|pending| pending.generation == current)
+        .filter(|pending| pending.live.live_inserted())
+        .map(|_| detect_current_context());
+    let _activity = ctx.cancel_activity_lock.lock();
+    if let Some(pending) = take_pending_live_draft(ctx, current) {
+        if let Some(cur) = detected.as_ref() {
+            let _ = erase_live_draft_locked(ctx, &pending.live, current, cur);
+        }
+    }
+    let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
+    ctx.cancel_active.store(cancel_active, Ordering::SeqCst);
+    next
+}
+
+/// Error exits before final reconciliation must not leave a speculative live
+/// partial in the target field. The actual erasure remains guarded by target,
+/// generation, abort, and the exact text tracked in `LiveState`.
+fn erase_live_draft_on_error<T>(
+    ctx: &EngineCtx,
+    my_gen: u64,
+    result: anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    if result.is_err() {
+        erase_registered_live_draft(ctx, my_gen);
+    }
+    result
 }
 
 fn process_utterance(
@@ -2848,6 +3227,11 @@ fn process_utterance(
     my_gen: u64,
     mut target_fp: TargetFingerprint,
 ) -> anyhow::Result<()> {
+    // Live auto/always may type partials before the final target check. Preserve
+    // the original pre-dictation tail now; a later Accessibility snapshot would
+    // already contain VoxFlow's own partial and would be an invalid anchor for
+    // manual-correction learning.
+    let field_before_dictation = compact_learning_text(&target_fp.captured_context().field_text);
     if !final_generation_is_current(ctx, my_gen) {
         dbg_log("финал: поколение устарело до препроцессинга — ASR пропущен");
         return Ok(());
@@ -2856,11 +3240,14 @@ fn process_utterance(
         // Первый tap double-tap жеста может завершиться до первого CoreAudio
         // callback. Это управляющий жест, поэтому не мигаем ложным norecog.
         dbg_log("финал: пустой короткий tap — нечего распознавать, norecog подавлен");
+        // Normally no partial can exist without captured samples. Keep the
+        // invariant defensive in case capture/live callbacks race at shutdown.
+        erase_registered_live_draft(ctx, my_gen);
         return Ok(());
     }
     let s = ctx.settings.lock().clone();
     // Что-то уже физически напечатано клавишами (always/auto) за эту диктовку.
-    let live_inserted = live.as_ref().map(|l| l.live_inserted()).unwrap_or(false);
+    let mut live_inserted = live.as_ref().map(|l| l.live_inserted()).unwrap_or(false);
 
     let t_all = Instant::now();
     let mut context_ms = 0u64;
@@ -2880,6 +3267,10 @@ fn process_utterance(
     if speech_trimmed.len() < 16000 / 5 {
         // < ~0.2 c полезного звука — считаем, что речи не было
         dbg_log("финал: VAD не нашёл речь — распознавание пропущено");
+        // A speculative live partial is not stronger evidence than the final
+        // VAD decision. Remove only VoxFlow's known draft under the existing
+        // target + generation guards.
+        erase_registered_live_draft(ctx, my_gen);
         if should_emit_norecog(capture_ms) {
             let _ = ctx.app.emit(
                 "norecog",
@@ -2895,7 +3286,11 @@ fn process_utterance(
     // финал предыдущей диктовки ещё в полёте, а уже стартовала следующая.
     let wav = paths::unique_tmp_path(&format!("utterance_{my_gen}"), "wav");
     let _wav_guard = paths::TempFileGuard::new(wav.clone());
-    audio::write_wav_16k_mono(&wav, &speech_trimmed)?;
+    erase_live_draft_on_error(
+        ctx,
+        my_gen,
+        audio::write_wav_16k_mono(&wav, &speech_trimmed),
+    )?;
 
     // Словарь, сниппеты и выученные исправления из БД (под локом).
     let (dict, snippets, corrections) = {
@@ -2936,7 +3331,7 @@ fn process_utterance(
         detected
     };
     let Some(asr_actx) = asr_target else {
-        erase_live_draft(ctx, live.as_ref(), my_gen);
+        erase_registered_live_draft(ctx, my_gen);
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     };
@@ -2987,11 +3382,16 @@ fn process_utterance(
                     }
                     log::warn!("облачный STT недоступен — откат на локальное распознавание");
                     emit_stt_mode(&ctx.app, "local", true);
-                    let (text, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed, my_gen)?;
+                    let (text, lang) = erase_live_draft_on_error(
+                        ctx,
+                        my_gen,
+                        local_asr(ctx, &s, &dict, &snippets, &wav, &trimmed, my_gen),
+                    )?;
                     lang_badge = lang;
                     text
                 } else {
                     // Fallback выключен — честно сообщаем об ошибке и выходим.
+                    erase_registered_live_draft(ctx, my_gen);
                     if s.play_sounds {
                         sound::fail();
                     }
@@ -3010,13 +3410,21 @@ fn process_utterance(
                     return Ok(());
                 }
                 log::warn!("облачный ASR (Gemini) ошибка: {e}; откат на локальное распознавание");
-                let (text, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed, my_gen)?;
+                let (text, lang) = erase_live_draft_on_error(
+                    ctx,
+                    my_gen,
+                    local_asr(ctx, &s, &dict, &snippets, &wav, &trimmed, my_gen),
+                )?;
                 lang_badge = lang;
                 text
             }
         }
     } else {
-        let (t, lang) = local_asr(ctx, &s, &dict, &wav, &trimmed, my_gen)?;
+        let (t, lang) = erase_live_draft_on_error(
+            ctx,
+            my_gen,
+            local_asr(ctx, &s, &dict, &snippets, &wav, &trimmed, my_gen),
+        )?;
         lang_badge = lang;
         t
     };
@@ -3038,22 +3446,25 @@ fn process_utterance(
     }
     let raw = postprocess::dedup_repeated_ngrams(&raw);
 
-    if raw.trim().is_empty() {
+    if let FinalPipelineDecision::Reject { .. } =
+        decide_final_pipeline(!raw.trim().is_empty(), live_inserted)
+    {
         dbg_log(&format!(
             "финал: ASR вернул пустой текст за {ms}мс (pre={pre_ms}мс)"
         ));
         // Гейт уверенности/VAD отклонил (невнятно / тишина / чужой язык).
-        // Если в режиме always/auto мы УЖЕ напечатали лучший partial — НЕ стираем
-        // экран (никакого mass-backspace), оставляем как есть; иначе старое поведение.
+        // A live partial is speculative and does not carry the final word
+        // confidence gate, so keeping it here would turn rejected noise into a
+        // permanent phantom insertion. Erase only VoxFlow's exact known draft;
+        // `erase_live_draft` refuses to touch another field or generation.
         //
         // ВАЖНО: это не системная ошибка. Пользователь мог случайно тапнуть хоткей,
         // отпустить слишком рано или говорить тише VAD-порога. Раньше здесь играл
         // sound::fail(), из-за чего нормальные "ничего не распознано" ощущались как
         // поломка приложения. Реальные ошибки (нет модели, облако недоступно и т.п.)
         // по-прежнему идут через emit_error/no_model и отдельные fail-пути.
-        if live_inserted {
-            dbg_log("финал отклонён, но живой текст уже вставлен — не стираем");
-        }
+        dbg_log("финал отклонён — безопасно убираем живой черновик");
+        erase_registered_live_draft(ctx, my_gen);
         let _ = ctx.app.emit(
             "norecog",
             serde_json::json!({ "message": "Не расслышал — повторите чётче" }),
@@ -3077,11 +3488,20 @@ fn process_utterance(
     ));
     // Постобработка (правила) + выученные исправления.
     let t_post = Instant::now();
-    let mut text = postprocess::process(&raw, &s, &dict, &snippets);
-    text = postprocess::apply_corrections(&text, &corrections);
+    let exact_snippet = postprocess::expand_matching_snippet(&raw, &snippets);
+    let snippet_expanded = exact_snippet.is_some();
+    let mut text =
+        exact_snippet.unwrap_or_else(|| postprocess::process(&raw, &s, &dict, &snippets));
+    if !snippet_expanded {
+        text = postprocess::apply_corrections(&text, &corrections);
+    }
     let post_ms = t_post.elapsed().as_millis() as u64;
-    if text.trim().is_empty() {
-        // Постобработка съела весь текст — экран не трогаем (как и при отклонении гейта).
+    if let FinalPipelineDecision::Reject { .. } =
+        decide_final_pipeline(!text.trim().is_empty(), live_inserted)
+    {
+        // Постобработка отвергла финал: speculative live draft тоже не должен
+        // оставаться в поле.
+        erase_registered_live_draft(ctx, my_gen);
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
@@ -3089,18 +3509,22 @@ fn process_utterance(
     // Голосовые команды оставляем как совместимость, но снимаем их ДО LLM:
     // форматирование должно быть автоматическим, а модель не должна съедать хвостовое
     // "отмена"/"абзац" до того, как движок успел распознать команду.
-    text = postprocess::normalize_spaces(&text);
-    text = match crate::voice_cmds::apply_voice_commands(&text) {
-        crate::voice_cmds::CmdOutcome::Cancel => {
-            dbg_log("финал: голосовая команда «отмена» — вставка и история пропущены");
-            erase_live_draft(ctx, live.as_ref(), my_gen);
-            let _ = std::fs::remove_file(&wav);
-            return Ok(());
-        }
-        crate::voice_cmds::CmdOutcome::Text(t) => t,
-    };
-    if text.is_empty() {
-        erase_live_draft(ctx, live.as_ref(), my_gen);
+    if !snippet_expanded {
+        text = postprocess::normalize_spaces(&text);
+        text = match crate::voice_cmds::apply_voice_commands(&text) {
+            crate::voice_cmds::CmdOutcome::Cancel => {
+                dbg_log("финал: голосовая команда «отмена» — вставка и история пропущены");
+                erase_registered_live_draft(ctx, my_gen);
+                let _ = std::fs::remove_file(&wav);
+                return Ok(());
+            }
+            crate::voice_cmds::CmdOutcome::Text(t) => t,
+        };
+    }
+    if let FinalPipelineDecision::Reject { .. } =
+        decide_final_pipeline(!text.is_empty(), live_inserted)
+    {
+        erase_registered_live_draft(ctx, my_gen);
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
@@ -3108,7 +3532,7 @@ fn process_utterance(
     // A local ASR pass can take seconds. If a configured rewrite backend may
     // send text off-device, validate the target again immediately before that
     // possible egress; the earlier cloud-ASR guard is too old by this point.
-    if potentially_remote_rewrite(&s) {
+    if !snippet_expanded && potentially_remote_rewrite(&s) {
         if ctx.gen.load(Ordering::SeqCst) != my_gen {
             dbg_log("финал: поколение устарело до remote rewrite — данные не отправляем");
             let _ = std::fs::remove_file(&wav);
@@ -3119,7 +3543,7 @@ fn process_utterance(
             current_or_restored_target(ctx, &mut target_fp, "перед удалённым rewrite");
         context_ms += context_started.elapsed().as_millis() as u64;
         let Some(fresh_actx) = fresh_target else {
-            erase_live_draft(ctx, live.as_ref(), my_gen);
+            erase_registered_live_draft(ctx, my_gen);
             let _ = std::fs::remove_file(&wav);
             return Ok(());
         };
@@ -3156,8 +3580,8 @@ fn process_utterance(
         tone.as_str()
     };
     let smart_active = smart_instruction.is_some();
-    let llm_eligible =
-        final_rewrite_eligible(&s, rewrite_tone, smart_active, explicit_smart_instruction);
+    let llm_eligible = !snippet_expanded
+        && final_rewrite_eligible(&s, rewrite_tone, smart_active, explicit_smart_instruction);
     let t_llm = Instant::now();
     if llm_eligible {
         text = refine_text_with_fallback(
@@ -3180,13 +3604,18 @@ fn process_utterance(
     // (replace_ci — сырая подстрочная замена; LLM иногда добавляет лишние пробелы).
     // normalize_spaces внутри postprocess::process отрабатывает РАНЬШЕ этих шагов,
     // поэтому нормализуем ещё раз — финально, перед вставкой.
-    text = postprocess::normalize_spaces(&text);
-    if conversational_continuation_enabled(&tone) {
-        text = postprocess::soften_false_sentence_breaks(&text);
+    if !snippet_expanded {
+        text = postprocess::normalize_spaces(&text);
+        if conversational_continuation_enabled(&tone) {
+            text = postprocess::soften_false_sentence_breaks(&text);
+        }
+        text = continue_from_previous_context(&text, previous_context_tail.as_deref(), &tone);
+        text = postprocess::normalize_spaces(&text);
     }
-    text = continue_from_previous_context(&text, previous_context_tail.as_deref(), &tone);
-    text = postprocess::normalize_spaces(&text);
-    if text.trim().is_empty() {
+    if let FinalPipelineDecision::Reject { .. } =
+        decide_final_pipeline(!text.trim().is_empty(), live_inserted)
+    {
+        erase_registered_live_draft(ctx, my_gen);
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
@@ -3218,6 +3647,19 @@ fn process_utterance(
     let final_target = current_or_restored_target(ctx, &mut target_fp, "перед вставкой");
     context_ms += context_started.elapsed().as_millis() as u64;
     let Some(final_target_actx) = final_target else {
+        // Do not press keys without a verified target, but never lose a fully
+        // recognized result: leave exactly this text ready for manual paste.
+        erase_registered_live_draft(ctx, my_gen);
+        if let Err(error) = inject::set_clipboard_text(&text) {
+            dbg_log(&format!(
+                "финал: не удалось сохранить текст в clipboard: {error:#}"
+            ));
+        } else {
+            emit_error(
+                &ctx.app,
+                "Активное окно не удалось подтвердить. Текст сохранён в буфере обмена",
+            );
+        }
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     };
@@ -3232,8 +3674,21 @@ fn process_utterance(
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
-    if ctx.last_injected_gen.swap(my_gen, Ordering::SeqCst) == my_gen {
+    if ctx.last_injected_gen.load(Ordering::SeqCst) == my_gen {
         dbg_log("финал: это поколение уже вставлено — пропускаем");
+        drop(inject_guard);
+        let _ = std::fs::remove_file(&wav);
+        return Ok(());
+    }
+    // A partial worker that was already inside inject_lock at Stop may have
+    // finished after the earlier snapshot. Re-read the shared ledger under the
+    // commit lock, then require the still-registered ownership token before
+    // touching a physical live draft. Start/Esc remove that token before they
+    // invalidate this generation, so a stale final can never rewrite their text.
+    live_inserted = live.as_ref().map(|l| l.live_inserted()).unwrap_or(false);
+    if live_inserted && !pending_live_draft_is_registered(ctx, my_gen) {
+        dbg_log("финал: ownership live-черновика уже передан Start/Esc — вставку пропускаем");
+        drop(commit_guard);
         drop(inject_guard);
         let _ = std::fs::remove_file(&wav);
         return Ok(());
@@ -3250,29 +3705,36 @@ fn process_utterance(
                 dbg_log("финал: целевое окно изменилось — реконсиляцию пропускаем");
             } else {
                 // prev = что уже физически в поле (injected для always, committed для auto).
-                let prev = if l.stream_mode == "always" {
-                    l.injected.lock().clone()
+                let live_ledger = if l.stream_mode == "always" {
+                    Arc::clone(&l.injected)
                 } else {
-                    l.committed.lock().clone()
+                    Arc::clone(&l.committed)
                 };
+                let prev = live_ledger.lock().clone();
                 if text.contains('\n') {
                     // Абзацы должны быть автоматическими, но Enter в чатах опасен.
                     // Поэтому живой черновик стираем клавишами, а финальный
                     // многострочный текст вставляем одним безопасным clipboard-paste.
                     let _ = inject::set_clipboard_text(&text)
                         .map_err(|e| log::warn!("clipboard final text: {e}"));
-                    if let Err(e) = inject::inject_incremental(&prev, "") {
-                        log::warn!("финальная очистка live-черновика: {e}");
-                        insert_error = Some(format!("{e:#}"));
-                    } else if let Err(e) = inject::inject_keep_clipboard(&text, "clipboard") {
-                        log::warn!("финальная clipboard-вставка с абзацами: {e}");
-                        insert_error = Some(format!("{e:#}"));
-                    } else if l.stream_mode == "always" {
-                        *l.injected.lock() = text.clone();
-                        final_inserted = true;
-                    } else {
-                        *l.committed.lock() = text.clone();
-                        final_inserted = true;
+                    match inject::inject_incremental(&prev, "") {
+                        Err(e) => {
+                            log::warn!("финальная очистка live-черновика: {e}");
+                            insert_error = Some(format!("{e:#}"));
+                        }
+                        Ok(()) => {
+                            // The physical draft is already gone. Update the
+                            // ledger before the separate paste so a failed paste
+                            // can never make the next Start backspace it twice.
+                            *live_ledger.lock() = String::new();
+                            if let Err(e) = inject::inject_keep_clipboard(&text, "clipboard") {
+                                log::warn!("финальная clipboard-вставка с абзацами: {e}");
+                                insert_error = Some(format!("{e:#}"));
+                            } else {
+                                *live_ledger.lock() = text.clone();
+                                final_inserted = true;
+                            }
+                        }
                     }
                 } else {
                     let flat = flatten_breaks(&text);
@@ -3281,11 +3743,8 @@ fn process_utterance(
                     if let Err(e) = inject::inject_incremental(&prev, &flat) {
                         log::warn!("финальная реконсиляция: {e}");
                         insert_error = Some(format!("{e:#}"));
-                    } else if l.stream_mode == "always" {
-                        *l.injected.lock() = flat;
-                        final_inserted = true;
                     } else {
-                        *l.committed.lock() = flat;
+                        *live_ledger.lock() = flat;
                         final_inserted = true;
                     }
                 }
@@ -3302,6 +3761,13 @@ fn process_utterance(
             }
             final_inserted = true;
         }
+    }
+    if final_inserted {
+        // Clear the ownership token only after the field contains the confirmed
+        // final text. Until this exact point a concurrent Start/Esc is blocked
+        // by the two guards and may not mistake the final for a stale draft.
+        let _ = take_pending_live_draft(ctx, my_gen);
+        ctx.last_injected_gen.store(my_gen, Ordering::SeqCst);
     }
     drop(inject_guard); // освобождаем замок клавиш сразу после вставки
     drop(commit_guard); // новый Start блокируется только на самом paste
@@ -3327,11 +3793,32 @@ fn process_utterance(
         "[lat] gen={my_gen} pre={pre_ms}мс context={context_ms}мс asr={ms}мс post={post_ms}мс llm={llm_ms}мс inject={inject_ms}мс total={}мс",
         t_all.elapsed().as_millis()
     ));
-    // Запомнить вставленное — для авто-захвата исправлений из буфера (во всех путях).
-    *ctx.last_inject.lock() = Some(LastInject {
-        text: text.clone(),
-        at: Instant::now(),
-    });
+    // Open a short, privacy-scoped learning window. The keyboard hook sends
+    // only a boolean ManualEdit signal; the actual edited value is read later
+    // from this exact field through Accessibility/UIA (never via clipboard).
+    // Snippet bodies are authored templates, not ASR hypotheses: editing a
+    // rendered snippet must not silently create a global speech correction.
+    if snippet_expanded || text.split_whitespace().next().is_none() {
+        close_correction_capture(ctx);
+    } else {
+        let learning_field_before = if live_inserted {
+            field_before_dictation
+        } else {
+            compact_learning_text(&final_target_actx.field_text)
+        };
+        *ctx.last_inject.lock() = Some(LastInject {
+            text: text.clone(),
+            at: Instant::now(),
+            target_fp: target_fp.clone(),
+            field_id: final_target_actx.field_id.clone(),
+            field_role: final_target_actx.field_role.clone(),
+            field_subrole: final_target_actx.field_subrole.clone(),
+            field_before: learning_field_before,
+            manual_edit_at: None,
+            pending_observation: None,
+        });
+        ctx.correction_capture_active.store(true, Ordering::Release);
+    }
 
     let words = text.split_whitespace().count() as u32;
     if words == 0 {
@@ -3901,12 +4388,13 @@ fn emit_no_model(app: &AppHandle) {
 }
 
 /// Локальный ASR с роутингом по языку (PLAN §2): ru → GigaAM (как раньше),
-/// en/auto → Parakeet при установленной модели, прочие языки → whisper. Общий VAD-гейт тишины для
+/// explicit en → Parakeet при установленной модели, auto/прочие языки → Whisper. Общий VAD-гейт тишины для
 /// резидентных движков. Возвращает (текст, язык для бейджа overlay).
 fn local_asr(
     ctx: &EngineCtx,
     s: &Settings,
     dict: &[postprocess::Dict],
+    snippets: &[postprocess::Snippet],
     wav: &std::path::Path,
     samples_16k: &[f32],
     my_gen: u64,
@@ -4023,11 +4511,14 @@ fn local_asr(
             LocalRoute::Whisper => unreachable!(),
         }
     }
-    // en/auto без Parakeet — текущее поведение (whisper) + разовая дружелюбная
+    // Explicit en without Parakeet uses Whisper and shows a one-time hint.
     // подсказка, что с Parakeet будет лучше.
     if route == LocalRoute::Whisper
         && s.engine == "gigaam"
-        && (s.language == "en" || is_auto_language_alias(&s.language))
+        && matches!(
+            s.language.trim().to_ascii_lowercase().as_str(),
+            "en" | "english"
+        )
     {
         hint_parakeet_once(&ctx.app);
     }
@@ -4072,12 +4563,13 @@ fn local_asr(
             Err(e) => log::warn!("auto-fallback GigaAM недоступен ({e})"),
         }
     }
-    let Some(whisper_text) = local_transcribe_guarded(ctx, s, dict, wav, my_gen)? else {
+    let Some(whisper_text) = local_transcribe_guarded(ctx, s, dict, snippets, wav, my_gen)? else {
         return Ok((String::new(), None));
     };
     if s.language == "auto"
         && s.engine == "gigaam"
         && crate::gigaam::dir_ready(&paths::gigaam_dir())
+        && should_probe_gigaam_for_auto(&whisper_text)
     {
         match ensure_gigaam(ctx, s) {
             Ok(()) => {
@@ -4107,7 +4599,7 @@ fn local_asr(
     Ok((whisper_text, lang))
 }
 
-/// Разовая (на сессию) подсказка для en/auto без установленного Parakeet:
+/// Разовая (на сессию) подсказка для explicit en без установленного Parakeet:
 /// фолбэк-whisper работает, но предлагаем модель получше. Баннер no_model
 /// на фронте уже умеет показывать произвольный message с кнопкой на «Модель».
 fn hint_parakeet_once(app: &AppHandle) {
@@ -4118,7 +4610,7 @@ fn hint_parakeet_once(app: &AppHandle) {
     let _ = app.emit(
         "no_model",
         serde_json::json!({
-            "message": "Для английского и автоопределения языка установите модель «Parakeet TDT v3» во вкладке «Модель» — точнее и с живыми партиалами"
+            "message": "Для английского установите модель «Parakeet TDT v3» во вкладке «Модель» — точнее и с живыми партиалами"
         }),
     );
 }
@@ -4263,6 +4755,133 @@ fn gap_starts_paragraph(has_previous_segment: bool, gap_samples: usize) -> bool 
 mod seg_tests {
     use super::*;
 
+    fn live_state_with_draft(mode: &str, draft: &str) -> LiveState {
+        let context = crate::app_context::AppContext {
+            exe: "editor.exe".into(),
+            title: "Editor".into(),
+            window_id: "window=1".into(),
+            category: "work".into(),
+            field_role: "UIAEdit".into(),
+            field_subrole: "textpattern".into(),
+            field_id: "field=1".into(),
+            field_text: draft.into(),
+            selected_text: String::new(),
+        };
+        let injected = if mode == "always" {
+            draft.to_string()
+        } else {
+            String::new()
+        };
+        let committed = if mode == "auto" {
+            draft.to_string()
+        } else {
+            String::new()
+        };
+        LiveState {
+            stream_mode: mode.into(),
+            injected: Arc::new(Mutex::new(injected)),
+            committed: Arc::new(Mutex::new(committed)),
+            abort: Arc::new(AtomicBool::new(false)),
+            start_fp: context.target_fingerprint(),
+        }
+    }
+
+    fn pending_slot(generation: u64, mode: &str, draft: &str) -> Option<PendingLiveDraft> {
+        Some(PendingLiveDraft {
+            generation,
+            live: live_state_with_draft(mode, draft),
+        })
+    }
+
+    #[test]
+    fn rapid_start_claims_old_live_draft_exactly_once() {
+        let mut slot = pending_slot(7, "always", "старый черновик");
+
+        let inherited = take_pending_live_draft_from_slot(&mut slot, 7);
+
+        assert!(inherited.is_some(), "new Start must own the old draft");
+        assert!(slot.is_none());
+        assert!(
+            take_pending_live_draft_from_slot(&mut slot, 7).is_none(),
+            "the stale detached final must not regain ownership"
+        );
+    }
+
+    #[test]
+    fn escape_claims_detached_live_draft_exactly_once() {
+        let mut slot = pending_slot(11, "auto", "стабильный префикс");
+
+        let cancelled = take_pending_live_draft_from_slot(&mut slot, 11);
+
+        assert!(cancelled.is_some(), "Esc must own the physical draft");
+        assert!(
+            take_pending_live_draft_from_slot(&mut slot, 11).is_none(),
+            "a later final must observe the cancelled ownership token"
+        );
+    }
+
+    #[test]
+    fn successful_final_clears_token_before_next_start_can_erase_it() {
+        let mut slot = pending_slot(13, "always", "черновик");
+        let live = slot.as_ref().expect("registered draft").live.clone();
+
+        // Final reconciliation succeeded while commit locks are held.
+        *live.injected.lock() = "готовый текст".into();
+        let terminal = take_pending_live_draft_from_slot(&mut slot, 13);
+
+        assert!(terminal.is_some());
+        assert_eq!(&*live.injected.lock(), "готовый текст");
+        assert!(
+            take_pending_live_draft_from_slot(&mut slot, 13).is_none(),
+            "the next Start must not backspace confirmed final text"
+        );
+    }
+
+    #[test]
+    fn multiline_paste_failure_does_not_leave_a_double_erase_ledger() {
+        let mut slot = pending_slot(17, "always", "живой черновик");
+        let live = slot.as_ref().expect("registered draft").live.clone();
+
+        // The first operation (draft -> empty) succeeded, while the separate
+        // multiline clipboard paste failed. Runtime keeps the terminal token,
+        // but the physical ledger must already say that nothing remains.
+        *live.injected.lock() = String::new();
+
+        assert!(slot.is_some());
+        assert!(!live.live_inserted());
+        let inherited = take_pending_live_draft_from_slot(&mut slot, 17)
+            .expect("next Start may retire the empty token");
+        assert!(
+            !inherited.live.live_inserted(),
+            "no second backspace operation may be scheduled"
+        );
+    }
+
+    #[test]
+    fn rejected_empty_final_erases_live_draft_and_cannot_reach_history() {
+        let decision = decide_final_pipeline(false, true);
+        let mut erase_calls = 0;
+        let mut commit_or_history_entries = 0;
+
+        match decision {
+            FinalPipelineDecision::Reject { erase_live_draft } => {
+                if erase_live_draft {
+                    erase_calls += 1;
+                }
+            }
+            FinalPipelineDecision::Continue => commit_or_history_entries += 1,
+        }
+
+        assert_eq!(
+            erase_calls, 1,
+            "the speculative physical draft must be erased"
+        );
+        assert_eq!(
+            commit_or_history_entries, 0,
+            "a rejected final must not enter the commit/history pipeline"
+        );
+    }
+
     #[test]
     fn restatement_replaces_similar_neighbor() {
         assert!(is_restatement(
@@ -4368,6 +4987,29 @@ mod seg_tests {
     }
 
     #[test]
+    fn exact_snippet_live_preview_matches_the_final_body_verbatim() {
+        let s = Settings::default();
+        let snippets = vec![postprocess::Snippet {
+            trigger: "/sig".into(),
+            content: "cat\n  indented signature".into(),
+            is_template: false,
+        }];
+        let corrections = vec![postprocess::Correction {
+            wrong: "cat".into(),
+            right: "dog".into(),
+        }];
+
+        let (_, volatile, live_full) =
+            clean_live_partial("", "/sig", &s, &[], &snippets, &corrections);
+        let final_body = postprocess::expand_matching_snippet("/sig", &snippets)
+            .expect("exact snippet must expand");
+
+        assert_eq!(live_full, final_body);
+        assert_eq!(volatile, final_body);
+        assert_eq!(live_full, "cat\n  indented signature");
+    }
+
+    #[test]
     fn flatten_breaks_for_keyboard() {
         assert_eq!(flatten_breaks("а\n\nб  в"), "а б в");
     }
@@ -4383,6 +5025,16 @@ mod seg_tests {
             "please update the prompt",
             "Пожалуйста обнови промпт"
         ));
+        assert!(!prefer_gigaam_for_auto(
+            "Подвяжи к боту ИИ и обучи его на шаблонах",
+            "Подключи бота и добавь шаблоны для обучения"
+        ));
+        assert!(!should_probe_gigaam_for_auto(
+            "Подвяжи к боту ИИ и обучи его на шаблонах"
+        ));
+        assert!(should_probe_gigaam_for_auto("After"));
+        assert!(should_probe_gigaam_for_auto("Коротко"));
+        assert!(!should_probe_gigaam_for_auto("Обнови README.md сегодня"));
     }
 
     #[test]
@@ -4405,19 +5057,22 @@ mod seg_tests {
     }
 
     #[test]
-    fn auto_language_uses_parakeet_when_installed_otherwise_whisper() {
+    fn auto_language_stays_on_multilingual_whisper_even_with_parakeet_installed() {
         let mut s = Settings {
             engine: "gigaam".to_string(),
             language: "auto".to_string(),
             ..Settings::default()
         };
-        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Whisper);
         assert_eq!(local_route_with_parakeet(&s, false), LocalRoute::Whisper);
 
         s.language = "multi".to_string();
-        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Whisper);
 
         s.language = "*".to_string();
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Whisper);
+
+        s.language = "en".to_string();
         assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
     }
 
@@ -4431,7 +5086,7 @@ mod seg_tests {
         assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::GigaAm);
 
         s.language = "auto".to_string();
-        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
+        assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Whisper);
         assert_eq!(local_route_with_parakeet(&s, false), LocalRoute::Whisper);
 
         s.engine = "whisper_server".to_string();
@@ -4516,6 +5171,7 @@ fn local_transcribe_guarded(
     ctx: &EngineCtx,
     s: &Settings,
     dict: &[postprocess::Dict],
+    snippets: &[postprocess::Snippet],
     wav: &std::path::Path,
     expected_gen: u64,
 ) -> anyhow::Result<Option<String>> {
@@ -4537,7 +5193,7 @@ fn local_transcribe_guarded(
                 dbg_log("финал: поколение устарело после asr_lock — Whisper пропущен");
                 return Ok(None);
             }
-            return local_transcribe(ctx, s, dict, wav).map(Some);
+            return local_transcribe(ctx, s, dict, snippets, wav).map(Some);
         }
     }
 
@@ -4549,19 +5205,20 @@ fn local_transcribe_guarded(
         "финал: asr_lock занят >3 с — сбрасываем whisper-server и используем whisper-cli fallback",
     );
     restart_whisper_server(ctx, "final asr_lock timeout");
-    local_transcribe_cli_only(ctx, s, dict, wav).map(Some)
+    local_transcribe_cli_only(ctx, s, dict, snippets, wav).map(Some)
 }
 
 fn local_transcribe_cli_only(
     ctx: &EngineCtx,
     s: &Settings,
     dict: &[postprocess::Dict],
+    snippets: &[postprocess::Snippet],
     wav: &std::path::Path,
 ) -> anyhow::Result<String> {
     let model = resolve_model(s)?;
     let language = whisper_language_arg(&s.language);
     let base_prompt = whisper_base_prompt(&s.language);
-    let prompt = postprocess::dict_bias_prompt(dict, base_prompt);
+    let prompt = postprocess::asr_bias_prompt(dict, snippets, base_prompt);
     transcribe_cli_with_runtime_fallback(
         ctx,
         &model,
@@ -4653,6 +5310,7 @@ fn local_transcribe(
     ctx: &EngineCtx,
     s: &Settings,
     dict: &[postprocess::Dict],
+    snippets: &[postprocess::Snippet],
     wav: &std::path::Path,
 ) -> anyhow::Result<String> {
     let model = resolve_model(s)?;
@@ -4660,7 +5318,7 @@ fn local_transcribe(
     // Короткая языковая затравка удерживает whisper в нужном режиме даже при
     // пустом словаре: ru — русский, auto/multi aliases — смешанная речь.
     let base_prompt = whisper_base_prompt(&s.language);
-    let prompt = postprocess::dict_bias_prompt(dict, base_prompt);
+    let prompt = postprocess::asr_bias_prompt(dict, snippets, base_prompt);
     if s.engine == "whisper_cli" {
         transcribe_cli_with_runtime_fallback(
             ctx,
@@ -5212,6 +5870,64 @@ fn configured_rewrite_backend(s: &Settings) -> Option<RewriteBackendRoute> {
     }
 }
 
+/// Automatic rewrite may improve form, but it must remain anchored in what the
+/// user actually dictated. Only explicit Improve Selection (`force`) may bypass
+/// this guard because that command intentionally requests a transformation.
+fn rewrite_is_grounded(input: &str, output: &str) -> bool {
+    let input_chars = input.chars().count();
+    let output_chars = output.chars().count();
+    if output_chars > input_chars.saturating_mul(2).saturating_add(32) {
+        return false;
+    }
+
+    let tokens = |value: &str| {
+        value
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|part| !part.is_empty())
+            .map(str::to_lowercase)
+            .collect::<Vec<_>>()
+    };
+    let input_tokens = tokens(input);
+    let output_tokens = tokens(output);
+    if input_tokens.is_empty() {
+        return output_tokens.is_empty();
+    }
+    if output_tokens.len() > input_tokens.len().saturating_add(4) {
+        return false;
+    }
+
+    // Automatic refinement is allowed to change punctuation/casing and add a
+    // tiny whitelist of harmless fillers, but never to change content order,
+    // morphology or logical glue. Even noun case can reverse subject/object,
+    // so automatic mode deliberately fails closed on every content-token edit.
+    // Prepositions and conjunctions are meaning-bearing ("в" != "из", "и" !=
+    // "или"), so only articles and polite fillers may appear/disappear.
+    let mut input_content = input_tokens
+        .iter()
+        .filter(|token| !rewrite_structural_token(token))
+        .collect::<Vec<_>>();
+    if input_content.is_empty() {
+        input_content = input_tokens.iter().collect();
+    }
+    let mut output_content = output_tokens
+        .iter()
+        .filter(|token| !rewrite_structural_token(token))
+        .collect::<Vec<_>>();
+    if output_content.is_empty() {
+        output_content = output_tokens.iter().collect();
+    }
+
+    input_content.len() == output_content.len()
+        && input_content
+            .iter()
+            .zip(output_content.iter())
+            .all(|(source, candidate)| source.as_str() == candidate.as_str())
+}
+
+fn rewrite_structural_token(token: &str) -> bool {
+    matches!(token, "пожалуйста" | "please" | "a" | "an" | "the")
+}
+
 fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (String, bool) {
     let RewriteRequest {
         actx,
@@ -5281,7 +5997,15 @@ fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (Stri
     for attempt in attempts {
         match attempt() {
             Ok(r) if !r.trim().is_empty() => {
-                return (postprocess::normalize_spaces(r.trim()), true)
+                let refined = postprocess::normalize_spaces(r.trim());
+                if force || rewrite_is_grounded(text, &refined) {
+                    return (refined, true);
+                }
+                log::warn!(
+                    "рерайт отклонён защитой от смыслового дрейфа: input_chars={} output_chars={}",
+                    text.chars().count(),
+                    refined.chars().count()
+                );
             }
             Ok(_) => {}
             Err(e) => log::warn!("рерайт недоступен: {e}; пробуем следующий fallback"),
@@ -5456,6 +6180,47 @@ mod smart_prompt_tests {
         assert!(payload.contains("Последние вставленные фрагменты"));
         assert!(payload.contains("[КАК ИСПОЛЬЗОВАТЬ ОКРУЖЕНИЕ]:"));
         assert!(payload.contains("[ДИКТОВКА]: наверное задержусь"));
+    }
+
+    #[test]
+    fn automatic_rewrite_grounding_rejects_phantom_content() {
+        assert!(rewrite_is_grounded(
+            "Отправь отчёт клиенту завтра утром",
+            "Отправь отчёт клиенту завтра утром."
+        ));
+        assert!(rewrite_is_grounded(
+            "Отправь отчёт",
+            "Пожалуйста, отправь отчёт."
+        ));
+        assert!(!rewrite_is_grounded(
+            "Отправь отчёт клиенту завтра утром",
+            "Сегодня прекрасная погода, поэтому предлагаю обсудить новую стратегию продаж."
+        ));
+        assert!(!rewrite_is_grounded(
+            "Привет",
+            "Конечно, вот подробный ответ с фактами, которых пользователь не произносил"
+        ));
+        assert!(!rewrite_is_grounded("Привет", "Сегодня отличная погода"));
+        assert!(!rewrite_is_grounded(
+            "удали файл",
+            "удали важный файл и перезагрузи сервер"
+        ));
+        for (input, output) in [
+            ("скопируй файл в архив", "скопируй файл из архива"),
+            ("удали файл и папку", "удали файл или папку"),
+            ("отправь файл", "отправь без файла"),
+            ("удали файл", "удари файл"),
+            ("открой порт", "открой торт"),
+            ("кот ест мышь", "мышь ест кот"),
+            ("Алиса любит Бориса", "Борис любит Алису"),
+            ("Алиса любит Бориса", "Алису любит Борис"),
+        ] {
+            assert!(
+                !rewrite_is_grounded(input, output),
+                "logic-changing rewrite passed: {input:?} -> {output:?}"
+            );
+        }
+        assert!(rewrite_is_grounded("Привет", "Привет!"));
     }
 
     #[test]
@@ -5657,58 +6422,93 @@ mod smart_prompt_tests {
     }
 }
 
-/// Монитор буфера обмена: если пользователь скопировал отредактированную версию
-/// последней вставки — выучить пословные исправления (распознано → правильно).
-/// Тикает ТОЛЬКО при включённой персонализации (P2-11): обучение выключено →
-/// буфер обмена вообще не опрашивается (ни лишнего CPU, ни чтения чужих копий).
-fn clipboard_monitor(ctx: EngineCtx) {
-    // Базовый снимок берём лениво — первый тик после включения персонализации
-    // лишь запоминает текущее содержимое, ничего не «выучивая» задним числом.
-    let mut last_seen: Option<String> = None;
-    loop {
-        std::thread::sleep(Duration::from_millis(1300));
-        if !ctx.settings.lock().personalize {
-            last_seen = None; // после повторного включения — свежий базовый снимок
-            std::thread::sleep(Duration::from_millis(1700)); // редкая проверка тоггла (~3 c)
-            continue;
+/// Close the privacy-scoped learning window and forget its in-memory field
+/// snapshot. No typed text is retained beyond this point.
+fn close_correction_capture(ctx: &EngineCtx) {
+    ctx.correction_capture_active
+        .store(false, Ordering::Release);
+    *ctx.last_inject.lock() = None;
+}
+
+/// The keyboard hook deliberately sends no key or character. It only marks the
+/// last injected field dirty; Accessibility/UIA supplies the resulting value
+/// after the user stops typing for a short debounce interval.
+fn note_manual_edit(ctx: &EngineCtx) {
+    if !ctx.correction_capture_active.load(Ordering::Acquire) {
+        return;
+    }
+    let now = Instant::now();
+    let mut slot = ctx.last_inject.lock();
+    let Some(last) = slot.as_mut() else {
+        ctx.correction_capture_active
+            .store(false, Ordering::Release);
+        return;
+    };
+    if now.saturating_duration_since(last.at) > TYPED_CORRECTION_WINDOW {
+        *slot = None;
+        ctx.correction_capture_active
+            .store(false, Ordering::Release);
+        return;
+    }
+    last.mark_manual_edit(now);
+}
+
+enum TypedLearningPoll {
+    Wait,
+    Close,
+    Learn(Vec<(String, String)>),
+}
+
+enum TypedLearningDecision {
+    Wait,
+    Stop,
+    Persist(Vec<(String, String)>),
+}
+
+/// Called while `last_inject` is locked. Consuming the slot and disabling the
+/// keyboard signal in this same critical section prevents a new ManualEdit
+/// epoch from slipping between a Learn decision and a later cleanup lock.
+fn consume_typed_learning_poll_locked(
+    slot: &mut Option<LastInject>,
+    capture_active: &AtomicBool,
+    poll: TypedLearningPoll,
+) -> TypedLearningDecision {
+    match poll {
+        TypedLearningPoll::Wait => TypedLearningDecision::Wait,
+        TypedLearningPoll::Close => {
+            *slot = None;
+            capture_active.store(false, Ordering::Release);
+            TypedLearningDecision::Stop
         }
-        // Пока инжектор печатает/работает с буфером — не лезем в clipboard
-        // (contention с arboard внутри вставки = подвисания и порча восстановления).
-        if inject::is_busy() {
-            continue;
-        }
-        let cur = match arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut c| c.get_text().ok())
-        {
-            Some(t) => t,
-            None => continue,
-        };
-        let Some(prev) = last_seen.replace(cur.clone()) else {
-            continue; // первый снимок после включения — только базовая точка
-        };
-        if cur == prev || cur.trim().is_empty() {
-            continue;
-        }
-        let injected = ctx.last_inject.lock().clone();
-        if let Some(inj) = injected {
-            if cur.trim() == inj.text.trim() {
-                continue; // это наш же текст — не учим
-            }
-            try_learn(&ctx, &inj, &cur);
+        TypedLearningPoll::Learn(pairs) => {
+            *slot = None;
+            capture_active.store(false, Ordering::Release);
+            TypedLearningDecision::Persist(pairs)
         }
     }
 }
 
-/// Выучить исправления из пары (вставлено → отредактировано пользователем).
-fn try_learn(ctx: &EngineCtx, injected: &LastInject, edited: &str) {
-    if injected.at.elapsed() > Duration::from_secs(10 * 60) {
+fn maybe_learn_typed_correction(ctx: &EngineCtx, current: &crate::app_context::AppContext) {
+    if !ctx.correction_capture_active.load(Ordering::Acquire) {
         return;
     }
-    let pairs = learned_correction_pairs(&injected.text, edited, injected.at.elapsed());
+    let now = Instant::now();
+    let decision = {
+        let mut slot = ctx.last_inject.lock();
+        let poll = match slot.as_mut() {
+            Some(last) => typed_learning_poll(last, current, now),
+            None => TypedLearningPoll::Close,
+        };
+        consume_typed_learning_poll_locked(&mut slot, ctx.correction_capture_active.as_ref(), poll)
+    };
+    let pairs = match decision {
+        TypedLearningDecision::Wait | TypedLearningDecision::Stop => return,
+        TypedLearningDecision::Persist(pairs) => pairs,
+    };
     if pairs.is_empty() {
-        return; // не похоже на правку (или идентично)
+        return;
     }
+
     let conn = ctx.db.lock();
     let mut learned = 0u32;
     for (wrong, right) in pairs {
@@ -5724,6 +6524,209 @@ fn try_learn(ctx: &EngineCtx, injected: &LastInject, edited: &str) {
     }
 }
 
+fn typed_learning_poll(
+    last: &mut LastInject,
+    current: &crate::app_context::AppContext,
+    now: Instant,
+) -> TypedLearningPoll {
+    let age = now.saturating_duration_since(last.at);
+    if age > TYPED_CORRECTION_WINDOW || !last.target_fp.matches(current) {
+        return TypedLearningPoll::Close;
+    }
+    let Some(manual_edit_at) = last.manual_edit_at else {
+        return TypedLearningPoll::Wait;
+    };
+    if now.saturating_duration_since(manual_edit_at) < TYPED_CORRECTION_DEBOUNCE {
+        return TypedLearningPoll::Wait;
+    }
+    if !field_metadata_allows_learning(&last.field_role, &last.field_subrole)
+        || !field_metadata_allows_learning(&current.field_role, &current.field_subrole)
+    {
+        return TypedLearningPoll::Close;
+    }
+
+    // An explicit field id is strongest. When a provider exposes no id, a
+    // non-empty pre-insert tail becomes the stable anchor; an initially empty,
+    // anonymous field is intentionally not learned from.
+    let same_known_field = !last.field_id.is_empty()
+        && !current.field_id.is_empty()
+        && last.field_id == current.field_id;
+    let anchored_anonymous_field = !last.field_before.is_empty();
+    if !same_known_field && !anchored_anonymous_field {
+        return TypedLearningPoll::Close;
+    }
+
+    let Some(observed) = current.focused_text_tail(TYPED_CORRECTION_FIELD_LIMIT) else {
+        return TypedLearningPoll::Close;
+    };
+    match last.pending_observation.as_mut() {
+        Some(pending) if pending.edit_epoch == manual_edit_at && pending.field_text == observed => {
+            if now.saturating_duration_since(pending.observed_at) < TYPED_CORRECTION_CONFIRM {
+                return TypedLearningPoll::Wait;
+            }
+        }
+        _ => {
+            last.pending_observation = Some(TypedCorrectionObservation {
+                field_text: observed,
+                edit_epoch: manual_edit_at,
+                observed_at: now,
+            });
+            return TypedLearningPoll::Wait;
+        }
+    }
+    let observed = last
+        .pending_observation
+        .take()
+        .map(|pending| pending.field_text)
+        .unwrap_or_default();
+    TypedLearningPoll::Learn(typed_correction_pairs_from_field(
+        &last.text,
+        &last.field_before,
+        &observed,
+        true,
+        age,
+    ))
+}
+
+fn field_metadata_allows_learning(role: &str, subrole: &str) -> bool {
+    let metadata = format!("{role} {subrole}").to_lowercase();
+    if ["password", "secure", "credential", "парол", "защищ"]
+        .iter()
+        .any(|marker| metadata.contains(marker))
+    {
+        return false;
+    }
+    ["text", "edit", "document"]
+        .iter()
+        .any(|marker| metadata.contains(marker))
+}
+
+fn compact_learning_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn typed_correction_pairs_from_field(
+    injected: &str,
+    field_before: &str,
+    observed_field: &str,
+    same_target: bool,
+    age: Duration,
+) -> Vec<(String, String)> {
+    if !same_target || age > TYPED_CORRECTION_WINDOW {
+        return Vec::new();
+    }
+    let Some(edited) = edited_inserted_segment(field_before, observed_field) else {
+        return Vec::new();
+    };
+    if contains_likely_secret(injected) || contains_likely_secret(&edited) {
+        return Vec::new();
+    }
+    learned_correction_pairs(injected, &edited, age)
+}
+
+fn edited_inserted_segment(field_before: &str, observed_field: &str) -> Option<String> {
+    let before = compact_learning_text(field_before);
+    let observed = compact_learning_text(observed_field);
+    if observed.is_empty() {
+        return None;
+    }
+    if before.is_empty() {
+        return Some(observed);
+    }
+    if let Some(rest) = observed.strip_prefix(&before) {
+        let rest = rest.trim();
+        return (!rest.is_empty()).then(|| rest.to_string());
+    }
+
+    // AX providers commonly expose the whole field, so dictation inserted at
+    // a caret in the middle appears between an unchanged prefix and suffix.
+    // Extract only a strongly two-sided region; weak/ambiguous anchors fail
+    // closed and cannot create a global correction rule.
+    if let Some(middle) = middle_inserted_segment(&before, &observed) {
+        return Some(middle);
+    }
+
+    // Both detector implementations return a bounded tail. A long pre-existing
+    // document may therefore lose its beginning after insertion; match only a
+    // sufficiently long suffix anchor and reject the field if it disappeared.
+    let anchor: String = before
+        .chars()
+        .rev()
+        .take(96)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect();
+    if anchor.chars().count() < 12 {
+        return None;
+    }
+    let index = observed.rfind(&anchor)?;
+    let rest = observed[index + anchor.len()..].trim();
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+fn middle_inserted_segment(before: &str, observed: &str) -> Option<String> {
+    let before_chars = before.chars().collect::<Vec<_>>();
+    let observed_chars = observed.chars().collect::<Vec<_>>();
+    let mut prefix = 0usize;
+    while prefix < before_chars.len()
+        && prefix < observed_chars.len()
+        && before_chars[prefix] == observed_chars[prefix]
+    {
+        prefix += 1;
+    }
+
+    let mut suffix = 0usize;
+    while suffix < before_chars.len().saturating_sub(prefix)
+        && suffix < observed_chars.len().saturating_sub(prefix)
+        && before_chars[before_chars.len() - 1 - suffix]
+            == observed_chars[observed_chars.len() - 1 - suffix]
+    {
+        suffix += 1;
+    }
+    if prefix == 0 || suffix == 0 {
+        return None;
+    }
+
+    let left_strength = before_chars[..prefix]
+        .iter()
+        .filter(|ch| ch.is_alphanumeric())
+        .count();
+    let right_strength = before_chars[before_chars.len() - suffix..]
+        .iter()
+        .filter(|ch| ch.is_alphanumeric())
+        .count();
+    if left_strength < 3 || right_strength < 3 || left_strength + right_strength < 8 {
+        return None;
+    }
+
+    let middle = observed_chars[prefix..observed_chars.len() - suffix]
+        .iter()
+        .collect::<String>();
+    let middle = middle.trim();
+    (!middle.is_empty()).then(|| middle.to_string())
+}
+
+fn contains_likely_secret(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if ["-----begin ", "ghp_", "github_pat_", "sk-", "eyj", "aiza"]
+        .iter()
+        .any(|prefix| lower.contains(prefix))
+    {
+        return true;
+    }
+    value.split_whitespace().any(|token| {
+        let compact: String = token
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect();
+        let has_letter = compact.chars().any(|c| c.is_ascii_alphabetic());
+        let has_digit = compact.chars().any(|c| c.is_ascii_digit());
+        let digit_count = compact.chars().filter(|c| c.is_ascii_digit()).count();
+        (compact.len() >= 20 && has_letter && has_digit) || (13..=19).contains(&digit_count)
+    })
+}
+
 #[derive(Clone, Debug)]
 struct LearnToken {
     raw: String,
@@ -5731,33 +6734,83 @@ struct LearnToken {
 }
 
 fn learned_correction_pairs(injected: &str, edited: &str, age: Duration) -> Vec<(String, String)> {
+    if age > TYPED_CORRECTION_WINDOW {
+        return Vec::new();
+    }
     let wrong = learning_tokens(injected);
     let right = learning_tokens(edited);
-    if wrong.is_empty() || right.is_empty() || token_norms_equal(&wrong, &right) {
+    if wrong.is_empty() || right.is_empty() {
         return Vec::new();
+    }
+    if token_norms_equal(&wrong, &right) {
+        let pairs = wrong
+            .iter()
+            .zip(&right)
+            .filter(|(before, after)| before.raw != after.raw)
+            .map(|(before, after)| (before.raw.clone(), after.raw.clone()))
+            .collect();
+        return dedup_learned_pairs(pairs);
     }
     if wrong.len() > 80 || right.len() > 80 {
         return Vec::new();
     }
 
     let anchors = lcs_token_anchors(&wrong, &right);
+    if !correction_edit_is_related(&wrong, &right, &anchors) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     if anchors.is_empty() {
-        push_learned_span(&mut out, &wrong, &right, false, age);
+        push_learned_span(&mut out, &wrong, &right, SpanBounds::None, age);
         return dedup_learned_pairs(out);
     }
 
     let mut prev_w = 0usize;
     let mut prev_r = 0usize;
+    let mut has_left_anchor = false;
     for (wi, ri) in anchors
         .into_iter()
         .chain(std::iter::once((wrong.len(), right.len())))
     {
-        push_learned_span(&mut out, &wrong[prev_w..wi], &right[prev_r..ri], true, age);
+        let has_right_anchor = wi < wrong.len() && ri < right.len();
+        let bounds = match (has_left_anchor, has_right_anchor) {
+            (true, true) => SpanBounds::Both,
+            (true, false) | (false, true) => SpanBounds::OneSided,
+            (false, false) => SpanBounds::None,
+        };
+        push_learned_span(
+            &mut out,
+            &wrong[prev_w..wi],
+            &right[prev_r..ri],
+            bounds,
+            age,
+        );
         prev_w = wi.saturating_add(1);
         prev_r = ri.saturating_add(1);
+        has_left_anchor |= has_right_anchor;
     }
     dedup_learned_pairs(out)
+}
+
+fn correction_edit_is_related(
+    wrong: &[LearnToken],
+    right: &[LearnToken],
+    anchors: &[(usize, usize)],
+) -> bool {
+    let min_tokens = wrong.len().min(right.len());
+    let max_tokens = wrong.len().max(right.len());
+    if min_tokens == 0
+        || max_tokens.saturating_sub(min_tokens) > 2
+        || max_tokens > min_tokens.saturating_mul(2).saturating_add(1)
+    {
+        return false;
+    }
+    let similarity = correction_similarity(&join_learn_tokens(wrong), &join_learn_tokens(right));
+    if anchors.is_empty() {
+        return max_tokens <= 6 && similarity >= 0.30;
+    }
+    let anchor_ratio = anchors.len() as f32 / min_tokens as f32;
+    anchor_ratio >= 0.40 || similarity >= 0.35
 }
 
 fn learning_tokens(text: &str) -> Vec<LearnToken> {
@@ -5810,29 +6863,47 @@ fn lcs_token_anchors(a: &[LearnToken], b: &[LearnToken]) -> Vec<(usize, usize)> 
     anchors
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpanBounds {
+    None,
+    OneSided,
+    Both,
+}
+
 fn push_learned_span(
     out: &mut Vec<(String, String)>,
     wrong: &[LearnToken],
     right: &[LearnToken],
-    anchored: bool,
+    bounds: SpanBounds,
     age: Duration,
 ) {
-    if wrong.is_empty() || right.is_empty() {
+    // Accessibility APIs can return only the text before the caret.  In that
+    // case a corrected final token looks like a many-to-one replacement that
+    // also swallowed the (unobserved) suffix.  Learn only replacement spans
+    // with the same token count: this deliberately fails closed instead of
+    // teaching a destructive rule from a truncated field snapshot.
+    if wrong.is_empty() || right.is_empty() || wrong.len() != right.len() {
         return;
     }
+    // A multi-token edit with an unchanged anchor on only one side is
+    // indistinguishable from a before-caret snapshot that silently omitted
+    // the rest of the sentence. Whole-utterance corrections (no anchors),
+    // single-word edits, and phrases bounded on both sides remain learnable.
+    if bounds == SpanBounds::OneSided && wrong.len() > 1 {
+        return;
+    }
+    let anchored = bounds != SpanBounds::None;
     if span_pair_valid(wrong, right, anchored, age) {
         out.push((join_learn_tokens(wrong), join_learn_tokens(right)));
     }
-    if wrong.len() == right.len() {
-        for (w, r) in wrong.iter().zip(right) {
-            if span_pair_valid(
-                std::slice::from_ref(w),
-                std::slice::from_ref(r),
-                anchored,
-                age,
-            ) {
-                out.push((w.raw.clone(), r.raw.clone()));
-            }
+    for (w, r) in wrong.iter().zip(right) {
+        if span_pair_valid(
+            std::slice::from_ref(w),
+            std::slice::from_ref(r),
+            anchored,
+            age,
+        ) {
+            out.push((w.raw.clone(), r.raw.clone()));
         }
     }
 }
@@ -5854,7 +6925,18 @@ fn span_pair_valid(
         return false;
     }
     if anchored {
-        return true;
+        // Stable surrounding words localize the edit, but a completely
+        // unrelated replacement is usually a content rewrite, not an ASR
+        // correction. Some Windows TextPattern providers expose only the text
+        // before the caret: after a mid-sentence edit, the unseen original
+        // suffix must never be absorbed into a learned phrase. Requiring
+        // one-to-one, individually related tokens keeps the real correction
+        // while dropping that truncated suffix.
+        return wrong.len() == right.len()
+            && wrong
+                .iter()
+                .zip(right)
+                .all(|(before, after)| correction_similarity(&before.raw, &after.raw) >= 0.20);
     }
     if age > Duration::from_secs(3 * 60) {
         return false;
@@ -5961,6 +7043,44 @@ mod correction_learning_tests {
         pairs.iter().any(|(w, r)| w == wrong && r == right)
     }
 
+    fn field_context(
+        exe: &str,
+        window_id: &str,
+        field_id: &str,
+        text: &str,
+    ) -> crate::app_context::AppContext {
+        crate::app_context::AppContext {
+            exe: exe.into(),
+            title: "Editor".into(),
+            window_id: window_id.into(),
+            category: "work".into(),
+            field_role: "UIAEdit".into(),
+            field_subrole: "textpattern".into(),
+            field_id: field_id.into(),
+            field_text: text.into(),
+            selected_text: String::new(),
+        }
+    }
+
+    fn last_inject(
+        context: &crate::app_context::AppContext,
+        text: &str,
+        before: &str,
+        at: Instant,
+    ) -> LastInject {
+        LastInject {
+            text: text.into(),
+            at,
+            target_fp: context.target_fingerprint(),
+            field_id: context.field_id.clone(),
+            field_role: context.field_role.clone(),
+            field_subrole: context.field_subrole.clone(),
+            field_before: before.into(),
+            manual_edit_at: Some(at + Duration::from_millis(100)),
+            pending_observation: None,
+        }
+    }
+
     #[test]
     fn learns_whole_brand_phrase_without_shared_tokens() {
         let pairs = learned_correction_pairs("Виспа Фолл", "Wispr Flow", Duration::from_secs(30));
@@ -5987,16 +7107,269 @@ mod correction_learning_tests {
     }
 
     #[test]
-    fn rejects_unrelated_copied_text() {
+    fn ordinary_backspace_and_typed_replacement_learns_without_clipboard() {
+        let at = Instant::now();
+        let start = field_context("editor.exe", "window-1", "field-1", "");
+        let mut last = last_inject(&start, "виспа", "", at);
+        // This is the Accessibility value after ordinary Backspace + typing;
+        // no clipboard value participates in the decision.
+        let current = field_context("editor.exe", "window-1", "field-1", "Wispr");
+
+        assert!(matches!(
+            typed_learning_poll(&mut last, &current, at + Duration::from_secs(1)),
+            TypedLearningPoll::Wait
+        ));
+        let TypedLearningPoll::Learn(pairs) =
+            typed_learning_poll(&mut last, &current, at + Duration::from_millis(1_400))
+        else {
+            panic!("stable typed edit must be evaluated");
+        };
+        assert!(has_pair(&pairs, "виспа", "Wispr"));
+    }
+
+    #[test]
+    fn partial_word_snapshot_never_learns_before_the_final_edit_epoch() {
+        let at = Instant::now();
+        let start = field_context("editor.exe", "window-1", "field-1", "");
+        let mut last = last_inject(&start, "cat", "", at);
+        let partial = field_context("editor.exe", "window-1", "field-1", "ca");
+
+        // The first post-debounce snapshot is only a candidate; it cannot
+        // persist cat -> ca on its own.
+        assert!(matches!(
+            typed_learning_poll(&mut last, &partial, at + Duration::from_secs(1)),
+            TypedLearningPoll::Wait
+        ));
+
+        // The final `r` is a new typing epoch and invalidates the partial
+        // candidate before the next Accessibility poll.
+        last.mark_manual_edit(at + Duration::from_millis(1_100));
+        let final_text = field_context("editor.exe", "window-1", "field-1", "car");
+        assert!(matches!(
+            typed_learning_poll(&mut last, &final_text, at + Duration::from_millis(1_900)),
+            TypedLearningPoll::Wait
+        ));
+        let TypedLearningPoll::Learn(pairs) =
+            typed_learning_poll(&mut last, &final_text, at + Duration::from_millis(2_300))
+        else {
+            panic!("two stable final snapshots must be learned");
+        };
+        assert!(has_pair(&pairs, "cat", "car"), "{pairs:?}");
+        assert!(!has_pair(&pairs, "cat", "ca"), "{pairs:?}");
+    }
+
+    #[test]
+    fn terminal_learning_poll_consumes_capture_in_one_locked_step() {
+        let at = Instant::now();
+        let start = field_context("editor.exe", "window-1", "field-1", "");
+        let active = AtomicBool::new(true);
+        let mut slot = Some(last_inject(&start, "cat", "", at));
+
+        assert!(matches!(
+            consume_typed_learning_poll_locked(&mut slot, &active, TypedLearningPoll::Wait),
+            TypedLearningDecision::Wait
+        ));
+        assert!(slot.is_some());
+        assert!(active.load(Ordering::Acquire));
+
+        let decision = consume_typed_learning_poll_locked(
+            &mut slot,
+            &active,
+            TypedLearningPoll::Learn(vec![("cat".into(), "car".into())]),
+        );
+        let TypedLearningDecision::Persist(pairs) = decision else {
+            panic!("learn must return the pairs for persistence");
+        };
+        assert!(has_pair(&pairs, "cat", "car"));
+        assert!(slot.is_none());
+        assert!(!active.load(Ordering::Acquire));
+
+        active.store(true, Ordering::Release);
+        slot = Some(last_inject(&start, "cat", "", at));
+        assert!(matches!(
+            consume_typed_learning_poll_locked(&mut slot, &active, TypedLearningPoll::Close),
+            TypedLearningDecision::Stop
+        ));
+        assert!(slot.is_none());
+        assert!(!active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn live_reconciled_final_uses_pre_dictation_prefix_for_phrase_edit() {
+        let pairs = typed_correction_pairs_from_field(
+            "открой Виспа Фолл пожалуйста",
+            "Черновик: ",
+            "Черновик: открой Wispr Flow пожалуйста",
+            true,
+            Duration::from_secs(20),
+        );
+        assert!(has_pair(&pairs, "Виспа Фолл", "Wispr Flow"));
+    }
+
+    #[test]
+    fn correction_inserted_at_middle_caret_uses_unchanged_prefix_and_suffix() {
+        let pairs = typed_correction_pairs_from_field(
+            "cat",
+            "hello  tail",
+            "hello car tail",
+            true,
+            Duration::from_secs(10),
+        );
+        assert!(has_pair(&pairs, "cat", "car"), "{pairs:?}");
+    }
+
+    #[test]
+    fn case_only_brand_edit_is_learned() {
+        let pairs = typed_correction_pairs_from_field(
+            "wispr flow",
+            "",
+            "Wispr Flow",
+            true,
+            Duration::from_secs(10),
+        );
+        assert!(has_pair(&pairs, "wispr", "Wispr"));
+        assert!(has_pair(&pairs, "flow", "Flow"));
+    }
+
+    #[test]
+    fn changed_window_or_field_closes_learning_window() {
+        let at = Instant::now();
+        let start = field_context("editor.exe", "window-1", "field-1", "");
+        let mut last = last_inject(&start, "виспа", "", at);
+        let other_window = field_context("browser.exe", "window-2", "field-1", "Wispr");
+        let other_field = field_context("editor.exe", "window-1", "field-2", "Wispr");
+
+        assert!(matches!(
+            typed_learning_poll(&mut last, &other_window, at + Duration::from_secs(1)),
+            TypedLearningPoll::Close
+        ));
+        assert!(matches!(
+            typed_learning_poll(&mut last, &other_field, at + Duration::from_secs(1)),
+            TypedLearningPoll::Close
+        ));
+    }
+
+    #[test]
+    fn secure_field_closes_without_reading_or_learning() {
+        let at = Instant::now();
+        let start = field_context("browser.exe", "window-1", "field-1", "");
+        let mut last = last_inject(&start, "секрет", "", at);
+        let mut secure = field_context("browser.exe", "window-1", "field-1", "do-not-store");
+        secure.field_subrole = "password secure credential".into();
+
+        assert!(matches!(
+            typed_learning_poll(&mut last, &secure, at + Duration::from_secs(1)),
+            TypedLearningPoll::Close
+        ));
+    }
+
+    #[test]
+    fn rejects_unrelated_new_text() {
         let pairs = learned_correction_pairs("привет", "password", Duration::from_secs(15));
+
+        assert!(pairs.is_empty(), "{pairs:?}");
+    }
+
+    #[test]
+    fn rejects_stale_typed_edit() {
+        let pairs = learned_correction_pairs("Виспа Фолл", "Wispr Flow", Duration::from_secs(121));
 
         assert!(pairs.is_empty());
     }
 
     #[test]
-    fn rejects_stale_direct_clipboard_change_without_anchors() {
-        let pairs = learned_correction_pairs("Виспа Фолл", "Wispr Flow", Duration::from_secs(240));
+    fn plain_append_is_not_mistaken_for_phrase_correction() {
+        let pairs = typed_correction_pairs_from_field(
+            "Готово",
+            "",
+            "Готово, отправь дальше",
+            true,
+            Duration::from_secs(10),
+        );
+        assert!(pairs.is_empty());
+    }
 
+    #[test]
+    fn truncated_before_caret_snapshot_is_not_learned_as_a_phrase_replacement() {
+        let pairs = typed_correction_pairs_from_field(
+            "открой виспа фолл пожалуйста сейчас",
+            "",
+            "открой Wispr",
+            true,
+            Duration::from_secs(10),
+        );
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn one_token_truncated_before_caret_snapshot_is_not_overlearned() {
+        let pairs = typed_correction_pairs_from_field(
+            "пожалуйста открой виспа фолл сейчас",
+            "",
+            "пожалуйста открой Wispr Flow",
+            true,
+            Duration::from_secs(10),
+        );
+        assert!(pairs.is_empty(), "{pairs:?}");
+    }
+
+    #[test]
+    fn balanced_before_caret_snapshot_is_not_overlearned() {
+        let pairs = typed_correction_pairs_from_field(
+            "пожалуйста открой виспа сейчас",
+            "",
+            "пожалуйста открой Wispr Flow",
+            true,
+            Duration::from_secs(10),
+        );
+        assert!(pairs.is_empty(), "{pairs:?}");
+    }
+
+    #[test]
+    fn one_sided_single_word_correction_remains_learnable() {
+        let pairs = typed_correction_pairs_from_field(
+            "открой виспа",
+            "",
+            "открой Wispr",
+            true,
+            Duration::from_secs(10),
+        );
+        assert!(has_pair(&pairs, "виспа", "Wispr"), "{pairs:?}");
+    }
+
+    #[test]
+    fn corrected_middle_word_with_hidden_suffix_is_not_overlearned() {
+        let pairs = typed_correction_pairs_from_field(
+            "hello cat tail",
+            "",
+            "hello car",
+            true,
+            Duration::from_secs(10),
+        );
+        assert!(pairs.is_empty(), "{pairs:?}");
+    }
+
+    #[test]
+    fn unchanged_field_is_a_noop() {
+        let pairs = typed_correction_pairs_from_field(
+            "Wispr Flow",
+            "Черновик: ",
+            "Черновик: Wispr Flow",
+            true,
+            Duration::from_secs(10),
+        );
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn likely_secret_tokens_are_never_learned() {
+        let pairs = typed_correction_pairs_from_field(
+            "токен",
+            "",
+            "ghp_1234567890abcdefghijklmnop",
+            true,
+            Duration::from_secs(10),
+        );
         assert!(pairs.is_empty());
     }
 }

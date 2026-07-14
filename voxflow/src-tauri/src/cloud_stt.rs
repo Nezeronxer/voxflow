@@ -17,6 +17,9 @@ use crate::settings::Settings;
 /// A dead route/proxy must fail over quickly instead of consuming the whole
 /// transcription deadline before local STT can start.
 const CONNECT_TIMEOUT_SECS: &str = "3";
+/// Ниже этого порога Deepgram чаще возвращает шумовую догадку. Пустой
+/// результат позволит общему пайплайну безопасно уйти в local fallback.
+const MIN_DEEPGRAM_CONFIDENCE: f64 = 0.45;
 /// Максимальный размер ASR-prompt для OpenAI-compatible STT.
 ///
 /// Это не rewrite-инструкция, а короткий bias-подсказчик для имён, терминов,
@@ -141,7 +144,12 @@ fn transcribe_openai_compat_inner(
         cmd.arg("--form-string").arg(format!("prompt={prompt}"));
     }
 
-    cmd.arg("-F").arg("response_format=json");
+    // Явный нуль не даёт compatible-провайдеру поднимать температуру и
+    // «додумывать» текст на шумном конце фразы.
+    cmd.arg("-F")
+        .arg("temperature=0")
+        .arg("-F")
+        .arg("response_format=json");
     cmd.arg(&url);
 
     // Ключ — через stdin-конфиг curl (-K -), НЕ в argv: командная строка
@@ -171,7 +179,7 @@ fn transcribe_openai_compat_inner(
         .get("text")
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow!("openai_compat STT: нет поля text"))?;
-    Ok(text.trim().to_string())
+    Ok(crate::asr::sanitize_transcript_text(text))
 }
 
 /// Deepgram: бинарный POST на `{base}/v1/listen?...`. Ответ — JSON, транскрипт
@@ -221,6 +229,10 @@ fn transcribe_deepgram_inner(s: &Settings, wav: &Path, profile: RequestProfile) 
     }
 
     let body = String::from_utf8_lossy(&out.stdout);
+    parse_deepgram_response(&body)
+}
+
+fn parse_deepgram_response(body: &str) -> Result<String> {
     let v: serde_json::Value =
         serde_json::from_str(body.trim()).map_err(|_| anyhow!("deepgram STT: ответ не JSON"))?;
 
@@ -232,17 +244,31 @@ fn transcribe_deepgram_inner(s: &Settings, wav: &Path, profile: RequestProfile) 
         return Err(anyhow!("deepgram STT: {msg}"));
     }
 
-    // Безопасная навигация по results.channels[0].alternatives[0].transcript.
-    let transcript = v
+    // Безопасная навигация по results.channels[0].alternatives[0].
+    let alternative = v
         .get("results")
         .and_then(|r| r.get("channels"))
         .and_then(|c| c.get(0))
         .and_then(|ch| ch.get("alternatives"))
         .and_then(|a| a.get(0))
-        .and_then(|alt| alt.get("transcript"))
+        .ok_or_else(|| anyhow!("deepgram STT: нет альтернативы в ответе"))?;
+    let transcript = alternative
+        .get("transcript")
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow!("deepgram STT: нет транскрипта в ответе"))?;
-    Ok(transcript.trim().to_string())
+    let text = crate::asr::sanitize_transcript_text(transcript);
+    if text.is_empty() {
+        return Ok(text);
+    }
+    if alternative
+        .get("confidence")
+        .and_then(|c| c.as_f64())
+        .is_some_and(|confidence| confidence < MIN_DEEPGRAM_CONFIDENCE)
+    {
+        log::info!("deepgram STT: низкая confidence, текст отклонён");
+        return Ok(String::new());
+    }
+    Ok(text)
 }
 
 fn normalized_cloud_language(language: &str) -> Option<&str> {
@@ -310,5 +336,32 @@ mod tests {
         assert_eq!(request_timeout_for_audio(30, RequestProfile::Final), 60);
         assert_eq!(request_timeout_for_audio(600, RequestProfile::Final), 60);
         assert_eq!(request_timeout_for_audio(600, RequestProfile::LiveDraft), 8);
+    }
+
+    #[test]
+    fn deepgram_low_confidence_becomes_empty_for_local_fallback() {
+        let response = serde_json::json!({
+            "results": {"channels": [{"alternatives": [{
+                "transcript": "Yeah",
+                "confidence": 0.12
+            }]}]}
+        })
+        .to_string();
+        assert!(parse_deepgram_response(&response).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deepgram_confident_text_is_normalized_without_rewrite() {
+        let response = serde_json::json!({
+            "results": {"channels": [{"alternatives": [{
+                "transcript": "  Привет,   VoxFlow!  ",
+                "confidence": 0.94
+            }]}]}
+        })
+        .to_string();
+        assert_eq!(
+            parse_deepgram_response(&response).unwrap(),
+            "Привет, VoxFlow!"
+        );
     }
 }

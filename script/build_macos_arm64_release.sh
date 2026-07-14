@@ -6,10 +6,13 @@ set -euo pipefail
 # The secret-free path uses Tauri's complete ad-hoc bundle signing (`-`). This
 # is not a trusted Developer ID signature, but it binds Info.plist/resources and
 # prevents the linker-only signature from becoming an invalid distributed app.
-# A local machine may opt into Developer ID signing by setting
+# A local machine or CI runner may opt into Developer ID signing by setting
 # VOXFLOW_SIGNING_IDENTITY to an identity already installed in the current
-# keychain. This script never imports certificates or handles notarization
-# credentials.
+# keychain. When either complete Apple ID or App Store Connect API credentials
+# are also present, Tauri notarizes/staples the app and this builder does the
+# same for the final DMG. Certificate import remains the caller's responsibility
+# so this script never writes secret material to the repository or a persistent
+# keychain.
 
 readonly TARGET_TRIPLE="aarch64-apple-darwin"
 readonly TARGET_ARCH="arm64"
@@ -35,6 +38,7 @@ readonly CMAKE_URL="https://github.com/Kitware/CMake/releases/download/v${CMAKE_
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$ROOT_DIR/voxflow"
 TAURI_DIR="$APP_DIR/src-tauri"
+MACOS_TAURI_CONFIG="$TAURI_DIR/tauri.macos.conf.json"
 RESOURCES_DIR="$TAURI_DIR/resources"
 ARM_RUNTIME_DIR="$RESOURCES_DIR/whisper-darwin-arm64"
 VAD_DIR="$RESOURCES_DIR/vad"
@@ -43,6 +47,9 @@ APP_BUNDLE="$TARGET_RELEASE_DIR/bundle/macos/VoxFlow.app"
 OUTPUT_ROOT="${VOXFLOW_RELEASE_DIR:-$APP_DIR/release/macos}"
 RELEASE_TAG=""
 RUNTIME_ONLY=0
+SIGNING_LABEL=""
+NOTARIZATION_AUTH="none"
+NOTARIZED="false"
 
 TEMP_ROOT=""
 MOUNT_POINT=""
@@ -55,6 +62,11 @@ Environment:
   VOXFLOW_RELEASE_DIR         Output parent (default: voxflow/release/macos)
   VOXFLOW_SIGNING_IDENTITY    Optional installed Developer ID identity.
                               Omit for the CI-default complete ad-hoc seal.
+  APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
+                              Optional complete Apple ID notarization tuple.
+  APPLE_API_ISSUER, APPLE_API_KEY, APPLE_API_KEY_PATH
+                              Optional complete App Store Connect API tuple.
+                              Never configure both notarization methods.
   VOXFLOW_XCODE_VERSION       Optional exact Xcode version gate (for CI).
   VOXFLOW_XCODE_BUILD         Optional exact Xcode build gate (for CI).
 EOF
@@ -331,21 +343,112 @@ rust_gates() {
 }
 
 configure_signing() {
-  SIGNING_LABEL="adhoc"
-  export APPLE_SIGNING_IDENTITY="-"
-  # Notarization is deliberately out of scope for this secret-free workflow.
-  # Clear ambient credentials so a local signed run cannot be mislabeled.
-  unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
-  unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
-  unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+  local apple_id_values=0
+  local api_values=0
+  local variable
+  local identity_listing
 
-  if [[ -n "${VOXFLOW_SIGNING_IDENTITY:-}" && "$VOXFLOW_SIGNING_IDENTITY" != "-" ]]; then
-    /usr/bin/security find-identity -v -p codesigning \
-      | grep -F -- "$VOXFLOW_SIGNING_IDENTITY" >/dev/null \
-      || die "requested signing identity is not installed: $VOXFLOW_SIGNING_IDENTITY"
-    export APPLE_SIGNING_IDENTITY="$VOXFLOW_SIGNING_IDENTITY"
-    SIGNING_LABEL="signed-unnotarized"
+  SIGNING_LABEL="adhoc"
+  NOTARIZATION_AUTH="none"
+  NOTARIZED="false"
+  export APPLE_SIGNING_IDENTITY="-"
+  # The release builder consumes only an identity already imported into a
+  # keychain. Avoid forwarding certificate material to child processes.
+  unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD
+
+  for variable in APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
+    if [[ -n "${!variable:-}" ]]; then
+      apple_id_values=$((apple_id_values + 1))
+    fi
+  done
+  for variable in APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH; do
+    if [[ -n "${!variable:-}" ]]; then
+      api_values=$((api_values + 1))
+    fi
+  done
+
+  if [[ "$apple_id_values" -gt 0 && "$apple_id_values" -lt 3 ]]; then
+    die "partial Apple ID notarization credentials; set APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID together"
   fi
+  if [[ "$api_values" -gt 0 && "$api_values" -lt 3 ]]; then
+    die "partial App Store Connect notarization credentials; set APPLE_API_ISSUER, APPLE_API_KEY, and APPLE_API_KEY_PATH together"
+  fi
+  if [[ "$apple_id_values" == 3 && "$api_values" == 3 ]]; then
+    die "both notarization authentication methods are configured; choose exactly one"
+  fi
+
+  if [[ -z "${VOXFLOW_SIGNING_IDENTITY:-}" || "$VOXFLOW_SIGNING_IDENTITY" == "-" ]]; then
+    if [[ "$apple_id_values" -gt 0 || "$api_values" -gt 0 ]]; then
+      die "notarization credentials require an installed Developer ID Application identity"
+    fi
+    # Ambient credentials must never turn a secret-free build into a mislabeled
+    # or partially notarized artifact.
+    unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
+    unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+    return
+  fi
+
+  identity_listing="$(/usr/bin/security find-identity -v -p codesigning)"
+  grep -F -- "$VOXFLOW_SIGNING_IDENTITY" <<< "$identity_listing" >/dev/null \
+    || die "requested signing identity is not installed: $VOXFLOW_SIGNING_IDENTITY"
+  export APPLE_SIGNING_IDENTITY="$VOXFLOW_SIGNING_IDENTITY"
+  SIGNING_LABEL="signed-unnotarized"
+
+  if [[ "$apple_id_values" == 3 ]]; then
+    NOTARIZATION_AUTH="apple-id"
+    NOTARIZED="true"
+    SIGNING_LABEL="developer-id-notarized"
+    unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
+  elif [[ "$api_values" == 3 ]]; then
+    [[ -f "$APPLE_API_KEY_PATH" && -r "$APPLE_API_KEY_PATH" ]] \
+      || die "APPLE_API_KEY_PATH is not a readable private key file"
+    NOTARIZATION_AUTH="app-store-connect-api"
+    NOTARIZED="true"
+    SIGNING_LABEL="developer-id-notarized"
+    unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+  else
+    unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
+    unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+  fi
+
+  if [[ "$NOTARIZED" == "true" ]]; then
+    grep -F -- "$VOXFLOW_SIGNING_IDENTITY" <<< "$identity_listing" \
+      | grep -F 'Developer ID Application:' >/dev/null \
+      || die "notarized distribution requires a Developer ID Application identity"
+  fi
+}
+
+validate_macos_bundle_config() {
+  [[ -s "$MACOS_TAURI_CONFIG" ]] \
+    || die "macOS Tauri config is missing: $MACOS_TAURI_CONFIG"
+  python3 - "$MACOS_TAURI_CONFIG" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as stream:
+    config = json.load(stream)
+
+bundle = config.get("bundle", {})
+targets = set(bundle.get("targets", []))
+resources = set(bundle.get("resources", []))
+expected_targets = {"app", "dmg"}
+expected_resources = {
+    "resources/whisper-darwin-arm64/*",
+    "resources/vad/*",
+}
+
+if targets != expected_targets:
+    raise SystemExit(
+        f"macOS bundle targets must be exactly {sorted(expected_targets)}, "
+        f"got {sorted(targets)}"
+    )
+if resources != expected_resources:
+    raise SystemExit(
+        f"macOS bundle resources must be exactly {sorted(expected_resources)}, "
+        f"got {sorted(resources)}"
+    )
+PY
 }
 
 sign_runtime_binaries() {
@@ -457,6 +560,88 @@ PY
   fi
 }
 
+validate_notarization_state() {
+  local app="$1"
+  local dmg="$2"
+
+  [[ "$NOTARIZED" == "true" ]] || return
+  /usr/bin/xcrun stapler validate "$app"
+  /usr/bin/xcrun stapler validate "$dmg"
+  /usr/sbin/spctl --assess --verbose=4 --type execute "$app"
+  /usr/sbin/spctl --assess --verbose=4 --type open \
+    --context context:primary-signature "$dmg"
+}
+
+notarize_dmg() {
+  local dmg="$1"
+  local response="$TEMP_ROOT/notarytool-dmg-response.json"
+  local log_file="$TEMP_ROOT/notarytool-dmg-log.json"
+  local submission_id
+  local status
+  local -a auth_args
+
+  [[ "$NOTARIZED" == "true" ]] || return
+  case "$NOTARIZATION_AUTH" in
+    apple-id)
+      auth_args=(
+        --apple-id "$APPLE_ID"
+        --password "$APPLE_PASSWORD"
+        --team-id "$APPLE_TEAM_ID"
+      )
+      ;;
+    app-store-connect-api)
+      auth_args=(
+        --key "$APPLE_API_KEY_PATH"
+        --key-id "$APPLE_API_KEY"
+        --issuer "$APPLE_API_ISSUER"
+      )
+      ;;
+    *)
+      die "missing notarization authentication mode for DMG"
+      ;;
+  esac
+
+  # Tauri 2.11 notarizes and staples the app bundle, then signs the generated
+  # DMG. Submit the final disk image separately so both distributed formats
+  # carry an offline-verifiable Apple ticket.
+  /usr/bin/codesign --verify --strict --verbose=4 "$dmg"
+  if ! /usr/bin/xcrun notarytool submit "$dmg" \
+    "${auth_args[@]}" --wait --output-format json > "$response"; then
+    /bin/cat "$response" >&2 || true
+    die "DMG notarization submission failed"
+  fi
+
+  submission_id="$(python3 - "$response" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("id", ""))
+PY
+)"
+  status="$(python3 - "$response" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    print(json.load(stream).get("status", ""))
+PY
+)"
+  [[ -n "$submission_id" ]] || die "notarytool returned no DMG submission id"
+
+  # Apple recommends reviewing the log even for accepted submissions. Keep it
+  # in the ephemeral build directory for diagnostics without publishing it.
+  /usr/bin/xcrun notarytool log "$submission_id" \
+    "${auth_args[@]}" "$log_file" || true
+  [[ "$status" == "Accepted" ]] || {
+    /bin/cat "$log_file" >&2 || true
+    die "DMG notarization status is $status"
+  }
+
+  /usr/bin/xcrun stapler staple "$dmg"
+  /usr/bin/xcrun stapler validate "$dmg"
+}
+
 validate_app_bundle() {
   local app="$1"
   local contents="$app/Contents"
@@ -475,6 +660,10 @@ validate_app_bundle() {
     -name 'whisper-darwin-*' ! -name 'whisper-darwin-arm64' -print -quit)"
   [[ -z "$unexpected_runtime" ]] \
     || die "non-ARM64 whisper runtime was bundled: $unexpected_runtime"
+  for unexpected_runtime in whisper whisper-cuda; do
+    [[ ! -e "$bundled_resources/$unexpected_runtime" ]] \
+      || die "Windows whisper runtime polluted the macOS bundle: $bundled_resources/$unexpected_runtime"
+  done
   /usr/bin/cmp "$ARM_RUNTIME_DIR/whisper-cli" "$bundled_resources/whisper-darwin-arm64/whisper-cli"
   /usr/bin/cmp "$ARM_RUNTIME_DIR/whisper-server" "$bundled_resources/whisper-darwin-arm64/whisper-server"
 
@@ -504,7 +693,7 @@ build_bundles() {
   for attempt in 1 2; do
     rm -rf "$TARGET_RELEASE_DIR/bundle/macos" "$TARGET_RELEASE_DIR/bundle/dmg"
     if (cd "$APP_DIR" && node "$tauri_cli" build --ci --target "$TARGET_TRIPLE" \
-      --bundles app,dmg); then
+      --bundles app,dmg --config "$MACOS_TAURI_CONFIG"); then
       built=1
       break
     fi
@@ -521,12 +710,19 @@ build_bundles() {
   [[ "${#dmg_candidates[@]}" == 1 ]] \
     || die "expected exactly one DMG, found ${#dmg_candidates[@]}"
   source_dmg="${dmg_candidates[0]}"
+  notarize_dmg "$source_dmg"
+  validate_notarization_state "$APP_BUNDLE" "$source_dmg"
   package_outputs "$source_dmg" "$version"
 }
 
 verify_dmg() {
   local dmg="$1"
   local version="$2"
+  if [[ "$NOTARIZED" == "true" ]]; then
+    /usr/bin/xcrun stapler validate "$dmg"
+    /usr/sbin/spctl --assess --verbose=4 --type open \
+      --context context:primary-signature "$dmg"
+  fi
   MOUNT_POINT="$TEMP_ROOT/dmg-mount"
   mkdir -p "$MOUNT_POINT"
   /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT_POINT" "$dmg" -quiet
@@ -545,6 +741,11 @@ verify_app_zip() {
   mkdir -p "$extract_dir"
   /usr/bin/ditto -x -k "$archive" "$extract_dir"
   validate_app_bundle "$extract_dir/VoxFlow.app" "$version"
+  if [[ "$NOTARIZED" == "true" ]]; then
+    /usr/bin/xcrun stapler validate "$extract_dir/VoxFlow.app"
+    /usr/sbin/spctl --assess --verbose=4 --type execute \
+      "$extract_dir/VoxFlow.app"
+  fi
 }
 
 package_outputs() {
@@ -576,7 +777,8 @@ package_outputs() {
     echo "target=$TARGET_TRIPLE"
     echo "minimum_macos=$MIN_MACOS_VERSION"
     echo "signing=$SIGNING_LABEL"
-    echo "notarized=false"
+    echo "notarized=$NOTARIZED"
+    echo "notarization_auth=$NOTARIZATION_AUTH"
     echo "microphone_entitlement=true"
     echo "apple_events_entitlement=true"
     echo "whisper_version=$WHISPER_VERSION"
@@ -591,6 +793,7 @@ package_outputs() {
     echo "cmake_version=$CMAKE_VERSION"
     echo "package_lock_sha256=$(sha256_of "$APP_DIR/package-lock.json")"
     echo "cargo_lock_sha256=$(sha256_of "$TAURI_DIR/Cargo.lock")"
+    echo "tauri_macos_config_sha256=$(sha256_of "$MACOS_TAURI_CONFIG")"
     echo "tauri_cli=$(cd "$APP_DIR" && node -p "require('./node_modules/@tauri-apps/cli/package.json').version")"
     echo "rustc=$(rustc --version)"
     echo "node=$(node --version)"
@@ -615,6 +818,7 @@ main() {
   require_command node
   require_command npm
   version_gate
+  validate_macos_bundle_config
   frontend_gates
   assert_tauri_cli
 

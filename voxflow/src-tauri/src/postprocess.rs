@@ -2,6 +2,7 @@
 //! сниппеты → паразиты → словарь → капитализация. Verbatim отключает всё.
 
 use crate::settings::Settings;
+use std::collections::HashSet;
 
 #[derive(Clone, Debug)]
 pub struct Dict {
@@ -97,16 +98,10 @@ pub fn process(text: &str, s: &Settings, dict: &[Dict], snippets: &[Snippet]) ->
         return t;
     }
 
-    // 1) Сниппет на всю фразу (триггер == произнесённое, без хвостовой пунктуации).
-    let bare = t.trim_matches(|c: char| ".,!?…".contains(c) || c.is_whitespace());
-    for sn in snippets {
-        if !sn.trigger.trim().is_empty() && bare.eq_ignore_ascii_case(sn.trigger.trim()) {
-            return if sn.is_template {
-                expand_template(&sn.content)
-            } else {
-                sn.content.clone()
-            };
-        }
+    // 1) Сниппет на всю фразу. Slash-триггеры принимают безопасные голосовые
+    // варианты, но никогда не срабатывают внутри обычного предложения.
+    if let Some(expanded) = expand_matching_snippet(&t, snippets) {
+        return expanded;
     }
 
     if s.verbatim {
@@ -123,12 +118,10 @@ pub fn process(text: &str, s: &Settings, dict: &[Dict], snippets: &[Snippet]) ->
     t = collapse_inline_self_corrections(&t);
     t = apply_self_corrections(&t);
 
-    // 4) Словарь (замены терминов, регистронезависимо по первому слову).
-    for d in dict {
-        if !d.term.trim().is_empty() {
-            t = replace_word_ci(&t, d.term.trim(), &d.replacement);
-        }
-    }
+    // 4) Словарь: longest match wins, а подставленный текст не проходит через
+    // следующие правила повторно. Иначе `wispr flow -> Wispr Flow` мог затем
+    // превратиться правилом `wispr -> X` в `X Flow`.
+    t = apply_dictionary_once(&t, dict);
 
     // 5) ASR иногда вставляет произвольные переносы строк по сегментам/паузам.
     // Для диктовки это не смысловая разметка: случайный "\n" не должен превращать
@@ -140,6 +133,60 @@ pub fn process(text: &str, s: &Settings, dict: &[Dict], snippets: &[Snippet]) ->
         t = capitalize_sentences(&t);
     }
     normalize_spaces(&t)
+}
+
+fn apply_dictionary_once(text: &str, dict: &[Dict]) -> String {
+    let mut ordered = dict
+        .iter()
+        .filter(|entry| !entry.term.trim().is_empty())
+        .collect::<Vec<_>>();
+    ordered.sort_by(|a, b| {
+        b.term
+            .split_whitespace()
+            .count()
+            .cmp(&a.term.split_whitespace().count())
+            .then_with(|| b.term.chars().count().cmp(&a.term.chars().count()))
+    });
+    if ordered.is_empty() {
+        return text.to_string();
+    }
+
+    // Use collision-free private-use markers while matching every rule against
+    // the original hypothesis. Markers are selected outside the source,
+    // terms, and replacements, so restoring them cannot rewrite user content.
+    let mut reserved = text.chars().collect::<HashSet<_>>();
+    for entry in &ordered {
+        reserved.extend(entry.term.chars());
+        reserved.extend(entry.replacement.chars());
+    }
+    let markers = (0xE000..=0xF8FF)
+        .chain(0xF0000..=0xFFFFD)
+        .chain(0x100000..=0x10FFFD)
+        .filter_map(char::from_u32)
+        .filter(|candidate| !reserved.contains(candidate))
+        .take(ordered.len())
+        .collect::<Vec<_>>();
+    if markers.len() != ordered.len() {
+        return text.to_string();
+    }
+
+    let mut out = text.to_string();
+    let mut restorations = Vec::with_capacity(ordered.len());
+    for (entry, marker) in ordered.into_iter().zip(markers) {
+        let term = entry.term.trim();
+        let replacement = entry.replacement.trim();
+        let replacement = if replacement.is_empty() {
+            term.to_string()
+        } else {
+            replacement.to_string()
+        };
+        out = replace_word_ci(&out, term, &marker.to_string());
+        restorations.push((marker, replacement));
+    }
+    for (marker, replacement) in restorations {
+        out = out.replace(marker, &replacement);
+    }
+    out
 }
 
 /// Хезитация-междометие: дефисная редупликация ОДНОЙ буквы («а-а», «э-э-э»,
@@ -168,26 +215,44 @@ fn remove_fillers(text: &str) -> String {
 }
 
 fn remove_fillers_line(text: &str) -> String {
-    let mut t = format!(" {} ", text);
-    // многословные — регистронезависимая подстрочная зачистка
-    for f in FILLERS_MULTI {
-        let lower = t.to_lowercase();
-        let pat = format!(" {} ", f);
-        let mut search_from = 0;
-        let mut out = String::new();
-        loop {
-            if let Some(pos) = lower[search_from..].find(&pat) {
-                let abs = search_from + pos;
-                out.push_str(&t[search_from..abs]);
-                out.push(' ');
-                search_from = abs + pat.len();
-            } else {
-                out.push_str(&t[search_from..]);
-                break;
-            }
+    // Match multi-word fillers as normalized tokens. Never transfer byte
+    // offsets from a lowercased copy back to the original: Unicode case folding
+    // may expand a character (`İ` -> `i` + combining dot).
+    let source_words = text.split_whitespace().collect::<Vec<_>>();
+    let normalized_words = source_words
+        .iter()
+        .map(|word| normalize_filler_word(word))
+        .collect::<Vec<_>>();
+    let filler_phrases = FILLERS_MULTI
+        .iter()
+        .map(|phrase| {
+            phrase
+                .split_whitespace()
+                .map(normalize_filler_word)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let mut multi_filtered = Vec::with_capacity(source_words.len());
+    let mut index = 0usize;
+    while index < source_words.len() {
+        let matched = filler_phrases
+            .iter()
+            .filter(|phrase| {
+                !phrase.is_empty()
+                    && index + phrase.len() <= normalized_words.len()
+                    && normalized_words[index..index + phrase.len()] == phrase[..]
+            })
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+        if matched > 0 {
+            index += matched;
+        } else {
+            multi_filtered.push(source_words[index]);
+            index += 1;
         }
-        t = out;
     }
+    let t = multi_filtered.join(" ");
     // одно-словные — токенами
     let words: Vec<&str> = t.split_whitespace().collect();
     let kept: Vec<&str> = words
@@ -208,6 +273,12 @@ fn remove_fillers_line(text: &str) -> String {
         })
         .collect();
     kept.join(" ")
+}
+
+fn normalize_filler_word(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_alphanumeric() && !DASH_CHARS.contains(c))
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase()
 }
 
 /// Срезать подряд идущие ПОЛНЫЕ повторы n-грамм из 2..=6 слов (заикания диктовки,
@@ -521,15 +592,43 @@ fn correction_cut_point(left: &[WordTok<'_>], right: &[WordTok<'_>]) -> usize {
 
 /// Заменить целое слово `term` на `repl` (регистронезависимо).
 fn replace_word_ci(text: &str, term: &str, repl: &str) -> String {
-    let lower_text = text.to_lowercase();
     let lower_term = term.to_lowercase();
-    let mut out = String::new();
-    let mut i = 0;
-    while let Some(pos) = lower_text[i..].find(&lower_term) {
-        let abs = i + pos;
-        let end = abs + lower_term.len();
-        let before_ok = abs == 0
-            || !text[..abs]
+    if lower_term.is_empty() {
+        return text.to_string();
+    }
+
+    // Never reuse offsets from `text.to_lowercase()` against `text`: Unicode
+    // lowercasing may change byte length (`İ` -> `i` + combining dot), which
+    // previously produced a non-char-boundary slice and panicked. Instead,
+    // grow each candidate over original char boundaries while folding it.
+    let mut out = String::with_capacity(text.len());
+    let mut copied_until = 0usize;
+    let mut search_at = 0usize;
+    while search_at < text.len() {
+        let mut folded = String::new();
+        let mut matched_end = None;
+        for (relative, ch) in text[search_at..].char_indices() {
+            folded.extend(ch.to_lowercase());
+            let end = search_at + relative + ch.len_utf8();
+            if folded == lower_term {
+                matched_end = Some(end);
+                break;
+            }
+            if !lower_term.starts_with(&folded) {
+                break;
+            }
+        }
+
+        let Some(end) = matched_end else {
+            search_at += text[search_at..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
+            continue;
+        };
+        let before_ok = search_at == 0
+            || !text[..search_at]
                 .chars()
                 .next_back()
                 .map(char::is_alphanumeric)
@@ -540,15 +639,20 @@ fn replace_word_ci(text: &str, term: &str, repl: &str) -> String {
                 .next()
                 .map(char::is_alphanumeric)
                 .unwrap_or(false);
-        out.push_str(&text[i..abs]);
         if before_ok && after_ok {
+            out.push_str(&text[copied_until..search_at]);
             out.push_str(repl);
-        } else {
-            out.push_str(&text[abs..end]);
+            copied_until = end;
+            search_at = end;
+            continue;
         }
-        i = end;
+        search_at += text[search_at..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(1);
     }
-    out.push_str(&text[i..]);
+    out.push_str(&text[copied_until..]);
     out
 }
 
@@ -803,20 +907,122 @@ fn normalize_dashes(s: &str) -> String {
     out
 }
 
-/// Шаблон сниппета: {date} {time} {clipboard}.
+fn normalize_snippet_phrase(value: &str) -> String {
+    value
+        .trim_matches(|c: char| c.is_whitespace() || ".,!?…:;\"'«»()[]{}".contains(c))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn snippet_trigger_matches(spoken: &str, trigger: &str) -> bool {
+    let spoken = normalize_snippet_phrase(spoken);
+    let trigger = normalize_snippet_phrase(trigger);
+    if trigger.is_empty() {
+        return false;
+    }
+    if spoken == trigger {
+        return true;
+    }
+    let Some(short) = trigger.strip_prefix('/').map(str::trim) else {
+        return false;
+    };
+    if short.is_empty() || spoken == short {
+        return !short.is_empty();
+    }
+    for prefix in ["слэш", "слеш", "slash", "косая черта", "сниппет", "снипет"]
+    {
+        let Some(rest) = spoken.strip_prefix(prefix) else {
+            continue;
+        };
+        let separated = rest
+            .chars()
+            .next()
+            .map(|c| c.is_whitespace() || "-/".contains(c))
+            .unwrap_or(false);
+        if separated
+            && rest.trim_start_matches(|c: char| c.is_whitespace() || "-/".contains(c)) == short
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Expand an exact whole-utterance snippet once. The engine uses this signal to
+/// keep the resulting body out of corrections and LLM rewrite.
+pub fn expand_matching_snippet(text: &str, snippets: &[Snippet]) -> Option<String> {
+    let spoken = text.trim();
+    if spoken.is_empty() {
+        return None;
+    }
+    snippets.iter().find_map(|snippet| {
+        snippet_trigger_matches(spoken, &snippet.trigger).then(|| {
+            if snippet.is_template {
+                expand_template(&snippet.content)
+            } else {
+                snippet.content.clone()
+            }
+        })
+    })
+}
+
+/// Шаблон сниппета: {date}/{дата}, {time}/{время},
+/// {clipboard}/{буфер}. Неизвестные и временно недоступные placeholders
+/// сохраняются дословно вместо тихой потери текста.
 fn expand_template(content: &str) -> String {
     let now = chrono::Local::now();
-    let mut s = content.to_string();
-    s = s.replace("{date}", &now.format("%d.%m.%Y").to_string());
-    s = s.replace("{time}", &now.format("%H:%M").to_string());
-    if s.contains("{clipboard}") {
-        let clip = arboard::Clipboard::new()
-            .ok()
-            .and_then(|mut c| c.get_text().ok())
-            .unwrap_or_default();
-        s = s.replace("{clipboard}", &clip);
+    let date = now.format("%d.%m.%Y").to_string();
+    let time = now.format("%H:%M").to_string();
+    let clipboard = arboard::Clipboard::new()
+        .ok()
+        .and_then(|mut c| c.get_text().ok());
+    expand_template_with(content, &date, &time, clipboard.as_deref())
+}
+
+fn expand_template_with(content: &str, date: &str, time: &str, clipboard: Option<&str>) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    let mut out = String::with_capacity(content.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '{' && chars.get(i + 1) == Some(&'{') {
+            out.push('{');
+            i += 2;
+            continue;
+        }
+        if chars[i] == '}' && chars.get(i + 1) == Some(&'}') {
+            out.push('}');
+            i += 2;
+            continue;
+        }
+        if chars[i] != '{' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == '}') else {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        };
+        let end = i + 1 + rel_end;
+        let name: String = chars[i + 1..end].iter().collect::<String>().to_lowercase();
+        match name.as_str() {
+            "date" | "дата" => out.push_str(date),
+            "time" | "время" => out.push_str(time),
+            "clipboard" | "буфер" => {
+                if let Some(value) = clipboard {
+                    out.push_str(value);
+                } else {
+                    out.extend(chars[i..=end].iter());
+                }
+            }
+            _ => out.extend(chars[i..=end].iter()),
+        }
+        i = end + 1;
     }
-    s
+    out
 }
 
 /// Короткая русская затравка по умолчанию. Даёт декодеру контекст языка/стиля
@@ -825,22 +1031,74 @@ fn expand_template(content: &str) -> String {
 /// распознанный текст. Применяется только для русского языка (см. engine.rs).
 pub const DEFAULT_RU_PROMPT: &str = "Распознавание русской речи. Грамотный текст с пунктуацией.";
 
-/// Подсказка-biasing для whisper (initial prompt) из словаря пользователя.
+/// Короткий local-ASR bias из желаемых словарных форм и голосовых триггеров.
+/// Тела сниппетов не включаются, чтобы decoder не галлюцинировал их в тишине.
 ///
 /// `base` — необязательная языковая затравка (для ru — `DEFAULT_RU_PROMPT`),
 /// чтобы и при ПУСТОМ словаре декодер получал контекст (раньше затравка была
 /// пустой → бесполезной). Для не-русского языка `base` передаётся как None.
-pub fn dict_bias_prompt(dict: &[Dict], base: Option<&str>) -> Option<String> {
-    let terms: Vec<&str> = dict
-        .iter()
-        .map(|d| d.term.trim())
-        .filter(|t| !t.is_empty())
-        .collect();
-    match (base, terms.is_empty()) {
-        (Some(b), true) => Some(b.to_string()),
-        (Some(b), false) => Some(format!("{b} Словарь: {}.", terms.join(", "))),
-        (None, true) => None,
-        (None, false) => Some(format!("Словарь: {}.", terms.join(", "))),
+pub fn asr_bias_prompt(dict: &[Dict], snippets: &[Snippet], base: Option<&str>) -> Option<String> {
+    const TERM_LIMIT: usize = 32;
+    const TRIGGER_LIMIT: usize = 12;
+    const MAX_CHARS: usize = 900;
+
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    for entry in dict {
+        for value in [&entry.replacement, &entry.term] {
+            let value = value.trim();
+            if value.is_empty() {
+                continue;
+            }
+            if seen.insert(value.to_lowercase()) {
+                terms.push(value);
+                if terms.len() >= TERM_LIMIT {
+                    break;
+                }
+            }
+        }
+        if terms.len() >= TERM_LIMIT {
+            break;
+        }
+    }
+
+    let mut triggers = Vec::new();
+    let mut seen_triggers = HashSet::new();
+    for snippet in snippets {
+        let trigger = snippet.trigger.trim();
+        if trigger.is_empty() {
+            continue;
+        }
+        for value in [Some(trigger), trigger.strip_prefix('/').map(str::trim)]
+            .into_iter()
+            .flatten()
+        {
+            if !value.is_empty() && seen_triggers.insert(value.to_lowercase()) {
+                triggers.push(value);
+                if triggers.len() >= TRIGGER_LIMIT {
+                    break;
+                }
+            }
+        }
+        if triggers.len() >= TRIGGER_LIMIT {
+            break;
+        }
+    }
+
+    let mut parts = Vec::new();
+    if let Some(base) = base.map(str::trim).filter(|value| !value.is_empty()) {
+        parts.push(base.to_string());
+    }
+    if !terms.is_empty() {
+        parts.push(format!("Словарь: {}.", terms.join(", ")));
+    }
+    if !triggers.is_empty() {
+        parts.push(format!("Голосовые триггеры: {}.", triggers.join(", ")));
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" ").chars().take(MAX_CHARS).collect())
     }
 }
 
@@ -1035,6 +1293,16 @@ mod filler_tests {
     }
 
     #[test]
+    fn unicode_case_expansion_before_multi_filler_is_boundary_safe() {
+        let s = st(true, false);
+        assert_eq!(process("İ как бы тест", &s, &[], &[]), "İ тест");
+        assert_eq!(
+            process("İ потому что тест", &s, &[], &[]),
+            "İ потому что тест"
+        );
+    }
+
+    #[test]
     fn false_sentence_breaks_after_short_pause_are_softened() {
         assert_eq!(
             soften_false_sentence_breaks("Я остановился. То есть продолжил мысль."),
@@ -1065,6 +1333,30 @@ mod filler_tests {
     }
 
     #[test]
+    fn unicode_case_expansion_never_uses_folded_byte_offsets_on_original_text() {
+        assert_eq!(
+            apply_corrections(
+                "İ",
+                &[Correction {
+                    wrong: "i".into(),
+                    right: "safe".into(),
+                }]
+            ),
+            "İ"
+        );
+        assert_eq!(
+            apply_corrections(
+                "İ",
+                &[Correction {
+                    wrong: "İ".into(),
+                    right: "Istanbul".into(),
+                }]
+            ),
+            "Istanbul"
+        );
+    }
+
+    #[test]
     fn learned_phrase_corrections_win_before_single_words() {
         let corrections = vec![
             Correction {
@@ -1081,6 +1373,121 @@ mod filler_tests {
             apply_corrections("открой виспа фолл", &corrections),
             "открой Wispr Flow"
         );
+    }
+
+    #[test]
+    fn unicode_and_spoken_slash_snippet_triggers_execute_whole_phrase_only() {
+        let s = st(false, false);
+        let snippets = vec![Snippet {
+            trigger: "/Адрес".into(),
+            content: "Москва".into(),
+            is_template: false,
+        }];
+        assert_eq!(process("АДРЕС", &s, &[], &snippets), "Москва");
+        assert_eq!(process("слэш адрес.", &s, &[], &snippets), "Москва");
+        assert_eq!(process("«слеш-адрес»", &s, &[], &snippets), "Москва");
+        assert_eq!(process("косая черта адрес", &s, &[], &snippets), "Москва");
+        assert_eq!(process("сниппет адрес", &s, &[], &snippets), "Москва");
+        assert_eq!(process("покажи адрес", &s, &[], &snippets), "покажи адрес");
+    }
+
+    #[test]
+    fn exact_snippet_body_is_returned_without_postprocessing() {
+        let snippets = vec![Snippet {
+            trigger: "/raw".into(),
+            content: "отмена\n  RAW {unknown}".into(),
+            is_template: false,
+        }];
+        assert_eq!(
+            expand_matching_snippet("slash raw", &snippets).as_deref(),
+            Some("отмена\n  RAW {unknown}")
+        );
+    }
+
+    #[test]
+    fn template_expansion_is_deterministic_and_lossless() {
+        assert_eq!(
+            expand_template_with(
+                "{DATE} {time} {clipboard} {unknown} {{date}}",
+                "14.07.2026",
+                "12:34",
+                Some("исходный текст")
+            ),
+            "14.07.2026 12:34 исходный текст {unknown} {date}"
+        );
+        assert_eq!(
+            expand_template_with(
+                "{дата} {время} {буфер}",
+                "14.07.2026",
+                "12:34",
+                Some("исходный текст")
+            ),
+            "14.07.2026 12:34 исходный текст"
+        );
+        assert_eq!(
+            expand_template_with("X {clipboard} Y", "d", "t", None),
+            "X {clipboard} Y"
+        );
+    }
+
+    #[test]
+    fn blank_dictionary_replacement_preserves_preferred_spelling() {
+        let s = st(false, false);
+        let dict = vec![Dict {
+            term: "Wispr Flow".into(),
+            replacement: String::new(),
+        }];
+        assert_eq!(
+            process("открой wispr flow", &s, &dict, &[]),
+            "открой Wispr Flow"
+        );
+    }
+
+    #[test]
+    fn overlapping_dictionary_terms_use_longest_match_without_cascading() {
+        let s = st(false, false);
+        let dict = vec![
+            Dict {
+                term: "wispr".into(),
+                replacement: "X".into(),
+            },
+            Dict {
+                term: "wispr flow".into(),
+                replacement: "Wispr Flow".into(),
+            },
+        ];
+
+        assert_eq!(
+            process("wispr flow and wispr", &s, &dict, &[]),
+            "Wispr Flow and X"
+        );
+    }
+
+    #[test]
+    fn local_asr_bias_contains_terms_and_triggers_but_not_snippet_body() {
+        let dict = vec![
+            Dict {
+                term: "виспр флоу".into(),
+                replacement: "Wispr Flow".into(),
+            },
+            Dict {
+                term: "WISPR FLOW".into(),
+                replacement: "Wispr Flow".into(),
+            },
+        ];
+        let snippets = vec![Snippet {
+            trigger: "/адрес".into(),
+            content: "Секретное тело сниппета".into(),
+            is_template: false,
+        }];
+        let prompt = asr_bias_prompt(&dict, &snippets, Some(DEFAULT_RU_PROMPT)).expect("prompt");
+        assert!(prompt.contains("Wispr Flow"));
+        assert!(prompt.contains("виспр флоу"));
+        assert_eq!(prompt.matches("Wispr Flow").count(), 1);
+        assert!(prompt.contains("/адрес"));
+        assert!(prompt.contains("адрес"));
+        assert!(!prompt.contains("Секретное тело сниппета"));
+        assert!(prompt.chars().count() <= 900);
     }
 }
 

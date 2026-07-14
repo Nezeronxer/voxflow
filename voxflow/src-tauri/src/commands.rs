@@ -9,6 +9,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use crate::db;
 use crate::engine::{EngineCmd, EngineHandle};
 use crate::models;
 use crate::settings::{self, ProfileOverride, Settings};
@@ -368,17 +369,7 @@ pub fn dictionary_upsert(
     replacement: String,
 ) -> R<()> {
     let conn = state.db.lock();
-    match id {
-        Some(i) => conn.execute(
-            "UPDATE dictionary SET term=?1, replacement=?2 WHERE id=?3",
-            params![term, replacement, i],
-        ),
-        None => conn.execute(
-            "INSERT INTO dictionary(term,replacement) VALUES(?1,?2)",
-            params![term, replacement],
-        ),
-    }
-    .map_err(err)?;
+    db::upsert_dictionary(&conn, id, &term, &replacement).map_err(err)?;
     Ok(())
 }
 
@@ -433,19 +424,7 @@ pub fn snippet_upsert(
     is_template: bool,
 ) -> R<()> {
     let conn = state.db.lock();
-    let tflag = if is_template { 1i64 } else { 0 };
-    match id {
-        Some(i) => conn.execute(
-            "UPDATE snippets SET trigger=?1, content=?2, is_template=?3 WHERE id=?4",
-            params![trigger, content, tflag, i],
-        ),
-        None => conn.execute(
-            "INSERT INTO snippets(trigger,content,is_template) VALUES(?1,?2,?3)
-             ON CONFLICT(trigger) DO UPDATE SET content=excluded.content, is_template=excluded.is_template",
-            params![trigger, content, tflag],
-        ),
-    }
-    .map_err(err)?;
+    db::upsert_snippet(&conn, id, &trigger, &content, is_template).map_err(err)?;
     Ok(())
 }
 

@@ -1,11 +1,45 @@
-name: Release macOS ARM64 (ad-hoc)
+name: Release macOS ARM64 (Developer ID or ad-hoc)
 
 on:
   workflow_call:
+    inputs:
+      release_build:
+        description: Enables the trusted tag-release job; callers must also run from a v* tag
+        required: true
+        type: boolean
+    secrets:
+      APPLE_CERTIFICATE:
+        description: Base64-encoded Developer ID Application .p12 certificate
+        required: false
+      APPLE_CERTIFICATE_PASSWORD:
+        description: Password for the Developer ID .p12 certificate
+        required: false
+      APPLE_SIGNING_IDENTITY:
+        description: Optional identity name or SHA-1 hash used to disambiguate the imported certificate
+        required: false
+      APPLE_ID:
+        description: Optional Apple ID used with an app-specific password for notarization
+        required: false
+      APPLE_PASSWORD:
+        description: Optional app-specific Apple ID password for notarization
+        required: false
+      APPLE_TEAM_ID:
+        description: Optional Apple Developer Team ID for notarization
+        required: false
+      APPLE_API_ISSUER:
+        description: Optional App Store Connect API issuer ID
+        required: false
+      APPLE_API_KEY:
+        description: Optional App Store Connect API key ID
+        required: false
+      APPLE_API_PRIVATE_KEY_BASE64:
+        description: Optional base64-encoded App Store Connect AuthKey .p8 contents
+        required: false
   workflow_dispatch:
   pull_request:
     paths:
       - ".github/workflows/release-macos-arm64.yml"
+      - ".github/workflows/release.yml"
       - "script/build_macos_arm64_release.sh"
       - "script/check_versions.py"
       - "script/patches/whisper.cpp-v1.8.6-macos11.patch"
@@ -22,8 +56,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: macOS 15 ARM64 / complete ad-hoc seal
+  build-adhoc:
+    name: macOS 15 ARM64 / forced ad-hoc validation
+    if: ${{ github.event_name == 'pull_request' || inputs.release_build != true || github.ref_type != 'tag' || !startsWith(github.ref_name, 'v') }}
     runs-on: macos-15
     timeout-minutes: 90
     env:
@@ -68,8 +103,222 @@ jobs:
           node --version
           python3 --version
 
-      - name: Build, test, package, and verify ad-hoc release
+      - name: Build, test, package, and verify forced ad-hoc release
         shell: bash
+        run: |
+          set -euo pipefail
+          unset VOXFLOW_SIGNING_IDENTITY
+          unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
+          unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
+          unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            ./script/build_macos_arm64_release.sh --tag "$GITHUB_REF_NAME"
+          else
+            ./script/build_macos_arm64_release.sh
+          fi
+
+      - name: Upload app, DMG, manifest, and SHA256 checksums
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: VoxFlow-macOS-arm64-${{ github.sha }}
+          path: voxflow/release/macos/*/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  build-release:
+    name: macOS 15 ARM64 / verified distribution bundle
+    if: ${{ github.event_name != 'pull_request' && inputs.release_build == true && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      CI: "true"
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
+      VOXFLOW_XCODE_BUILD: "16F6"
+      VOXFLOW_XCODE_VERSION: "16.4"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.23.1"
+          cache: npm
+          cache-dependency-path: voxflow/package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.13.5"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.96.1"
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy
+
+      - name: Verify native ARM64 runner and pinned Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == "arm64" ]]
+          [[ -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]
+          [[ "$(xcodebuild -version | awk 'NR == 1 {print $2}')" == "$VOXFLOW_XCODE_VERSION" ]]
+          [[ "$(xcodebuild -version | awk 'NR == 2 {print $3}')" == "$VOXFLOW_XCODE_BUILD" ]]
+          rustc --version --verbose
+          node --version
+          python3 --version
+
+      - name: Prepare optional Developer ID signing and notarization
+        id: signing
+        shell: bash
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE }}
+          CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          REQUESTED_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          NOTARY_APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          NOTARY_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          NOTARY_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          NOTARY_API_PRIVATE_KEY_BASE64: ${{ secrets.APPLE_API_PRIVATE_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          count_values() {
+            local count=0 value
+            for value in "$@"; do
+              if [[ -n "$value" ]]; then
+                count=$((count + 1))
+              fi
+            done
+            printf '%s\n' "$count"
+          }
+
+          certificate_values="$(count_values "$CERTIFICATE_BASE64" "$CERTIFICATE_PASSWORD")"
+          apple_id_values="$(count_values "$NOTARY_APPLE_ID" "$NOTARY_APPLE_PASSWORD" "$NOTARY_TEAM_ID")"
+          api_values="$(count_values "$NOTARY_API_ISSUER" "$NOTARY_API_KEY" "$NOTARY_API_PRIVATE_KEY_BASE64")"
+
+          if [[ "$certificate_values" -gt 0 && "$certificate_values" -lt 2 ]]; then
+            echo "APPLE_CERTIFICATE and APPLE_CERTIFICATE_PASSWORD must be configured together" >&2
+            exit 1
+          fi
+          if [[ "$apple_id_values" -gt 0 && "$apple_id_values" -lt 3 ]]; then
+            echo "APPLE_ID, APPLE_PASSWORD, and APPLE_TEAM_ID must be configured together" >&2
+            exit 1
+          fi
+          if [[ "$api_values" -gt 0 && "$api_values" -lt 3 ]]; then
+            echo "APPLE_API_ISSUER, APPLE_API_KEY, and APPLE_API_PRIVATE_KEY_BASE64 must be configured together" >&2
+            exit 1
+          fi
+          if [[ "$apple_id_values" == 3 && "$api_values" == 3 ]]; then
+            echo "Configure exactly one notarization authentication method" >&2
+            exit 1
+          fi
+
+          if [[ "$certificate_values" == 0 && "$apple_id_values" == 0 && "$api_values" == 0 && -z "$REQUESTED_IDENTITY" ]]; then
+            echo "mode=adhoc" >> "$GITHUB_OUTPUT"
+            echo "signing_identity=" >> "$GITHUB_OUTPUT"
+            echo "api_key_path=" >> "$GITHUB_OUTPUT"
+            echo "keychain_path=" >> "$GITHUB_OUTPUT"
+            echo "No Apple secrets configured; using complete ad-hoc signing."
+            exit 0
+          fi
+
+          if [[ "$certificate_values" != 2 || ( "$apple_id_values" != 3 && "$api_values" != 3 ) ]]; then
+            echo "Developer ID CI mode requires the certificate pair and one complete notarization credential set" >&2
+            exit 1
+          fi
+
+          certificate_path="$RUNNER_TEMP/voxflow-developer-id.p12"
+          keychain_path="$RUNNER_TEMP/voxflow-signing.keychain-db"
+          keychain_password="$(/usr/bin/openssl rand -hex 32)"
+          export CERTIFICATE_PATH="$certificate_path"
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          encoded = "".join(os.environ["CERTIFICATE_BASE64"].split())
+          payload = base64.b64decode(encoded, validate=True)
+          if not payload:
+              raise SystemExit("decoded APPLE_CERTIFICATE is empty")
+          Path(os.environ["CERTIFICATE_PATH"]).write_bytes(payload)
+          PY
+          chmod 600 "$certificate_path"
+
+          /usr/bin/security create-keychain -p "$keychain_password" "$keychain_path"
+          /usr/bin/security default-keychain -s "$keychain_path"
+          /usr/bin/security unlock-keychain -p "$keychain_password" "$keychain_path"
+          /usr/bin/security set-keychain-settings -lut 21600 "$keychain_path"
+          /usr/bin/security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          /usr/bin/security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "$keychain_password" "$keychain_path"
+          rm -f "$certificate_path"
+
+          identity_listing="$(/usr/bin/security find-identity -v -p codesigning "$keychain_path")"
+          if [[ -n "$REQUESTED_IDENTITY" ]]; then
+            matching_identity="$(printf '%s\n' "$identity_listing" \
+              | grep -F -- "$REQUESTED_IDENTITY" \
+              | grep -F 'Developer ID Application:' || true)"
+            [[ "$(printf '%s\n' "$matching_identity" | grep -c . || true)" == 1 ]] || {
+              echo "Requested Developer ID Application identity was not found exactly once" >&2
+              exit 1
+            }
+            signing_identity="$REQUESTED_IDENTITY"
+          else
+            developer_identities="$(printf '%s\n' "$identity_listing" \
+              | sed -nE 's/.*"(Developer ID Application:[^"]+)".*/\1/p')"
+            [[ "$(printf '%s\n' "$developer_identities" | grep -c . || true)" == 1 ]] || {
+              echo "Expected exactly one Developer ID Application identity; set APPLE_SIGNING_IDENTITY to disambiguate" >&2
+              exit 1
+            }
+            signing_identity="$developer_identities"
+          fi
+
+          api_key_path=""
+          if [[ "$api_values" == 3 ]]; then
+            api_key_path="$RUNNER_TEMP/AuthKey_${NOTARY_API_KEY}.p8"
+            export API_KEY_PATH="$api_key_path"
+            python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          encoded = "".join(os.environ["NOTARY_API_PRIVATE_KEY_BASE64"].split())
+          payload = base64.b64decode(encoded, validate=True)
+          if b"BEGIN PRIVATE KEY" not in payload:
+              raise SystemExit("decoded App Store Connect key is not a .p8 private key")
+          Path(os.environ["API_KEY_PATH"]).write_bytes(payload)
+          PY
+            chmod 600 "$api_key_path"
+          fi
+
+          echo "mode=developer-id-notarized" >> "$GITHUB_OUTPUT"
+          echo "signing_identity=$signing_identity" >> "$GITHUB_OUTPUT"
+          echo "api_key_path=$api_key_path" >> "$GITHUB_OUTPUT"
+          echo "keychain_path=$keychain_path" >> "$GITHUB_OUTPUT"
+          echo "Developer ID identity imported; notarization will be verified before upload."
+
+      - name: Build, test, package, sign, and verify release
+        shell: bash
+        env:
+          VOXFLOW_SIGNING_IDENTITY: ${{ steps.signing.outputs.signing_identity }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_PATH: ${{ steps.signing.outputs.api_key_path }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
@@ -81,8 +330,27 @@ jobs:
       - name: Upload app, DMG, manifest, and SHA256 checksums
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: VoxFlow-macOS-arm64-adhoc-${{ github.sha }}
+          name: VoxFlow-macOS-arm64-${{ github.sha }}
           path: voxflow/release/macos/*/
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Remove ephemeral signing material
+        if: always()
+        shell: bash
+        env:
+          KEYCHAIN_PATH: ${{ steps.signing.outputs.keychain_path }}
+          API_KEY_PATH: ${{ steps.signing.outputs.api_key_path }}
+        run: |
+          set -euo pipefail
+          keychain_path="${KEYCHAIN_PATH:-$RUNNER_TEMP/voxflow-signing.keychain-db}"
+          if [[ -f "$keychain_path" ]]; then
+            /usr/bin/security delete-keychain "$keychain_path" || true
+          fi
+          rm -f \
+            "$RUNNER_TEMP/voxflow-developer-id.p12" \
+            "$RUNNER_TEMP"/AuthKey_*.p8
+          if [[ -n "${API_KEY_PATH:-}" ]]; then
+            rm -f "$API_KEY_PATH"
+          fi
