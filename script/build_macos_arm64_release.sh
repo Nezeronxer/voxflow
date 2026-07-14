@@ -564,7 +564,10 @@ validate_notarization_state() {
   local app="$1"
   local dmg="$2"
 
-  [[ "$NOTARIZED" == "true" ]] || return
+  if [[ "$NOTARIZED" != "true" ]]; then
+    echo "Skipping notarization-state validation for signing=$SIGNING_LABEL"
+    return 0
+  fi
   /usr/bin/xcrun stapler validate "$app"
   /usr/bin/xcrun stapler validate "$dmg"
   /usr/sbin/spctl --assess --verbose=4 --type execute "$app"
@@ -580,7 +583,10 @@ notarize_dmg() {
   local status
   local -a auth_args
 
-  [[ "$NOTARIZED" == "true" ]] || return
+  if [[ "$NOTARIZED" != "true" ]]; then
+    echo "Skipping DMG notarization for signing=$SIGNING_LABEL"
+    return 0
+  fi
   case "$NOTARIZATION_AUTH" in
     apple-id)
       auth_args=(
