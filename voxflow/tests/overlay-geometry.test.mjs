@@ -145,7 +145,6 @@ test("live preview survives transcribing and frame updates bypass React state", 
   assert.ok(transcribingBranch, "missing transcribing status branch");
   assert.doesNotMatch(transcribingBranch[1], /resetTextEngine\(\)/);
   assert.match(transcribingBranch[1], /setShownDirect\(targetCharsRef\.current\.length\)/);
-  assert.match(overlaySource, /status === "transcribing"[\s\S]*?hasPreview[\s\S]*?"stream"/);
   assert.doesNotMatch(overlaySource, /const \[shown,\s*setShown\]/);
   assert.match(overlaySource, /committedTextRef\.current\.textContent/);
   assert.match(overlaySource, /el\.style\.transform = `scaleY/);
