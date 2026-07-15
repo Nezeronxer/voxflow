@@ -1666,11 +1666,27 @@ fn cloud_partial_loop(
 }
 
 /// Сегменты надиктованного: (абзац-перед?, текст). Рендер: " " либо "\n\n".
+#[cfg(test)]
 fn render_segments(segs: &[(bool, String)]) -> String {
+    render_segments_with_paragraph_separator(segs, "\n\n")
+}
+
+// Private-use marker: unlike raw ASR newlines, this boundary is produced from
+// the measured VAD gap and therefore must survive generic ASR cleanup.
+const SEMANTIC_PARAGRAPH_MARKER: &str = "\u{e000}\u{e001}";
+
+fn render_segments_for_postprocess(segs: &[(bool, String)]) -> String {
+    render_segments_with_paragraph_separator(segs, SEMANTIC_PARAGRAPH_MARKER)
+}
+
+fn render_segments_with_paragraph_separator(
+    segs: &[(bool, String)],
+    paragraph_separator: &str,
+) -> String {
     let mut out = String::new();
     for (i, (para, t)) in segs.iter().enumerate() {
         if i > 0 {
-            out.push_str(if *para { "\n\n" } else { " " });
+            out.push_str(if *para { paragraph_separator } else { " " });
         }
         out.push_str(t);
     }
@@ -1803,12 +1819,31 @@ fn clean_live_text(
     // Exact snippet bodies are authored output, not an ASR hypothesis. Keep the
     // live pill byte-for-byte aligned with the final insertion: corrections,
     // capitalization and whitespace normalization must not rewrite the body.
-    if let Some(expanded) = postprocess::expand_matching_snippet(text, snippets) {
-        return expanded;
+    if !text.contains(SEMANTIC_PARAGRAPH_MARKER) {
+        if let Some(expanded) = postprocess::expand_matching_snippet(text, snippets) {
+            return expanded;
+        }
     }
-    let mut t = postprocess::process(text, s, dict, snippets);
+    let mut t = process_dictation_text(text, s, dict, snippets);
     t = postprocess::apply_corrections(&t, corrections);
     postprocess::normalize_spaces(&t)
+}
+
+fn process_dictation_text(
+    text: &str,
+    s: &Settings,
+    dict: &[postprocess::Dict],
+    snippets: &[postprocess::Snippet],
+) -> String {
+    if !text.contains(SEMANTIC_PARAGRAPH_MARKER) {
+        return postprocess::process(text, s, dict, snippets);
+    }
+
+    text.split(SEMANTIC_PARAGRAPH_MARKER)
+        .map(|paragraph| postprocess::process(paragraph, s, dict, snippets))
+        .filter(|paragraph| !paragraph.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn join_partial(committed: &str, volatile: &str) -> String {
@@ -2082,7 +2117,7 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                 && settled_emitted_for_end != prev_seg_end
             {
                 let (committed, volatile, full) = clean_live_partial(
-                    &render_segments(&committed_segs),
+                    &render_segments_for_postprocess(&committed_segs),
                     "",
                     &a.settings,
                     &a.dict,
@@ -2132,11 +2167,17 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             seg_start = bound;
             seg_has_speech = false;
             cur_seg_first_speech = None;
-            (render_segments(&committed_segs), String::new())
+            (
+                render_segments_for_postprocess(&committed_segs),
+                String::new(),
+            )
         } else {
             let txt = gm.transcribe(&mono16[seg_start..]).unwrap_or_default();
             drop(g);
-            (render_segments(&committed_segs), txt.trim().to_string())
+            (
+                render_segments_for_postprocess(&committed_segs),
+                txt.trim().to_string(),
+            )
         };
 
         let (committed, volatile, full) = clean_live_partial(
@@ -3543,10 +3584,14 @@ fn process_utterance(
     ));
     // Постобработка (правила) + выученные исправления.
     let t_post = Instant::now();
-    let exact_snippet = postprocess::expand_matching_snippet(&raw, &snippets);
+    let exact_snippet = if raw.contains(SEMANTIC_PARAGRAPH_MARKER) {
+        None
+    } else {
+        postprocess::expand_matching_snippet(&raw, &snippets)
+    };
     let snippet_expanded = exact_snippet.is_some();
     let mut text =
-        exact_snippet.unwrap_or_else(|| postprocess::process(&raw, &s, &dict, &snippets));
+        exact_snippet.unwrap_or_else(|| process_dictation_text(&raw, &s, &dict, &snippets));
     if !snippet_expanded {
         text = postprocess::apply_corrections(&text, &corrections);
     }
@@ -4806,7 +4851,7 @@ where
         let para = gap_starts_paragraph(!segs.is_empty(), u.gap_before);
         push_dictation_segment(&mut segs, para, t);
     }
-    Ok(render_segments(&segs))
+    Ok(render_segments_for_postprocess(&segs))
 }
 
 fn gap_starts_paragraph(has_previous_segment: bool, gap_samples: usize) -> bool {
@@ -5398,6 +5443,41 @@ mod seg_tests {
         assert_eq!(committed, "Привет");
         assert_eq!(volatile, "мир");
         assert_eq!(full, "Привет мир");
+    }
+
+    #[test]
+    fn live_preview_preserves_a_semantic_paragraph_from_a_long_pause() {
+        let s = Settings::default();
+        let segs = vec![
+            (false, "Первая мысль.".to_string()),
+            (true, "Вторая мысль.".to_string()),
+        ];
+        let committed = render_segments_for_postprocess(&segs);
+        let (_, _, full) = clean_live_partial(&committed, "", &s, &[], &[], &[]);
+
+        assert_eq!(full, "Первая мысль.\n\nВторая мысль.");
+    }
+
+    #[test]
+    fn final_pipeline_preserves_two_deliberate_sentence_repetitions() {
+        let s = Settings::default();
+        let raw = postprocess::dedup_repeated_ngrams("Я пошёл домой. Я пошёл домой.");
+        let final_text = process_dictation_text(&raw, &s, &[], &[]);
+
+        assert_eq!(final_text, "Я пошёл домой. Я пошёл домой.");
+    }
+
+    #[test]
+    fn final_pipeline_preserves_a_semantic_paragraph_from_a_long_pause() {
+        let s = Settings::default();
+        let segs = vec![
+            (false, "Первая мысль.".to_string()),
+            (true, "Вторая мысль.".to_string()),
+        ];
+        let raw = render_segments_for_postprocess(&segs);
+        let final_text = process_dictation_text(&raw, &s, &[], &[]);
+
+        assert_eq!(final_text, "Первая мысль.\n\nВторая мысль.");
     }
 
     #[test]
