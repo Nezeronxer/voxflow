@@ -2921,8 +2921,6 @@ fn compact_speech_for_final_asr(
 ) -> Vec<f32> {
     const SPEECH_PROB: f32 = 0.35;
     const SIL_SPLIT: usize = 600 * 16;
-    const PAD: usize = 4800;
-    const JOIN_SILENCE: usize = 3200; // 200 мс между склеенными фразами
 
     if samples.len() < 16000 / 5 {
         return samples.to_vec();
@@ -2973,8 +2971,8 @@ fn compact_speech_for_final_asr(
             }
             j = k;
         }
-        let start = (start_chunk * chunk).saturating_sub(PAD);
-        let end = (((last_voiced + 1) * chunk) + PAD).min(samples.len());
+        let start = (start_chunk * chunk).saturating_sub(FINAL_ASR_PAD_SAMPLES);
+        let end = (((last_voiced + 1) * chunk) + FINAL_ASR_PAD_SAMPLES).min(samples.len());
         if end > start {
             spans.push((start, end));
         }
@@ -2989,14 +2987,37 @@ fn compact_speech_for_final_asr(
         return samples.to_vec();
     }
 
-    let mut out = Vec::with_capacity(kept + JOIN_SILENCE.saturating_mul(spans.len()));
+    let mut out =
+        Vec::with_capacity(kept + FINAL_ASR_JOIN_SILENCE_SAMPLES.saturating_mul(spans.len()));
+    let mut previous_end: Option<usize> = None;
     for (idx, (start, end)) in spans.into_iter().enumerate() {
         if idx > 0 {
-            out.extend(std::iter::repeat_n(0.0, JOIN_SILENCE));
+            let original_gap = previous_end
+                .map(|prev| start.saturating_sub(prev))
+                .unwrap_or(0);
+            let join_silence = compacted_final_asr_join_silence(original_gap);
+            out.extend(std::iter::repeat_n(0.0, join_silence));
         }
         out.extend_from_slice(&samples[start..end]);
+        previous_end = Some(end);
     }
     out
+}
+
+const FINAL_ASR_PAD_SAMPLES: usize = 4800;
+const FINAL_ASR_JOIN_SILENCE_SAMPLES: usize = 3200;
+
+fn compacted_final_asr_join_silence(gap_between_padded_spans: usize) -> usize {
+    // `spans` already include 300 ms of PAD on both sides. Recover the original
+    // speech-to-speech gap for the paragraph decision, then keep an 8 s marker
+    // instead of copying arbitrarily long silence into final ASR.
+    let paragraph_gap_without_padding =
+        PARAGRAPH_GAP_SAMPLES.saturating_sub(FINAL_ASR_PAD_SAMPLES * 2);
+    if gap_between_padded_spans >= paragraph_gap_without_padding {
+        PARAGRAPH_GAP_SAMPLES
+    } else {
+        FINAL_ASR_JOIN_SILENCE_SAMPLES
+    }
 }
 
 fn final_local_asr_samples<'a>(_trimmed: &'a [f32], speech_compacted: &'a [f32]) -> &'a [f32] {
@@ -4807,6 +4828,24 @@ mod seg_tests {
 
         assert_eq!(selected, speech_compacted.as_slice());
         assert!(std::ptr::eq(selected.as_ptr(), speech_compacted.as_ptr()));
+    }
+
+    #[test]
+    fn compacted_final_audio_keeps_paragraph_gap_reachable() {
+        let padded_eight_second_gap = PARAGRAPH_GAP_SAMPLES - FINAL_ASR_PAD_SAMPLES * 2;
+
+        assert_eq!(
+            compacted_final_asr_join_silence(padded_eight_second_gap),
+            PARAGRAPH_GAP_SAMPLES
+        );
+        assert_eq!(
+            compacted_final_asr_join_silence(padded_eight_second_gap - 1),
+            FINAL_ASR_JOIN_SILENCE_SAMPLES
+        );
+        assert!(gap_starts_paragraph(
+            true,
+            compacted_final_asr_join_silence(padded_eight_second_gap)
+        ));
     }
 
     fn live_state_with_draft(mode: &str, draft: &str) -> LiveState {

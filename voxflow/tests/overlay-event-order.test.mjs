@@ -51,6 +51,20 @@ test("a detached live partial cannot replace the final text for the same seq", (
   assert.equal(lateDraft.preview, null);
 });
 
+test("a detached settled preview cannot replace the final text for the same seq", () => {
+  const lateSettled = previewState.resolveOverlayPreviewEvent("transcribing", 41, 41, {
+    text: "устаревший settled-черновик",
+    committed: "устаревший settled-черновик",
+    volatile: "",
+    settled: true,
+    seq: 41,
+  });
+
+  assert.equal(lateSettled.currentSeq, 41);
+  assert.equal(lateSettled.finalSeq, 41);
+  assert.equal(lateSettled.preview, null);
+});
+
 test("stale final and idle settled previews remain rejected", () => {
   const staleFinal = previewState.resolveOverlayPreviewEvent("idle", 42, 42, {
     text: "старый финал",
