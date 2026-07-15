@@ -4,7 +4,7 @@ VoxFlow превращает речь в готовый текст в актив
 документе или IDE. Локальное распознавание работает без подписки и API-ключа;
 облачные STT/rewrite-провайдеры подключаются только пользователем в режиме BYOK.
 
-![version](https://img.shields.io/badge/version-2.0.5-6b7cff)
+![version](https://img.shields.io/badge/version-2.0.6-6b7cff)
 ![macOS](https://img.shields.io/badge/macOS-ARM64-111827)
 ![Windows](https://img.shields.io/badge/Windows-x64-2563eb)
 ![privacy](https://img.shields.io/badge/privacy-local%20by%20default-16a34a)
@@ -45,8 +45,8 @@ VoxFlow превращает речь в готовый текст в актив
 
 | Платформа | Цель релиза 2.0 | Артефакт |
 |---|---|---|
-| macOS Apple Silicon | macOS 11+, ARM64 | `VoxFlow-macOS-2.0.5-arm64-adhoc.dmg` |
-| Windows | Windows 10/11, x64 | `VoxFlow-Setup-2.0.5.exe` |
+| macOS Apple Silicon | macOS 11+, ARM64 | `VoxFlow-macOS-2.0.6-arm64-adhoc.dmg` |
+| Windows | Windows 10/11, x64 | `VoxFlow-Setup-2.0.6.exe` |
 
 Windows-установщик работает per-user и не требует отдельной установки VC++
 Redistributable с повышением прав: нужные Microsoft VC++ CRT/OpenMP DLL лежат
@@ -122,7 +122,7 @@ Rust:
 cargo fmt --manifest-path voxflow/src-tauri/Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path voxflow/src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path voxflow/src-tauri/Cargo.toml --lib
-python3 script/check_versions.py --tag v2.0.5
+python3 script/check_versions.py --tag v2.0.6
 ```
 
 `.github/workflows/ci.yml` повторяет проверки на Windows x64 и macOS ARM64.

@@ -208,9 +208,24 @@ fn should_emit_norecog(capture_ms: u64) -> bool {
 
 #[derive(Default)]
 struct DictationMemory {
-    target_fp: Option<(String, String)>,
+    target_fp: Option<DictationMemoryTarget>,
     summary: String,
-    recent: VecDeque<String>,
+    recent: VecDeque<DictationMemoryItem>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DictationMemoryTarget {
+    exe: String,
+    title: String,
+    window_id: String,
+    field_id: String,
+}
+
+#[derive(Clone)]
+struct DictationMemoryItem {
+    text: String,
+    hard_boundary: bool,
+    truncated_start: bool,
 }
 
 struct LastInject {
@@ -839,7 +854,7 @@ fn should_probe_gigaam_for_auto(whisper_text: &str) -> bool {
     !has_cyrillic(whisper)
 }
 
-const DEFAULT_MULTILINGUAL_PROMPT: &str = "Multilingual speech recognition. Preserve Russian, English and other language switches. Use punctuation. Keep technical terms such as VoxFlow, Tauri, whisper.cpp and Codex.";
+const DEFAULT_MULTILINGUAL_PROMPT: &str = "Multilingual speech recognition. Preserve Russian, English and other language switches. Use punctuation, but do not add a final period merely because recording stopped when the sentence is grammatically unfinished. Keep technical terms such as VoxFlow, Tauri, whisper.cpp and Codex.";
 
 fn whisper_base_prompt(language: &str) -> Option<&'static str> {
     match language.trim().to_ascii_lowercase().as_str() {
@@ -3005,6 +3020,10 @@ fn decide_final_pipeline(accepted_text: bool, live_inserted: bool) -> FinalPipel
     }
 }
 
+fn final_text_is_insertable(text: &str) -> bool {
+    !text.trim().is_empty() || text.contains('\n')
+}
+
 /// Стереть уже напечатанный живой черновик (режимы always/auto): голосовая
 /// «отмена» или команды, съевшие весь текст, не должны оставлять в поле
 /// черновик, набранный петлёй партиалов (включая само слово «отмена»).
@@ -3231,7 +3250,8 @@ fn process_utterance(
     // the original pre-dictation tail now; a later Accessibility snapshot would
     // already contain VoxFlow's own partial and would be an invalid anchor for
     // manual-correction learning.
-    let field_before_dictation = compact_learning_text(&target_fp.captured_context().field_text);
+    let field_before_context = target_fp.captured_context().field_text.clone();
+    let field_before_dictation = compact_learning_text(&field_before_context);
     if !final_generation_is_current(ctx, my_gen) {
         dbg_log("финал: поколение устарело до препроцессинга — ASR пропущен");
         return Ok(());
@@ -3497,7 +3517,7 @@ fn process_utterance(
     }
     let post_ms = t_post.elapsed().as_millis() as u64;
     if let FinalPipelineDecision::Reject { .. } =
-        decide_final_pipeline(!text.trim().is_empty(), live_inserted)
+        decide_final_pipeline(final_text_is_insertable(&text), live_inserted)
     {
         // Постобработка отвергла финал: speculative live draft тоже не должен
         // оставаться в поле.
@@ -3561,9 +3581,9 @@ fn process_utterance(
     // Prefer what is already in the focused field over VoxFlow's own memory.
     // This keeps sentence casing/punctuation continuous even when the existing
     // text was typed manually or inserted by another application.
-    let previous_context_tail = actx
-        .focused_text_tail(600)
-        .or_else(|| last_dictation_context(ctx, &actx));
+    let visible_previous =
+        visible_previous_context_tail(&actx, &field_before_context, live_inserted);
+    let previous_context_tail = previous_context_with_memory_boundary(ctx, &actx, visible_previous);
 
     // ── «Умный» рерайт под стиль активного приложения (Gemini/Ollama/OpenAI-compatible) ──
     // verbatim/neutral и встроенный AI-профиль LLM не зовут: вставка должна быть
@@ -3612,8 +3632,11 @@ fn process_utterance(
         text = continue_from_previous_context(&text, previous_context_tail.as_deref(), &tone);
         text = postprocess::normalize_spaces(&text);
     }
+    if should_preserve_unfinished_ending(&s, &tone, snippet_expanded) {
+        text = postprocess::preserve_unfinished_ending(&text, &raw);
+    }
     if let FinalPipelineDecision::Reject { .. } =
-        decide_final_pipeline(!text.trim().is_empty(), live_inserted)
+        decide_final_pipeline(final_text_is_insertable(&text), live_inserted)
     {
         erase_registered_live_draft(ctx, my_gen);
         let _ = std::fs::remove_file(&wav);
@@ -3784,7 +3807,12 @@ fn process_utterance(
         return Ok(());
     }
     if final_inserted {
-        remember_dictation_context(ctx, &actx, &text);
+        remember_dictation_context(
+            ctx,
+            &actx,
+            &text,
+            postprocess::utterance_has_explicit_terminal_punctuation(&raw),
+        );
         emit_final_preview(&ctx.app, &text, my_gen, lang_badge);
     }
     let inject_ms = t_inj.elapsed().as_millis() as u64;
@@ -4968,6 +4996,279 @@ mod seg_tests {
     }
 
     #[test]
+    fn grammatically_unfinished_context_continues_without_a_cue_word() {
+        assert_eq!(
+            continue_from_previous_context(
+                "Сделал это завтра",
+                Some("Я хотел, чтобы ты"),
+                "casual",
+            ),
+            " сделал это завтра"
+        );
+        assert_eq!(
+            continue_from_previous_context(
+                "Finished the release",
+                Some("I asked that you"),
+                "work",
+            ),
+            " finished the release"
+        );
+        assert_eq!(
+            continue_from_previous_context(
+                "Подготовил документ",
+                Some("Я попросил, чтобы ты"),
+                "formal",
+            ),
+            " подготовил документ"
+        );
+        assert_eq!(
+            continue_from_previous_context(
+                "Сформулировал критерии",
+                Some("Сделай так, чтобы ты"),
+                "ai",
+            ),
+            " сформулировал критерии"
+        );
+        assert_eq!(
+            continue_from_previous_context(
+                "Это продолжение",
+                Some("Я хотел, чтобы ты\n"),
+                "casual",
+            ),
+            "Это продолжение"
+        );
+        assert_eq!(
+            continue_from_previous_context(", наверное завтра", Some("Я думаю, что"), "casual"),
+            ", наверное завтра"
+        );
+        assert_eq!(
+            continue_from_previous_context("Новая мысль", None, "casual"),
+            "Новая мысль"
+        );
+        assert_eq!(
+            continue_from_previous_context("Новая мысль", Some("   "), "casual"),
+            "Новая мысль"
+        );
+        assert_eq!(
+            continue_from_previous_context("Москву вчера", Some("Я приехал в"), "casual"),
+            " Москву вчера"
+        );
+        assert_eq!(
+            continue_from_previous_context("Новой вкладке", Some("Открой документ в"), "work"),
+            " новой вкладке"
+        );
+        assert_eq!(
+            continue_from_previous_context("Нижний Новгород", Some("Я приехал в"), "casual"),
+            " Нижний Новгород"
+        );
+    }
+
+    #[test]
+    fn unfinished_ending_gate_respects_exact_modes_and_punctuation_setting() {
+        let defaults = Settings::default();
+        assert!(should_preserve_unfinished_ending(
+            &Settings {
+                auto_punct: true,
+                ..defaults.clone()
+            },
+            "neutral",
+            false,
+        ));
+        assert!(!should_preserve_unfinished_ending(
+            &Settings {
+                auto_punct: false,
+                ..defaults.clone()
+            },
+            "neutral",
+            false,
+        ));
+        assert!(!should_preserve_unfinished_ending(
+            &Settings {
+                auto_punct: true,
+                verbatim: true,
+                ..defaults.clone()
+            },
+            "neutral",
+            false,
+        ));
+        for tone in ["code", "verbatim"] {
+            assert!(!should_preserve_unfinished_ending(
+                &Settings {
+                    auto_punct: true,
+                    ..defaults.clone()
+                },
+                tone,
+                false,
+            ));
+        }
+        assert!(!should_preserve_unfinished_ending(
+            &Settings {
+                auto_punct: true,
+                ..defaults
+            },
+            "neutral",
+            true,
+        ));
+    }
+
+    #[test]
+    fn ellipsis_keeps_context_open_but_real_period_closes_it() {
+        assert!(previous_context_is_closed("Я ещё думаю…"));
+        assert!(!previous_context_is_closed("Я хотел сказать, что…"));
+        assert!(!previous_context_is_closed("Я хотел сказать, что."));
+        assert!(previous_context_is_closed("Релиз готов."));
+        assert!(previous_context_is_closed("Релиз готов!"));
+        assert!(previous_context_is_closed("Строка завершена\n"));
+    }
+
+    #[test]
+    fn live_context_uses_the_pre_dictation_field_not_its_own_draft() {
+        let context = crate::app_context::AppContext {
+            exe: "editor.exe".into(),
+            title: "Editor".into(),
+            window_id: "window=1".into(),
+            category: "work".into(),
+            field_role: "UIAEdit".into(),
+            field_subrole: "textpattern".into(),
+            field_id: "field=1".into(),
+            field_text: "Я хотел, чтобы ты Сделал это".into(),
+            selected_text: String::new(),
+        };
+        assert_eq!(
+            visible_previous_context_tail(&context, "Я хотел, чтобы ты", true),
+            Some("Я хотел, чтобы ты".into())
+        );
+        assert_eq!(visible_previous_context_tail(&context, "", true), None);
+        assert_eq!(
+            visible_previous_context_tail(&context, "ignored", false),
+            Some("Я хотел, чтобы ты Сделал это".into())
+        );
+        let bounded = visible_previous_context_tail(&context, "Я хотел, чтобы ты\n", true)
+            .expect("newline boundary");
+        assert!(bounded.ends_with('\n'));
+        assert_eq!(
+            continue_from_previous_context("Новая тема", Some(&bounded), "casual"),
+            "Новая тема"
+        );
+    }
+
+    #[test]
+    fn dictation_memory_never_crosses_fields_or_unidentified_controls() {
+        let context = crate::app_context::AppContext {
+            exe: "browser.exe".into(),
+            title: "Form".into(),
+            window_id: "window=1".into(),
+            category: "work".into(),
+            field_role: "UIAEdit".into(),
+            field_subrole: "textpattern".into(),
+            field_id: "field=A".into(),
+            field_text: String::new(),
+            selected_text: String::new(),
+        };
+        let memory = DictationMemory {
+            target_fp: dictation_memory_target(&context),
+            ..DictationMemory::default()
+        };
+        assert!(target_matches_memory(&memory, &context));
+
+        let mut other = context.clone();
+        other.field_id = "field=B".into();
+        assert!(!target_matches_memory(&memory, &other));
+
+        other.field_id.clear();
+        assert!(!target_matches_memory(&memory, &other));
+        assert!(dictation_memory_target(&other).is_none());
+    }
+
+    #[test]
+    fn final_gate_accepts_an_explicit_line_break_without_text() {
+        assert!(final_text_is_insertable("\n"));
+        assert!(final_text_is_insertable("\n\n"));
+        assert!(final_text_is_insertable("готово"));
+        assert!(!final_text_is_insertable("   \t"));
+    }
+
+    #[test]
+    fn remembered_line_break_is_a_hard_sentence_boundary() {
+        let context = crate::app_context::AppContext {
+            exe: "editor.exe".into(),
+            title: "Editor".into(),
+            window_id: "window=1".into(),
+            category: "work".into(),
+            field_role: "UIAEdit".into(),
+            field_subrole: "textpattern".into(),
+            field_id: "field=A".into(),
+            field_text: String::new(),
+            selected_text: String::new(),
+        };
+        let mut memory = DictationMemory::default();
+        remember_dictation_context_in(&mut memory, &context, "Я хотел, чтобы ты", false);
+        remember_dictation_context_in(&mut memory, &context, "\n", false);
+
+        let boundary = dictation_memory_item_context(
+            memory.recent.back().expect("remembered newline boundary"),
+        );
+        assert_eq!(boundary, "\n");
+        assert_eq!(
+            continue_from_previous_context("Новая тема", Some(&boundary), "casual"),
+            "Новая тема"
+        );
+    }
+
+    #[test]
+    fn spoken_period_stays_a_boundary_after_existing_field_text() {
+        let context = crate::app_context::AppContext {
+            exe: "editor.exe".into(),
+            title: "Editor".into(),
+            window_id: "window=1".into(),
+            category: "work".into(),
+            field_role: "UIAEdit".into(),
+            field_subrole: "textpattern".into(),
+            field_id: "field=A".into(),
+            field_text: String::new(),
+            selected_text: String::new(),
+        };
+        let mut memory = DictationMemory::default();
+        remember_dictation_context_in(&mut memory, &context, "Я хотел сказать, что.", true);
+
+        let boundary = previous_context_with_memory_boundary_in(
+            &memory,
+            &context,
+            Some("Привет. Я хотел сказать, что.".into()),
+        )
+        .expect("visible field tail");
+        assert!(boundary.ends_with('\n'));
+        assert_eq!(
+            continue_from_previous_context("Новая тема", Some(&boundary), "casual"),
+            "Новая тема"
+        );
+
+        let unrelated = previous_context_with_memory_boundary_in(
+            &memory,
+            &context,
+            Some("Привет. Совсем другой текст.".into()),
+        );
+        assert_eq!(unrelated.as_deref(), Some("Привет. Совсем другой текст."));
+        assert!(!visible_tail_matches_memory_item(
+            "контекстчто.",
+            "что.",
+            false,
+        ));
+
+        let long_spoken_sentence = format!(
+            "{}Я хотел сказать, что.",
+            "очень длинный контекст ".repeat(30)
+        );
+        remember_dictation_context_in(&mut memory, &context, &long_spoken_sentence, true);
+        let visible_long =
+            sentence_context_tail(&format!("Старый префикс. {long_spoken_sentence}"), 600);
+        let long_boundary =
+            previous_context_with_memory_boundary_in(&memory, &context, Some(visible_long))
+                .expect("long visible field tail");
+        assert!(long_boundary.ends_with('\n'));
+    }
+
+    #[test]
     fn paragraph_gap_keeps_short_continuation_together() {
         assert!(!gap_starts_paragraph(true, 3 * 16000));
         assert!(!gap_starts_paragraph(true, 4 * 16000));
@@ -5159,8 +5460,12 @@ mod seg_tests {
         for lang in ["auto", "all", "any", "multi", "multilingual", "*"] {
             let prompt = whisper_base_prompt(lang).expect("multilingual prompt");
             assert!(prompt.contains("language switches"));
+            assert!(prompt.contains("do not add a final period"));
             assert_eq!(whisper_language_arg(lang), "auto");
         }
+        assert!(postprocess::DEFAULT_RU_PROMPT.contains("Окончание записи"));
+        assert!(crate::ollama::SYSTEM_PROMPT.contains("Окончание записи"));
+        assert!(crate::ollama::SYSTEM_PROMPT.contains("Грамматически незавершённую"));
         assert!(whisper_base_prompt("en").is_none());
         assert_eq!(whisper_language_arg("en"), "en");
     }
@@ -5400,8 +5705,44 @@ fn target_matches_memory(memory: &DictationMemory, actx: &crate::app_context::Ap
     memory
         .target_fp
         .as_ref()
-        .map(|(exe, title)| exe == &actx.exe && title == &actx.title)
+        .map(|target| {
+            let same_window = if !target.window_id.is_empty() && !actx.window_id.is_empty() {
+                target.exe == actx.exe && target.window_id == actx.window_id
+            } else {
+                target.exe == actx.exe && target.title == actx.title
+            };
+            same_window && !actx.field_id.is_empty() && target.field_id == actx.field_id
+        })
         .unwrap_or(false)
+}
+
+fn dictation_memory_target(actx: &crate::app_context::AppContext) -> Option<DictationMemoryTarget> {
+    if actx.field_id.trim().is_empty() {
+        return None;
+    }
+    Some(DictationMemoryTarget {
+        exe: actx.exe.clone(),
+        title: actx.title.clone(),
+        window_id: actx.window_id.clone(),
+        field_id: actx.field_id.clone(),
+    })
+}
+
+fn visible_previous_context_tail(
+    actx: &crate::app_context::AppContext,
+    field_before_dictation: &str,
+    live_inserted: bool,
+) -> Option<String> {
+    if live_inserted {
+        let previous = field_before_dictation.trim();
+        if previous.is_empty() {
+            None
+        } else {
+            Some(sentence_context_tail(field_before_dictation, 600))
+        }
+    } else {
+        actx.focused_text_tail(600)
+    }
 }
 
 fn last_dictation_context(
@@ -5412,25 +5753,119 @@ fn last_dictation_context(
     if !target_matches_memory(&memory, actx) {
         return None;
     }
-    memory.recent.back().cloned()
+    memory.recent.back().map(dictation_memory_item_context)
+}
+
+fn dictation_memory_item_context(item: &DictationMemoryItem) -> String {
+    let mut context = item.text.clone();
+    if item.hard_boundary && !context.ends_with('\n') {
+        context.push('\n');
+    }
+    context
+}
+
+fn previous_context_with_memory_boundary(
+    ctx: &EngineCtx,
+    actx: &crate::app_context::AppContext,
+    visible: Option<String>,
+) -> Option<String> {
+    let memory = ctx.dictation_memory.lock();
+    previous_context_with_memory_boundary_in(&memory, actx, visible)
+}
+
+fn previous_context_with_memory_boundary_in(
+    memory: &DictationMemory,
+    actx: &crate::app_context::AppContext,
+    visible: Option<String>,
+) -> Option<String> {
+    if !target_matches_memory(memory, actx) {
+        return visible;
+    }
+    let Some(last) = memory.recent.back() else {
+        return visible;
+    };
+    match visible {
+        Some(mut current) => {
+            if last.hard_boundary
+                && visible_tail_matches_memory_item(&current, &last.text, last.truncated_start)
+                && !current.ends_with('\n')
+            {
+                current.push('\n');
+            }
+            Some(current)
+        }
+        None => Some(dictation_memory_item_context(last)),
+    }
+}
+
+fn visible_tail_matches_memory_item(visible: &str, item: &str, truncated_start: bool) -> bool {
+    let visible = compact_instruction_source(visible);
+    let mut item = compact_instruction_source(item);
+    if truncated_start {
+        item = item.strip_prefix("...").unwrap_or(&item).to_string();
+    }
+    if item.is_empty() {
+        return false;
+    }
+    if visible == item {
+        return true;
+    }
+    let Some(prefix) = visible.strip_suffix(&item) else {
+        return false;
+    };
+    // A complete token boundary prevents a short remembered fragment from
+    // matching the ending of an unrelated word. Normal insertion before a
+    // remembered phrase leaves exactly this whitespace boundary.
+    truncated_start || prefix.chars().last().is_some_and(char::is_whitespace)
 }
 
 fn conversational_continuation_enabled(tone: &str) -> bool {
     matches!(tone, "" | "neutral" | "casual" | "very_casual" | "work")
 }
 
+fn should_preserve_unfinished_ending(
+    settings: &Settings,
+    tone: &str,
+    is_exact_snippet: bool,
+) -> bool {
+    settings.auto_punct
+        && !settings.verbatim
+        && !is_exact_snippet
+        && !matches!(tone, "code" | "verbatim")
+}
+
 fn continue_from_previous_context(text: &str, previous: Option<&str>, tone: &str) -> String {
-    if !conversational_continuation_enabled(tone) {
-        return text.to_string();
-    }
-    let Some(prev) = previous.map(str::trim).filter(|v| !v.is_empty()) else {
+    let Some(raw_prev) = previous.filter(|v| !v.trim().is_empty()) else {
         return text.to_string();
     };
-    if previous_context_is_closed(prev) {
+    // Check the original tail before trimming it. A user-requested newline is
+    // a hard boundary and must not disappear on the way into the continuation
+    // detector.
+    if previous_context_is_closed(raw_prev) {
         return text.to_string();
     }
-    let Some(next) = lower_if_continuation_start(text) else {
+    let prev = raw_prev.trim();
+    let grammatically_open = postprocess::looks_unfinished_utterance(prev);
+    if matches!(tone, "code" | "verbatim")
+        || (!grammatically_open && !conversational_continuation_enabled(tone))
+    {
         return text.to_string();
+    }
+    let next = if grammatically_open {
+        // A high-confidence open clause may resume with any ordinary word, not
+        // only a connective such as "и"/"потому что". The ASR capitalizes each
+        // recording independently. Preserve it after a preposition because the
+        // next word may be a proper name ("в" + "Москву").
+        if postprocess::continuation_may_start_with_proper_name(prev, text) {
+            text.trim_start().to_string()
+        } else {
+            lower_first_alphabetic(text.trim_start())
+        }
+    } else {
+        let Some(next) = lower_if_continuation_start(text) else {
+            return text.to_string();
+        };
+        next
     };
     if next
         .chars()
@@ -5445,12 +5880,25 @@ fn continue_from_previous_context(text: &str, previous: Option<&str>, tone: &str
 }
 
 fn previous_context_is_closed(text: &str) -> bool {
-    text.trim_end()
+    // A user-requested newline is an explicit boundary. Ignore only spaces and
+    // tabs here so the newline is not erased before the check.
+    if text.trim_end_matches([' ', '\t', '\r']).ends_with('\n') {
+        return true;
+    }
+    let terminal = text
+        .trim_end()
         .chars()
         .rev()
         .find(|c| !matches!(c, '"' | '\'' | ')' | ']' | '}' | '»' | '”'))
-        .map(|c| ".!?…\n".contains(c))
-        .unwrap_or(false)
+        .filter(|c| !c.is_whitespace());
+    match terminal {
+        Some('?' | '!') => true,
+        // Ellipsis is an open pause. A single/full stop closes only a phrase
+        // whose words are not themselves a high-confidence dangling clause.
+        Some('.') => !postprocess::looks_unfinished_utterance(text),
+        Some('…') => !postprocess::looks_unfinished_utterance(text),
+        _ => false,
+    }
 }
 
 fn compact_context_tail(value: &str, max_chars: usize) -> String {
@@ -5475,6 +5923,15 @@ fn compact_context_tail(value: &str, max_chars: usize) -> String {
     format!("...{tail}")
 }
 
+fn sentence_context_tail(value: &str, max_chars: usize) -> String {
+    let terminal_newline = value.trim_end_matches([' ', '\t', '\r']).ends_with('\n');
+    let mut tail = compact_context_tail(value, max_chars);
+    if terminal_newline && !tail.ends_with('\n') {
+        tail.push('\n');
+    }
+    tail
+}
+
 fn merge_context_summary(current: &str, old: &str) -> String {
     let merged = if current.trim().is_empty() {
         old.to_string()
@@ -5484,32 +5941,61 @@ fn merge_context_summary(current: &str, old: &str) -> String {
     compact_context_tail(&merged, DICTATION_CONTEXT_SUMMARY_CHARS)
 }
 
-fn recent_context_len(recent: &VecDeque<String>) -> usize {
-    recent.iter().map(|v| v.chars().count()).sum()
+fn recent_context_len(recent: &VecDeque<DictationMemoryItem>) -> usize {
+    recent.iter().map(|v| v.text.chars().count()).sum()
 }
 
-fn remember_dictation_context(ctx: &EngineCtx, actx: &crate::app_context::AppContext, text: &str) {
-    let compact = compact_context_tail(text, DICTATION_CONTEXT_ITEM_CHARS);
-    if compact.trim().is_empty() {
+fn remember_dictation_context(
+    ctx: &EngineCtx,
+    actx: &crate::app_context::AppContext,
+    text: &str,
+    explicit_terminal: bool,
+) {
+    let mut memory = ctx.dictation_memory.lock();
+    remember_dictation_context_in(&mut memory, actx, text, explicit_terminal);
+}
+
+fn remember_dictation_context_in(
+    memory: &mut DictationMemory,
+    actx: &crate::app_context::AppContext,
+    text: &str,
+    explicit_terminal: bool,
+) {
+    let compact = sentence_context_tail(text, DICTATION_CONTEXT_ITEM_CHARS);
+    if compact.is_empty() {
         return;
     }
 
-    let mut memory = ctx.dictation_memory.lock();
-    let target_fp = (actx.exe.clone(), actx.title.clone());
+    let Some(target_fp) = dictation_memory_target(actx) else {
+        // Without a stable field identifier, reusing hidden memory in another
+        // empty control of the same window can leak sentence context. The
+        // visible focused-field tail remains the safe continuation source.
+        memory.target_fp = None;
+        memory.summary.clear();
+        memory.recent.clear();
+        return;
+    };
     if memory.target_fp.as_ref() != Some(&target_fp) {
         memory.target_fp = Some(target_fp);
         memory.summary.clear();
         memory.recent.clear();
     }
 
-    memory.recent.push_back(compact);
+    let hard_boundary = compact.ends_with('\n') || explicit_terminal;
+    let truncated_start =
+        compact_instruction_source(text).chars().count() > DICTATION_CONTEXT_ITEM_CHARS;
+    memory.recent.push_back(DictationMemoryItem {
+        text: compact,
+        hard_boundary,
+        truncated_start,
+    });
     while memory.recent.len() > DICTATION_CONTEXT_RECENT_LIMIT
         || recent_context_len(&memory.recent) > DICTATION_CONTEXT_RECENT_CHARS
     {
         let Some(old) = memory.recent.pop_front() else {
             break;
         };
-        memory.summary = merge_context_summary(&memory.summary, &old);
+        memory.summary = merge_context_summary(&memory.summary, &old.text);
     }
 }
 
@@ -5546,7 +6032,7 @@ fn rewrite_context_hint(
                 memory
                     .recent
                     .iter()
-                    .map(|v| v.as_str())
+                    .map(|v| v.text.as_str())
                     .collect::<Vec<_>>()
                     .join(" / ")
             ));
@@ -5590,7 +6076,7 @@ fn build_asr_prompt(
     corrections: &[postprocess::Correction],
 ) -> Option<String> {
     let mut parts = vec![
-        "Speech recognition context only: transcribe what was said, preserve Russian/English/other language switches, do not rewrite.".to_string(),
+        "Speech recognition context only: transcribe what was said, preserve Russian/English/other language switches, do not rewrite. Recording stop is not necessarily a sentence boundary: do not add a final period when the utterance is grammatically unfinished.".to_string(),
     ];
 
     let app = app_label_for_payload(actx);
@@ -5602,14 +6088,23 @@ fn build_asr_prompt(
         }
     }
 
-    if let Some(previous) = previous_context_tail
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        parts.push(format!(
-            "Previous same-field text tail: {}.",
-            compact_context_tail(previous, ASR_PROMPT_PREVIOUS_CHARS)
-        ));
+    if let Some(raw_previous) = previous_context_tail.filter(|value| !value.trim().is_empty()) {
+        let terminal_newline = raw_previous
+            .trim_end_matches([' ', '\t', '\r'])
+            .ends_with('\n');
+        let previous = raw_previous.trim();
+        let tail = compact_context_tail(previous, ASR_PROMPT_PREVIOUS_CHARS);
+        if terminal_newline {
+            parts.push(format!(
+                "Previous same-field text tail (explicit line boundary; do not merge across it): {tail}"
+            ));
+        } else if postprocess::looks_unfinished_utterance(previous) {
+            parts.push(format!(
+                "Previous same-field text tail (grammatically unfinished; current speech may continue it): {tail}"
+            ));
+        } else {
+            parts.push(format!("Previous same-field text tail: {tail}."));
+        }
     }
 
     let mut terms = Vec::new();
@@ -6036,6 +6531,7 @@ fn build_tone_instruction(
          Удали запинки, междометия, повторы и брошенные начала фраз. \
          Сбивчивые устные команды приводи к письменной форме: «я объясни мне» → «Объясни мне», «а что ещё я хочу сказать» → «Также учти». \
          Сохраняй контекст соседних фраз: если следующая фраза продолжает мысль, объединяй её с предыдущей и продолжай предложение. \
+         Окончание записи само по себе не означает окончание предложения: если фраза грамматически не закончена, не дописывай мысль и не ставь принудительную финальную точку. \
          Новый абзац делай только при явной смене темы, перечислении, новом смысловом блоке, явной команде абзаца или действительно длинной паузе. \
          Не разбивай каждую фразу или каждое предложение в отдельный абзац. \
          Если дан контекст предыдущего или выделенного текста, используй его только для пунктуации, местоимений, продолжения предложения и стиля; не добавляй новые факты из контекста. \
@@ -6234,6 +6730,7 @@ mod smart_prompt_tests {
 
         assert!(instruction.contains("Контекст для понимания соседнего текста"));
         assert!(instruction.contains("не добавляй новые факты из контекста"));
+        assert!(instruction.contains("Окончание записи само по себе"));
     }
 
     #[test]
@@ -6412,6 +6909,7 @@ mod smart_prompt_tests {
         .expect("prompt");
 
         assert!(prompt.contains("preserve Russian/English"));
+        assert!(prompt.contains("Recording stop is not necessarily"));
         assert!(prompt.contains("Previous same-field text tail"));
         assert!(prompt.contains("Wispr Flow"));
         assert!(prompt.contains("VoxFlow"));
@@ -6419,6 +6917,26 @@ mod smart_prompt_tests {
         assert!(prompt.contains("Виспа Фолл -> Wispr Flow"));
         assert!(!prompt.contains("super secret expanded template"));
         assert!(prompt.chars().count() <= ASR_PROMPT_MAX_CHARS);
+
+        let unfinished =
+            build_asr_prompt(&app("Codex"), "ai", Some("Я хочу, чтобы ты"), &[], &[], &[])
+                .expect("unfinished prompt");
+        assert!(unfinished.contains("grammatically unfinished"));
+        assert!(!unfinished.contains("Я хочу, чтобы ты."));
+
+        let newline_boundary = build_asr_prompt(
+            &app("Codex"),
+            "ai",
+            Some("Я хочу, чтобы ты\n"),
+            &[],
+            &[],
+            &[],
+        )
+        .expect("newline boundary prompt");
+        assert!(newline_boundary.contains("explicit line boundary"));
+        assert!(
+            !newline_boundary.contains("Previous same-field text tail (grammatically unfinished;")
+        );
     }
 }
 
