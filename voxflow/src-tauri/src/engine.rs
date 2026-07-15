@@ -2971,8 +2971,8 @@ fn compact_speech_for_final_asr(
             }
             j = k;
         }
-        let start = (start_chunk * chunk).saturating_sub(FINAL_ASR_PAD_SAMPLES);
-        let end = (((last_voiced + 1) * chunk) + FINAL_ASR_PAD_SAMPLES).min(samples.len());
+        let start = start_chunk * chunk;
+        let end = ((last_voiced + 1) * chunk).min(samples.len());
         if end > start {
             spans.push((start, end));
         }
@@ -2982,42 +2982,70 @@ fn compact_speech_for_final_asr(
     if spans.is_empty() {
         return Vec::new();
     }
-    let kept: usize = spans.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
-    if spans.len() == 1 && kept + 16000 >= samples.len() {
-        return samples.to_vec();
-    }
-
-    let mut out =
-        Vec::with_capacity(kept + FINAL_ASR_JOIN_SILENCE_SAMPLES.saturating_mul(spans.len()));
-    let mut previous_end: Option<usize> = None;
-    for (idx, (start, end)) in spans.into_iter().enumerate() {
-        if idx > 0 {
-            let original_gap = previous_end
-                .map(|prev| start.saturating_sub(prev))
-                .unwrap_or(0);
-            let join_silence = compacted_final_asr_join_silence(original_gap);
-            out.extend(std::iter::repeat_n(0.0, join_silence));
+    if spans.len() == 1 {
+        let (start, end) = spans[0];
+        let padded_start = start.saturating_sub(FINAL_ASR_PAD_SAMPLES);
+        let padded_end = (end + FINAL_ASR_PAD_SAMPLES).min(samples.len());
+        if padded_end.saturating_sub(padded_start) + 16000 >= samples.len() {
+            return samples.to_vec();
         }
-        out.extend_from_slice(&samples[start..end]);
-        previous_end = Some(end);
     }
-    out
+    stitch_final_asr_spans(samples, &spans)
 }
 
 const FINAL_ASR_PAD_SAMPLES: usize = 4800;
 const FINAL_ASR_JOIN_SILENCE_SAMPLES: usize = 3200;
+const LOCAL_ASR_SIL_SPLIT_SAMPLES: usize = 600 * 16;
 
-fn compacted_final_asr_join_silence(gap_between_padded_spans: usize) -> usize {
-    // `spans` already include 300 ms of PAD on both sides. Recover the original
-    // speech-to-speech gap for the paragraph decision, then keep an 8 s marker
-    // instead of copying arbitrarily long silence into final ASR.
-    let paragraph_gap_without_padding =
-        PARAGRAPH_GAP_SAMPLES.saturating_sub(FINAL_ASR_PAD_SAMPLES * 2);
-    if gap_between_padded_spans >= paragraph_gap_without_padding {
+fn stitch_final_asr_spans(samples: &[f32], spans: &[(usize, usize)]) -> Vec<f32> {
+    let kept: usize = spans.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    let joins: usize = spans
+        .windows(2)
+        .map(|pair| compacted_final_asr_join_silence(pair[1].0.saturating_sub(pair[0].1)))
+        .sum();
+    let mut out = Vec::with_capacity(kept + FINAL_ASR_PAD_SAMPLES * 2 + joins);
+    let mut previous_end: Option<usize> = None;
+    for (idx, &(speech_start, speech_end)) in spans.iter().enumerate() {
+        if idx > 0 {
+            let original_gap = previous_end
+                .map(|prev| speech_start.saturating_sub(prev))
+                .unwrap_or(0);
+            let join_silence = compacted_final_asr_join_silence(original_gap);
+            out.extend(std::iter::repeat_n(0.0, join_silence));
+        }
+        // Padding is only needed at the outer recording edges. Keeping 300 ms
+        // on both sides of every internal island turned a 200 ms compacted join
+        // into 800 ms, tripping the 600 ms segment splitter and producing
+        // artificial word fragments such as «вок» + «зал».
+        let start = if idx == 0 {
+            speech_start.saturating_sub(FINAL_ASR_PAD_SAMPLES)
+        } else {
+            speech_start
+        };
+        let end = if idx + 1 == spans.len() {
+            (speech_end + FINAL_ASR_PAD_SAMPLES).min(samples.len())
+        } else {
+            speech_end
+        };
+        out.extend_from_slice(&samples[start..end]);
+        previous_end = Some(speech_end);
+    }
+    out
+}
+
+fn compacted_final_asr_join_silence(gap_between_speech_spans: usize) -> usize {
+    // Keep the paragraph signal but do not copy arbitrarily long silence into
+    // final ASR. Shorter pauses become a 200 ms join, safely below the local
+    // 600 ms segment boundary.
+    if gap_between_speech_spans >= PARAGRAPH_GAP_SAMPLES {
         PARAGRAPH_GAP_SAMPLES
     } else {
         FINAL_ASR_JOIN_SILENCE_SAMPLES
     }
+}
+
+fn local_asr_gap_starts_segment(gap_samples: usize) -> bool {
+    gap_samples >= LOCAL_ASR_SIL_SPLIT_SAMPLES
 }
 
 fn final_local_asr_samples<'a>(_trimmed: &'a [f32], speech_compacted: &'a [f32]) -> &'a [f32] {
@@ -4694,7 +4722,6 @@ pub(crate) fn local_transcribe_long<F>(
 where
     F: FnMut(&[f32]) -> anyhow::Result<String>,
 {
-    const SIL_SPLIT: usize = 600 * 16; // межфразная тишина
     const MAX_SEG: usize = 25 * 16000;
     const PAD: usize = 4800; // 300 мс запас вокруг речи
 
@@ -4758,7 +4785,7 @@ where
             while k < n && !speech[k] {
                 k += 1;
             }
-            if (k - j) * chunk >= SIL_SPLIT {
+            if local_asr_gap_starts_segment((k - j) * chunk) {
                 break;
             }
             j = k;
@@ -4832,19 +4859,35 @@ mod seg_tests {
 
     #[test]
     fn compacted_final_audio_keeps_paragraph_gap_reachable() {
-        let padded_eight_second_gap = PARAGRAPH_GAP_SAMPLES - FINAL_ASR_PAD_SAMPLES * 2;
-
         assert_eq!(
-            compacted_final_asr_join_silence(padded_eight_second_gap),
+            compacted_final_asr_join_silence(PARAGRAPH_GAP_SAMPLES),
             PARAGRAPH_GAP_SAMPLES
         );
         assert_eq!(
-            compacted_final_asr_join_silence(padded_eight_second_gap - 1),
+            compacted_final_asr_join_silence(PARAGRAPH_GAP_SAMPLES - 1),
             FINAL_ASR_JOIN_SILENCE_SAMPLES
         );
         assert!(gap_starts_paragraph(
             true,
-            compacted_final_asr_join_silence(padded_eight_second_gap)
+            compacted_final_asr_join_silence(PARAGRAPH_GAP_SAMPLES)
+        ));
+    }
+
+    #[test]
+    fn compacted_word_fragments_reach_one_local_asr_segment() {
+        let samples = vec![1.0_f32; 40_000];
+        let spans = [(4_800, 9_600), (20_000, 24_800)];
+
+        let stitched = stitch_final_asr_spans(&samples, &spans);
+        let join_start = 9_600;
+        let join_end = join_start + FINAL_ASR_JOIN_SILENCE_SAMPLES;
+
+        assert!(stitched[join_start..join_end]
+            .iter()
+            .all(|sample| *sample == 0.0));
+        assert_eq!(stitched[join_end], 1.0);
+        assert!(!local_asr_gap_starts_segment(
+            FINAL_ASR_JOIN_SILENCE_SAMPLES
         ));
     }
 
