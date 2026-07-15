@@ -2349,6 +2349,12 @@ fn partial_loop(a: PartialLoopArgs) {
                 }
             }
         };
+        // Stop can be raised while the blocking whisper request is in flight.
+        // Re-check after it returns so a detached worker cannot publish a live
+        // draft after the exact final text has already been inserted/emitted.
+        if a.stop.load(Ordering::Acquire) {
+            break;
+        }
 
         if txt.trim().is_empty() {
             if !empty_logged {

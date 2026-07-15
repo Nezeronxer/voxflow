@@ -145,21 +145,12 @@ test("live preview survives transcribing and frame updates bypass React state", 
   assert.ok(transcribingBranch, "missing transcribing status branch");
   assert.doesNotMatch(transcribingBranch[1], /resetTextEngine\(\)/);
   assert.match(transcribingBranch[1], /setShownDirect\(targetCharsRef\.current\.length\)/);
-  assert.match(overlaySource, /status === "transcribing"[\s\S]*?hasPreview[\s\S]*?"stream"/);
   assert.doesNotMatch(overlaySource, /const \[shown,\s*setShown\]/);
   assert.match(overlaySource, /committedTextRef\.current\.textContent/);
   assert.match(overlaySource, /el\.style\.transform = `scaleY/);
   assert.match(overlaySource, /seq\?: number/);
   assert.match(overlaySource, /p\?\.latched === true/);
   assert.match(overlaySource, /if \(seq > currentSeqRef\.current\) currentSeqRef\.current = seq/);
-});
-
-test("final preview survives idle arriving first on another Tauri event channel", () => {
-  assert.match(
-    overlaySource,
-    /isFinalPreview\s*&&\s*statusRef\.current === "idle"\s*&&\s*seq === currentSeqRef\.current/,
-    "the exact inserted text must still reach the pill when status=idle wins the cross-channel race",
-  );
 });
 
 test("recording and double-tap latch share geometry without a second pop animation", () => {

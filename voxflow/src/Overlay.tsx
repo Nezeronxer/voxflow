@@ -23,6 +23,11 @@ import { cursorPosition, getCurrentWindow, PhysicalPosition } from "@tauri-apps/
 import { getSettings, IS_TAURI_RUNTIME, subscribe } from "./api";
 import FpsMeter from "./components/FpsMeter";
 import "./overlay.css";
+import {
+  previewPillMode,
+  resolveOverlayPreviewEvent,
+  shouldResetFinalPreviewAfterHold,
+} from "./overlayPreviewState";
 import { DEFAULT_HOTKEY, normalizeOverlayScale } from "./types";
 import { prettyHotkey } from "./ui";
 import type {
@@ -154,6 +159,9 @@ export default function Overlay() {
   // внутри диктовки (= её поколение) и строго растёт между ними, поэтому монотонность и
   // принимает все партиалы текущей записи, и режет эхо прошлой без окна для «мигания».
   const currentSeqRef = useRef(-1);
+  // После принятого final обычный partial того же seq уже не имеет права менять
+  // кружок: это может быть только запоздавший результат детачнутого live-worker.
+  const finalSeqRef = useRef(-1);
   // PERF (60fps): зеркало React-стейта typing, чтобы выставлять его РОВНО один раз
   // на старте печати и один раз в конце — а не setState каждый кадр rAF.
   const typingRef = useRef(false);
@@ -461,7 +469,7 @@ export default function Overlay() {
         finalHoldTimer.current = null;
         finalHoldRef.current = false;
         setFinalHold(false);
-        if (statusRef.current === "idle") resetTextEngine();
+        if (shouldResetFinalPreviewAfterHold(statusRef.current)) resetTextEngine();
       }, FINAL_PREVIEW_HOLD_MS);
     };
 
@@ -528,64 +536,26 @@ export default function Overlay() {
     });
 
     const offPartial = subscribe<PartialWithLang>("partial", (e) => {
-      // Дедуп: партиал старее текущей диктовки — это эхо прошлой записи (StrictMode/
-      // async-гонки), игнорируем. seq константен внутри диктовки (= поколение) и строго
-      // растёт между ними, поэтому "<" пропускает все партиалы текущей и режет эхо прошлой.
-      const seq = e.payload?.seq;
-      if (seq != null) {
-        if (seq < currentSeqRef.current) return;
-        currentSeqRef.current = seq;
-      }
-      const isFinalPreview = e.payload?.final === true;
-      const isSettledPreview = e.payload?.settled === true;
-      // Tauri preserves each event stream, but `status` and `partial` are
-      // separate channels. The final preview and the following idle status can
-      // therefore reach the WebView in the opposite order. Accept the exact
-      // final text for this generation after idle; the seq guard above still
-      // rejects a late final from an older dictation.
-      const isSameSeqFinalAfterIdle =
-        isFinalPreview &&
-        statusRef.current === "idle" &&
-        seq === currentSeqRef.current;
-      if (
-        statusRef.current === "transcribing" &&
-        !isFinalPreview &&
-        !isSettledPreview
-      ) {
-        return;
-      }
-      if (
-        (isFinalPreview || isSettledPreview) &&
-        statusRef.current !== "recording" &&
-        statusRef.current !== "transcribing" &&
-        !isSameSeqFinalAfterIdle
-      ) {
-        return;
-      }
+      const resolved = resolveOverlayPreviewEvent(
+        statusRef.current,
+        currentSeqRef.current,
+        finalSeqRef.current,
+        e.payload,
+      );
+      currentSeqRef.current = resolved.currentSeq;
+      finalSeqRef.current = resolved.finalSeq;
+      const preview = resolved.preview;
+      if (preview == null) return;
+      const { text, committedLen: nextCommittedLen } = preview;
+      const isFinalPreview = preview.isFinal;
+      const isSettledPreview = preview.isSettled;
       if (!isFinalPreview && !isSettledPreview && finalHoldRef.current) {
         clearFinalHold();
       }
       // Язык от STT (опционален): обновляем после дедупа — эхо прошлой записи
       // не перетирает бейдж текущей. setState с тем же значением React гасит сам.
       applyLang(e.payload?.lang);
-      const committed = (e.payload.committed ?? "").trim();
-      const volatileTail = (e.payload.volatile ?? "").trim();
-      const combinedFallback = (committed + " " + volatileTail).trim();
-      const payloadText =
-        typeof e.payload.text === "string" ? e.payload.text : undefined;
-      // `text` — полный текст по контракту бэкенда. Для final=true это ровно та
-      // строка, которую уже успешно вставили в целевое поле, поэтому не собираем
-      // её заново из committed/volatile и не trim'им (это меняло пробелы/абзацы).
-      // Сборка из частей остаётся только совместимостью со старым payload без text.
-      const text = isFinalPreview
-        ? (payloadText ?? combinedFallback)
-        : (payloadText || combinedFallback).trim();
       const chars = Array.from(text);
-      // Array.from считает Unicode code points, поэтому не разрезает surrogate pair
-      // в эмодзи и использует ту же шкалу индексов, что targetCharsRef ниже.
-      const nextCommittedLen = isFinalPreview
-        ? chars.length
-        : Math.min(Array.from(committed).length, chars.length);
       const previewChanged =
         targetTextRef.current !== text ||
         committedLenRef.current !== nextCommittedLen;
@@ -614,7 +584,7 @@ export default function Overlay() {
           setShownDirect(shownRef.current);
         }
       }
-      if (isFinalPreview || isSettledPreview) holdFinalPreview();
+      if (preview.holdFinal) holdFinalPreview();
       kick();
     });
 
@@ -691,17 +661,7 @@ export default function Overlay() {
       ? "notice"
       : latchNotice != null
         ? "latch"
-        : finalHold && hasPreview
-        ? "stream"
-        : status === "transcribing"
-        ? hasPreview
-          ? "stream"
-          : "trans"
-        : status === "recording"
-            ? hasPreview
-              ? "stream"
-              : "rec"
-            : "idle";
+        : previewPillMode(status, hasPreview, finalHold);
   const compactHotkeyTip = compactHotkeyLabel(hotkeyTip);
 
   const pillHitRect = () => {
