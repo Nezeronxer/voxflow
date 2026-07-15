@@ -74,7 +74,8 @@ pub struct Settings {
     pub autostart: bool,
     /// Автоматически проверять GitHub Releases на обновления при запуске UI.
     pub auto_update_check: bool,
-    /// Учиться на речи пользователя: сбор датасета (аудио↔текст) + адаптивный biasing.
+    /// Сохранять локальный датасет аудио↔текст для будущего обучения.
+    /// Ручные same-field исправления слов запоминаются отдельно и всегда.
     pub personalize: bool,
     /// ИИ-движок рефайна: "off" | "gemini" | "ollama" | "openai_compat".
     pub ai_backend: String,

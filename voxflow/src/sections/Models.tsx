@@ -12,6 +12,24 @@ import type {
 // Коэффициент EMA-сглаживания мгновенной скорости: резкие скачки сети не дёргают ETA.
 const SPEED_EMA = 0.3;
 
+// Слабые пресеты создают ложный выбор и заметно уступают Turbo. Новым
+// пользователям их не показываем; уже установленную/активную legacy-модель
+// оставляем видимой, чтобы её можно было безопасно сменить или удалить.
+const WEAK_WHISPER_MODELS = new Set([
+  "ggml-tiny.bin",
+  "ggml-base.bin",
+  "ggml-small.bin",
+]);
+
+const PRIMARY_ENGINE_OPTIONS = [
+  { value: "whisper_server", label: "Whisper Server (все языки)" },
+  { value: "gigaam", label: "GigaAM RU / Parakeet EN" },
+];
+const LEGACY_CLI_OPTION = {
+  value: "whisper_cli",
+  label: "Whisper CLI (устаревший, медленнее)",
+};
+
 type Progress = {
   received: number;
   total: number;
@@ -217,9 +235,17 @@ export default function Models({
   // рисуем их hero-карточками, остальное (whisper) — привычным списком ниже.
   const giga = models.find((m) => m.kind === "gigaam");
   const para = models.find((m) => m.kind === "parakeet");
-  const whisperModels = models.filter(
-    (m) => m.kind !== "gigaam" && m.kind !== "parakeet"
-  );
+  const whisperModels = models.filter((m) => {
+    if (m.kind === "gigaam" || m.kind === "parakeet") return false;
+    if (!WEAK_WHISPER_MODELS.has(m.name)) return true;
+    return m.installed || settings.model === m.name;
+  });
+  // Новому выбору CLI не предлагаем. Если он уже сохранён, option остаётся
+  // видимым, чтобы select не получил неизвестный value и переход был явным.
+  const engineOptions =
+    settings.engine === "whisper_cli"
+      ? [...PRIMARY_ENGINE_OPTIONS, LEGACY_CLI_OPTION]
+      : PRIMARY_ENGINE_OPTIONS;
 
   return (
     <div className="content-inner">
@@ -251,14 +277,14 @@ export default function Models({
         </div>
       )}
 
-      {/* Подсказка: для EN/авто нужен Parakeet — мягкий call-to-action. */}
-      {(settings.language === "en" || settings.language === "auto") &&
+      {/* Parakeet — специализированный маршрут только для explicit EN. */}
+      {settings.language === "en" &&
         para &&
         !para.installed && (
           <div className="toast" role="status">
             <span className="toast-msg">
-              Для английского и автоопределения языка скачайте модель Parakeet
-              TDT v3 ниже — без неё auto/EN распознаются запасным Whisper.
+              Для быстрого английского распознавания скачайте Parakeet TDT v3
+              ниже. Без неё English распознаётся запасным Whisper.
             </span>
           </div>
         )}
@@ -274,12 +300,12 @@ export default function Models({
         />
       )}
 
-      {/* ── Hero-карточка Parakeet: английский + автоопределение языка ── */}
+      {/* ── Hero-карточка Parakeet: специализированный explicit EN маршрут ── */}
       {para && (
         <HeroModelCard
           model={para}
           prog={progress[para.name]}
-          subtitle="Английский и ещё 24 языка, автоопределение, офлайн на CPU"
+          subtitle="Английская речь, офлайн на CPU"
           onDownload={onDownload}
           onDelete={onDelete}
         />
@@ -292,7 +318,7 @@ export default function Models({
             Whisper (все языки)
           </div>
           <div className="sub">
-            Универсальная локальная модель для языков вне быстрых RU/EN/auto маршрутов
+            Основная модель для авто/смешанной речи и универсальный запасной маршрут
           </div>
         </div>
 
@@ -375,7 +401,10 @@ export default function Models({
         <div className="card-head">
           <div className="card-title">Параметры распознавания</div>
         </div>
-        <Field label="Язык" hint="Все языки — Parakeet auto, если модель установлена; иначе запасной Whisper. Для максимальной скорости можно явно выбрать RU или EN.">
+        <Field
+          label="Язык"
+          hint="Авто и смешанная речь — Whisper Large v3 Turbo; Русский — GigaAM; English — Parakeet. Если специализированная модель не установлена, используется запасной Whisper."
+        >
           <Select
             value={settings.language}
             onChange={(v) => update({ language: v })}
@@ -401,16 +430,12 @@ export default function Models({
         </Field>
         <Field
           label="Движок"
-          hint="Whisper Server держит универсальную модель в памяти. GigaAM/Parakeet — быстрый спец-маршрут для RU/EN/auto. Whisper CLI грузит модель каждый раз."
+          hint="Whisper Server обслуживает авто и смешанную речь. GigaAM/Parakeet — быстрые специализированные маршруты для явно выбранных RU/EN."
         >
           <Select
             value={settings.engine}
             onChange={(v) => update({ engine: v })}
-            options={[
-              { value: "whisper_server", label: "Whisper Server (все языки)" },
-              { value: "gigaam", label: "GigaAM RU / Parakeet EN+auto" },
-              { value: "whisper_cli", label: "Whisper CLI (медленнее)" },
-            ]}
+            options={engineOptions}
           />
         </Field>
         <Field

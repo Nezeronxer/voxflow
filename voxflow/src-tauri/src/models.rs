@@ -34,6 +34,12 @@ pub struct ModelInfo {
 pub const GIGAAM_NAME: &str = "gigaam-v3";
 /// Имя каталожного пункта Parakeet TDT v3 (набор из 4 файлов в models/parakeet/).
 pub const PARAKEET_NAME: &str = "parakeet-v3";
+/// Единственный рекомендованный Whisper-пресет: multilingual, пригоден для RU/EN
+/// и смешанной речи, но не требует 1.6–3.1 ГБ на диске.
+pub const RECOMMENDED_WHISPER_NAME: &str = "ggml-large-v3-turbo-q5_0.bin";
+/// Слабые legacy-пресеты не предлагаем к новой загрузке, но сохраняем в
+/// каталоге, чтобы уже установленную/активную модель можно было увидеть и удалить.
+const WEAK_LEGACY_WHISPER_NAMES: &[&str] = &["ggml-tiny.bin", "ggml-base.bin", "ggml-small.bin"];
 
 /// Защита от двойного запуска загрузки каталожной модели: автозагрузка при первом
 /// старте (ensure_default_models) и клик «Скачать» в UI могут прилететь
@@ -125,7 +131,7 @@ const DIR_MODELS: &[DirModel] = &[
     },
     DirModel {
         name: PARAKEET_NAME,
-        label: "Parakeet TDT v3 — 25 языков + автоопределение",
+        label: "Parakeet TDT v3 — быстрый English (явный EN)",
         size_mb: 640,
         kind: "parakeet",
         base_url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/",
@@ -150,7 +156,7 @@ struct Entry {
 const CATALOG: &[Entry] = &[
     Entry {
         name: "ggml-tiny.bin",
-        label: "Tiny — минимальная задержка (78 МБ)",
+        label: "Tiny — legacy, низкая точность (78 МБ)",
         size_mb: 78,
         size_bytes: 77_691_713,
         sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
@@ -185,14 +191,14 @@ const CATALOG: &[Entry] = &[
     },
     Entry {
         name: "ggml-base.bin",
-        label: "Base — быстрая, для слабых ПК (148 МБ)",
+        label: "Base — legacy, низкая точность (148 МБ)",
         size_mb: 148,
         size_bytes: 147_951_465,
         sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
     },
     Entry {
         name: "ggml-small.bin",
-        label: "Small — компромисс качество/скорость (488 МБ)",
+        label: "Small — legacy, уступает Turbo (488 МБ)",
         size_mb: 488,
         size_bytes: 487_601_967,
         sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
@@ -239,6 +245,10 @@ fn url_for(name: &str) -> String {
 
 fn is_whisper_catalog_name(name: &str) -> bool {
     CATALOG.iter().any(|e| e.name == name)
+}
+
+fn is_weak_legacy_whisper(name: &str) -> bool {
+    WEAK_LEGACY_WHISPER_NAMES.contains(&name)
 }
 
 fn catalog_entry(name: &str) -> Option<&'static Entry> {
@@ -446,10 +456,13 @@ pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Setting
         "auto" | "all" | "any" | "multi" | "multilingual" | "*"
     ) || settings.engine != "gigaam";
 
-    let name = if wants_multilingual && is_whisper_catalog_name(&settings.model) {
+    let configured_model_is_usable = is_whisper_catalog_name(&settings.model)
+        && (!is_weak_legacy_whisper(&settings.model)
+            || crate::paths::model_path(&settings.model).exists());
+    let name = if wants_multilingual && configured_model_is_usable {
         settings.model.clone()
     } else if wants_multilingual {
-        crate::settings::Settings::default().model
+        RECOMMENDED_WHISPER_NAME.to_string()
     } else if language == "ru" || language == "russian" {
         GIGAAM_NAME.to_string()
     } else {
@@ -499,6 +512,13 @@ pub fn start_download(app: AppHandle, name: String) -> Result<()> {
     }
     if !CATALOG.iter().any(|e| e.name == name) {
         return Err(anyhow!("Неизвестная модель: {name}"));
+    }
+    // Уже скачанные legacy-веса остаются управляемыми и удаляемыми. Новую
+    // загрузку слабого пресета не начинаем: предлагаем один понятный default.
+    if is_weak_legacy_whisper(&name) && !crate::paths::model_path(&name).exists() {
+        return Err(anyhow!(
+            "Эта legacy-модель больше не предлагается; выберите Large v3 Turbo Q5"
+        ));
     }
     if WHISPER_DOWNLOADING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -769,6 +789,25 @@ mod tests {
             assert_eq!(entry.sha256.len(), 64, "{} sha256", entry.name);
             assert!(entry.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()));
             assert!(url_for(entry.name).contains("5359861c739e955e79d9a303bcbc70fb988958b1"));
+        }
+    }
+
+    #[test]
+    fn catalog_has_one_recommendation_and_marks_weak_legacy_models() {
+        let recommended = CATALOG
+            .iter()
+            .filter(|entry| entry.label.contains("рекомендуется"))
+            .collect::<Vec<_>>();
+        assert_eq!(recommended.len(), 1);
+        assert_eq!(recommended[0].name, RECOMMENDED_WHISPER_NAME);
+
+        for name in WEAK_LEGACY_WHISPER_NAMES {
+            let entry = CATALOG
+                .iter()
+                .find(|entry| entry.name == *name)
+                .expect("legacy-модель остаётся управляемой");
+            assert!(entry.label.contains("legacy"), "{}", entry.label);
+            assert!(is_weak_legacy_whisper(name));
         }
     }
 
