@@ -1836,11 +1836,15 @@ fn process_dictation_text(
     snippets: &[postprocess::Snippet],
 ) -> String {
     if !text.contains(SEMANTIC_PARAGRAPH_MARKER) {
-        return postprocess::process(text, s, dict, snippets);
+        let deduped = postprocess::dedup_repeated_ngrams(text);
+        return postprocess::process(&deduped, s, dict, snippets);
     }
 
     text.split(SEMANTIC_PARAGRAPH_MARKER)
-        .map(|paragraph| postprocess::process(paragraph, s, dict, snippets))
+        .map(|paragraph| {
+            let deduped = postprocess::dedup_repeated_ngrams(paragraph);
+            postprocess::process(&deduped, s, dict, snippets)
+        })
         .filter(|paragraph| !paragraph.trim().is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -5465,6 +5469,18 @@ mod seg_tests {
         let final_text = process_dictation_text(&raw, &s, &[], &[]);
 
         assert_eq!(final_text, "Я пошёл домой. Я пошёл домой.");
+    }
+
+    #[test]
+    fn live_and_final_collapse_a_proven_decoder_loop_identically() {
+        let s = Settings::default();
+        let raw = "Отправь отчёт отправь отчёт отправь отчёт пожалуйста";
+        let live_text = clean_live_text(raw, &s, &[], &[], &[]);
+        let final_raw = postprocess::dedup_repeated_ngrams(raw);
+        let final_text = process_dictation_text(&final_raw, &s, &[], &[]);
+
+        assert_eq!(live_text, "Отправь отчёт пожалуйста");
+        assert_eq!(final_text, live_text);
     }
 
     #[test]
