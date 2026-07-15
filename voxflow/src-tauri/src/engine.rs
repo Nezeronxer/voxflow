@@ -1666,11 +1666,27 @@ fn cloud_partial_loop(
 }
 
 /// Сегменты надиктованного: (абзац-перед?, текст). Рендер: " " либо "\n\n".
+#[cfg(test)]
 fn render_segments(segs: &[(bool, String)]) -> String {
+    render_segments_with_paragraph_separator(segs, "\n\n")
+}
+
+// Private-use marker: unlike raw ASR newlines, this boundary is produced from
+// the measured VAD gap and therefore must survive generic ASR cleanup.
+const SEMANTIC_PARAGRAPH_MARKER: &str = "\u{e000}\u{e001}";
+
+fn render_segments_for_postprocess(segs: &[(bool, String)]) -> String {
+    render_segments_with_paragraph_separator(segs, SEMANTIC_PARAGRAPH_MARKER)
+}
+
+fn render_segments_with_paragraph_separator(
+    segs: &[(bool, String)],
+    paragraph_separator: &str,
+) -> String {
     let mut out = String::new();
     for (i, (para, t)) in segs.iter().enumerate() {
         if i > 0 {
-            out.push_str(if *para { "\n\n" } else { " " });
+            out.push_str(if *para { paragraph_separator } else { " " });
         }
         out.push_str(t);
     }
@@ -1683,10 +1699,10 @@ fn push_dictation_segment(segs: &mut Vec<(bool, String)>, para: bool, text: Stri
         return;
     }
     if let Some(last) = segs.last_mut() {
-        if is_restatement(&last.1, &text) {
-            last.1 = text;
-            return;
-        }
+        // A pause is not an edit command. Similar neighboring phrases may be
+        // intentional repetition or a continuation, so never delete one by
+        // guessing. Explicit spoken corrections are handled later by
+        // postprocess markers such as "точнее" and "нет, стоп".
         if !para && soft_join_continuation_segment(&mut last.1, &text) {
             return;
         }
@@ -1800,15 +1816,81 @@ fn clean_live_text(
     if text.trim().is_empty() {
         return String::new();
     }
+    let processed = process_dictation_text(text, s, dict, snippets, corrections);
     // Exact snippet bodies are authored output, not an ASR hypothesis. Keep the
-    // live pill byte-for-byte aligned with the final insertion: corrections,
-    // capitalization and whitespace normalization must not rewrite the body.
-    if let Some(expanded) = postprocess::expand_matching_snippet(text, snippets) {
-        return expanded;
+    // live pill byte-for-byte aligned with the final insertion even when the
+    // trigger follows a semantic paragraph boundary.
+    if processed.voice_cancelled {
+        return String::new();
     }
-    let mut t = postprocess::process(text, s, dict, snippets);
-    t = postprocess::apply_corrections(&t, corrections);
-    postprocess::normalize_spaces(&t)
+    if processed.snippet_expanded {
+        return processed.text;
+    }
+    postprocess::normalize_spaces(&processed.text)
+}
+
+struct ProcessedDictationText {
+    text: String,
+    snippet_expanded: bool,
+    voice_cancelled: bool,
+}
+
+fn process_dictation_text(
+    text: &str,
+    s: &Settings,
+    dict: &[postprocess::Dict],
+    snippets: &[postprocess::Snippet],
+    corrections: &[postprocess::Correction],
+) -> ProcessedDictationText {
+    let mut snippet_expanded = false;
+    let mut voice_cancelled = false;
+    let mut paragraphs = Vec::new();
+    let raw_paragraphs = text
+        .split(SEMANTIC_PARAGRAPH_MARKER)
+        .map(postprocess::dedup_repeated_ngrams)
+        .filter(|paragraph| !paragraph.trim().is_empty())
+        .collect::<Vec<_>>();
+    let paragraph_count = raw_paragraphs.len();
+    for (index, deduped) in raw_paragraphs.into_iter().enumerate() {
+        if let Some(expanded) = postprocess::expand_matching_snippet(&deduped, snippets) {
+            snippet_expanded = true;
+            paragraphs.push(expanded);
+            continue;
+        }
+
+        let mut processed = postprocess::process(&deduped, s, dict, snippets);
+        processed = postprocess::apply_corrections(&processed, corrections);
+        processed = postprocess::normalize_spaces(&processed);
+        if index + 1 < paragraph_count {
+            if !processed.is_empty() {
+                paragraphs.push(processed);
+            }
+            continue;
+        }
+        // Voice commands are suffix commands for the entire utterance. A word
+        // such as "отмена" in an earlier paragraph is ordinary dictation once
+        // the speaker continues after the semantic pause.
+        match crate::voice_cmds::apply_voice_commands(&processed) {
+            crate::voice_cmds::CmdOutcome::Cancel => {
+                voice_cancelled = true;
+                break;
+            }
+            crate::voice_cmds::CmdOutcome::Text(command_text) => {
+                if !command_text.is_empty() {
+                    paragraphs.push(command_text);
+                }
+            }
+        }
+    }
+    ProcessedDictationText {
+        text: if voice_cancelled {
+            String::new()
+        } else {
+            paragraphs.join("\n\n")
+        },
+        snippet_expanded,
+        voice_cancelled,
+    }
 }
 
 fn join_partial(committed: &str, volatile: &str) -> String {
@@ -1852,35 +1934,6 @@ fn clean_live_partial(
         }
     }
     (String::new(), full.clone(), full)
-}
-
-/// Похоже ли `b` на переговорённую заново версию `a` (человек ошибся, сделал
-/// паузу и сказал фразу ещё раз): пословный Жаккар >= 0.5 при сопоставимой
-/// длине. Сравниваем только СОСЕДНИЕ сегменты — типичный паттерн самоправки.
-fn is_restatement(a: &str, b: &str) -> bool {
-    let norm = |s: &str| -> Vec<String> {
-        s.split_whitespace()
-            .map(|w| {
-                w.trim_matches(|c: char| !c.is_alphanumeric())
-                    .to_lowercase()
-            })
-            .filter(|w| !w.is_empty())
-            .collect()
-    };
-    let ta = norm(a);
-    let tb = norm(b);
-    if ta.len() < 2 || tb.len() < 2 {
-        return false;
-    }
-    let (la, lb) = (ta.len() as f64, tb.len() as f64);
-    if lb < la * 0.5 || lb > la * 2.5 {
-        return false;
-    }
-    let sa: HashSet<&String> = ta.iter().collect();
-    let sb: HashSet<&String> = tb.iter().collect();
-    let inter = sa.intersection(&sb).count() as f64;
-    let union = sa.union(&sb).count() as f64;
-    inter / union.max(1.0) >= 0.5
 }
 
 /// Для вставки КЛАВИШАМИ (живые режимы) абзацы заменяем пробелом: Enter в
@@ -2111,7 +2164,7 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                 && settled_emitted_for_end != prev_seg_end
             {
                 let (committed, volatile, full) = clean_live_partial(
-                    &render_segments(&committed_segs),
+                    &render_segments_for_postprocess(&committed_segs),
                     "",
                     &a.settings,
                     &a.dict,
@@ -2149,8 +2202,8 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             drop(g);
             let t = txt.trim().to_string();
             if !t.is_empty() {
-                // Длинная пауза перед сегментом -> абзац. Переговорённая заново
-                // фраза ЗАМЕНЯЕТ предыдущий сегмент, а не дописывается дважды.
+                // Длинная пауза перед сегментом -> абзац. Пауза сама по себе
+                // никогда не удаляет предыдущий сегмент.
                 let gap = cur_seg_first_speech
                     .unwrap_or(prev_seg_end)
                     .saturating_sub(prev_seg_end);
@@ -2161,11 +2214,17 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             seg_start = bound;
             seg_has_speech = false;
             cur_seg_first_speech = None;
-            (render_segments(&committed_segs), String::new())
+            (
+                render_segments_for_postprocess(&committed_segs),
+                String::new(),
+            )
         } else {
             let txt = gm.transcribe(&mono16[seg_start..]).unwrap_or_default();
             drop(g);
-            (render_segments(&committed_segs), txt.trim().to_string())
+            (
+                render_segments_for_postprocess(&committed_segs),
+                txt.trim().to_string(),
+            )
         };
 
         let (committed, volatile, full) = clean_live_partial(
@@ -3572,14 +3631,17 @@ fn process_utterance(
     ));
     // Постобработка (правила) + выученные исправления.
     let t_post = Instant::now();
-    let exact_snippet = postprocess::expand_matching_snippet(&raw, &snippets);
-    let snippet_expanded = exact_snippet.is_some();
-    let mut text =
-        exact_snippet.unwrap_or_else(|| postprocess::process(&raw, &s, &dict, &snippets));
-    if !snippet_expanded {
-        text = postprocess::apply_corrections(&text, &corrections);
-    }
+    let processed = process_dictation_text(&raw, &s, &dict, &snippets, &corrections);
+    let snippet_expanded = processed.snippet_expanded;
+    let voice_cancelled = processed.voice_cancelled;
+    let mut text = processed.text;
     let post_ms = t_post.elapsed().as_millis() as u64;
+    if voice_cancelled {
+        dbg_log("финал: голосовая команда «отмена» — вставка и история пропущены");
+        erase_registered_live_draft(ctx, my_gen);
+        let _ = std::fs::remove_file(&wav);
+        return Ok(());
+    }
     if let FinalPipelineDecision::Reject { .. } =
         decide_final_pipeline(final_text_is_insertable(&text), live_inserted)
     {
@@ -3590,20 +3652,11 @@ fn process_utterance(
         return Ok(());
     }
 
-    // Голосовые команды оставляем как совместимость, но снимаем их ДО LLM:
-    // форматирование должно быть автоматическим, а модель не должна съедать хвостовое
-    // "отмена"/"абзац" до того, как движок успел распознать команду.
+    // Голосовые команды уже применены отдельно к каждому обычному абзацу во
+    // время process_dictation_text. Сниппет-абзацы остаются непрозрачными:
+    // authored body с текстом "отмена" не должен отменять диктовку.
     if !snippet_expanded {
         text = postprocess::normalize_spaces(&text);
-        text = match crate::voice_cmds::apply_voice_commands(&text) {
-            crate::voice_cmds::CmdOutcome::Cancel => {
-                dbg_log("финал: голосовая команда «отмена» — вставка и история пропущены");
-                erase_registered_live_draft(ctx, my_gen);
-                let _ = std::fs::remove_file(&wav);
-                return Ok(());
-            }
-            crate::voice_cmds::CmdOutcome::Text(t) => t,
-        };
     }
     if let FinalPipelineDecision::Reject { .. } =
         decide_final_pipeline(!text.is_empty(), live_inserted)
@@ -4710,9 +4763,9 @@ fn hint_parakeet_once(app: &AppHandle) {
 /// Финал локального резидентного движка с разметкой: VAD делит запись на фразы
 /// (тишина >=600 мс), фразы длиннее 25 c дорезаются по ближайшей тишине (лимит
 /// pos_emb GigaAM; Parakeet такие куски тоже переваривает). Длинная пауза между
-/// фразами -> абзац ("\n\n"); переговорённая заново фраза заменяет предыдущую
-/// (is_restatement) — та же логика, что в живой петле. `transcribe` — замыкание
-/// конкретного движка (так auto-маршрут решает судьбу каждого сегмента сам).
+/// фразами -> абзац ("\n\n"). Похожие соседние фразы сохраняются: только
+/// явный голосовой маркер исправления может удалить сказанное. `transcribe` —
+/// замыкание конкретного движка (так auto-маршрут решает судьбу каждого сегмента сам).
 /// pub(crate): используется финалом и headless-селфтестами (lib.rs).
 pub(crate) fn local_transcribe_long<F>(
     vad: &Arc<Mutex<Option<crate::vad::SileroVad>>>,
@@ -4835,7 +4888,7 @@ where
         let para = gap_starts_paragraph(!segs.is_empty(), u.gap_before);
         push_dictation_segment(&mut segs, para, t);
     }
-    Ok(render_segments(&segs))
+    Ok(render_segments_for_postprocess(&segs))
 }
 
 fn gap_starts_paragraph(has_previous_segment: bool, gap_samples: usize) -> bool {
@@ -5019,13 +5072,47 @@ mod seg_tests {
     }
 
     #[test]
-    fn restatement_replaces_similar_neighbor() {
-        assert!(is_restatement(
-            "Поставь мою песню лучше будет работать",
-            "Поставь мою музыку лучше будет работать"
-        ));
-        assert!(!is_restatement("Я пошёл домой", "Завтра будет дождь"));
-        assert!(!is_restatement("да", "да")); // короткие не трогаем
+    fn long_pause_never_replaces_a_similar_previous_paragraph() {
+        let mut segs = Vec::new();
+        push_dictation_segment(
+            &mut segs,
+            false,
+            "Поставь мою песню лучше будет работать".to_string(),
+        );
+
+        let para = gap_starts_paragraph(!segs.is_empty(), PARAGRAPH_GAP_SAMPLES);
+        assert!(para);
+
+        push_dictation_segment(
+            &mut segs,
+            para,
+            "Поставь мою музыку лучше будет работать".to_string(),
+        );
+
+        assert_eq!(
+            render_segments(&segs),
+            "Поставь мою песню лучше будет работать\n\nПоставь мою музыку лучше будет работать"
+        );
+    }
+
+    #[test]
+    fn pause_never_implies_that_a_similar_sentence_was_a_correction() {
+        let mut segs = Vec::new();
+        push_dictation_segment(
+            &mut segs,
+            false,
+            "Поставь мою песню лучше будет работать".to_string(),
+        );
+        push_dictation_segment(
+            &mut segs,
+            false,
+            "Поставь мою музыку лучше будет работать".to_string(),
+        );
+
+        assert_eq!(
+            render_segments(&segs),
+            "Поставь мою песню лучше будет работать Поставь мою музыку лучше будет работать"
+        );
     }
 
     #[test]
@@ -5396,6 +5483,53 @@ mod seg_tests {
     }
 
     #[test]
+    fn live_preview_preserves_a_semantic_paragraph_from_a_long_pause() {
+        let s = Settings::default();
+        let segs = vec![
+            (false, "Первая мысль.".to_string()),
+            (true, "Вторая мысль.".to_string()),
+        ];
+        let committed = render_segments_for_postprocess(&segs);
+        let (_, _, full) = clean_live_partial(&committed, "", &s, &[], &[], &[]);
+
+        assert_eq!(full, "Первая мысль.\n\nВторая мысль.");
+    }
+
+    #[test]
+    fn final_pipeline_preserves_two_deliberate_sentence_repetitions() {
+        let s = Settings::default();
+        let raw = postprocess::dedup_repeated_ngrams("Я пошёл домой. Я пошёл домой.");
+        let final_text = process_dictation_text(&raw, &s, &[], &[], &[]).text;
+
+        assert_eq!(final_text, "Я пошёл домой. Я пошёл домой.");
+    }
+
+    #[test]
+    fn live_and_final_collapse_a_proven_decoder_loop_identically() {
+        let s = Settings::default();
+        let raw = "Отправь отчёт отправь отчёт отправь отчёт пожалуйста";
+        let live_text = clean_live_text(raw, &s, &[], &[], &[]);
+        let final_raw = postprocess::dedup_repeated_ngrams(raw);
+        let final_text = process_dictation_text(&final_raw, &s, &[], &[], &[]).text;
+
+        assert_eq!(live_text, "Отправь отчёт пожалуйста");
+        assert_eq!(final_text, live_text);
+    }
+
+    #[test]
+    fn final_pipeline_preserves_a_semantic_paragraph_from_a_long_pause() {
+        let s = Settings::default();
+        let segs = vec![
+            (false, "Первая мысль.".to_string()),
+            (true, "Вторая мысль.".to_string()),
+        ];
+        let raw = render_segments_for_postprocess(&segs);
+        let final_text = process_dictation_text(&raw, &s, &[], &[], &[]).text;
+
+        assert_eq!(final_text, "Первая мысль.\n\nВторая мысль.");
+    }
+
+    #[test]
     fn exact_snippet_live_preview_matches_the_final_body_verbatim() {
         let s = Settings::default();
         let snippets = vec![postprocess::Snippet {
@@ -5416,6 +5550,61 @@ mod seg_tests {
         assert_eq!(live_full, final_body);
         assert_eq!(volatile, final_body);
         assert_eq!(live_full, "cat\n  indented signature");
+    }
+
+    #[test]
+    fn semantic_paragraph_keeps_snippet_body_authored_and_opaque() {
+        let s = Settings::default();
+        let snippets = vec![postprocess::Snippet {
+            trigger: "/sig".into(),
+            content: "cat\nотмена".into(),
+            is_template: false,
+        }];
+        let corrections = vec![postprocess::Correction {
+            wrong: "cat".into(),
+            right: "dog".into(),
+        }];
+        let segs = vec![(false, "cat".to_string()), (true, "/sig".to_string())];
+        let raw = render_segments_for_postprocess(&segs);
+
+        let final_processed = process_dictation_text(&raw, &s, &[], &snippets, &corrections);
+        let live = clean_live_text(&raw, &s, &[], &snippets, &corrections);
+
+        assert!(final_processed.snippet_expanded);
+        assert_eq!(final_processed.text, "dog\n\ncat\nотмена");
+        assert_eq!(live, "dog\n\ncat\nотмена");
+    }
+
+    #[test]
+    fn voice_cancel_in_a_normal_paragraph_still_wins_next_to_a_snippet() {
+        let s = Settings::default();
+        let snippets = vec![postprocess::Snippet {
+            trigger: "/sig".into(),
+            content: "authored signature".into(),
+            is_template: false,
+        }];
+        let segs = vec![(false, "/sig".to_string()), (true, "отмена".to_string())];
+        let raw = render_segments_for_postprocess(&segs);
+
+        let live = clean_live_text(&raw, &s, &[], &snippets, &[]);
+
+        assert!(live.is_empty());
+    }
+
+    #[test]
+    fn voice_cancel_before_a_later_paragraph_is_plain_dictation() {
+        let s = Settings::default();
+        let snippets = vec![postprocess::Snippet {
+            trigger: "/sig".into(),
+            content: "authored signature".into(),
+            is_template: false,
+        }];
+        let segs = vec![(false, "отмена".to_string()), (true, "/sig".to_string())];
+        let raw = render_segments_for_postprocess(&segs);
+
+        let live = clean_live_text(&raw, &s, &[], &snippets, &[]);
+
+        assert_eq!(live, "Отмена\n\nauthored signature");
     }
 
     #[test]
