@@ -216,7 +216,7 @@ export function listModels(): Promise<ModelInfo[]> {
   if (!IS_TAURI_RUNTIME) {
     const models: ModelInfo[] = [
       { name: "gigaam-v3", label: "GigaAM-v3 — быстрый русский", size_mb: 217, installed: true, kind: "gigaam" },
-      { name: "parakeet-v3", label: "Parakeet TDT v3 — 25 языков + автоопределение", size_mb: 640, installed: true, kind: "parakeet" },
+      { name: "parakeet-v3", label: "Parakeet TDT v3 — быстрый English (явный EN)", size_mb: 640, installed: true, kind: "parakeet" },
       { name: "ggml-tiny.bin", label: "Tiny — минимальная задержка (78 МБ)", size_mb: 78, installed: false, kind: "whisper" },
       { name: "ggml-base.bin", label: "Base — быстрая, для слабых ПК (148 МБ)", size_mb: 148, installed: false, kind: "whisper" },
       { name: "ggml-small.bin", label: "Small — компромисс качество/скорость (488 МБ)", size_mb: 488, installed: false, kind: "whisper" },
@@ -316,10 +316,7 @@ export function getHistory(limit: number): Promise<HistoryItem[]> {
 
 export function dictionaryList(): Promise<DictionaryEntry[]> {
   if (!IS_TAURI_RUNTIME) return Promise.resolve([]);
-  return safe<DictionaryEntry[]>(
-    () => invoke<DictionaryEntry[]>("dictionary_list"),
-    [],
-  );
+  return invoke<DictionaryEntry[]>("dictionary_list");
 }
 
 export function dictionaryUpsert(
@@ -328,21 +325,17 @@ export function dictionaryUpsert(
   replacement: string,
 ): Promise<void> {
   if (!IS_TAURI_RUNTIME) return Promise.resolve();
-  return safe<void>(async () => {
-    await invoke("dictionary_upsert", { id, term, replacement });
-  }, undefined);
+  return invoke<void>("dictionary_upsert", { id, term, replacement });
 }
 
 export function dictionaryDelete(id: number): Promise<void> {
   if (!IS_TAURI_RUNTIME) return Promise.resolve();
-  return safe<void>(async () => {
-    await invoke("dictionary_delete", { id });
-  }, undefined);
+  return invoke<void>("dictionary_delete", { id });
 }
 
 export function snippetList(): Promise<SnippetEntry[]> {
   if (!IS_TAURI_RUNTIME) return Promise.resolve([]);
-  return safe<SnippetEntry[]>(() => invoke<SnippetEntry[]>("snippet_list"), []);
+  return invoke<SnippetEntry[]>("snippet_list");
 }
 
 export function snippetUpsert(
@@ -352,16 +345,17 @@ export function snippetUpsert(
   is_template: boolean,
 ): Promise<void> {
   if (!IS_TAURI_RUNTIME) return Promise.resolve();
-  return safe<void>(async () => {
-    await invoke("snippet_upsert", { id, trigger, content, isTemplate: is_template });
-  }, undefined);
+  return invoke<void>("snippet_upsert", {
+    id,
+    trigger,
+    content,
+    isTemplate: is_template,
+  });
 }
 
 export function snippetDelete(id: number): Promise<void> {
   if (!IS_TAURI_RUNTIME) return Promise.resolve();
-  return safe<void>(async () => {
-    await invoke("snippet_delete", { id });
-  }, undefined);
+  return invoke<void>("snippet_delete", { id });
 }
 
 export function showMainWindow(): Promise<void> {

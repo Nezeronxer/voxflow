@@ -11,27 +11,66 @@ export default function Dictionary() {
   const [entries, setEntries] = useState<DictionaryEntry[]>([]);
   const [term, setTerm] = useState("");
   const [replacement, setReplacement] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [status, setStatus] = useState<{
+    kind: "success" | "error";
+    text: string;
+  } | null>(null);
 
-  async function refresh() {
-    setEntries(await dictionaryList());
+  async function refresh(): Promise<boolean> {
+    try {
+      setEntries(await dictionaryList());
+      return true;
+    } catch (error) {
+      setStatus({
+        kind: "error",
+        text: errorText(error, "Не удалось загрузить словарь"),
+      });
+      return false;
+    }
   }
 
   useEffect(() => {
-    refresh();
+    void refresh();
   }, []);
 
   async function onAdd() {
     const t = term.trim();
-    if (!t) return;
-    await dictionaryUpsert(null, t, replacement.trim());
-    setTerm("");
-    setReplacement("");
-    refresh();
+    if (!t || busy) return;
+    setBusy(true);
+    setStatus(null);
+    try {
+      await dictionaryUpsert(null, t, replacement.trim());
+      if (!(await refresh())) return;
+      setTerm("");
+      setReplacement("");
+      setStatus({ kind: "success", text: "Термин сохранён и уже применяется" });
+    } catch (error) {
+      setStatus({
+        kind: "error",
+        text: errorText(error, "Не удалось сохранить термин"),
+      });
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function onDelete(id: number) {
-    await dictionaryDelete(id);
-    refresh();
+    if (busy) return;
+    setBusy(true);
+    setStatus(null);
+    try {
+      await dictionaryDelete(id);
+      if (!(await refresh())) return;
+      setStatus({ kind: "success", text: "Термин удалён" });
+    } catch (error) {
+      setStatus({
+        kind: "error",
+        text: errorText(error, "Не удалось удалить термин"),
+      });
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -48,6 +87,15 @@ export default function Dictionary() {
             Слева — что распознаётся, справа — на что заменить
           </div>
         </div>
+
+        {status && (
+          <div
+            className={`toast toast-${status.kind}`}
+            role={status.kind === "error" ? "alert" : "status"}
+          >
+            <span className="toast-msg">{status.text}</span>
+          </div>
+        )}
 
         {entries.length === 0 ? (
           <div className="empty">Пока нет ни одной замены</div>
@@ -70,6 +118,7 @@ export default function Dictionary() {
                       className="btn btn-sm btn-danger btn-ghost"
                       onClick={() => onDelete(e.id)}
                       title="Удалить"
+                      disabled={busy}
                     >
                       <Icon.Trash className="ico" />
                     </button>
@@ -87,20 +136,35 @@ export default function Dictionary() {
             value={term}
             onChange={(e) => setTerm(e.currentTarget.value)}
             onKeyDown={(e) => e.key === "Enter" && onAdd()}
+            disabled={busy}
           />
           <input
             type="text"
-            placeholder="Замена"
+            placeholder="Замена (необязательно)"
             value={replacement}
             onChange={(e) => setReplacement(e.currentTarget.value)}
             onKeyDown={(e) => e.key === "Enter" && onAdd()}
+            disabled={busy}
           />
-          <button className="btn btn-primary" onClick={onAdd} disabled={!term.trim()}>
+          <button
+            className="btn btn-primary"
+            onClick={onAdd}
+            disabled={busy || !term.trim()}
+          >
             <Icon.Plus className="ico" />
-            Добавить
+            {busy ? "Сохранение…" : "Добавить"}
           </button>
+        </div>
+        <div className="sub" style={{ marginTop: 10 }}>
+          Если замену не указывать, VoxFlow запомнит точное написание термина.
         </div>
       </div>
     </div>
   );
+}
+
+function errorText(error: unknown, fallback: string): string {
+  if (typeof error === "string" && error.trim()) return error;
+  if (error instanceof Error && error.message.trim()) return error.message;
+  return fallback;
 }

@@ -1,6 +1,6 @@
 [package]
 name = "voxflow"
-version = "2.0.4"
+version = "2.0.5"
 description = "Local-first voice dictation for desktop"
 authors = ["Nezeronxer"]
 license = "LicenseRef-Proprietary"
@@ -46,3 +46,12 @@ ort = "=2.0.0-rc.12"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61.3", features = ["Win32_Foundation", "Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com", "Win32_UI_Accessibility"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Parse bundle metadata in-process. Spawning PlistBuddy four times per bundle
+# made cleanup checks flaky under concurrent macOS CI/release tests.
+plist = "1.9.0"
+# NSWorkspace is the authoritative owner of keyboard focus on macOS. AX's
+# system-wide `AXFocusedApplication` attribute can briefly be absent, which used
+# to turn an otherwise valid dictation into an empty AppContext.
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "libc", "NSRunningApplication", "NSWindow", "NSWorkspace"] }

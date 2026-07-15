@@ -73,14 +73,10 @@ pub fn run() {
         .setup(|app| {
             let handle = app.handle().clone();
             let autostarted = std::env::args().any(|a| a == "--autostart");
-
-            match paths::cleanup_stale_temp_files() {
-                Ok(removed) if removed > 0 => {
-                    log::info!("удалено устаревших временных файлов: {removed}");
-                }
-                Ok(_) => {}
-                Err(e) => log::warn!("не удалось очистить временные файлы: {e}"),
-            }
+            // Directory scan/removal is maintenance, not a prerequisite for UI.
+            // Keep it off Tauri setup so thousands of crash leftovers cannot
+            // delay the first visible window.
+            spawn_stale_temp_cleanup();
 
             // A drag-installed macOS update can coexist with renamed copies of
             // older releases (including the pre-1.0.8 legacy bundle id). Remove
@@ -129,6 +125,7 @@ pub fn run() {
                 recording.clone(),
             );
             let cancel_active = engine.cancel_active_flag();
+            let correction_capture = engine.correction_capture_flag();
             if !autostarted {
                 // Поднимаем onboarding до запуска CGEventTap-слушателя, чтобы он
                 // не успевал первым открыть Input Monitoring вместо Accessibility.
@@ -140,6 +137,7 @@ pub fn run() {
                 handle.clone(),
                 cancel_active,
                 hotkey_capture_active.clone(),
+                correction_capture,
             );
 
             let want_autostart = settings_arc.lock().autostart;
@@ -166,19 +164,9 @@ pub fn run() {
             let startup_settings = settings_arc.lock().clone();
             models::ensure_default_models(handle.clone(), &startup_settings);
 
-            // Применить автозапуск согласно сохранённым настройкам (reconcile с ОС).
-            {
-                use tauri_plugin_autostart::ManagerExt;
-                let mgr = handle.autolaunch();
-                let res = if want_autostart {
-                    mgr.enable()
-                } else {
-                    mgr.disable()
-                };
-                if let Err(e) = res {
-                    log::error!("autostart reconcile ({want_autostart}) failed: {e}");
-                }
-            }
+            // Реестр/LaunchAgent может отвечать медленно. Reconcile не должен
+            // блокировать setup и задерживать показ окна.
+            spawn_autostart_reconcile(handle.clone(), want_autostart);
 
             // Показать окно настроек при запуске, НО не при автозапуске (тогда — в трей).
             if !autostarted {
@@ -244,6 +232,54 @@ pub fn run() {
             }
             _ => {}
         });
+}
+
+fn spawn_stale_temp_cleanup() {
+    if let Err(e) = std::thread::Builder::new()
+        .name("voxflow-startup-cleanup".into())
+        .spawn(|| {
+            let started = std::time::Instant::now();
+            match paths::cleanup_stale_temp_files() {
+                Ok(removed) if removed > 0 => log::info!(
+                    "удалено устаревших временных файлов: {removed} ({} мс)",
+                    started.elapsed().as_millis()
+                ),
+                Ok(_) => log::debug!(
+                    "startup cleanup завершён за {} мс",
+                    started.elapsed().as_millis()
+                ),
+                Err(error) => log::warn!("не удалось очистить временные файлы: {error}"),
+            }
+        })
+    {
+        log::warn!("не удалось запустить startup cleanup: {e}");
+    }
+}
+
+fn spawn_autostart_reconcile(handle: tauri::AppHandle, want_autostart: bool) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("voxflow-autostart".into())
+        .spawn(move || {
+            use tauri_plugin_autostart::ManagerExt;
+            let started = std::time::Instant::now();
+            let mgr = handle.autolaunch();
+            let result = if want_autostart {
+                mgr.enable()
+            } else {
+                mgr.disable()
+            };
+            if let Err(error) = result {
+                log::error!("autostart reconcile ({want_autostart}) failed: {error}");
+            } else {
+                log::debug!(
+                    "autostart reconcile ({want_autostart}) завершён за {} мс",
+                    started.elapsed().as_millis()
+                );
+            }
+        })
+    {
+        log::error!("не удалось запустить autostart reconcile: {e}");
+    }
 }
 
 /// Показать фатальную ошибку старта понятным окном (GUI ещё не поднят, поэтому

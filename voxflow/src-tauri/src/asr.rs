@@ -4,7 +4,8 @@
 //! одноразовый дочерний процесс (one-shot subprocess). Никаких серверов
 //! и лишних зависимостей: только `std::process` и `std`.
 
-use std::io::Read;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +67,10 @@ fn transcribe_cli_inner(p: &AsrParams, timeout: Option<Duration>) -> anyhow::Res
     cmd.arg("-m").arg(p.model_path);
     cmd.arg("-l").arg(p.language);
     cmd.arg("-nt"); // без таймстампов
+    cmd.arg("-np"); // stdout содержит только результат
+                    // Не поднимаем температуру на сложном/шумном звуке и подавляем
+                    // специальные non-speech токены: оба флага есть в bundled runtime VoxFlow.
+    cmd.arg("-nf").arg("-sns");
     cmd.arg("-t").arg(p.threads.to_string());
 
     if let Some(prompt) = p.initial_prompt {
@@ -115,7 +120,7 @@ fn transcribe_cli_inner(p: &AsrParams, timeout: Option<Duration>) -> anyhow::Res
         kept.push(line.to_string());
     }
 
-    let text = kept.join(" ").trim().to_string();
+    let text = sanitize_transcript_text(&kept.join(" "));
 
     // Если процесс упал И при этом ничего не распарсилось — это ошибка.
     if !out.status.success() && text.is_empty() {
@@ -363,7 +368,14 @@ fn try_start_server(
         // beam=2 (а не 5): ~1.5–2× быстрее на GPU при почти той же точности на
         // large-v3-turbo — баланс «скорость↔качество» в пользу отзывчивости (жалоба
         // на задержку). Чистая жадность (-bo 2 без beam) давала неверные слова.
-        cmd.arg("-bs").arg("2").arg("-bo").arg("2");
+        cmd.arg("-bs")
+            .arg("2")
+            .arg("-bo")
+            .arg("2")
+            // Температурный fallback на шуме и non-speech токены — два
+            // типичных источника уверенно звучащих «фантомных» фраз.
+            .arg("-nf")
+            .arg("-sns");
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
@@ -410,23 +422,31 @@ fn try_start_server(
     }
 }
 
-/// Готов ли сервер (curl к корню отвечает).
+/// Готов ли сервер (нативный HTTP-probe к корню отвечает).
+///
+/// Раньше каждая проверка запускала новый `curl`-процесс. Во время 3-секундной
+/// загрузки large-v3 это давало около 30 лишних процессов. Нативный probe
+/// сохраняет прежнюю семантику HTTP-ready (не только TCP bind), но не создаёт
+/// subprocess и остаётся жёстко ограничен короткими socket timeouts.
 pub fn server_ready(port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{port}/");
-    let mut cmd = Command::new("curl");
-    cmd.arg("--noproxy")
-        .arg("*")
-        .arg("-s")
-        .arg("-o")
-        .arg(if cfg!(windows) { "NUL" } else { "/dev/null" })
-        .arg("--connect-timeout")
-        .arg("0.1")
-        .arg("-m")
-        .arg("0.25")
-        .arg(&url);
-    #[cfg(windows)]
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    cmd.status().map(|s| s.success()).unwrap_or(false)
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let timeout = Duration::from_millis(75);
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    if stream.set_read_timeout(Some(timeout)).is_err()
+        || stream.set_write_timeout(Some(timeout)).is_err()
+    {
+        return false;
+    }
+    if stream
+        .write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut first_byte = [0_u8; 1];
+    stream.read(&mut first_byte).is_ok_and(|read| read > 0)
 }
 
 /// Транскрибировать WAV через работающий whisper-server (/inference, multipart via curl).
@@ -520,14 +540,15 @@ pub fn transcribe_server_partial(port: u16, wav: &Path, language: &str) -> anyho
         ));
     }
     let raw = String::from_utf8_lossy(&out.stdout);
-    Ok(extract_text(&raw))
+    Ok(parse_partial_verbose(&raw))
 }
 
 // Пороги «гейта уверенности» против галлюцинаций whisper на невнятном/коротком звуке.
 const MIN_MEAN_PROB: f64 = 0.60; // средняя вероятность слов
 const LOW_PROB: f64 = 0.40; // что считаем «неуверенным» словом
 const MAX_LOW_FRAC: f64 = 0.34; // доля неуверенных слов
-const MAX_NO_SPEECH: f64 = 0.70; // вероятность «это не речь»
+const MAX_NO_SPEECH: f64 = 0.60; // default whisper.cpp для «это не речь»
+const MIN_SEGMENT_AVG_LOGPROB: f64 = -1.0; // default decoder-fail threshold whisper.cpp
 
 /// Достать «сырой» текст из ответа сервера БЕЗ гейта уверенности.
 /// Парсит поле "text" из verbose_json (схлопывает переводы строк/пробелы);
@@ -542,11 +563,161 @@ fn extract_text(json: &str) -> String {
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .replace('\n', " ");
-    // Схлопнуть пробелы, убрать «прилипшие» к пунктуации пробелы (для пилюли/живой
-    // вставки) и срезать повторяющиеся подряд n-граммы (beam иногда зацикливается).
+    sanitize_transcript_text(&text)
+}
+
+/// Единая дешёвая санитарная обработка финального ASR-текста.
+/// Она не переписывает фразу: только схлопывает пробелы/повторы и убирает
+/// ответы, целиком состоящие из non-speech аннотаций (`[music]`, `(noise)`, `♪`).
+pub(crate) fn sanitize_transcript_text(text: &str) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
     let deduped = dedup_repeats(&collapsed);
-    crate::postprocess::normalize_spaces(&deduped)
+    let normalized = crate::postprocess::normalize_spaces(&deduped);
+    if is_non_speech_only(&normalized) {
+        String::new()
+    } else {
+        normalized
+    }
+}
+
+fn is_non_speech_only(text: &str) -> bool {
+    let text = text.trim();
+    if text.is_empty() {
+        return true;
+    }
+
+    let mut saw_music = false;
+    let only_music_or_punctuation = text.chars().all(|c| {
+        if matches!(c, '♪' | '♫' | '♬' | '♩' | '🎵' | '🎶') {
+            saw_music = true;
+            true
+        } else {
+            c.is_whitespace()
+                || c.is_ascii_punctuation()
+                || matches!(c, '…' | '—' | '–' | '·' | '•')
+        }
+    });
+    if saw_music && only_music_or_punctuation {
+        return true;
+    }
+
+    // Whisper часто обозначает не-речь скобками, но скобки сами по себе не
+    // означают шум: `[TODO]`, `(важно)` и `<div>` — нормальная диктовка.
+    // Отклоняем только полностью аннотационный ответ из известного списка.
+    let mut chars = text.chars().peekable();
+    let mut saw_group = false;
+    loop {
+        while chars.peek().is_some_and(|c| {
+            c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '-' | '—' | '–' | '…')
+        }) {
+            chars.next();
+        }
+        let Some(open) = chars.next() else {
+            return saw_group;
+        };
+        let close = match open {
+            '[' => ']',
+            '(' => ')',
+            '<' => '>',
+            '【' => '】',
+            _ => return false,
+        };
+        let mut closed = false;
+        let mut content = String::new();
+        for c in chars.by_ref() {
+            if c == close {
+                closed = true;
+                break;
+            }
+            content.push(c);
+        }
+        if !closed || !is_known_non_speech_marker(&content) {
+            return false;
+        }
+        saw_group = true;
+    }
+}
+
+fn is_known_non_speech_marker(content: &str) -> bool {
+    let normalized = content
+        .trim()
+        .chars()
+        .map(|c| if matches!(c, '_' | '-') { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "blank audio"
+            | "no audio"
+            | "silence"
+            | "silent"
+            | "noise"
+            | "background noise"
+            | "music"
+            | "applause"
+            | "laughter"
+            | "laughing"
+            | "breathing"
+            | "inaudible"
+            | "unintelligible"
+            | "sound effect"
+            | "sound effects"
+            | "нет звука"
+            | "тишина"
+            | "шум"
+            | "фоновый шум"
+            | "музыка"
+            | "аплодисменты"
+            | "смех"
+            | "дыхание"
+            | "неразборчиво"
+            | "неразборчивая речь"
+            | "звуковой эффект"
+    )
+}
+
+fn segment_is_rejected(segment: &serde_json::Value) -> bool {
+    let no_speech = segment
+        .get("no_speech_prob")
+        .and_then(|x| x.as_f64())
+        .is_some_and(|p| p >= MAX_NO_SPEECH);
+    let low_logprob = segment
+        .get("avg_logprob")
+        .and_then(|x| x.as_f64())
+        .is_some_and(|p| p < MIN_SEGMENT_AVG_LOGPROB);
+    let marker_only = segment
+        .get("text")
+        .and_then(|x| x.as_str())
+        .is_none_or(is_non_speech_only);
+    // Match Whisper's own decoder rule: a segment is silence only when the
+    // no-speech prediction is high *and* decoding confidence is poor.  Either
+    // signal alone is common in quiet/accented but valid speech.
+    marker_only || (no_speech && low_logprob)
+}
+
+/// Partial-ответ не проходит строгий word-confidence gate, но сегменты,
+/// которые сам Whisper считает не-речью, в живую пилюлю не попадают.
+fn parse_partial_verbose(json: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(json.trim()) {
+        Ok(v) => v,
+        Err(_) => return sanitize_transcript_text(&clean_server_text(json)),
+    };
+    let Some(segments) = v.get("segments").and_then(|s| s.as_array()) else {
+        return extract_text(json);
+    };
+    if segments.is_empty() {
+        return extract_text(json);
+    }
+    let text = segments
+        .iter()
+        .filter(|segment| !segment_is_rejected(segment))
+        .filter_map(|segment| segment.get("text").and_then(|x| x.as_str()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    sanitize_transcript_text(&text)
 }
 
 /// Срезать подряд повторяющиеся n-граммы (1..=5 токенов), оставив одну копию.
@@ -615,25 +786,24 @@ pub fn dedup_repeats(text: &str) -> String {
 fn parse_verbose(json: &str, requested_language: &str) -> String {
     let v: serde_json::Value = match serde_json::from_str(json.trim()) {
         Ok(v) => v,
-        Err(_) => return clean_server_text(json), // не JSON — вернём как есть
+        Err(_) => return sanitize_transcript_text(&clean_server_text(json)),
     };
 
-    let text = extract_text(json);
-
     let mut probs: Vec<f64> = Vec::new();
-    // Гейт no_speech: раньше брали МАКСИМУМ no_speech_prob по всем сегментам — из-за
-    // этого одна пауза/вдох в середине длинной диктовки заворачивала ВЕСЬ текст.
-    // Теперь считаем ДОЛЮ сегментов, помеченных как «не речь», и общее число сегментов:
-    // отклоняем по no_speech лишь если таких сегментов большинство (или сегмент один).
+    let mut accepted_text = Vec::new();
     let mut seg_count = 0usize;
-    let mut nsp_high = 0usize;
+    let mut rejected_segments = 0usize;
     if let Some(segs) = v.get("segments").and_then(|s| s.as_array()) {
         for seg in segs {
             seg_count += 1;
-            if let Some(nsp) = seg.get("no_speech_prob").and_then(|x| x.as_f64()) {
-                if nsp > MAX_NO_SPEECH {
-                    nsp_high += 1;
-                }
+            // Отбрасываем конкретный плохой сегмент, а не всю диктовку. Так
+            // пауза в середине не убивает хорошую речь, но её фантом не вставляется.
+            if segment_is_rejected(seg) {
+                rejected_segments += 1;
+                continue;
+            }
+            if let Some(text) = seg.get("text").and_then(|x| x.as_str()) {
+                accepted_text.push(text);
             }
             if let Some(words) = seg.get("words").and_then(|w| w.as_array()) {
                 for w in words {
@@ -648,6 +818,12 @@ fn parse_verbose(json: &str, requested_language: &str) -> String {
             }
         }
     }
+
+    let text = if seg_count == 0 {
+        extract_text(json)
+    } else {
+        sanitize_transcript_text(&accepted_text.join(" "))
+    };
 
     let det_lang = v
         .get("detected_language")
@@ -667,27 +843,18 @@ fn parse_verbose(json: &str, requested_language: &str) -> String {
         (mean, low as f64 / probs.len() as f64)
     };
 
-    // no_speech: при ≥2 сегментах заворачиваем только если БОЛЬШИНСТВО сегментов —
-    // «не речь» (одиночная пауза в длинной диктовке больше не убивает весь текст).
-    // При одном сегменте (короткий клип) поведение строгое, как раньше.
-    let nsp_reject = if seg_count <= 1 {
-        nsp_high >= 1
-    } else {
-        (nsp_high as f64 / seg_count as f64) > 0.6
-    };
-    let nsp_frac = if seg_count > 0 {
-        nsp_high as f64 / seg_count as f64
-    } else {
-        0.0
-    };
-
-    let reject = mean < MIN_MEAN_PROB || frac_low > MAX_LOW_FRAC || nsp_reject || lang_mismatch;
+    let reject = mean < MIN_MEAN_PROB || frac_low > MAX_LOW_FRAC || lang_mismatch;
 
     if reject || text.is_empty() {
         log::info!(
-            "ASR отклонён: mean={mean:.2} frac_low={frac_low:.2} nsp_frac={nsp_frac:.2} ({nsp_high}/{seg_count}) req_lang={requested_language} lang={det_lang}/{det_prob:.2} text={text:?}"
+            "ASR отклонён: mean={mean:.2} frac_low={frac_low:.2} rejected_segments={rejected_segments}/{seg_count} req_lang={requested_language} lang={det_lang}/{det_prob:.2} text={text:?}"
         );
         return String::new();
+    }
+    if rejected_segments > 0 {
+        log::info!(
+            "ASR: отфильтровано фантомных/no-speech сегментов: {rejected_segments}/{seg_count}"
+        );
     }
     text
 }
@@ -760,10 +927,137 @@ mod tests {
     }
 
     #[test]
+    fn server_ready_uses_native_http_probe() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test listener");
+        let port = listener.local_addr().expect("listener address").port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept readiness probe");
+            let mut request = [0_u8; 128];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .expect("write readiness response");
+        });
+        assert!(server_ready(port));
+        server.join().expect("readiness server thread");
+    }
+
+    #[test]
     fn final_server_timeout_scales_without_penalizing_short_taps() {
         assert_eq!(server_request_timeout_for_audio(0), 15);
         assert_eq!(server_request_timeout_for_audio(1), 15);
         assert_eq!(server_request_timeout_for_audio(5), 25);
         assert_eq!(server_request_timeout_for_audio(30), 45);
+    }
+
+    #[test]
+    fn final_gate_drops_only_the_no_speech_segment() {
+        let response = serde_json::json!({
+            "text": " Привет, мир. Yeah.",
+            "segments": [
+                {
+                    "text": " Привет, мир.",
+                    "avg_logprob": -0.18,
+                    "no_speech_prob": 0.03,
+                    "words": [
+                        {"word": " Привет", "probability": 0.95},
+                        {"word": " мир", "probability": 0.93}
+                    ]
+                },
+                {
+                    "text": " Yeah.",
+                    "avg_logprob": -1.40,
+                    "no_speech_prob": 0.91,
+                    "words": [{"word": " Yeah", "probability": 0.97}]
+                }
+            ]
+        })
+        .to_string();
+
+        assert_eq!(parse_verbose(&response, "auto"), "Привет, мир.");
+    }
+
+    #[test]
+    fn low_logprob_alone_does_not_delete_valid_speech() {
+        let response = serde_json::json!({
+            "text": " Thanks for watching.",
+            "segments": [{
+                "text": " Thanks for watching.",
+                "avg_logprob": -1.4,
+                "no_speech_prob": 0.20,
+                "words": [{"word": " Thanks", "probability": 0.91}]
+            }]
+        })
+        .to_string();
+
+        assert_eq!(parse_verbose(&response, "auto"), "Thanks for watching.");
+    }
+
+    #[test]
+    fn no_speech_gate_requires_both_decoder_signals() {
+        let high_no_speech_good_decode = serde_json::json!({
+            "text": " тихая речь",
+            "avg_logprob": -0.2,
+            "no_speech_prob": 0.91
+        });
+        let low_no_speech_weak_decode = serde_json::json!({
+            "text": " речь с акцентом",
+            "avg_logprob": -1.4,
+            "no_speech_prob": 0.10
+        });
+        let likely_silence = serde_json::json!({
+            "text": " Yeah",
+            "avg_logprob": -1.4,
+            "no_speech_prob": 0.91
+        });
+
+        assert!(!segment_is_rejected(&high_no_speech_good_decode));
+        assert!(!segment_is_rejected(&low_no_speech_weak_decode));
+        assert!(segment_is_rejected(&likely_silence));
+    }
+
+    #[test]
+    fn partial_gate_hides_no_speech_but_keeps_uncertain_speech() {
+        let no_speech = serde_json::json!({
+            "text": " Yeah",
+            "segments": [{
+                "text": " Yeah",
+                "avg_logprob": -1.3,
+                "no_speech_prob": 0.9
+            }]
+        })
+        .to_string();
+        assert!(parse_partial_verbose(&no_speech).is_empty());
+
+        let uncertain_speech = serde_json::json!({
+            "text": " начало фразы",
+            "segments": [{
+                "text": " начало фразы",
+                "avg_logprob": -1.3,
+                "no_speech_prob": 0.1
+            }]
+        })
+        .to_string();
+        assert_eq!(parse_partial_verbose(&uncertain_speech), "начало фразы");
+    }
+
+    #[test]
+    fn sanitizer_rejects_only_annotation_only_transcripts() {
+        for text in [
+            "[BLANK_AUDIO]",
+            "(music)",
+            "♪ ♪",
+            "[noise], (applause)",
+            "【фоновый шум】",
+        ] {
+            assert!(sanitize_transcript_text(text).is_empty(), "{text}");
+        }
+        assert_eq!(
+            sanitize_transcript_text("Начало текста [шум]"),
+            "Начало текста [шум]"
+        );
+        for text in ["[TODO]", "(важно)", "<div>", "【проверить позже】"] {
+            assert_eq!(sanitize_transcript_text(text), text, "{text}");
+        }
     }
 }
