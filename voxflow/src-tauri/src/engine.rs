@@ -1816,21 +1816,23 @@ fn clean_live_text(
     if text.trim().is_empty() {
         return String::new();
     }
-    let processed = process_dictation_text(text, s, dict, snippets);
+    let processed = process_dictation_text(text, s, dict, snippets, corrections);
     // Exact snippet bodies are authored output, not an ASR hypothesis. Keep the
     // live pill byte-for-byte aligned with the final insertion even when the
     // trigger follows a semantic paragraph boundary.
+    if processed.voice_cancelled {
+        return String::new();
+    }
     if processed.snippet_expanded {
         return processed.text;
     }
-    let mut t = processed.text;
-    t = postprocess::apply_corrections(&t, corrections);
-    postprocess::normalize_spaces(&t)
+    postprocess::normalize_spaces(&processed.text)
 }
 
 struct ProcessedDictationText {
     text: String,
     snippet_expanded: bool,
+    voice_cancelled: bool,
 }
 
 fn process_dictation_text(
@@ -1838,26 +1840,45 @@ fn process_dictation_text(
     s: &Settings,
     dict: &[postprocess::Dict],
     snippets: &[postprocess::Snippet],
+    corrections: &[postprocess::Correction],
 ) -> ProcessedDictationText {
     let mut snippet_expanded = false;
-    let paragraphs = text
-        .split(SEMANTIC_PARAGRAPH_MARKER)
-        .filter_map(|paragraph| {
-            let deduped = postprocess::dedup_repeated_ngrams(paragraph);
-            let processed =
-                if let Some(expanded) = postprocess::expand_matching_snippet(&deduped, snippets) {
-                    snippet_expanded = true;
-                    expanded
-                } else {
-                    postprocess::process(&deduped, s, dict, snippets)
-                };
-            (!processed.trim().is_empty()).then_some(processed)
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let mut voice_cancelled = false;
+    let mut paragraphs = Vec::new();
+    for paragraph in text.split(SEMANTIC_PARAGRAPH_MARKER) {
+        let deduped = postprocess::dedup_repeated_ngrams(paragraph);
+        if deduped.trim().is_empty() {
+            continue;
+        }
+        if let Some(expanded) = postprocess::expand_matching_snippet(&deduped, snippets) {
+            snippet_expanded = true;
+            paragraphs.push(expanded);
+            continue;
+        }
+
+        let mut processed = postprocess::process(&deduped, s, dict, snippets);
+        processed = postprocess::apply_corrections(&processed, corrections);
+        processed = postprocess::normalize_spaces(&processed);
+        match crate::voice_cmds::apply_voice_commands(&processed) {
+            crate::voice_cmds::CmdOutcome::Cancel => {
+                voice_cancelled = true;
+                break;
+            }
+            crate::voice_cmds::CmdOutcome::Text(command_text) => {
+                if !command_text.is_empty() {
+                    paragraphs.push(command_text);
+                }
+            }
+        }
+    }
     ProcessedDictationText {
-        text: paragraphs,
+        text: if voice_cancelled {
+            String::new()
+        } else {
+            paragraphs.join("\n\n")
+        },
         snippet_expanded,
+        voice_cancelled,
     }
 }
 
@@ -3599,13 +3620,17 @@ fn process_utterance(
     ));
     // Постобработка (правила) + выученные исправления.
     let t_post = Instant::now();
-    let processed = process_dictation_text(&raw, &s, &dict, &snippets);
+    let processed = process_dictation_text(&raw, &s, &dict, &snippets, &corrections);
     let snippet_expanded = processed.snippet_expanded;
+    let voice_cancelled = processed.voice_cancelled;
     let mut text = processed.text;
-    if !snippet_expanded {
-        text = postprocess::apply_corrections(&text, &corrections);
-    }
     let post_ms = t_post.elapsed().as_millis() as u64;
+    if voice_cancelled {
+        dbg_log("финал: голосовая команда «отмена» — вставка и история пропущены");
+        erase_registered_live_draft(ctx, my_gen);
+        let _ = std::fs::remove_file(&wav);
+        return Ok(());
+    }
     if let FinalPipelineDecision::Reject { .. } =
         decide_final_pipeline(final_text_is_insertable(&text), live_inserted)
     {
@@ -3616,20 +3641,11 @@ fn process_utterance(
         return Ok(());
     }
 
-    // Голосовые команды оставляем как совместимость, но снимаем их ДО LLM:
-    // форматирование должно быть автоматическим, а модель не должна съедать хвостовое
-    // "отмена"/"абзац" до того, как движок успел распознать команду.
+    // Голосовые команды уже применены отдельно к каждому обычному абзацу во
+    // время process_dictation_text. Сниппет-абзацы остаются непрозрачными:
+    // authored body с текстом "отмена" не должен отменять диктовку.
     if !snippet_expanded {
         text = postprocess::normalize_spaces(&text);
-        text = match crate::voice_cmds::apply_voice_commands(&text) {
-            crate::voice_cmds::CmdOutcome::Cancel => {
-                dbg_log("финал: голосовая команда «отмена» — вставка и история пропущены");
-                erase_registered_live_draft(ctx, my_gen);
-                let _ = std::fs::remove_file(&wav);
-                return Ok(());
-            }
-            crate::voice_cmds::CmdOutcome::Text(t) => t,
-        };
     }
     if let FinalPipelineDecision::Reject { .. } =
         decide_final_pipeline(!text.is_empty(), live_inserted)
@@ -5472,7 +5488,7 @@ mod seg_tests {
     fn final_pipeline_preserves_two_deliberate_sentence_repetitions() {
         let s = Settings::default();
         let raw = postprocess::dedup_repeated_ngrams("Я пошёл домой. Я пошёл домой.");
-        let final_text = process_dictation_text(&raw, &s, &[], &[]).text;
+        let final_text = process_dictation_text(&raw, &s, &[], &[], &[]).text;
 
         assert_eq!(final_text, "Я пошёл домой. Я пошёл домой.");
     }
@@ -5483,7 +5499,7 @@ mod seg_tests {
         let raw = "Отправь отчёт отправь отчёт отправь отчёт пожалуйста";
         let live_text = clean_live_text(raw, &s, &[], &[], &[]);
         let final_raw = postprocess::dedup_repeated_ngrams(raw);
-        let final_text = process_dictation_text(&final_raw, &s, &[], &[]).text;
+        let final_text = process_dictation_text(&final_raw, &s, &[], &[], &[]).text;
 
         assert_eq!(live_text, "Отправь отчёт пожалуйста");
         assert_eq!(final_text, live_text);
@@ -5497,7 +5513,7 @@ mod seg_tests {
             (true, "Вторая мысль.".to_string()),
         ];
         let raw = render_segments_for_postprocess(&segs);
-        let final_text = process_dictation_text(&raw, &s, &[], &[]).text;
+        let final_text = process_dictation_text(&raw, &s, &[], &[], &[]).text;
 
         assert_eq!(final_text, "Первая мысль.\n\nВторая мысль.");
     }
@@ -5537,18 +5553,31 @@ mod seg_tests {
             wrong: "cat".into(),
             right: "dog".into(),
         }];
-        let segs = vec![
-            (false, "Первая мысль.".to_string()),
-            (true, "/sig".to_string()),
-        ];
+        let segs = vec![(false, "cat".to_string()), (true, "/sig".to_string())];
         let raw = render_segments_for_postprocess(&segs);
 
-        let final_processed = process_dictation_text(&raw, &s, &[], &snippets);
+        let final_processed = process_dictation_text(&raw, &s, &[], &snippets, &corrections);
         let live = clean_live_text(&raw, &s, &[], &snippets, &corrections);
 
         assert!(final_processed.snippet_expanded);
-        assert_eq!(final_processed.text, "Первая мысль.\n\ncat\nотмена");
-        assert_eq!(live, "Первая мысль.\n\ncat\nотмена");
+        assert_eq!(final_processed.text, "dog\n\ncat\nотмена");
+        assert_eq!(live, "dog\n\ncat\nотмена");
+    }
+
+    #[test]
+    fn voice_cancel_in_a_normal_paragraph_still_wins_next_to_a_snippet() {
+        let s = Settings::default();
+        let snippets = vec![postprocess::Snippet {
+            trigger: "/sig".into(),
+            content: "authored signature".into(),
+            is_template: false,
+        }];
+        let segs = vec![(false, "/sig".to_string()), (true, "отмена".to_string())];
+        let raw = render_segments_for_postprocess(&segs);
+
+        let live = clean_live_text(&raw, &s, &[], &snippets, &[]);
+
+        assert!(live.is_empty());
     }
 
     #[test]
