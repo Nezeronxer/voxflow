@@ -154,6 +154,14 @@ test("live preview survives transcribing and frame updates bypass React state", 
   assert.match(overlaySource, /if \(seq > currentSeqRef\.current\) currentSeqRef\.current = seq/);
 });
 
+test("final preview survives idle arriving first on another Tauri event channel", () => {
+  assert.match(
+    overlaySource,
+    /isFinalPreview\s*&&\s*statusRef\.current === "idle"\s*&&\s*seq === currentSeqRef\.current/,
+    "the exact inserted text must still reach the pill when status=idle wins the cross-channel race",
+  );
+});
+
 test("recording and double-tap latch share geometry without a second pop animation", () => {
   const recording = finalRule(".aq-rec");
   const latch = finalRule(".aq-latch");
