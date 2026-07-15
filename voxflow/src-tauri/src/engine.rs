@@ -1816,17 +1816,21 @@ fn clean_live_text(
     if text.trim().is_empty() {
         return String::new();
     }
+    let processed = process_dictation_text(text, s, dict, snippets);
     // Exact snippet bodies are authored output, not an ASR hypothesis. Keep the
-    // live pill byte-for-byte aligned with the final insertion: corrections,
-    // capitalization and whitespace normalization must not rewrite the body.
-    if !text.contains(SEMANTIC_PARAGRAPH_MARKER) {
-        if let Some(expanded) = postprocess::expand_matching_snippet(text, snippets) {
-            return expanded;
-        }
+    // live pill byte-for-byte aligned with the final insertion even when the
+    // trigger follows a semantic paragraph boundary.
+    if processed.snippet_expanded {
+        return processed.text;
     }
-    let mut t = process_dictation_text(text, s, dict, snippets);
+    let mut t = processed.text;
     t = postprocess::apply_corrections(&t, corrections);
     postprocess::normalize_spaces(&t)
+}
+
+struct ProcessedDictationText {
+    text: String,
+    snippet_expanded: bool,
 }
 
 fn process_dictation_text(
@@ -1834,20 +1838,27 @@ fn process_dictation_text(
     s: &Settings,
     dict: &[postprocess::Dict],
     snippets: &[postprocess::Snippet],
-) -> String {
-    if !text.contains(SEMANTIC_PARAGRAPH_MARKER) {
-        let deduped = postprocess::dedup_repeated_ngrams(text);
-        return postprocess::process(&deduped, s, dict, snippets);
-    }
-
-    text.split(SEMANTIC_PARAGRAPH_MARKER)
-        .map(|paragraph| {
+) -> ProcessedDictationText {
+    let mut snippet_expanded = false;
+    let paragraphs = text
+        .split(SEMANTIC_PARAGRAPH_MARKER)
+        .filter_map(|paragraph| {
             let deduped = postprocess::dedup_repeated_ngrams(paragraph);
-            postprocess::process(&deduped, s, dict, snippets)
+            let processed =
+                if let Some(expanded) = postprocess::expand_matching_snippet(&deduped, snippets) {
+                    snippet_expanded = true;
+                    expanded
+                } else {
+                    postprocess::process(&deduped, s, dict, snippets)
+                };
+            (!processed.trim().is_empty()).then_some(processed)
         })
-        .filter(|paragraph| !paragraph.trim().is_empty())
         .collect::<Vec<_>>()
-        .join("\n\n")
+        .join("\n\n");
+    ProcessedDictationText {
+        text: paragraphs,
+        snippet_expanded,
+    }
 }
 
 fn join_partial(committed: &str, volatile: &str) -> String {
@@ -3588,14 +3599,9 @@ fn process_utterance(
     ));
     // Постобработка (правила) + выученные исправления.
     let t_post = Instant::now();
-    let exact_snippet = if raw.contains(SEMANTIC_PARAGRAPH_MARKER) {
-        None
-    } else {
-        postprocess::expand_matching_snippet(&raw, &snippets)
-    };
-    let snippet_expanded = exact_snippet.is_some();
-    let mut text =
-        exact_snippet.unwrap_or_else(|| process_dictation_text(&raw, &s, &dict, &snippets));
+    let processed = process_dictation_text(&raw, &s, &dict, &snippets);
+    let snippet_expanded = processed.snippet_expanded;
+    let mut text = processed.text;
     if !snippet_expanded {
         text = postprocess::apply_corrections(&text, &corrections);
     }
@@ -5466,7 +5472,7 @@ mod seg_tests {
     fn final_pipeline_preserves_two_deliberate_sentence_repetitions() {
         let s = Settings::default();
         let raw = postprocess::dedup_repeated_ngrams("Я пошёл домой. Я пошёл домой.");
-        let final_text = process_dictation_text(&raw, &s, &[], &[]);
+        let final_text = process_dictation_text(&raw, &s, &[], &[]).text;
 
         assert_eq!(final_text, "Я пошёл домой. Я пошёл домой.");
     }
@@ -5477,7 +5483,7 @@ mod seg_tests {
         let raw = "Отправь отчёт отправь отчёт отправь отчёт пожалуйста";
         let live_text = clean_live_text(raw, &s, &[], &[], &[]);
         let final_raw = postprocess::dedup_repeated_ngrams(raw);
-        let final_text = process_dictation_text(&final_raw, &s, &[], &[]);
+        let final_text = process_dictation_text(&final_raw, &s, &[], &[]).text;
 
         assert_eq!(live_text, "Отправь отчёт пожалуйста");
         assert_eq!(final_text, live_text);
@@ -5491,7 +5497,7 @@ mod seg_tests {
             (true, "Вторая мысль.".to_string()),
         ];
         let raw = render_segments_for_postprocess(&segs);
-        let final_text = process_dictation_text(&raw, &s, &[], &[]);
+        let final_text = process_dictation_text(&raw, &s, &[], &[]).text;
 
         assert_eq!(final_text, "Первая мысль.\n\nВторая мысль.");
     }
@@ -5517,6 +5523,32 @@ mod seg_tests {
         assert_eq!(live_full, final_body);
         assert_eq!(volatile, final_body);
         assert_eq!(live_full, "cat\n  indented signature");
+    }
+
+    #[test]
+    fn semantic_paragraph_keeps_snippet_body_authored_and_opaque() {
+        let s = Settings::default();
+        let snippets = vec![postprocess::Snippet {
+            trigger: "/sig".into(),
+            content: "cat\nотмена".into(),
+            is_template: false,
+        }];
+        let corrections = vec![postprocess::Correction {
+            wrong: "cat".into(),
+            right: "dog".into(),
+        }];
+        let segs = vec![
+            (false, "Первая мысль.".to_string()),
+            (true, "/sig".to_string()),
+        ];
+        let raw = render_segments_for_postprocess(&segs);
+
+        let final_processed = process_dictation_text(&raw, &s, &[], &snippets);
+        let live = clean_live_text(&raw, &s, &[], &snippets, &corrections);
+
+        assert!(final_processed.snippet_expanded);
+        assert_eq!(final_processed.text, "Первая мысль.\n\ncat\nотмена");
+        assert_eq!(live, "Первая мысль.\n\ncat\nотмена");
     }
 
     #[test]

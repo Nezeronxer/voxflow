@@ -321,9 +321,9 @@ fn dedup_ngrams_pass(line: &str) -> String {
     let mut i = 0usize;
     while i < toks.len() {
         let mut matched = false;
-        // Длинные блоки первыми, чтобы не дробить фразу (как в asr::dedup_repeats).
         let max_n = ((toks.len() - i) / 2).min(6);
-        for n in (2..=max_n).rev() {
+        let mut best: Option<(usize, usize, usize)> = None;
+        for n in 2..=max_n {
             let block_eq = |j: usize| {
                 toks[i..i + n]
                     .iter()
@@ -342,11 +342,23 @@ fn dedup_ngrams_pass(line: &str) -> String {
                 if copies < 3 {
                     continue;
                 }
-                out.extend_from_slice(&toks[i..i + n]);
-                i = j;
-                matched = true;
-                break;
+                let span = j - i;
+                let replace_best = best
+                    .map(|(best_n, _, best_span)| {
+                        span > best_span || (span == best_span && n < best_n)
+                    })
+                    .unwrap_or(true);
+                if replace_best {
+                    best = Some((n, j, span));
+                }
             }
+        }
+        if let Some((n, end, _)) = best {
+            // Prefer the primitive repeated phrase when a composite block spans
+            // the same loop (6× "a b" must become one "a b", not two copies).
+            out.extend_from_slice(&toks[i..i + n]);
+            i = end;
+            matched = true;
         }
         if !matched {
             out.push(toks[i]);
@@ -2041,10 +2053,22 @@ mod dedup_tests {
 
     #[test]
     fn even_copies_collapse_to_one() {
-        // 4 копии «раз два»: longest-first за один проход оставил бы «раз два раз два»,
-        // фикспойнт дожимает до одной копии.
         assert_eq!(
             dedup_repeated_ngrams("раз два раз два раз два раз два три"),
+            "раз два три"
+        );
+    }
+
+    #[test]
+    fn long_decoder_loops_collapse_to_the_primitive_phrase() {
+        assert_eq!(
+            dedup_repeated_ngrams("раз два раз два раз два раз два раз два раз два три"),
+            "раз два три"
+        );
+        assert_eq!(
+            dedup_repeated_ngrams(
+                "раз два раз два раз два раз два раз два раз два раз два раз два три"
+            ),
             "раз два три"
         );
     }
