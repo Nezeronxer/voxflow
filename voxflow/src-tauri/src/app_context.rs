@@ -46,8 +46,9 @@ pub struct AppContext {
     /// Стабильный best-effort id сфокусированного поля. Нужен, чтобы
     /// финальная вставка не ушла в другое поле того же окна.
     pub field_id: String,
-    /// Локальный хвост текста активного поля, ограниченный и очищенный от
-    /// переводов строк. Не логируется и не попадает во frontend API.
+    /// Локальный хвост текста активного поля, ограниченный и уплотнённый.
+    /// Конечный перевод строки сохраняется как граница предложения. Значение не
+    /// логируется и не попадает во frontend API.
     pub field_text: String,
     /// Выделенный текст активного поля, если ОС отдаёт его без изменения UI.
     pub selected_text: String,
@@ -207,20 +208,26 @@ impl TargetFingerprint {
 }
 
 fn tail_chars(value: &str, max_chars: usize) -> String {
+    let terminal_newline = value.trim_end_matches([' ', '\t', '\r']).ends_with('\n');
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     let len = compact.chars().count();
-    if len <= max_chars {
-        return compact;
+    let mut tail = if len <= max_chars {
+        compact
+    } else {
+        let tail = compact
+            .chars()
+            .rev()
+            .take(max_chars)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        format!("...{}", tail.trim_start())
+    };
+    if terminal_newline && !tail.is_empty() {
+        tail.push('\n');
     }
-    let tail = compact
-        .chars()
-        .rev()
-        .take(max_chars)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!("...{}", tail.trim_start())
+    tail
 }
 
 /// Privacy gate shared by the native detector and tests. AX uses the standard
@@ -297,7 +304,17 @@ fn focused_text_tail_from_parts(
         return None;
     }
     let value = field_text.trim();
-    (!value.is_empty()).then(|| tail_chars(value, max_chars))
+    if value.is_empty() {
+        return None;
+    }
+    let terminal_newline = field_text
+        .trim_end_matches([' ', '\t', '\r'])
+        .ends_with('\n');
+    let mut tail = tail_chars(value, max_chars);
+    if terminal_newline && !tail.ends_with('\n') {
+        tail.push('\n');
+    }
+    Some(tail)
 }
 
 fn is_own_app_parts(exe: &str, window_id: &str) -> bool {
@@ -728,6 +745,12 @@ mod tests {
         assert_eq!(
             context.focused_text_tail(1_600).as_deref(),
             Some("whole field value")
+        );
+
+        context.field_text = "whole field value\n  ".into();
+        assert_eq!(
+            context.focused_text_tail(1_600).as_deref(),
+            Some("whole field value\n")
         );
     }
 
