@@ -1683,10 +1683,10 @@ fn push_dictation_segment(segs: &mut Vec<(bool, String)>, para: bool, text: Stri
         return;
     }
     if let Some(last) = segs.last_mut() {
-        if is_restatement(&last.1, &text) {
-            last.1 = text;
-            return;
-        }
+        // A pause is not an edit command. Similar neighboring phrases may be
+        // intentional repetition or a continuation, so never delete one by
+        // guessing. Explicit spoken corrections are handled later by
+        // postprocess markers such as "точнее" and "нет, стоп".
         if !para && soft_join_continuation_segment(&mut last.1, &text) {
             return;
         }
@@ -1852,35 +1852,6 @@ fn clean_live_partial(
         }
     }
     (String::new(), full.clone(), full)
-}
-
-/// Похоже ли `b` на переговорённую заново версию `a` (человек ошибся, сделал
-/// паузу и сказал фразу ещё раз): пословный Жаккар >= 0.5 при сопоставимой
-/// длине. Сравниваем только СОСЕДНИЕ сегменты — типичный паттерн самоправки.
-fn is_restatement(a: &str, b: &str) -> bool {
-    let norm = |s: &str| -> Vec<String> {
-        s.split_whitespace()
-            .map(|w| {
-                w.trim_matches(|c: char| !c.is_alphanumeric())
-                    .to_lowercase()
-            })
-            .filter(|w| !w.is_empty())
-            .collect()
-    };
-    let ta = norm(a);
-    let tb = norm(b);
-    if ta.len() < 2 || tb.len() < 2 {
-        return false;
-    }
-    let (la, lb) = (ta.len() as f64, tb.len() as f64);
-    if lb < la * 0.5 || lb > la * 2.5 {
-        return false;
-    }
-    let sa: HashSet<&String> = ta.iter().collect();
-    let sb: HashSet<&String> = tb.iter().collect();
-    let inter = sa.intersection(&sb).count() as f64;
-    let union = sa.union(&sb).count() as f64;
-    inter / union.max(1.0) >= 0.5
 }
 
 /// Для вставки КЛАВИШАМИ (живые режимы) абзацы заменяем пробелом: Enter в
@@ -2149,8 +2120,8 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             drop(g);
             let t = txt.trim().to_string();
             if !t.is_empty() {
-                // Длинная пауза перед сегментом -> абзац. Переговорённая заново
-                // фраза ЗАМЕНЯЕТ предыдущий сегмент, а не дописывается дважды.
+                // Длинная пауза перед сегментом -> абзац. Пауза сама по себе
+                // никогда не удаляет предыдущий сегмент.
                 let gap = cur_seg_first_speech
                     .unwrap_or(prev_seg_end)
                     .saturating_sub(prev_seg_end);
@@ -4710,9 +4681,9 @@ fn hint_parakeet_once(app: &AppHandle) {
 /// Финал локального резидентного движка с разметкой: VAD делит запись на фразы
 /// (тишина >=600 мс), фразы длиннее 25 c дорезаются по ближайшей тишине (лимит
 /// pos_emb GigaAM; Parakeet такие куски тоже переваривает). Длинная пауза между
-/// фразами -> абзац ("\n\n"); переговорённая заново фраза заменяет предыдущую
-/// (is_restatement) — та же логика, что в живой петле. `transcribe` — замыкание
-/// конкретного движка (так auto-маршрут решает судьбу каждого сегмента сам).
+/// фразами -> абзац ("\n\n"). Похожие соседние фразы сохраняются: только
+/// явный голосовой маркер исправления может удалить сказанное. `transcribe` —
+/// замыкание конкретного движка (так auto-маршрут решает судьбу каждого сегмента сам).
 /// pub(crate): используется финалом и headless-селфтестами (lib.rs).
 pub(crate) fn local_transcribe_long<F>(
     vad: &Arc<Mutex<Option<crate::vad::SileroVad>>>,
@@ -5019,13 +4990,47 @@ mod seg_tests {
     }
 
     #[test]
-    fn restatement_replaces_similar_neighbor() {
-        assert!(is_restatement(
-            "Поставь мою песню лучше будет работать",
-            "Поставь мою музыку лучше будет работать"
-        ));
-        assert!(!is_restatement("Я пошёл домой", "Завтра будет дождь"));
-        assert!(!is_restatement("да", "да")); // короткие не трогаем
+    fn long_pause_never_replaces_a_similar_previous_paragraph() {
+        let mut segs = Vec::new();
+        push_dictation_segment(
+            &mut segs,
+            false,
+            "Поставь мою песню лучше будет работать".to_string(),
+        );
+
+        let para = gap_starts_paragraph(!segs.is_empty(), PARAGRAPH_GAP_SAMPLES);
+        assert!(para);
+
+        push_dictation_segment(
+            &mut segs,
+            para,
+            "Поставь мою музыку лучше будет работать".to_string(),
+        );
+
+        assert_eq!(
+            render_segments(&segs),
+            "Поставь мою песню лучше будет работать\n\nПоставь мою музыку лучше будет работать"
+        );
+    }
+
+    #[test]
+    fn pause_never_implies_that_a_similar_sentence_was_a_correction() {
+        let mut segs = Vec::new();
+        push_dictation_segment(
+            &mut segs,
+            false,
+            "Поставь мою песню лучше будет работать".to_string(),
+        );
+        push_dictation_segment(
+            &mut segs,
+            false,
+            "Поставь мою музыку лучше будет работать".to_string(),
+        );
+
+        assert_eq!(
+            render_segments(&segs),
+            "Поставь мою песню лучше будет работать Поставь мою музыку лучше будет работать"
+        );
     }
 
     #[test]
