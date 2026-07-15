@@ -1845,11 +1845,13 @@ fn process_dictation_text(
     let mut snippet_expanded = false;
     let mut voice_cancelled = false;
     let mut paragraphs = Vec::new();
-    for paragraph in text.split(SEMANTIC_PARAGRAPH_MARKER) {
-        let deduped = postprocess::dedup_repeated_ngrams(paragraph);
-        if deduped.trim().is_empty() {
-            continue;
-        }
+    let raw_paragraphs = text
+        .split(SEMANTIC_PARAGRAPH_MARKER)
+        .map(postprocess::dedup_repeated_ngrams)
+        .filter(|paragraph| !paragraph.trim().is_empty())
+        .collect::<Vec<_>>();
+    let paragraph_count = raw_paragraphs.len();
+    for (index, deduped) in raw_paragraphs.into_iter().enumerate() {
         if let Some(expanded) = postprocess::expand_matching_snippet(&deduped, snippets) {
             snippet_expanded = true;
             paragraphs.push(expanded);
@@ -1859,6 +1861,15 @@ fn process_dictation_text(
         let mut processed = postprocess::process(&deduped, s, dict, snippets);
         processed = postprocess::apply_corrections(&processed, corrections);
         processed = postprocess::normalize_spaces(&processed);
+        if index + 1 < paragraph_count {
+            if !processed.is_empty() {
+                paragraphs.push(processed);
+            }
+            continue;
+        }
+        // Voice commands are suffix commands for the entire utterance. A word
+        // such as "отмена" in an earlier paragraph is ordinary dictation once
+        // the speaker continues after the semantic pause.
         match crate::voice_cmds::apply_voice_commands(&processed) {
             crate::voice_cmds::CmdOutcome::Cancel => {
                 voice_cancelled = true;
@@ -5578,6 +5589,22 @@ mod seg_tests {
         let live = clean_live_text(&raw, &s, &[], &snippets, &[]);
 
         assert!(live.is_empty());
+    }
+
+    #[test]
+    fn voice_cancel_before_a_later_paragraph_is_plain_dictation() {
+        let s = Settings::default();
+        let snippets = vec![postprocess::Snippet {
+            trigger: "/sig".into(),
+            content: "authored signature".into(),
+            is_template: false,
+        }];
+        let segs = vec![(false, "отмена".to_string()), (true, "/sig".to_string())];
+        let raw = render_segments_for_postprocess(&segs);
+
+        let live = clean_live_text(&raw, &s, &[], &snippets, &[]);
+
+        assert_eq!(live, "Отмена\n\nauthored signature");
     }
 
     #[test]
