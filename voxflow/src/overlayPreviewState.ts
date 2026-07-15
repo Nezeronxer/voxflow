@@ -38,10 +38,10 @@ export function resolveOverlayPreviewEvent(
 
   const isFinal = payload.final === true;
   const isSettled = payload.settled === true;
-  // A detached live worker can finish after the final event for the same
-  // generation. Once finalSeq is latched, that speculative draft must never
-  // replace the exact string that was inserted.
-  if (!isFinal && !isSettled && seq != null && seq === finalSeq) {
+  // A detached worker can finish after the final event for the same generation.
+  // Once finalSeq is latched, neither a live nor a settled speculative preview
+  // may replace the exact string that was inserted.
+  if (!isFinal && seq != null && seq === finalSeq) {
     return { currentSeq: nextSeq, finalSeq, preview: null };
   }
   if (status === "transcribing" && !isFinal && !isSettled) {
