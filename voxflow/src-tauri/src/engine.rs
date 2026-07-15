@@ -2993,6 +2993,14 @@ fn compact_speech_for_final_asr(
     out
 }
 
+fn final_local_asr_samples<'a>(_trimmed: &'a [f32], speech_compacted: &'a [f32]) -> &'a [f32] {
+    // Keep resident engines on the exact same pause-compacted audio that is
+    // written to the replayable WAV. Feeding GigaAM the pre-compaction buffer
+    // made its VAD split one spoken word into independent hypotheses; the
+    // segment renderer then inserted a real space between those fragments.
+    speech_compacted
+}
+
 fn generation_is_current(current: u64, expected: u64) -> bool {
     current == expected
 }
@@ -3311,6 +3319,7 @@ fn process_utterance(
         my_gen,
         audio::write_wav_16k_mono(&wav, &speech_trimmed),
     )?;
+    let local_samples = final_local_asr_samples(&trimmed, &speech_trimmed);
 
     // Словарь, сниппеты и выученные исправления из БД (под локом).
     let (dict, snippets, corrections) = {
@@ -3405,7 +3414,7 @@ fn process_utterance(
                     let (text, lang) = erase_live_draft_on_error(
                         ctx,
                         my_gen,
-                        local_asr(ctx, &s, &dict, &snippets, &wav, &trimmed, my_gen),
+                        local_asr(ctx, &s, &dict, &snippets, &wav, local_samples, my_gen),
                     )?;
                     lang_badge = lang;
                     text
@@ -3433,7 +3442,7 @@ fn process_utterance(
                 let (text, lang) = erase_live_draft_on_error(
                     ctx,
                     my_gen,
-                    local_asr(ctx, &s, &dict, &snippets, &wav, &trimmed, my_gen),
+                    local_asr(ctx, &s, &dict, &snippets, &wav, local_samples, my_gen),
                 )?;
                 lang_badge = lang;
                 text
@@ -3443,7 +3452,7 @@ fn process_utterance(
         let (t, lang) = erase_live_draft_on_error(
             ctx,
             my_gen,
-            local_asr(ctx, &s, &dict, &snippets, &wav, &trimmed, my_gen),
+            local_asr(ctx, &s, &dict, &snippets, &wav, local_samples, my_gen),
         )?;
         lang_badge = lang;
         t
@@ -4782,6 +4791,17 @@ fn gap_starts_paragraph(has_previous_segment: bool, gap_samples: usize) -> bool 
 #[cfg(test)]
 mod seg_tests {
     use super::*;
+
+    #[test]
+    fn final_local_asr_reuses_the_compacted_audio_written_to_wav() {
+        let trimmed = vec![1.0_f32; 32];
+        let speech_compacted = vec![2.0_f32; 8];
+
+        let selected = final_local_asr_samples(&trimmed, &speech_compacted);
+
+        assert_eq!(selected, speech_compacted.as_slice());
+        assert!(std::ptr::eq(selected.as_ptr(), speech_compacted.as_ptr()));
+    }
 
     fn live_state_with_draft(mode: &str, draft: &str) -> LiveState {
         let context = crate::app_context::AppContext {
