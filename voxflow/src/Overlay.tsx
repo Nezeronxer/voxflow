@@ -538,6 +538,15 @@ export default function Overlay() {
       }
       const isFinalPreview = e.payload?.final === true;
       const isSettledPreview = e.payload?.settled === true;
+      // Tauri preserves each event stream, but `status` and `partial` are
+      // separate channels. The final preview and the following idle status can
+      // therefore reach the WebView in the opposite order. Accept the exact
+      // final text for this generation after idle; the seq guard above still
+      // rejects a late final from an older dictation.
+      const isSameSeqFinalAfterIdle =
+        isFinalPreview &&
+        statusRef.current === "idle" &&
+        seq === currentSeqRef.current;
       if (
         statusRef.current === "transcribing" &&
         !isFinalPreview &&
@@ -548,7 +557,8 @@ export default function Overlay() {
       if (
         (isFinalPreview || isSettledPreview) &&
         statusRef.current !== "recording" &&
-        statusRef.current !== "transcribing"
+        statusRef.current !== "transcribing" &&
+        !isSameSeqFinalAfterIdle
       ) {
         return;
       }
