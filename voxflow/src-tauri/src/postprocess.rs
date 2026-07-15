@@ -738,6 +738,357 @@ fn capitalize_sentences(text: &str) -> String {
     out
 }
 
+/// High-confidence signal that the speaker stopped while the current clause is
+/// still grammatically open. Recording boundaries are transport events, not
+/// sentence boundaries: Whisper/cloud punctuation may still append a period at
+/// every Stop, so the final pipeline needs an independent, deterministic guard.
+///
+/// This intentionally stays conservative. It recognizes dangling conjunctions,
+/// subordinators/prepositions, a subordinator with at most one following word,
+/// unmatched brackets and an ellipsis. Ambiguous complete fragments such as
+/// "Я хотел." are left to the recognizer instead of being rewritten here.
+pub fn looks_unfinished_utterance(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // An explicit question/exclamation is a strong completion signal even when
+    // its final word also happens to be a conjunction (for example "Что?").
+    let terminal_view = trimmed.trim_end_matches(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '"' | '\'' | ')' | ']' | '}' | '»' | '”')
+    });
+    let significant = terminal_view.chars().last();
+    if matches!(significant, Some('?' | '!')) {
+        return false;
+    }
+    // Ellipsis alone is ambiguous: it may be hesitation inside a sentence or
+    // an intentional soft ending ("Ну, не знаю…"). Keep evaluating the words;
+    // only another dangling grammatical signal makes it high-confidence open.
+    if has_unclosed_brackets(trimmed) {
+        return true;
+    }
+
+    let words = semantic_words(trimmed);
+    if words.is_empty() {
+        return false;
+    }
+    let joined = words.join(" ");
+    const OPEN_TAILS: &[&str] = &[
+        // Russian logical glue.
+        "и",
+        "или",
+        "либо",
+        "а",
+        "но",
+        "чтобы",
+        "для того чтобы",
+        "из за того что",
+        // Russian prepositions which cannot normally finish a clause.
+        "в",
+        "во",
+        "на",
+        "к",
+        "ко",
+        "от",
+        "до",
+        "для",
+        "по",
+        "из",
+        "с",
+        "со",
+        "без",
+        "у",
+        "о",
+        "об",
+        "обо",
+        "над",
+        "под",
+        "между",
+        "через",
+        "перед",
+        // English equivalents for the multilingual default.
+        "and",
+        "or",
+        "but",
+        // English clause-final prepositions and pronouns are deliberately not
+        // listed: "Log in.", "I want to." and "I wanted that." are complete.
+        "because of",
+        "so that",
+    ];
+    if OPEN_TAILS
+        .iter()
+        .any(|tail| joined == *tail || joined.ends_with(&format!(" {tail}")))
+    {
+        return true;
+    }
+
+    // These subordinators are only a high-confidence open tail when the same
+    // clause contains an explicit comma before them. Standalone conversational
+    // answers such as "Потому что." / "Just because." stay complete.
+    let clause_view = terminal_view
+        .trim_end_matches(|ch: char| ch.is_whitespace() || matches!(ch, '.' | '…'))
+        .to_lowercase();
+    if [", что", ", потому что", ", так как", ", поскольку"]
+        .iter()
+        .any(|tail| clause_view.ends_with(tail))
+    {
+        return true;
+    }
+    // English usually omits a comma before `because`. A main clause with at
+    // least two preceding words is a strong open-tail signal, while common
+    // standalone answers (`Because.`, `Just because.`) remain complete.
+    if words.last().is_some_and(|word| word == "because")
+        && words.len() >= 3
+        && words
+            .get(words.len() - 2)
+            .is_some_and(|word| word != "just")
+    {
+        return true;
+    }
+
+    // "Я хочу, чтобы ты." / "I think that we." — the recognizer may add a
+    // period although the dependent clause contains only its pronominal
+    // subject. Do not treat every one-word dependent clause as unfinished:
+    // "Я думаю, что да." and "I know that works." can be complete.
+    const RECENT_SUBORDINATORS: &[&str] = &[
+        "что",
+        "чтобы",
+        "если",
+        "когда",
+        "который",
+        "которая",
+        "которое",
+        "которые",
+        "that",
+        "if",
+        "when",
+        "which",
+        "who",
+        "where",
+        "because",
+    ];
+    const DANGLING_SUBJECTS: &[&str] = &[
+        "я", "ты", "вы", "он", "она", "оно", "мы", "они", "i", "you", "he", "she", "it", "we",
+        "they",
+    ];
+    words.iter().enumerate().any(|(index, word)| {
+        // A sentence-initial "That works." / "Если можно." is not enough
+        // evidence. This rule is for a newly opened dependent clause after an
+        // already present main clause: "Я хочу, чтобы ты.".
+        index > 0
+            && RECENT_SUBORDINATORS.contains(&word.as_str())
+            && words.len().saturating_sub(index) == 2
+            && DANGLING_SUBJECTS.contains(&words[index + 1].as_str())
+    })
+}
+
+/// A dangling Russian preposition often introduces a proper name in the next
+/// recording ("приехал в" + "Москву"). In that case ASR capitalization is
+/// meaningful and must not be lowered as if it were a synthetic sentence start.
+pub fn continuation_may_start_with_proper_name(previous: &str, next: &str) -> bool {
+    let words = semantic_words(previous);
+    let Some(last) = words.last().map(String::as_str) else {
+        return false;
+    };
+    if !matches!(
+        last,
+        "в" | "во"
+            | "на"
+            | "к"
+            | "ко"
+            | "от"
+            | "до"
+            | "для"
+            | "по"
+            | "из"
+            | "с"
+            | "со"
+            | "без"
+            | "у"
+            | "о"
+            | "об"
+            | "обо"
+            | "над"
+            | "под"
+            | "между"
+            | "через"
+            | "после"
+            | "перед"
+            | "вокруг"
+    ) {
+        return false;
+    }
+
+    let original_words = next
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(first) = original_words.first().copied() else {
+        return false;
+    };
+    let starts_uppercase = first.chars().next().is_some_and(char::is_uppercase);
+    if !starts_uppercase {
+        return false;
+    }
+    // Two title-cased words are a useful proper-name signal: "Нижний
+    // Новгород". A single title-cased word is not: every independent ASR
+    // result starts that way. Preserve it only for an acronym or when the
+    // preceding clause itself signals a person/place name ("приехал в").
+    if original_words
+        .get(1)
+        .and_then(|word| word.chars().next())
+        .is_some_and(char::is_uppercase)
+    {
+        return true;
+    }
+    let is_acronym = first.chars().filter(|ch| ch.is_alphabetic()).count() > 1
+        && first
+            .chars()
+            .filter(|ch| ch.is_alphabetic())
+            .all(char::is_uppercase);
+    const NAMED_ENTITY_CONTEXT_STEMS: &[&str] = &[
+        // Motion/location.
+        "приех",
+        "поех",
+        "прилет",
+        "улетел",
+        "прибы",
+        "родил",
+        "переех",
+        "верну",
+        "отправ",
+        "направ",
+        "пойд",
+        // People/organisations.
+        "встрет",
+        "поговор",
+        "говор",
+        "позвон",
+        "связ",
+    ];
+    const NAMED_ENTITY_CONTEXT_WORDS: &[&str] = &[
+        "едем",
+        "едет",
+        "едут",
+        "ехал",
+        "ехала",
+        "ехали",
+        "иду",
+        "идем",
+        "идём",
+        "идет",
+        "идёт",
+        "идут",
+        "лечу",
+        "летим",
+        "летит",
+        "летят",
+        "летел",
+        "летела",
+        "летели",
+        "живу",
+        "живем",
+        "живём",
+        "живет",
+        "живёт",
+        "живут",
+        "жил",
+        "жила",
+        "жили",
+    ];
+    let governor_index = words.len().saturating_sub(2);
+    let governor = words.get(governor_index);
+    let first_person_ride = governor.is_some_and(|word| word == "еду")
+        && words
+            .get(governor_index.saturating_sub(1))
+            .is_some_and(|word| word == "я");
+    is_acronym
+        || first_person_ride
+        || governor.is_some_and(|word| {
+            NAMED_ENTITY_CONTEXT_WORDS.contains(&word.as_str())
+                || NAMED_ENTITY_CONTEXT_STEMS
+                    .iter()
+                    .any(|stem| word.starts_with(stem))
+        })
+}
+
+/// Remove only a model-added single final period from a high-confidence open
+/// clause. Question/exclamation marks, ellipses and explicitly spoken terminal
+/// punctuation are preserved. Closing quotes/brackets may follow the period.
+pub fn preserve_unfinished_ending(text: &str, raw_hypothesis: &str) -> String {
+    if utterance_has_explicit_terminal_punctuation(raw_hypothesis)
+        || !looks_unfinished_utterance(text)
+    {
+        return text.to_string();
+    }
+
+    let mut chars = text.chars().collect::<Vec<_>>();
+    let mut cursor = chars.len();
+    while cursor > 0
+        && (chars[cursor - 1].is_whitespace()
+            || matches!(chars[cursor - 1], '"' | '\'' | ')' | ']' | '}' | '»' | '”'))
+    {
+        cursor -= 1;
+    }
+    if cursor == 0 || chars[cursor - 1] != '.' {
+        return text.to_string();
+    }
+    // Three ASCII dots are an intentional/open ellipsis, not an auto-period.
+    if cursor >= 2 && chars[cursor - 2] == '.' {
+        return text.to_string();
+    }
+    chars.remove(cursor - 1);
+    chars.into_iter().collect()
+}
+
+fn semantic_words(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+pub fn utterance_has_explicit_terminal_punctuation(raw: &str) -> bool {
+    let joined = semantic_words(raw).join(" ");
+    const SPOKEN_TERMINALS: &[&str] = &[
+        "точка",
+        "вопросительный знак",
+        "восклицательный знак",
+        "многоточие",
+        "period",
+        "full stop",
+        "question mark",
+        "exclamation mark",
+        "ellipsis",
+    ];
+    SPOKEN_TERMINALS
+        .iter()
+        .any(|tail| joined == *tail || joined.ends_with(&format!(" {tail}")))
+}
+
+fn has_unclosed_brackets(text: &str) -> bool {
+    let mut stack = Vec::new();
+    for ch in text.chars() {
+        match ch {
+            '(' | '[' | '{' => stack.push(ch),
+            ')' | ']' | '}' => {
+                let expected = match ch {
+                    ')' => '(',
+                    ']' => '[',
+                    '}' => '{',
+                    _ => unreachable!(),
+                };
+                if stack.last().copied() == Some(expected) {
+                    stack.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+    !stack.is_empty()
+}
+
 /// Смягчить типичный артефакт диктовки: ASR ставит точку после короткой паузы,
 /// а следующий дискурсивный маркер начинает с заглавной ("... . То есть ...").
 /// Формальные профили решают это выше по контексту; функция публична, чтобы движок
@@ -1029,7 +1380,7 @@ fn expand_template_with(content: &str, date: &str, time: &str, clipboard: Option
 /// (грамотный русский с пунктуацией) и подавляет дрейф в латиницу, когда словарь
 /// пользователя пуст. Намеренно нейтральная и КОРОТКАЯ, чтобы не «протекать» в
 /// распознанный текст. Применяется только для русского языка (см. engine.rs).
-pub const DEFAULT_RU_PROMPT: &str = "Распознавание русской речи. Грамотный текст с пунктуацией.";
+pub const DEFAULT_RU_PROMPT: &str = "Распознавание русской речи. Грамотный текст с пунктуацией. Окончание записи не означает окончание предложения: не ставь финальную точку, если фраза грамматически не закончена.";
 
 /// Короткий local-ASR bias из желаемых словарных форм и голосовых триггеров.
 /// Тела сниппетов не включаются, чтобы decoder не галлюцинировал их в тишине.
@@ -1316,6 +1667,181 @@ mod filler_tests {
             soften_false_sentence_breaks("Готово. Следующая тема."),
             "Готово. Следующая тема."
         );
+    }
+
+    #[test]
+    fn unfinished_clause_rejects_recognizer_added_period() {
+        for (final_text, raw, expected) in [
+            (
+                "Я хотел сказать, что.",
+                "я хотел сказать что",
+                "Я хотел сказать, что",
+            ),
+            ("Я хочу, чтобы ты.", "я хочу чтобы ты", "Я хочу, чтобы ты"),
+            (
+                "Открой документ в.",
+                "открой документ в",
+                "Открой документ в",
+            ),
+            ("I think that we.", "I think that we", "I think that we"),
+            (
+                "Сравни варианты A и.",
+                "сравни варианты A и",
+                "Сравни варианты A и",
+            ),
+            (
+                "Я остался, потому что.",
+                "я остался потому что",
+                "Я остался, потому что",
+            ),
+            (
+                "I stopped because.",
+                "I stopped because",
+                "I stopped because",
+            ),
+        ] {
+            assert_eq!(preserve_unfinished_ending(final_text, raw), expected);
+            assert!(looks_unfinished_utterance(final_text));
+        }
+    }
+
+    #[test]
+    fn complete_or_explicit_end_is_never_removed() {
+        assert_eq!(
+            preserve_unfinished_ending("Релиз полностью готов.", "релиз полностью готов"),
+            "Релиз полностью готов."
+        );
+        assert_eq!(
+            preserve_unfinished_ending("Я хотел сказать, что.", "я хотел сказать что точка"),
+            "Я хотел сказать, что."
+        );
+        assert_eq!(preserve_unfinished_ending("Что?", "что"), "Что?");
+        assert!(!looks_unfinished_utterance("Что?"));
+        assert!(!looks_unfinished_utterance(""));
+        assert!(!looks_unfinished_utterance("."));
+        assert!(!looks_unfinished_utterance("!!!"));
+        for fragment in [
+            "Я за.",
+            "Если можно.",
+            "Потому что я устал.",
+            "Я думаю, что да.",
+            "Я знаю, что делать.",
+            "That works.",
+            "I know that works.",
+            "Log in.",
+            "I'm in.",
+            "I wanted that.",
+            "I know where.",
+            "I want to.",
+            "The person I was with.",
+            "Stay for a while.",
+            "I don't know when.",
+            "Я не знаю когда.",
+            "Just because.",
+            "Because.",
+            "Потому что.",
+            "Ну и что.",
+            "Пока.",
+            "До и после.",
+            "Посмотри вокруг.",
+        ] {
+            assert!(!looks_unfinished_utterance(fragment), "{fragment}");
+        }
+    }
+
+    #[test]
+    fn proper_name_continuation_requires_positive_context() {
+        assert!(continuation_may_start_with_proper_name(
+            "Я приехал в",
+            "Москву вчера"
+        ));
+        assert!(continuation_may_start_with_proper_name(
+            "Я приехал в",
+            "Нижний Новгород"
+        ));
+        assert!(continuation_may_start_with_proper_name(
+            "Я еду в",
+            "Москву завтра"
+        ));
+        for ordinary in ["Новой вкладке", "Старой версии", "Текущей папке"]
+        {
+            assert!(!continuation_may_start_with_proper_name(
+                "Открой файл в",
+                ordinary
+            ));
+        }
+        assert!(!continuation_may_start_with_proper_name(
+            "Напиши текст в",
+            "Старой версии"
+        ));
+        assert!(!continuation_may_start_with_proper_name(
+            "Я приехал вчера и открыл файл в",
+            "Старой версии"
+        ));
+        assert!(!continuation_may_start_with_proper_name(
+            "Запиши идею в",
+            "Новом документе"
+        ));
+        assert!(!continuation_may_start_with_proper_name(
+            "Положи еду в",
+            "Старую коробку"
+        ));
+    }
+
+    #[test]
+    fn ellipsis_and_unclosed_brackets_remain_open_without_being_destroyed() {
+        assert!(!looks_unfinished_utterance("Я ещё думаю…"));
+        assert!(!looks_unfinished_utterance("«Я ещё думаю…»"));
+        assert!(looks_unfinished_utterance("Я хотел сказать, что…"));
+        assert!(looks_unfinished_utterance("Я хотел сказать, что..."));
+        assert_eq!(
+            preserve_unfinished_ending("Я хотел сказать, что…", "я хотел сказать что"),
+            "Я хотел сказать, что…"
+        );
+        assert_eq!(
+            preserve_unfinished_ending("Я хотел сказать, что...", "я хотел сказать что"),
+            "Я хотел сказать, что..."
+        );
+        assert!(looks_unfinished_utterance("Проверь функцию (которая."));
+        assert_eq!(
+            preserve_unfinished_ending("Проверь функцию (которая.", "проверь функцию которая"),
+            "Проверь функцию (которая"
+        );
+        for fragment in [
+            "Проверь список [в котором.",
+            "Проверь объект {который.",
+            "Проверь ([вложенную конструкцию.",
+        ] {
+            assert!(looks_unfinished_utterance(fragment), "{fragment}");
+        }
+        for fragment in [
+            "Проверь функцию (готово).",
+            "Проверь список [готово].",
+            "Проверь объект {готово}.",
+        ] {
+            assert!(!looks_unfinished_utterance(fragment), "{fragment}");
+        }
+    }
+
+    #[test]
+    fn unfinished_period_before_closers_is_removed_but_spoken_english_marks_survive() {
+        assert_eq!(
+            preserve_unfinished_ending("Я хотел сказать, что.»  ", "я хотел сказать что"),
+            "Я хотел сказать, что»  "
+        );
+        for raw in [
+            "i wanted to say that period",
+            "i wanted to say that full stop",
+            "i wanted to say that question mark",
+            "i wanted to say that exclamation mark",
+            "i wanted to say that ellipsis",
+        ] {
+            assert_eq!(
+                preserve_unfinished_ending("I wanted to say that.", raw),
+                "I wanted to say that.",
+                "{raw}"
+            );
+        }
     }
 
     #[test]
