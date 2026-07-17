@@ -250,16 +250,6 @@ export default function Dashboard({
               </div>
             </div>
             <div className="voice-status"><span />{statusText}</div>
-            <button
-              type="button"
-              className="btn btn-primary dictation-button"
-              data-testid="dictation-primary"
-              onClick={onToggle}
-              disabled={busy}
-            >
-              <Icon.Mic className="ico" />
-              {status === "recording" ? "Остановить диктовку" : "Начать диктовку"}
-            </button>
           </section>
 
           <section className="today-section">
