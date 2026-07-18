@@ -837,6 +837,16 @@ fn prefer_gigaam_for_auto(whisper_text: &str, gigaam_text: &str) -> bool {
     !has_cyrillic(w) && gw >= 3 && (ww <= 2 || gw >= ww.saturating_mul(2))
 }
 
+/// Финал auto-маршрута принимает результат GigaAM БЕЗ whisper-прохода, когда
+/// текст выглядит как русская речь (кириллицы больше латиницы). Словарь GigaAM v3
+/// содержит латиницу: английскую речь он отдаёт латиницей — такой (или пустой)
+/// результат уходит на медленное whisper-уточнение. Так горячий путь русской
+/// диктовки стоит ~0.1с вместо ~2.7с whisper large на каждом финале.
+fn gigaam_auto_final_trusted(text: &str) -> bool {
+    let t = text.trim();
+    !t.is_empty() && crate::parakeet::is_mostly_cyrillic(t)
+}
+
 fn should_probe_gigaam_for_auto(whisper_text: &str) -> bool {
     let whisper = whisper_text.trim();
     if whisper.is_empty() {
@@ -4667,10 +4677,13 @@ fn local_asr(
     {
         hint_parakeet_once(&ctx.app);
     }
+    // Auto+gigaam: GigaAM — ОСНОВНОЙ финал (тот же движок, что рисует превью в
+    // пилюле, ~0.1с). Whisper large (~2.7с) подключается только когда GigaAM
+    // вернул нерусский/пустой текст — редкий холодный путь вместо каждого финала.
+    let mut gigaam_auto_text: Option<String> = None;
     if route == LocalRoute::Whisper
         && s.engine == "gigaam"
         && is_auto_language_alias(&s.language)
-        && !whisper_model_installed(s)
         && crate::gigaam::dir_ready(&paths::gigaam_dir())
     {
         let t_vad = Instant::now();
@@ -4694,50 +4707,76 @@ fn local_asr(
                     }) {
                         Ok(t) => {
                             let st = g.last_stats;
-                            emit_stt_mode(&ctx.app, "gigaam", false);
                             dbg_log(&format!(
-                                "[lat] vad={vad_ms}мс auto-fallback gigaam: audio={}мс frontend={}мс encoder={}мс decoder={}мс asr={}мс",
+                                "[lat] vad={vad_ms}мс auto gigaam: audio={}мс frontend={}мс encoder={}мс decoder={}мс asr={}мс",
                                 st.audio_ms, st.frontend_ms, st.encoder_ms, st.decoder_ms, st.total_ms
                             ));
-                            return Ok((postprocess::dedup_repeated_ngrams(&t), Some("ru")));
+                            // Без whisper-модели уточнять нечем — отдаём GigaAM
+                            // как есть (прежнее поведение auto-fallback).
+                            if gigaam_auto_final_trusted(&t) || !whisper_model_installed(s) {
+                                emit_stt_mode(&ctx.app, "gigaam", false);
+                                let lang = if gigaam_auto_final_trusted(&t) {
+                                    Some("ru")
+                                } else {
+                                    detect_lang_label(&t)
+                                };
+                                return Ok((postprocess::dedup_repeated_ngrams(&t), lang));
+                            }
+                            dbg_log(
+                                "auto: GigaAM-финал не похож на русскую речь — уточняем whisper-ом",
+                            );
+                            gigaam_auto_text = Some(t);
                         }
-                        Err(e) => log::warn!("auto-fallback GigaAM ошибка: {e:#}"),
+                        Err(e) => log::warn!("auto GigaAM-финал ошибка: {e:#}; откат на whisper"),
                     }
                 }
             }
-            Err(e) => log::warn!("auto-fallback GigaAM недоступен ({e})"),
+            Err(e) => log::warn!("auto GigaAM-финал недоступен ({e}); откат на whisper"),
         }
     }
     let Some(whisper_text) = local_transcribe_guarded(ctx, s, dict, snippets, wav, my_gen)? else {
         return Ok((String::new(), None));
     };
-    if s.language == "auto"
+    if is_auto_language_alias(&s.language)
         && s.engine == "gigaam"
         && crate::gigaam::dir_ready(&paths::gigaam_dir())
         && should_probe_gigaam_for_auto(&whisper_text)
     {
-        match ensure_gigaam(ctx, s) {
-            Ok(()) => {
-                let mut guard = ctx.gigaam.lock();
-                if let Some(g) = guard.as_mut() {
-                    match local_transcribe_long(&ctx.vad_final, samples_16k, &mut |seg| {
-                        g.transcribe(seg)
-                    }) {
-                        Ok(t) if prefer_gigaam_for_auto(&whisper_text, &t) => {
-                            emit_stt_mode(&ctx.app, "gigaam", false);
-                            dbg_log(&format!(
-                                "auto: выбран GigaAM вместо whisper auto (whisper_len={}, gigaam_len={})",
-                                whisper_text.chars().count(),
-                                t.chars().count()
-                            ));
-                            return Ok((postprocess::dedup_repeated_ngrams(&t), Some("ru")));
+        // GigaAM уже отработал перед whisper-ом — второй полный прогон не нужен.
+        if let Some(t) = gigaam_auto_text {
+            if prefer_gigaam_for_auto(&whisper_text, &t) {
+                emit_stt_mode(&ctx.app, "gigaam", false);
+                dbg_log(&format!(
+                    "auto: выбран GigaAM вместо whisper auto (whisper_len={}, gigaam_len={})",
+                    whisper_text.chars().count(),
+                    t.chars().count()
+                ));
+                return Ok((postprocess::dedup_repeated_ngrams(&t), Some("ru")));
+            }
+        } else {
+            match ensure_gigaam(ctx, s) {
+                Ok(()) => {
+                    let mut guard = ctx.gigaam.lock();
+                    if let Some(g) = guard.as_mut() {
+                        match local_transcribe_long(&ctx.vad_final, samples_16k, &mut |seg| {
+                            g.transcribe(seg)
+                        }) {
+                            Ok(t) if prefer_gigaam_for_auto(&whisper_text, &t) => {
+                                emit_stt_mode(&ctx.app, "gigaam", false);
+                                dbg_log(&format!(
+                                    "auto: выбран GigaAM вместо whisper auto (whisper_len={}, gigaam_len={})",
+                                    whisper_text.chars().count(),
+                                    t.chars().count()
+                                ));
+                                return Ok((postprocess::dedup_repeated_ngrams(&t), Some("ru")));
+                            }
+                            Ok(_) => {}
+                            Err(e) => log::warn!("auto: GigaAM final fallback ошибка: {e:#}"),
                         }
-                        Ok(_) => {}
-                        Err(e) => log::warn!("auto: GigaAM final fallback ошибка: {e:#}"),
                     }
                 }
+                Err(e) => log::warn!("auto: GigaAM final fallback недоступен ({e})"),
             }
-            Err(e) => log::warn!("auto: GigaAM final fallback недоступен ({e})"),
         }
     }
     let lang = detect_lang_label(&whisper_text);
@@ -5672,6 +5711,20 @@ mod seg_tests {
 
         s.language = "en".to_string();
         assert_eq!(local_route_with_parakeet(&s, true), LocalRoute::Parakeet);
+    }
+
+    /// Горячий путь auto-финала: русская речь (в т.ч. с латинскими терминами)
+    /// принимается от GigaAM мгновенно; латиница/пусто — уточнение whisper-ом.
+    #[test]
+    fn gigaam_auto_final_trusted_accepts_russian_rejects_latin_and_empty() {
+        assert!(gigaam_auto_final_trusted("привет, это тест диктовки"));
+        assert!(gigaam_auto_final_trusted(
+            "открой файл main.rs и запусти cargo build"
+        ));
+        assert!(!gigaam_auto_final_trusted("hello this is an english phrase"));
+        assert!(!gigaam_auto_final_trusted(""));
+        assert!(!gigaam_auto_final_trusted("   "));
+        assert!(!gigaam_auto_final_trusted("123 456."));
     }
 
     #[test]
