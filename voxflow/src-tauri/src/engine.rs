@@ -5721,7 +5721,9 @@ mod seg_tests {
         assert!(gigaam_auto_final_trusted(
             "открой файл main.rs и запусти cargo build"
         ));
-        assert!(!gigaam_auto_final_trusted("hello this is an english phrase"));
+        assert!(!gigaam_auto_final_trusted(
+            "hello this is an english phrase"
+        ));
         assert!(!gigaam_auto_final_trusted(""));
         assert!(!gigaam_auto_final_trusted("   "));
         assert!(!gigaam_auto_final_trusted("123 456."));
