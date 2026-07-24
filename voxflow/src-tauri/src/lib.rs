@@ -562,10 +562,11 @@ pub fn stt_test_cli(wav: &str) {
 /// зоной пилюли (overlay_hit от фронта, CSS px × scale + позиция окна) и
 /// переключает click-through. Вне пилюли окно прозрачно для мыши — кнопки
 /// приложений под оверлеем остаются кликабельными, и над пустыми полями окна
-/// нет ни «ладошки», ни перехвата кликов. Во время зажатой ЛКМ состояние не
-/// переключаем (не рвать drag пилюли). macOS-ветка повторяет Windows: курсор
-/// берём из `app.cursor_position()`, состояние ЛКМ — из CGEventSourceButtonState
-/// (ApplicationServices уже слинкован в inject.rs).
+/// нет ни «ладошки», ни перехвата кликов. Windows на время зажатой ЛКМ состояние
+/// не трогает (GetAsyncKeyState); macOS-ветка курсор берёт из
+/// `app.cursor_position()` и опирается на широкий гистерезис вместо чтения кнопки
+/// (drag двигает окно за курсором — пилюля остаётся под ним). Сам drag остаётся
+/// единым pointer-путём в Overlay.tsx, без CGEvent-поллера.
 fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitRect>>) {
     #[cfg(windows)]
     {
@@ -626,17 +627,13 @@ fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitR
     }
     #[cfg(target_os = "macos")]
     {
-        // Глобальное состояние ЛКМ, чтобы не сбрасывать интерактивность посреди
-        // drag'а пилюли — аналог GetAsyncKeyState на Windows. Фреймворк уже
-        // слинкован (inject.rs использует CGEvent*).
-        #[link(name = "ApplicationServices", kind = "framework")]
-        extern "C" {
-            fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
-        }
-        // kCGEventSourceStateCombinedSessionState = 0, kCGMouseButtonLeft = 0.
-        const COMBINED_SESSION_STATE: u32 = 0;
-        const LEFT_BUTTON: u32 = 0;
-
+        // Курсор берём из Tauri (те же физические px, что outer_position). Состояние
+        // ЛКМ НЕ читаем: drag двигает окно за курсором, поэтому пилюля остаётся под
+        // курсором и поллер и так видит его внутри hit-rect. Широкий гистерезис
+        // (32px в интерактивном состоянии) поглощает лаг в один кадр на быстром
+        // рывке, чтобы окно не переключилось в click-through посреди перетаскивания.
+        // ponytail: без OS-состояния кнопки; если очень резкие флики всё же будут
+        // ронять drag — прокинуть флаг «идёт drag» из Overlay.tsx в overlay_hit.
         let app = app.clone();
         std::thread::Builder::new()
             .name("voxflow-hover".into())
@@ -647,14 +644,6 @@ fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitR
                     let Some(ov) = app.get_webview_window("overlay") else {
                         continue;
                     };
-                    // ЛКМ зажата (вероятен drag пилюли) — состояние не трогаем.
-                    if interactive
-                        && unsafe {
-                            CGEventSourceButtonState(COMBINED_SESSION_STATE, LEFT_BUTTON)
-                        }
-                    {
-                        continue;
-                    }
                     let (Ok(cur), Ok(pos), scale) = (
                         app.cursor_position(),
                         ov.outer_position(),
@@ -676,8 +665,8 @@ fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitR
                             Err(_) => continue,
                         },
                     };
-                    // Гистерезис 8px против дребезга на границе.
-                    let pad = if interactive { 8.0 * scale } else { 0.0 };
+                    // Гистерезис: 0 до входа, 32px внутри — не рвать drag на рывке.
+                    let pad = if interactive { 32.0 * scale } else { 0.0 };
                     let inside = cur.x >= zx - pad
                         && cur.x <= zx + zw + pad
                         && cur.y >= zy - pad
