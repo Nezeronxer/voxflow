@@ -219,15 +219,16 @@ jobs:
               [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
               [Parameter(Mandatory = $true)][string]$FailureMessage
             )
+            # Responding проверяется ВНУТРИ поллинга: в момент появления окна
+            # UI-поток ещё занят инициализацией WebView2, и одноразовый снимок
+            # Responding на холодном раннере даёт ложный отказ (флак v2.0.11).
+            # Зависшее по-настоящему окно всё равно валит тест по таймауту.
             Wait-ForCondition -TimeoutSeconds 60 -FailureMessage $FailureMessage -Condition {
               if ($Process.HasExited) {
                 return $false
               }
               $Process.Refresh()
-              return $Process.MainWindowHandle -ne [IntPtr]::Zero
-            }
-            if (-not $Process.Responding) {
-              throw "VoxFlow created a window but is not responding"
+              return ($Process.MainWindowHandle -ne [IntPtr]::Zero) -and $Process.Responding
             }
           }
 
