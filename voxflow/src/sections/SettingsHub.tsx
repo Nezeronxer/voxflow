@@ -77,7 +77,9 @@ export default function SettingsHub({
           <Recognition settings={settings} update={update} />
         )}
         {page === "models" && <Models settings={settings} update={update} />}
-        {page === "personalization" && <Corrections />}
+        {page === "personalization" && (
+          <Corrections settings={settings} update={update} />
+        )}
         {page === "applications" && (
           <Applications settings={settings} update={update} />
         )}

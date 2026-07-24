@@ -56,6 +56,11 @@ pub struct Settings {
     pub remove_fillers: bool,
     /// Авто-пунктуация/капитализация (постобработка).
     pub auto_punct: bool,
+    /// Учиться на ручных правках надиктованного текста: авто-создавать пары
+    /// «распознано → правильно». Эвристика, поэтому по умолчанию ВЫКЛ — иначе
+    /// плодит мусорные исправления, бьющие по нормальным словам. Ручные пары
+    /// из раздела «Исправления» работают всегда, независимо от флага.
+    pub learn_corrections: bool,
     /// Тон: "very_casual" | "casual" | "neutral" | "formal".
     pub tone: String,
     /// Включить пользовательскую инструкцию стиля для модельного рерайта.
@@ -195,6 +200,7 @@ impl Default for Settings {
             verbatim: false,
             remove_fillers: true,
             auto_punct: true,
+            learn_corrections: false,
             tone: "neutral".into(),
             smart_prompt_enabled: true,
             smart_prompt_source: String::new(),

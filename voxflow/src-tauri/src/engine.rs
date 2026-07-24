@@ -3953,7 +3953,11 @@ fn process_utterance(
     // from this exact field through Accessibility/UIA (never via clipboard).
     // Snippet bodies are authored templates, not ASR hypotheses: editing a
     // rendered snippet must not silently create a global speech correction.
-    if snippet_expanded || text.split_whitespace().next().is_none() {
+    // Авто-обучение исправлений — опция (по умолчанию ВЫКЛ): эвристика склонна
+    // плодить мусорные пары, бьющие по нормальным словам. Выключено → окно
+    // обучения не открываем вовсе; ручные пары из «Исправлений» не затрагиваются.
+    let learn_enabled = ctx.settings.lock().learn_corrections;
+    if !learn_enabled || snippet_expanded || text.split_whitespace().next().is_none() {
         close_correction_capture(ctx);
     } else {
         let learning_field_before = if live_inserted {

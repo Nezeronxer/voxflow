@@ -16,6 +16,7 @@ export interface Settings {
   verbatim: boolean;
   remove_fillers: boolean;
   auto_punct: boolean;
+  learn_corrections: boolean;
   // "very_casual" | "casual" | "neutral" | "work" | "formal" | "doc" | "ai"
   tone: string;
   smart_prompt_enabled: boolean;
@@ -140,6 +141,7 @@ export const DEFAULT_SETTINGS: Settings = {
   verbatim: false,
   remove_fillers: true,
   auto_punct: true,
+  learn_corrections: false,
   tone: "neutral",
   smart_prompt_enabled: true,
   smart_prompt_source: "",

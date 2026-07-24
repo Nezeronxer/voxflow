@@ -4,10 +4,16 @@ import {
   correctionsUpsert,
   correctionsDelete,
 } from "../api";
-import { PageHead, Icon } from "../ui";
-import type { CorrectionEntry } from "../types";
+import { PageHead, Icon, Field, Switch } from "../ui";
+import type { CorrectionEntry, Settings } from "../types";
 
-export default function Corrections() {
+export default function Corrections({
+  settings,
+  update,
+}: {
+  settings: Settings;
+  update: (patch: Partial<Settings>) => void;
+}) {
   const [entries, setEntries] = useState<CorrectionEntry[]>([]);
   const [wrong, setWrong] = useState("");
   const [right, setRight] = useState("");
@@ -38,8 +44,20 @@ export default function Corrections() {
     <div className="content-inner">
       <PageHead
         title="Исправления"
-        desc="Пары распознано → правильно. Применяются автоматически и пополняются, когда вы правите надиктованный текст."
+        desc="Пары распознано → правильно. Применяются автоматически к каждой диктовке."
       />
+
+      <div className="card">
+        <Field
+          label="Учиться на моих правках"
+          hint="Автоматически создавать пары, когда вы правите надиктованный текст. Эвристика может добавлять неточные исправления — держите выключенным, если видите мусор в списке."
+        >
+          <Switch
+            checked={settings.learn_corrections}
+            onChange={(v) => update({ learn_corrections: v })}
+          />
+        </Field>
+      </div>
 
       <div className="card">
         <div className="card-head">

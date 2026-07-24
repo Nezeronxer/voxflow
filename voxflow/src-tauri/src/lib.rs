@@ -558,12 +558,14 @@ pub fn stt_test_cli(wav: &str) {
     }
 }
 
-/// Поллер «мышь над пилюлей»: на Windows каждые 120 мс сравнивает глобальный курсор с
+/// Поллер «мышь над пилюлей»: каждые 120 мс сравнивает глобальный курсор с
 /// зоной пилюли (overlay_hit от фронта, CSS px × scale + позиция окна) и
 /// переключает click-through. Вне пилюли окно прозрачно для мыши — кнопки
-/// фуллскрин-приложений под оверлеем остаются кликабельными. Во время зажатой
-/// ЛКМ состояние не переключаем (не рвать drag пилюли). На macOS overlay
-/// оставляем интерактивным всегда, а drag обрабатывает общий pointer-путь в Overlay.tsx.
+/// приложений под оверлеем остаются кликабельными, и над пустыми полями окна
+/// нет ни «ладошки», ни перехвата кликов. Во время зажатой ЛКМ состояние не
+/// переключаем (не рвать drag пилюли). macOS-ветка повторяет Windows: курсор
+/// берём из `app.cursor_position()`, состояние ЛКМ — из CGEventSourceButtonState
+/// (ApplicationServices уже слинкован в inject.rs).
 fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitRect>>) {
     #[cfg(windows)]
     {
@@ -622,7 +624,73 @@ fn spawn_overlay_hover_poller(app: &tauri::AppHandle, hit: Arc<Mutex<OverlayHitR
             })
             .ok();
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        // Глобальное состояние ЛКМ, чтобы не сбрасывать интерактивность посреди
+        // drag'а пилюли — аналог GetAsyncKeyState на Windows. Фреймворк уже
+        // слинкован (inject.rs использует CGEvent*).
+        #[link(name = "ApplicationServices", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
+        }
+        // kCGEventSourceStateCombinedSessionState = 0, kCGMouseButtonLeft = 0.
+        const COMBINED_SESSION_STATE: u32 = 0;
+        const LEFT_BUTTON: u32 = 0;
+
+        let app = app.clone();
+        std::thread::Builder::new()
+            .name("voxflow-hover".into())
+            .spawn(move || {
+                let mut interactive = false;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                    let Some(ov) = app.get_webview_window("overlay") else {
+                        continue;
+                    };
+                    // ЛКМ зажата (вероятен drag пилюли) — состояние не трогаем.
+                    if interactive
+                        && unsafe {
+                            CGEventSourceButtonState(COMBINED_SESSION_STATE, LEFT_BUTTON)
+                        }
+                    {
+                        continue;
+                    }
+                    let (Ok(cur), Ok(pos), scale) = (
+                        app.cursor_position(),
+                        ov.outer_position(),
+                        ov.scale_factor().unwrap_or(1.0),
+                    ) else {
+                        continue;
+                    };
+                    // Зона = пилюля (от фронта) либо всё окно, пока репорта нет.
+                    let zone = *hit.lock();
+                    let (zx, zy, zw, zh) = match zone {
+                        Some((x, y, w, h)) => (
+                            pos.x as f64 + x * scale,
+                            pos.y as f64 + y * scale,
+                            w * scale,
+                            h * scale,
+                        ),
+                        None => match ov.outer_size() {
+                            Ok(s) => (pos.x as f64, pos.y as f64, s.width as f64, s.height as f64),
+                            Err(_) => continue,
+                        },
+                    };
+                    // Гистерезис 8px против дребезга на границе.
+                    let pad = if interactive { 8.0 * scale } else { 0.0 };
+                    let inside = cur.x >= zx - pad
+                        && cur.x <= zx + zw + pad
+                        && cur.y >= zy - pad
+                        && cur.y <= zy + zh + pad;
+                    if inside != interactive {
+                        interactive = inside;
+                        let _ = ov.set_ignore_cursor_events(!interactive);
+                    }
+                }
+            })
+            .ok();
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         let _ = (app, hit);
     }
@@ -1001,19 +1069,21 @@ pub(crate) fn commit_overlay_position(app: &tauri::AppHandle) -> Result<(), Stri
     Ok(())
 }
 
-/// Overlay-индикатор (orb): маленькое плавающее окно. На macOS оно всегда
-/// интерактивно в пределах своего небольшого бокса, чтобы drag не ломался
-/// из-за системного click-through. На Windows hover-poller по-прежнему
-/// включает мышь только над актуальным hit-rect.
+/// Overlay-индикатор (orb): маленькое плавающее окно. И на macOS, и на Windows
+/// оно СТАРТУЕТ click-through: прозрачное окно (крупнее видимой пилюли — запас
+/// под тень) иначе перехватывало бы курсор и клики над пустыми полями, показывая
+/// «ладошку» и блокируя приложения под оверлеем. Мышь включает hover-poller —
+/// только пока курсор над hit-rect самой пилюли (см. spawn_overlay_hover_poller).
 /// Позиция запоминается как anchor в kv "overlay_anchor" и восстанавливается
 /// относительно актуального размера; старый "overlay_pos" читается как fallback.
 fn setup_overlay(app: &tauri::AppHandle) {
     if let Some(ov) = app.get_webview_window("overlay") {
-        // На macOS настоящие mouse-drag события должны доходить до webview.
-        // Windows сохраняет старую click-through модель через hover-poller.
-        #[cfg(windows)]
+        // Стартуем прозрачными для мыши на обеих платформах с hover-poller'ом;
+        // где поллера нет (напр. Linux) — оставляем окно интерактивным, иначе
+        // пилюлю нельзя было бы схватить.
+        #[cfg(any(windows, target_os = "macos"))]
         let _ = ov.set_ignore_cursor_events(true);
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "macos")))]
         let _ = ov.set_ignore_cursor_events(false);
         let _ = ov.set_always_on_top(true);
         let scale = ov.scale_factor().unwrap_or(1.0);
