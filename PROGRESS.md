@@ -393,3 +393,33 @@
 - **Процесс**: интеграция + фиксы по непересекающимся файлам (5 правок, доведено
   и проверено). Грабля БД восстановлена дважды:
   свежий слепок из .corrupt + Groq-ключ из backup_db_20260610.
+
+## 2026-07-25 — фикс потери надиктованного текста (D-024)
+
+- **Причина 1 (главная), локальные самоисправления**: `postprocess.rs` — маркеры разделены на
+  Cancel/Replacement/Reformulation, рез ограничен, добавлена опция `aggressive_self_correction`
+  (по умолчанию выкл) + переключатель в UI (Распознавание). Новые тесты:
+  `ordinary_speech_survives_self_correction_rules` (6 фраз без изменений + проверка, что начало
+  фразы не съедено), `aggressive_mode_restores_old_cutting_behavior`,
+  `set_phrases_are_not_mistaken_for_fillers`, `meaningful_conjunction_znachit_survives`. ✅
+- **Причина 2, окно Ollama**: `num_ctx`/`num_predict` от длины запроса, минимум 16384;
+  `done_reason=length` → fallback. Тесты `context_window_fits_system_prompt_and_output`,
+  `long_input_grows_the_window_above_the_minimum`, `truncated_answer_is_rejected_instead_of_inserted`. ✅
+- **Причина 3, лимиты вывода**: `net::estimate_tokens` + `net::output_token_budget`;
+  проверка обрыва во всех трёх клиентах (тесты с моком ответа в `ollama.rs`, `gemini.rs`,
+  `rewrite.rs`); Gemini — `maxOutputTokens` + `thinkingBudget: 0`. ✅
+- **Причина 4, гард рерайта**: асимметричный recall по основам слов, порог `rewrite_min_recall`
+  (0.9), лог пропавших слов; гард применён к `force: true` и к `commands.rs` (transform/rewrite
+  prompt). Тесты `rewrite_grounding_accepts_reformulation_that_keeps_facts`,
+  `rewrite_grounding_rejects_lost_content`, `rewrite_grounding_with_zero_recall_only_blocks_inflation`. ✅
+- **Причина 5, окружение**: `rewrite_context_hint` получил `live_inserted`; тест
+  `live_draft_never_leaks_into_environment_context` (в поле «Привет», надиктовано «как дела» —
+  черновик в окружение не попадает). Обрезка окружения — с сохранением хвоста. ✅
+- **Таймауты**: настройка `ai_timeout_s` (20 с; локальная модель ≥60 с) + поля в UI (ИИ →
+  «Надёжность рерайта»), явное сообщение об истёкшем таймауте из всех трёх клиентов. ✅
+- **Аудио-слой**: диагностическое логирование в `compact_speech_for_final_asr`,
+  `local_transcribe_long` (индекс и длительность потерянного сегмента), `trim_silence`.
+  Параметры VAD не менялись. ✅
+- **Зелёные прогоны**: `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings`
+  без новых предупреждений; `cargo test` 323 passed / 0 failed; `npm test` 21/21;
+  `npx tsc --noEmit` + `npm run build` exit 0; `python3 script/check_versions.py` → 2.0.11. ✅

@@ -416,6 +416,16 @@ export default function Recognition({
             onChange={(v) => update({ auto_punct: v })}
           />
         </Field>
+
+        <Field
+          label="Агрессивные самоисправления"
+          hint="Вырезать левую часть фразы по словам «то есть», «в смысле», «нет», «точнее». Это обычные связки речи — включайте, только если диктуете исправления голосом и готовы терять текст"
+        >
+          <Switch
+            checked={settings.aggressive_self_correction}
+            onChange={(v) => update({ aggressive_self_correction: v })}
+          />
+        </Field>
       </div>
 
       <div className="card">

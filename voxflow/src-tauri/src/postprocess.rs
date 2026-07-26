@@ -75,7 +75,10 @@ const FILLERS_ONE: &[&str] = &[
 ];
 /// Контекстные вводные: удаляем только в начале/после пунктуационной паузы,
 /// чтобы не ломать смысл ("это значит", "вот это").
-const FILLERS_CONTEXTUAL: &[&str] = &["ну", "вот", "значит"];
+///
+/// «значит» убрано намеренно: как союз-следствие оно содержательно
+/// («…, значит, x = 5»), а отличить его от пустой вводной по тексту нельзя.
+const FILLERS_CONTEXTUAL: &[&str] = &["ну", "вот"];
 /// Многословные паразиты (подстрока, с границами-пробелами). EN-фраз тут нет
 /// намеренно: "you know" / "i mean" / "kind of" / "sort of" часто несут смысл
 /// («this kind of model») — подстрочная зачистка съедала легитимный текст.
@@ -91,6 +94,47 @@ const FILLERS_MULTI: &[&str] = &[
     "я не знаю честно",
     "честно говоря",
 ];
+
+/// Слова-продолжения, после которых «филлер» — часть устойчивого оборота, а не
+/// паразит: «как бы то ни было», «в общем виде», «короче говоря», «типа того».
+/// Без этой проверки подстрочная зачистка ломала нормальную речь.
+const FILLER_DEPENDENTS: &[(&str, &[&str])] = &[
+    ("как бы", &["то", "там", "не", "ни"]),
+    (
+        "в общем",
+        &["виде", "случае", "плане", "смысле", "итоге", "и"],
+    ),
+    (
+        "это самое",
+        &[
+            "главное",
+            "важное",
+            "интересное",
+            "сложное",
+            "трудное",
+            "лучшее",
+            "худшее",
+            "дело",
+            "место",
+            "время",
+            "слово",
+        ],
+    ),
+    ("короче", &["говоря"]),
+    ("типа", &["того", "этого", "такого"]),
+];
+
+/// Идёт ли за филлером зависимое слово, превращающее его в осмысленный оборот.
+fn filler_has_dependent(filler: &str, next: Option<&str>) -> bool {
+    let Some(next) = next else {
+        return false;
+    };
+    FILLER_DEPENDENTS
+        .iter()
+        .find(|(name, _)| *name == filler)
+        .map(|(_, deps)| deps.contains(&next))
+        .unwrap_or(false)
+}
 
 pub fn process(text: &str, s: &Settings, dict: &[Dict], snippets: &[Snippet]) -> String {
     let mut t = text.trim().to_string();
@@ -113,10 +157,11 @@ pub fn process(text: &str, s: &Settings, dict: &[Dict], snippets: &[Snippet]) ->
         t = remove_fillers(&t);
     }
 
-    // 3) Самоисправления: "нет, стоп", "точнее", "вернее" заменяют хвост фразы.
+    // 3) Самоисправления: по умолчанию только явные отмены («нет, стоп»,
+    // «отмена») и замены с подтверждением. Обычные связки речи не режем.
     t = collapse_stuttered_words(&t);
     t = collapse_inline_self_corrections(&t);
-    t = apply_self_corrections(&t);
+    t = apply_self_corrections(&t, s.aggressive_self_correction);
 
     // 4) Словарь: longest match wins, а подставленный текст не проходит через
     // следующие правила повторно. Иначе `wispr flow -> Wispr Flow` мог затем
@@ -189,6 +234,23 @@ fn apply_dictionary_once(text: &str, dict: &[Dict]) -> String {
     out
 }
 
+/// Слово, исчезновение которого при ИИ-рерайте НЕ считается потерей содержания:
+/// паразит, хезитация или одиночный маркер самоисправления. Используется
+/// защитой `rewrite_is_grounded` в engine.rs — модели прямо велено убирать этот
+/// мусор, и наказывать её за это нельзя.
+pub fn is_disposable_word(word: &str) -> bool {
+    let bare = word
+        .trim_matches(|c: char| !c.is_alphanumeric() && !DASH_CHARS.contains(c))
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    FILLERS_ONE.contains(&bare.as_str())
+        || FILLERS_CONTEXTUAL.contains(&bare.as_str())
+        || is_hesitation(&bare)
+        || SELF_CORRECTION_MARKERS
+            .iter()
+            .any(|(marker, _)| marker.len() == 1 && marker[0] == bare)
+}
+
 /// Хезитация-междометие: дефисная редупликация ОДНОЙ буквы («а-а», «э-э-э»,
 /// «м-м») либо повтор одной буквы («ээ», «ммм», «ааа»). GigaAM-v3 e2e
 /// транскрибирует такие звуки дословно — режем их здесь. Реальные слова из
@@ -226,10 +288,13 @@ fn remove_fillers_line(text: &str) -> String {
     let filler_phrases = FILLERS_MULTI
         .iter()
         .map(|phrase| {
-            phrase
-                .split_whitespace()
-                .map(normalize_filler_word)
-                .collect::<Vec<_>>()
+            (
+                *phrase,
+                phrase
+                    .split_whitespace()
+                    .map(normalize_filler_word)
+                    .collect::<Vec<_>>(),
+            )
         })
         .collect::<Vec<_>>();
     let mut multi_filtered = Vec::with_capacity(source_words.len());
@@ -237,12 +302,18 @@ fn remove_fillers_line(text: &str) -> String {
     while index < source_words.len() {
         let matched = filler_phrases
             .iter()
-            .filter(|phrase| {
+            .filter(|(name, phrase)| {
                 !phrase.is_empty()
                     && index + phrase.len() <= normalized_words.len()
                     && normalized_words[index..index + phrase.len()] == phrase[..]
+                    && !filler_has_dependent(
+                        name,
+                        normalized_words
+                            .get(index + phrase.len())
+                            .map(String::as_str),
+                    )
             })
-            .map(Vec::len)
+            .map(|(_, phrase)| phrase.len())
             .max()
             .unwrap_or(0);
         if matched > 0 {
@@ -263,9 +334,12 @@ fn remove_fillers_line(text: &str) -> String {
                 .trim_matches(|c: char| !c.is_alphanumeric() && !DASH_CHARS.contains(c))
                 .trim_matches(|c: char| !c.is_alphanumeric())
                 .to_lowercase();
+            let next = words.get(i + 1).map(|w| normalize_filler_word(w));
+            let dependent = filler_has_dependent(&bare, next.as_deref());
             let contextual = FILLERS_CONTEXTUAL.contains(&bare.as_str())
                 && (i == 0 || words[i - 1].ends_with(|c: char| ",.!?…:;".contains(c)));
-            if FILLERS_ONE.contains(&bare.as_str()) || contextual || is_hesitation(&bare) {
+            let single = FILLERS_ONE.contains(&bare.as_str()) || contextual;
+            if (single && !dependent) || is_hesitation(&bare) {
                 None
             } else {
                 Some(*w)
@@ -374,23 +448,38 @@ struct WordTok<'a> {
     bare: String,
 }
 
-const SELF_CORRECTION_MARKERS: &[&[&str]] = &[
-    &["нет", "стоп"],
-    &["нет"],
-    &["ой"],
-    &["погоди"],
-    &["подожди"],
-    &["стоп", "не", "то"],
-    &["не", "так"],
-    &["не", "точно"],
-    &["точнее"],
-    &["точнее", "говоря"],
-    &["вернее"],
-    &["в", "смысле"],
-    &["то", "есть"],
-    &["отмена"],
-    &["забудь"],
-    &["зачеркни"],
+/// Насколько маркер доказывает самоисправление. Обычная русская связка («то
+/// есть», «нет», «точнее») сама по себе НЕ доказательство: без дополнительного
+/// признака вырезание левой части съедало нормальную речь.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CorrectionKind {
+    /// Однозначная команда отмены («нет, стоп», «отмена», «забудь») — режем всегда.
+    Cancel,
+    /// Замена элемента («точнее», «вернее», «нет») — только если правая часть
+    /// занимает то же место (повтор якорного слова) либо это ровно одно слово.
+    Replacement,
+    /// Переформулировка («то есть», «в смысле») — только по якорному слову.
+    /// Иначе это обычная связка, а не отказ от сказанного.
+    Reformulation,
+}
+
+const SELF_CORRECTION_MARKERS: &[(&[&str], CorrectionKind)] = &[
+    (&["нет", "стоп"], CorrectionKind::Cancel),
+    (&["стоп", "не", "то"], CorrectionKind::Cancel),
+    (&["отмена"], CorrectionKind::Cancel),
+    (&["забудь"], CorrectionKind::Cancel),
+    (&["зачеркни"], CorrectionKind::Cancel),
+    (&["нет"], CorrectionKind::Replacement),
+    (&["ой"], CorrectionKind::Replacement),
+    (&["погоди"], CorrectionKind::Replacement),
+    (&["подожди"], CorrectionKind::Replacement),
+    (&["не", "так"], CorrectionKind::Replacement),
+    (&["не", "точно"], CorrectionKind::Replacement),
+    (&["точнее"], CorrectionKind::Replacement),
+    (&["точнее", "говоря"], CorrectionKind::Replacement),
+    (&["вернее"], CorrectionKind::Replacement),
+    (&["в", "смысле"], CorrectionKind::Reformulation),
+    (&["то", "есть"], CorrectionKind::Reformulation),
 ];
 
 fn collapse_stuttered_words(text: &str) -> String {
@@ -529,14 +618,14 @@ fn looks_like_inline_correction(left: &str, right: &str) -> bool {
 /// Применить устные самоисправления: "в пять, нет, стоп, в шесть" →
 /// "в шесть" в хвосте той же фразы. Это локальная дешёвая версия backtrack,
 /// до LLM: срабатывает только при явном маркере и наличии текста до/после него.
-fn apply_self_corrections(text: &str) -> String {
+fn apply_self_corrections(text: &str, aggressive: bool) -> String {
     text.split('\n')
-        .map(apply_self_corrections_line)
+        .map(|line| apply_self_corrections_line(line, aggressive))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-fn apply_self_corrections_line(line: &str) -> String {
+fn apply_self_corrections_line(line: &str, aggressive: bool) -> String {
     let mut toks: Vec<WordTok<'_>> = line
         .split_whitespace()
         .map(|raw| WordTok {
@@ -550,13 +639,10 @@ fn apply_self_corrections_line(line: &str) -> String {
         return line.to_string();
     }
 
-    while let Some((start, len)) = find_last_self_correction_marker(&toks) {
-        if start == 0 || start + len >= toks.len() {
-            break;
-        }
+    while let Some((start, len, kind)) = find_last_self_correction_marker(&toks, aggressive) {
         let left = &toks[..start];
         let right = &toks[start + len..];
-        let cut = correction_cut_point(left, right);
+        let cut = correction_cut_point(kind, left, right);
         let mut next = Vec::with_capacity(cut + right.len());
         next.extend_from_slice(&left[..cut]);
         next.extend_from_slice(right);
@@ -569,43 +655,93 @@ fn apply_self_corrections_line(line: &str) -> String {
     toks.iter().map(|t| t.raw).collect::<Vec<_>>().join(" ")
 }
 
-fn find_last_self_correction_marker(toks: &[WordTok<'_>]) -> Option<(usize, usize)> {
-    let mut found = None;
+/// Последний маркер, который РЕАЛЬНО сработает: с текстом слева и справа и с
+/// подтверждением по [`correction_fires`]. Маркеры без подтверждения
+/// пропускаются, поэтому цикл в вызывающем коде не зацикливается.
+fn find_last_self_correction_marker(
+    toks: &[WordTok<'_>],
+    aggressive: bool,
+) -> Option<(usize, usize, CorrectionKind)> {
+    let mut found: Option<(usize, usize, CorrectionKind)> = None;
     for i in 0..toks.len() {
-        for marker in SELF_CORRECTION_MARKERS {
-            if i + marker.len() <= toks.len()
-                && marker
+        for (marker, kind) in SELF_CORRECTION_MARKERS {
+            let len = marker.len();
+            if i + len > toks.len()
+                || !marker
                     .iter()
                     .enumerate()
                     .all(|(j, w)| toks[i + j].bare == *w)
             {
-                let better = found
-                    .map(|(prev_i, prev_len)| {
-                        i > prev_i || (i == prev_i && marker.len() > prev_len)
-                    })
-                    .unwrap_or(true);
-                if better {
-                    found = Some((i, marker.len()));
-                }
+                continue;
+            }
+            if i == 0 || i + len >= toks.len() {
+                continue;
+            }
+            // Явная опция возвращает старое поведение 2.0.x: любой маркер режет.
+            let kind = if aggressive {
+                CorrectionKind::Cancel
+            } else {
+                *kind
+            };
+            if !correction_fires(kind, &toks[..i], &toks[i + len..]) {
+                continue;
+            }
+            let better = found
+                .map(|(prev_i, prev_len, _)| i > prev_i || (i == prev_i && len > prev_len))
+                .unwrap_or(true);
+            if better {
+                found = Some((i, len, kind));
             }
         }
     }
     found
 }
 
-fn correction_cut_point(left: &[WordTok<'_>], right: &[WordTok<'_>]) -> usize {
-    let Some(first) = right
-        .iter()
-        .find(|t| !t.bare.is_empty())
-        .map(|t| t.bare.as_str())
-    else {
-        return left.len();
-    };
-    if let Some(i) = left.iter().rposition(|t| t.bare == first) {
+/// Якорь: правая часть начинается тем же словом, что уже было слева
+/// («в пять, то есть в шесть» → якорь «в»). Это и есть доказательство, что
+/// говорящий переигрывает ту же синтаксическую позицию.
+fn correction_anchor(left: &[WordTok<'_>], right: &[WordTok<'_>]) -> Option<usize> {
+    let first = right.iter().find(|t| !t.bare.is_empty())?.bare.as_str();
+    left.iter().rposition(|t| t.bare == first)
+}
+
+fn correction_fires(kind: CorrectionKind, left: &[WordTok<'_>], right: &[WordTok<'_>]) -> bool {
+    if right.iter().all(|t| t.bare.is_empty()) {
+        return false;
+    }
+    // Явный дубль позиции — режем даже начало фразы.
+    if correction_anchor(left, right).is_some() {
+        return true;
+    }
+    match kind {
+        CorrectionKind::Cancel => true,
+        // Без якоря режем не более одного слова и только когда слева есть что
+        // оставить: иначе замена снесла бы начало предложения.
+        CorrectionKind::Replacement => right.len() == 1 && left.len() >= 2,
+        CorrectionKind::Reformulation => false,
+    }
+}
+
+fn correction_cut_point(
+    kind: CorrectionKind,
+    left: &[WordTok<'_>],
+    right: &[WordTok<'_>],
+) -> usize {
+    if let Some(i) = correction_anchor(left, right) {
         return i;
     }
-    let drop = right.len().clamp(1, 4).min(left.len());
-    left.len() - drop
+    match kind {
+        CorrectionKind::Cancel => {
+            let drop = right.len().clamp(1, 4).min(left.len());
+            left.len() - drop
+        }
+        // Замена без якоря разрешена только при одном слове справа и при
+        // left.len() >= 2 (см. correction_fires): режем ровно один фрагмент,
+        // начало фразы остаётся на месте.
+        CorrectionKind::Replacement | CorrectionKind::Reformulation => {
+            left.len().saturating_sub(1).max(1)
+        }
+    }
 }
 
 /// Заменить целое слово `term` на `repl` (регистронезависимо).
@@ -1605,6 +1741,87 @@ mod filler_tests {
                 &[]
             ),
             "Поставь встречу на вторник"
+        );
+    }
+
+    /// Регрессия «VoxFlow теряет часть надиктованного»: обычные связки русского
+    /// языка в списке маркеров вырезали левую часть фразы даже при ai_backend=off.
+    #[test]
+    fn ordinary_speech_survives_self_correction_rules() {
+        let s = st(true, true);
+        for phrase in [
+            "Это стоит сто рублей, то есть примерно один доллар",
+            "Я считаю, что нет, это плохая идея",
+            "Мы обсуждали архитектуру и базу данных, то есть я хочу переписать модуль авторизации",
+            "Он сказал, что это не так работает, надо иначе",
+            "Я пришёл домой, ой, забыл сказать, я купил хлеб",
+            "Нужно сделать отчёт, точнее не отчёт, а презентацию",
+        ] {
+            assert_eq!(
+                process(phrase, &s, &[], &[]),
+                phrase,
+                "фраза изменена постобработкой: {phrase}"
+            );
+        }
+        // Замена имени в той же позиции — допустимо и без изменений, и с заменой,
+        // но начало фразы обязано остаться.
+        let replaced = process("Позвони Ивану, в смысле Петру, завтра утром", &s, &[], &[]);
+        assert!(
+            replaced.starts_with("Позвони") && replaced.contains("Петру"),
+            "начало фразы съедено: {replaced}"
+        );
+        // Одно слово слева — резать нечего, начало предложения неприкосновенно.
+        assert_eq!(process("Да, точнее нет", &s, &[], &[]), "Да, точнее нет");
+    }
+
+    #[test]
+    fn aggressive_mode_restores_old_cutting_behavior() {
+        let s = Settings {
+            remove_fillers: true,
+            auto_punct: true,
+            verbatim: false,
+            aggressive_self_correction: true,
+            ..Settings::default()
+        };
+        assert_eq!(
+            process("Я считаю, что нет, это плохая идея", &s, &[], &[]),
+            "Это плохая идея"
+        );
+    }
+
+    #[test]
+    fn set_phrases_are_not_mistaken_for_fillers() {
+        let s = st(true, false);
+        for phrase in [
+            "как бы то ни было я пойду",
+            "как бы там ни было всё хорошо",
+            "нужен ответ в общем виде",
+            "в общем и целом всё нормально",
+            "короче говоря я устал",
+            "это самое главное в проекте",
+            "сделай что-то типа того",
+        ] {
+            assert_eq!(
+                process(phrase, &s, &[], &[]),
+                phrase,
+                "устойчивый оборот срезан как паразит: {phrase}"
+            );
+        }
+        // Настоящие паразиты по-прежнему удаляются.
+        assert_eq!(process("ну короче я пошёл", &s, &[], &[]), "я пошёл");
+        assert_eq!(
+            process("это, как бы, странно", &s, &[], &[]),
+            "это, странно"
+        );
+    }
+
+    #[test]
+    fn meaningful_conjunction_znachit_survives() {
+        let s = st(true, false);
+        assert_eq!(process("значит, x = 5", &s, &[], &[]), "значит, x = 5");
+        assert_eq!(
+            process("если a больше b, значит, b меньше a", &s, &[], &[]),
+            "если a больше b, значит, b меньше a"
         );
     }
 

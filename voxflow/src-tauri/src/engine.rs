@@ -2892,13 +2892,14 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
     }
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
-    let context_hint = rewrite_context_hint(ctx, &actx, Some(&text));
+    // «Улучшить выделенное»: живой черновик не печатался, окружение = выделение.
+    let context_hint = rewrite_context_hint(ctx, &actx, Some(&text), "", false);
     let rewrite_tone = if ai_prompt_context {
         "ai"
     } else {
         tone.as_str()
     };
-    let (refined, used_model) = refine_text_with_fallback(
+    let (refined, used_model, failure) = refine_text_with_fallback(
         &s,
         RewriteRequest {
             actx: &actx,
@@ -2912,11 +2913,15 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
     );
     if !used_model {
         let message = if cloud_or_remote_rewrite {
-            "Глобальное улучшение не отправляет выделенный текст в облако, применены локальные правила"
+            "Глобальное улучшение не отправляет выделенный текст в облако, применены локальные правила".to_string()
+        } else if let Some(reason) = failure {
+            // Таймаут, обрыв по лимиту токенов и потеря слов требуют РАЗНЫХ
+            // действий пользователя — показываем настоящую причину.
+            format!("Применены локальные правила: {reason}")
         } else {
-            "Модель недоступна, применены локальные правила"
+            "Модель недоступна, применены локальные правила".to_string()
         };
-        emit_improve_status(&ctx.app, "fallback_rules", message);
+        emit_improve_status(&ctx.app, "fallback_rules", &message);
     }
     if ctx.gen.load(Ordering::SeqCst) != my_gen {
         return Ok(());
@@ -3012,6 +3017,10 @@ fn compact_speech_for_final_asr(
         return samples.to_vec();
     }
     if !speech.iter().any(|&x| x) {
+        log::warn!(
+            "VAD не нашёл речи в финальном буфере ({} мс, порог {SPEECH_PROB}) — запись выброшена целиком",
+            samples.len() * 1000 / 16000
+        );
         return Vec::new();
     }
 
@@ -3049,7 +3058,22 @@ fn compact_speech_for_final_asr(
     }
 
     if spans.is_empty() {
+        log::warn!(
+            "компакт финального ASR не выделил ни одного речевого островка ({} мс) — запись выброшена",
+            samples.len() * 1000 / 16000
+        );
         return Vec::new();
+    }
+    let kept: usize = spans.iter().map(|(s, e)| e.saturating_sub(*s)).sum();
+    if kept * 4 < samples.len() * 3 {
+        // Больше четверти записи не дошло до ASR: без этой строки «пропала
+        // половина фразы» нечем отличить от ошибки модели.
+        log::warn!(
+            "компакт финального ASR: оставлено {} мс из {} мс в {} островках (порог {SPEECH_PROB})",
+            kept * 1000 / 16000,
+            samples.len() * 1000 / 16000,
+            spans.len()
+        );
     }
     if spans.len() == 1 {
         let (start, end) = spans[0];
@@ -3555,7 +3579,13 @@ fn process_utterance(
             }
         }
     } else if use_cloud_gemini {
-        match crate::gemini::transcribe(&s.ai_api_key, &s.ai_model, &wav, &s.language) {
+        match crate::gemini::transcribe(
+            &s.ai_api_key,
+            &s.ai_model,
+            &wav,
+            &s.language,
+            s.backend_timeout_s(false),
+        ) {
             Ok(t) => postprocess::dedup_repeated_ngrams(&t),
             Err(e) => {
                 if !final_generation_is_current(ctx, my_gen) {
@@ -3720,7 +3750,7 @@ fn process_utterance(
         ai_prompt_rule_for_app(&s, &actx).is_some() || effective_smart_instruction(&s).is_some();
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
-    let context_hint = rewrite_context_hint(ctx, &actx, None);
+    let context_hint = rewrite_context_hint(ctx, &actx, None, &field_before_context, live_inserted);
     let rewrite_tone = if ai_prompt_context {
         "ai"
     } else {
@@ -4845,7 +4875,14 @@ where
         while start < samples.len() {
             let cut = (start + MAX_SEG).min(samples.len());
             let t = transcribe(&samples[start..cut])?;
-            if !t.trim().is_empty() {
+            if t.trim().is_empty() {
+                log::warn!(
+                    "локальный ASR вернул пустой текст для среза {}..{} ({} мс) — фрагмент потерян",
+                    start,
+                    cut,
+                    (cut - start) * 1000 / 16000
+                );
+            } else {
                 parts.push(t.trim().to_string());
             }
             start = cut;
@@ -4900,7 +4937,7 @@ where
 
     // Транскрипция фраз: запас PAD по краям; >25 c — жёсткая дорезка по тишине.
     let mut segs: Vec<(bool, String)> = Vec::new();
-    for u in &units {
+    for (unit_idx, u) in units.iter().enumerate() {
         let s0 = u.start.saturating_sub(PAD);
         let e0 = (u.end + PAD).min(samples.len());
         let mut texts: Vec<String> = Vec::new();
@@ -4926,6 +4963,12 @@ where
         }
         let t = texts.join(" ");
         if t.is_empty() {
+            // Молчаливый пропуск сегмента — это ровно «половина фразы не
+            // доехала». Логируем индекс и длительность, чтобы было что искать.
+            log::warn!(
+                "локальный ASR: сегмент #{unit_idx} пуст, потеряно {} мс речи",
+                (e0.saturating_sub(s0)) * 1000 / 16000
+            );
             continue;
         }
         let para = gap_starts_paragraph(!segs.is_empty(), u.gap_before);
@@ -6355,24 +6398,47 @@ fn remember_dictation_context_in(
     }
 }
 
-fn rewrite_context_hint(
-    ctx: &EngineCtx,
+/// Видимая часть окружения. Вынесена отдельно от памяти диктовок, чтобы
+/// проверяться юнит-тестом без живого [`EngineCtx`].
+fn rewrite_context_visible_parts(
     actx: &crate::app_context::AppContext,
     current_document: Option<&str>,
-) -> Option<String> {
+    field_before_dictation: &str,
+    live_inserted: bool,
+) -> Vec<String> {
     let mut parts = Vec::new();
     if let Some(doc) = current_document.map(str::trim).filter(|v| !v.is_empty()) {
         parts.push(format!(
             "Готовый/выделенный текст для правки: {}",
             compact_context_tail(doc, 1200)
         ));
+        return parts;
     }
 
-    if current_document.is_none() {
-        if let Some(field_tail) = actx.focused_text_tail(600) {
-            parts.push(format!("Хвост текста в активном поле: {field_tail}"));
-        }
+    // В live-режиме черновик диктовки УЖЕ напечатан в поле. Без вычитания он
+    // попадал в [ОКРУЖЕНИЕ] вместе с [ДИКТОВКА], модель схлопывала дубль и
+    // съедала начало фразы.
+    if let Some(field_tail) =
+        visible_previous_context_tail(actx, field_before_dictation, live_inserted)
+    {
+        parts.push(format!("Хвост текста в активном поле: {field_tail}"));
     }
+    parts
+}
+
+fn rewrite_context_hint(
+    ctx: &EngineCtx,
+    actx: &crate::app_context::AppContext,
+    current_document: Option<&str>,
+    field_before_dictation: &str,
+    live_inserted: bool,
+) -> Option<String> {
+    let mut parts = rewrite_context_visible_parts(
+        actx,
+        current_document,
+        field_before_dictation,
+        live_inserted,
+    );
 
     let memory = ctx.dictation_memory.lock();
     if target_matches_memory(&memory, actx) {
@@ -6398,7 +6464,9 @@ fn rewrite_context_hint(
     if parts.is_empty() {
         None
     } else {
-        Some(clamp_chars(&parts.join("\n"), 1800))
+        // Для окружения релевантен именно ХВОСТ (текст слева от курсора), а не
+        // голова: обрезаем с сохранением конца.
+        Some(compact_context_tail(&parts.join("\n"), 1800))
     }
 }
 
@@ -6678,7 +6746,9 @@ fn build_voiceflow_payload(
     }
     if let Some(context) = context_hint.map(str::trim).filter(|v| !v.is_empty()) {
         payload.push_str("[ОКРУЖЕНИЕ]: ");
-        payload.push_str(&one_line_instruction(context));
+        // Хвост, а не голова: обрезка с начала выбросила бы как раз тот текст,
+        // что стоит непосредственно слева от курсора.
+        payload.push_str(&compact_context_tail(context, 1800));
         payload.push('\n');
         payload.push_str("[КАК ИСПОЛЬЗОВАТЬ ОКРУЖЕНИЕ]: ");
         payload.push_str(
@@ -6721,65 +6791,117 @@ fn configured_rewrite_backend(s: &Settings) -> Option<RewriteBackendRoute> {
     }
 }
 
-/// Automatic rewrite may improve form, but it must remain anchored in what the
-/// user actually dictated. Only explicit Improve Selection (`force`) may bypass
-/// this guard because that command intentionally requests a transformation.
-fn rewrite_is_grounded(input: &str, output: &str) -> bool {
+/// Основа слова для сравнения содержания: нижний регистр, ё→е и обрезка до
+/// первых четырёх символов, чтобы «модуль»/«модуля», «файл»/«файла» и
+/// «Алиса»/«Алису» считались одним словом — иначе гард отклонял бы штатное
+/// исправление окончаний. Числа сравниваем целиком: «1200» и «12» — разные
+/// факты, и склеивать их нельзя.
+fn rewrite_stem(token: &str) -> String {
+    let normalized: String = token
+        .chars()
+        .flat_map(char::to_lowercase)
+        .map(|c| if c == 'ё' { 'е' } else { c })
+        .collect();
+    if normalized.chars().all(char::is_numeric) {
+        return normalized;
+    }
+    normalized.chars().take(4).collect()
+}
+
+fn rewrite_content_stems(value: &str) -> Vec<String> {
+    value
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_lowercase)
+        .filter(|token| !rewrite_structural_token(token))
+        .map(|token| rewrite_stem(&token))
+        .collect()
+}
+
+/// Слова, которым разрешено появляться и исчезать: вежливые вставки, артикли и
+/// речевой мусор, который модель обязана убирать по системному промпту.
+fn rewrite_structural_token(token: &str) -> bool {
+    matches!(token, "пожалуйста" | "please" | "a" | "an" | "the")
+        || postprocess::is_disposable_word(token)
+}
+
+struct RewriteGrounding {
+    grounded: bool,
+    recall: f64,
+    lost: Vec<String>,
+}
+
+/// Асимметричная защита от ПОТЕРИ содержания: содержательные слова диктовки
+/// обязаны остаться в ответе (recall по основам ≥ порога). Переформулировка,
+/// смена порядка слов, исправление морфологии и пунктуации разрешены —
+/// симметричное сравнение «1-в-1 и по порядку» из 2.0.x отклоняло вообще любой
+/// полезный рерайт, и в поле всё равно уходил сырой текст. Раздувать текст
+/// вдвое по-прежнему запрещено.
+fn rewrite_grounding(input: &str, output: &str, min_recall: f64) -> RewriteGrounding {
     let input_chars = input.chars().count();
     let output_chars = output.chars().count();
     if output_chars > input_chars.saturating_mul(2).saturating_add(32) {
-        return false;
+        return RewriteGrounding {
+            grounded: false,
+            recall: 0.0,
+            lost: vec![format!(
+                "<ответ длиннее входа: {output_chars}/{input_chars}>"
+            )],
+        };
     }
 
-    let tokens = |value: &str| {
-        value
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|part| !part.is_empty())
-            .map(str::to_lowercase)
-            .collect::<Vec<_>>()
-    };
-    let input_tokens = tokens(input);
-    let output_tokens = tokens(output);
-    if input_tokens.is_empty() {
-        return output_tokens.is_empty();
+    let mut unique_input: Vec<String> = Vec::new();
+    for stem in rewrite_content_stems(input) {
+        if !unique_input.contains(&stem) {
+            unique_input.push(stem);
+        }
     }
-    if output_tokens.len() > input_tokens.len().saturating_add(4) {
-        return false;
+    if unique_input.is_empty() {
+        return RewriteGrounding {
+            grounded: true,
+            recall: 1.0,
+            lost: Vec::new(),
+        };
     }
 
-    // Automatic refinement is allowed to change punctuation/casing and add a
-    // tiny whitelist of harmless fillers, but never to change content order,
-    // morphology or logical glue. Even noun case can reverse subject/object,
-    // so automatic mode deliberately fails closed on every content-token edit.
-    // Prepositions and conjunctions are meaning-bearing ("в" != "из", "и" !=
-    // "или"), so only articles and polite fillers may appear/disappear.
-    let mut input_content = input_tokens
+    let present: HashSet<String> = rewrite_content_stems(output).into_iter().collect();
+    let lost: Vec<String> = unique_input
         .iter()
-        .filter(|token| !rewrite_structural_token(token))
-        .collect::<Vec<_>>();
-    if input_content.is_empty() {
-        input_content = input_tokens.iter().collect();
+        .filter(|stem| !present.contains(*stem))
+        .cloned()
+        .collect();
+    let recall = 1.0 - lost.len() as f64 / unique_input.len() as f64;
+    RewriteGrounding {
+        grounded: recall + 1e-9 >= min_recall,
+        recall,
+        lost,
     }
-    let mut output_content = output_tokens
-        .iter()
-        .filter(|token| !rewrite_structural_token(token))
-        .collect::<Vec<_>>();
-    if output_content.is_empty() {
-        output_content = output_tokens.iter().collect();
-    }
-
-    input_content.len() == output_content.len()
-        && input_content
-            .iter()
-            .zip(output_content.iter())
-            .all(|(source, candidate)| source.as_str() == candidate.as_str())
 }
 
-fn rewrite_structural_token(token: &str) -> bool {
-    matches!(token, "пожалуйста" | "please" | "a" | "an" | "the")
+/// Та же защита для UI-команд (`transform_text`, переработка промпта) — там
+/// раньше не было вообще ничего, и обрезанный ответ затирал текст пользователя.
+/// `min_recall = 0.0` для намеренно сокращающих преобразований: остаётся только
+/// проверка на раздувание, обрыв ловится по finish_reason в клиентах.
+pub(crate) fn rewrite_is_grounded(input: &str, output: &str, min_recall: f64) -> bool {
+    let grounding = rewrite_grounding(input, output, min_recall);
+    if !grounding.grounded {
+        log::warn!(
+            "ответ модели отклонён: recall={:.2} < {:.2}, пропали: {}",
+            grounding.recall,
+            min_recall,
+            grounding.lost.join(", ")
+        );
+    }
+    grounding.grounded
 }
 
-fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (String, bool) {
+/// Возвращает `(текст, использована_ли_модель, причина_отказа)`. Причина нужна
+/// UI: «модель не ответила за 20 с» и «модель потеряла слова» — разные проблемы
+/// с разными действиями пользователя, а раньше обе выглядели одинаково.
+fn refine_text_with_fallback(
+    s: &Settings,
+    request: RewriteRequest<'_>,
+) -> (String, bool, Option<String>) {
     let RewriteRequest {
         actx,
         text,
@@ -6791,10 +6913,10 @@ fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (Stri
     } = request;
 
     if text.trim().is_empty() {
-        return (String::new(), false);
+        return (String::new(), false, None);
     }
     if s.verbatim && !force {
-        return (text.to_string(), false);
+        return (text.to_string(), false, None);
     }
     let has_smart_instruction = smart_instruction
         .map(|v| !v.trim().is_empty())
@@ -6810,7 +6932,7 @@ fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (Stri
             tone
         };
     if !force && !has_smart_instruction && (target_tone.is_empty() || target_tone == "neutral") {
-        return (text.to_string(), false);
+        return (text.to_string(), false, None);
     }
 
     let mut attempts: Vec<Box<dyn Fn() -> anyhow::Result<String>>> = Vec::with_capacity(1);
@@ -6821,8 +6943,10 @@ fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (Stri
             let instruction =
                 build_tone_instruction(target_tone, smart_instruction, context_hint, corrections);
             let input = text.to_string();
+            let timeout_s = s.backend_timeout_s(false);
+            let cap = s.rewrite_max_output_tokens;
             attempts.push(Box::new(move || {
-                crate::gemini::refine(&key, &model, &instruction, &input)
+                crate::gemini::refine(&key, &model, &instruction, &input, timeout_s, cap)
             }));
         }
         Some(RewriteBackendRoute::OpenAiCompat) => {
@@ -6836,33 +6960,46 @@ fn refine_text_with_fallback(s: &Settings, request: RewriteRequest<'_>) -> (Stri
         Some(RewriteBackendRoute::Ollama) => {
             let url = s.ollama_url.clone();
             let model = s.ollama_model.clone();
+            let timeout_s = s.backend_timeout_s(crate::net::is_loopback_base_url(&s.ollama_url));
             let user =
                 build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
             attempts.push(Box::new(move || {
-                crate::ollama::refine(&url, &model, crate::ollama::SYSTEM_PROMPT, &user)
+                crate::ollama::refine(&url, &model, crate::ollama::SYSTEM_PROMPT, &user, timeout_s)
             }));
         }
         None => {}
     }
 
+    let mut failure: Option<String> = None;
     for attempt in attempts {
         match attempt() {
             Ok(r) if !r.trim().is_empty() => {
                 let refined = postprocess::normalize_spaces(r.trim());
-                if force || rewrite_is_grounded(text, &refined) {
-                    return (refined, true);
+                let grounding = rewrite_grounding(text, &refined, s.rewrite_min_recall);
+                if grounding.grounded {
+                    return (refined, true, None);
                 }
+                failure = Some(format!(
+                    "модель потеряла часть текста ({} из слов диктовки нет в ответе)",
+                    grounding.lost.len()
+                ));
+                // Логируем ИМЕННО пропавшие слова: по паре чисел input/output
+                // диагностировать было нечего.
                 log::warn!(
-                    "рерайт отклонён защитой от смыслового дрейфа: input_chars={} output_chars={}",
-                    text.chars().count(),
-                    refined.chars().count()
+                    "рерайт отклонён защитой от потери содержания: recall={:.2} < {:.2}, пропали: {}",
+                    grounding.recall,
+                    s.rewrite_min_recall,
+                    grounding.lost.join(", ")
                 );
             }
-            Ok(_) => {}
-            Err(e) => log::warn!("рерайт недоступен: {e}; пробуем следующий fallback"),
+            Ok(_) => failure = Some("модель вернула пустой ответ".to_string()),
+            Err(e) => {
+                log::warn!("рерайт недоступен: {e}; пробуем следующий fallback");
+                failure = Some(e.to_string());
+            }
         }
     }
-    (text.to_string(), false)
+    (text.to_string(), false, failure)
 }
 
 /// Инструкция для Gemini: переписать текст в нужном стиле, без отсебятины.
@@ -6884,7 +7021,10 @@ fn build_tone_instruction(
     let mut s = format!(
         "Ты — редактор надиктованного голосом текста. Перепиши его в стиле: {style}. \
          Сохрани смысл и язык оригинала. Исправь ошибки распознавания, опечатки и пунктуацию. \
-         Удали запинки, междометия, повторы и брошенные начала фраз. \
+         ГЛАВНОЕ ПРАВИЛО: сохрани ВСЕ факты, числа, имена и смысловые слова диктовки. \
+         Удалять можно только однозначный речевой мусор: звуки-хезитации («э-э», «ммм»), \
+         дословные повторы одного слова и оборванные начала фраз, которые тут же переформулированы. \
+         Если сомневаешься, мусор это или содержание — ОСТАВЬ как есть. \
          Сбивчивые устные команды приводи к письменной форме: «я объясни мне» → «Объясни мне», «а что ещё я хочу сказать» → «Также учти». \
          Сохраняй контекст соседних фраз: если следующая фраза продолжает мысль, объединяй её с предыдущей и продолжай предложение. \
          Окончание записи само по себе не означает окончание предложения: если фраза грамматически не закончена, не дописывай мысль и не ставь принудительную финальную точку. \
@@ -7035,44 +7175,125 @@ mod smart_prompt_tests {
     }
 
     #[test]
-    fn automatic_rewrite_grounding_rejects_phantom_content() {
+    fn live_draft_never_leaks_into_environment_context() {
+        // Поле: пользователь набрал «Привет», live-режим уже допечатал «как дела».
+        let mut actx = app("Telegram");
+        actx.field_role = "AXTextArea".into();
+        actx.field_text = "Привет как дела".into();
+
+        let parts = rewrite_context_visible_parts(&actx, None, "Привет", true);
+        let joined = parts.join(" ");
+        assert!(
+            joined.contains("Привет"),
+            "уже набранный текст обязан попасть в окружение: {joined}"
+        );
+        assert!(
+            !joined.contains("как дела"),
+            "черновик диктовки продублирован в окружение: {joined}"
+        );
+
+        // Без live-вставки окружение берётся из поля как есть.
+        let parts = rewrite_context_visible_parts(&actx, None, "Привет", false);
+        assert!(parts.join(" ").contains("Привет как дела"));
+    }
+
+    /// Порог по умолчанию из настроек — тесты гарда идут через него.
+    const RECALL: f64 = 0.9;
+
+    #[test]
+    fn rewrite_grounding_accepts_reformulation_that_keeps_facts() {
+        // Пунктуация, регистр и вежливая вставка.
         assert!(rewrite_is_grounded(
             "Отправь отчёт клиенту завтра утром",
-            "Отправь отчёт клиенту завтра утром."
+            "Отправь отчёт клиенту завтра утром.",
+            RECALL
         ));
         assert!(rewrite_is_grounded(
             "Отправь отчёт",
-            "Пожалуйста, отправь отчёт."
+            "Пожалуйста, отправь отчёт.",
+            RECALL
         ));
+        // Исправление морфологии и смена порядка слов — это работа редактора,
+        // а не потеря содержания. Симметричный гард 2.0.x отклонял и это.
+        assert!(rewrite_is_grounded(
+            "Алиса любит Бориса",
+            "Алису любит Борис",
+            RECALL
+        ));
+        assert!(rewrite_is_grounded(
+            "отправь файл клиенту",
+            "Клиенту нужно отправить файл",
+            RECALL
+        ));
+        // Склейка с уже набранным в поле текстом.
+        assert!(rewrite_is_grounded("как дела", "Привет, как дела?", RECALL));
+        // Речевой мусор модель обязана убирать по системному промпту.
+        assert!(rewrite_is_grounded(
+            "ну эм отправь отчёт типа завтра",
+            "Отправь отчёт завтра.",
+            RECALL
+        ));
+        assert!(rewrite_is_grounded("Привет", "Привет!", RECALL));
+    }
+
+    #[test]
+    fn rewrite_grounding_rejects_lost_content() {
+        // Выпало содержательное слово.
         assert!(!rewrite_is_grounded(
             "Отправь отчёт клиенту завтра утром",
-            "Сегодня прекрасная погода, поэтому предлагаю обсудить новую стратегию продаж."
+            "Отправь отчёт завтра утром",
+            RECALL
+        ));
+        // Ответ вообще не о том.
+        assert!(!rewrite_is_grounded(
+            "Отправь отчёт клиенту завтра утром",
+            "Сегодня прекрасная погода, поэтому предлагаю обсудить новую стратегию.",
+            RECALL
         ));
         assert!(!rewrite_is_grounded(
             "Привет",
-            "Конечно, вот подробный ответ с фактами, которых пользователь не произносил"
+            "Сегодня отличная погода",
+            RECALL
         ));
-        assert!(!rewrite_is_grounded("Привет", "Сегодня отличная погода"));
+        // Раздувание вдвое: модель начала отвечать, а не переписывать.
         assert!(!rewrite_is_grounded(
-            "удали файл",
-            "удали важный файл и перезагрузи сервер"
+            "Привет",
+            "Конечно, вот подробный ответ с фактами, которых пользователь не произносил",
+            RECALL
         ));
+        // Подмена и потеря предлога/союза — тоже потеря содержания.
         for (input, output) in [
             ("скопируй файл в архив", "скопируй файл из архива"),
             ("удали файл и папку", "удали файл или папку"),
-            ("отправь файл", "отправь без файла"),
             ("удали файл", "удари файл"),
             ("открой порт", "открой торт"),
-            ("кот ест мышь", "мышь ест кот"),
-            ("Алиса любит Бориса", "Борис любит Алису"),
-            ("Алиса любит Бориса", "Алису любит Борис"),
         ] {
             assert!(
-                !rewrite_is_grounded(input, output),
-                "logic-changing rewrite passed: {input:?} -> {output:?}"
+                !rewrite_is_grounded(input, output, RECALL),
+                "потеря содержания прошла гард: {input:?} -> {output:?}"
             );
         }
-        assert!(rewrite_is_grounded("Привет", "Привет!"));
+        // Числа сравниваем целиком: обрезка суммы — не морфология.
+        assert!(!rewrite_is_grounded(
+            "переведи 1200 рублей",
+            "переведи 12 рублей",
+            RECALL
+        ));
+    }
+
+    #[test]
+    fn rewrite_grounding_with_zero_recall_only_blocks_inflation() {
+        // Путь «Сократить»: выбрасывать слова разрешено по заданию.
+        assert!(rewrite_is_grounded(
+            "очень длинный текст про отчёт и клиента",
+            "Отчёт клиенту",
+            0.0
+        ));
+        assert!(!rewrite_is_grounded(
+            "Привет",
+            "Привет! ".repeat(20).trim(),
+            0.0
+        ));
     }
 
     #[test]

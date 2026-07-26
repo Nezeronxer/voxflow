@@ -56,6 +56,11 @@ pub struct Settings {
     pub remove_fillers: bool,
     /// Авто-пунктуация/капитализация (постобработка).
     pub auto_punct: bool,
+    /// Агрессивные локальные «самоисправления»: любой маркер («то есть»,
+    /// «в смысле», «нет», «точнее») вырезает левую часть фразы — поведение до
+    /// 2.0.12. По умолчанию ВЫКЛ: эти же слова — обычные связки русской речи,
+    /// и правило молча съедало половину предложения даже при ai_backend=off.
+    pub aggressive_self_correction: bool,
     /// Учиться на ручных правках надиктованного текста: авто-создавать пары
     /// «распознано → правильно». Эвристика, поэтому по умолчанию ВЫКЛ — иначе
     /// плодит мусорные исправления, бьющие по нормальным словам. Ручные пары
@@ -145,6 +150,17 @@ pub struct Settings {
     /// API-ключ rewrite (заголовок Authorization: Bearer).
     /// Пусто → env REWRITE_API_KEY / OPENAI_API_KEY. НИКОГДА не логируется.
     pub rewrite_key: String,
+    /// Верхняя граница токенов ответа рерайта. Фактический лимит считается от
+    /// длины входа (см. `net::output_token_budget`) и упирается в это число.
+    pub rewrite_max_output_tokens: u32,
+    /// Минимальная доля содержательных слов диктовки, которые обязаны остаться
+    /// в ответе модели (0.0..=1.0). Ниже порога рерайт отклоняется и в поле
+    /// уходит исходный текст. 1.0 = запрет любой потери слов.
+    pub rewrite_min_recall: f64,
+    /// Таймаут синхронного запроса к ИИ-бэкенду, секунды. Для локальной Ollama
+    /// применяется увеличенный (см. `Settings::backend_timeout_s`): CPU-модель
+    /// с промптом на тысячи токенов в 10 секунд не укладывается.
+    pub ai_timeout_s: u32,
 
     /// Прокси для ВСЕХ внешних запросов (STT/LLM). Пусто → curl сам берёт
     /// HTTPS_PROXY/HTTP_PROXY из окружения. Формат: http://host:port.
@@ -200,6 +216,7 @@ impl Default for Settings {
             verbatim: false,
             remove_fillers: true,
             auto_punct: true,
+            aggressive_self_correction: false,
             learn_corrections: false,
             tone: "neutral".into(),
             smart_prompt_enabled: true,
@@ -240,6 +257,9 @@ impl Default for Settings {
             rewrite_base_url: String::new(),
             rewrite_model: String::new(),
             rewrite_key: String::new(),
+            rewrite_max_output_tokens: 4096,
+            rewrite_min_recall: 0.9,
+            ai_timeout_s: 20,
             proxy_url: String::new(),
             app_profile_overrides: Vec::new(),
             ai_prompt_rules: Vec::new(),
@@ -278,6 +298,24 @@ impl Settings {
         } else {
             OVERLAY_SCALE_DEFAULT
         };
+        self.rewrite_min_recall = if self.rewrite_min_recall.is_finite() {
+            self.rewrite_min_recall.clamp(0.0, 1.0)
+        } else {
+            0.9
+        };
+        self.rewrite_max_output_tokens = self.rewrite_max_output_tokens.clamp(256, 32_768);
+        self.ai_timeout_s = self.ai_timeout_s.clamp(5, 300);
+    }
+
+    /// Таймаут синхронного запроса к ИИ. Локальная модель на CPU физически
+    /// медленнее облака: 10 секунд из 2.0.x означали «рерайта нет вообще».
+    pub fn backend_timeout_s(&self, local_model: bool) -> u64 {
+        let base = self.ai_timeout_s.max(5) as u64;
+        if local_model {
+            base.max(60)
+        } else {
+            base
+        }
     }
 
     pub fn redacted_for_renderer(mut self) -> Self {

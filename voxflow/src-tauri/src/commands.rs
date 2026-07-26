@@ -507,8 +507,14 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
             if key.trim().is_empty() {
                 return ai_test_plain(false, "Введите API-ключ");
             }
-            match crate::gemini::refine(&key, &model, "Ответь ровно одним словом.", "Напиши: ОК")
-            {
+            match crate::gemini::refine(
+                &key,
+                &model,
+                "Ответь ровно одним словом.",
+                "Напиши: ОК",
+                settings.backend_timeout_s(false),
+                settings.rewrite_max_output_tokens,
+            ) {
                 Ok(t) => ai_test_plain(true, format!("Gemini отвечает: {}", t.trim())),
                 Err(e) => ai_test_plain(false, format!("Ошибка: {e}")),
             }
@@ -536,6 +542,7 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
                     &ollama_model,
                     "Ответь ровно одним словом.",
                     "Напиши: ОК",
+                    settings.backend_timeout_s(crate::net::is_loopback_base_url(&ollama_url)),
                 ) {
                     Ok(t) => ai_test_plain(true, format!("Ollama отвечает: {}", t.trim())),
                     Err(e) => ai_test_plain(false, format!("Ошибка: {e}")),
@@ -637,16 +644,40 @@ pub fn rewrite_prompt_with_instruction(
     }
 
     let result = if s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key) {
-        crate::gemini::refine(&s.ai_api_key, &s.ai_model, system, &user)
+        crate::gemini::refine(
+            &s.ai_api_key,
+            &s.ai_model,
+            system,
+            &user,
+            s.backend_timeout_s(false),
+            s.rewrite_max_output_tokens,
+        )
     } else if s.ai_backend == "openai_compat" && crate::rewrite::configured(&s) {
         crate::rewrite::refine(&s, system, &user)
     } else if s.ai_backend == "ollama" && crate::ollama::configured(&s.ollama_url) {
-        crate::ollama::refine(&s.ollama_url, &s.ollama_model, system, &user)
+        crate::ollama::refine(
+            &s.ollama_url,
+            &s.ollama_model,
+            system,
+            &user,
+            s.backend_timeout_s(crate::net::is_loopback_base_url(&s.ollama_url)),
+        )
     } else {
         Err(anyhow::anyhow!("выбранный ИИ-бэкенд не настроен"))
     };
 
     match result {
+        // Переработка промпта меняет формулировки намеренно, поэтому recall не
+        // требуем — но раздутый/обрезанный ответ затирать исходник не должен.
+        Ok(out)
+            if !out.trim().is_empty() && !crate::engine::rewrite_is_grounded(&user, &out, 0.0) =>
+        {
+            TransformResult {
+                ok: false,
+                text: String::new(),
+                message: "ИИ вернул ответ, не похожий на переработанный prompt".into(),
+            }
+        }
         Ok(out) if !out.trim().is_empty() => TransformResult {
             ok: true,
             text: out.trim().to_string(),
@@ -694,6 +725,13 @@ pub fn transform_text(state: State<AppState>, text: String, transform: String) -
             message: "Включите ИИ-бэкенд для transforms".into(),
         };
     }
+    // «Сократить», «в промпт» и смена стиля меняют формулировки по заданию
+    // пользователя — recall там не требуем. «Исправить» и «улучшить» обязаны
+    // сохранить содержание: там ответ затирает текст пользователя.
+    let min_recall = match transform.as_str() {
+        "shorten" | "prompt" | "formal" => 0.0,
+        _ => s.rewrite_min_recall,
+    };
 
     let user =
         format!("[ПРИЛОЖЕНИЕ]: VoxFlow Scratchpad\n[ЗАДАЧА]: {transform_label}\n[ТЕКСТ]: {input}");
@@ -704,6 +742,8 @@ pub fn transform_text(state: State<AppState>, text: String, transform: String) -
             &s.ai_model,
             "Верни только готовый преобразованный текст, без комментариев.",
             &user,
+            s.backend_timeout_s(false),
+            s.rewrite_max_output_tokens,
         )
     } else if s.ai_backend == "openai_compat" && crate::rewrite::configured(&s) {
         crate::rewrite::refine(&s, crate::ollama::SYSTEM_PROMPT, &user)
@@ -713,12 +753,22 @@ pub fn transform_text(state: State<AppState>, text: String, transform: String) -
             &s.ollama_model,
             crate::ollama::SYSTEM_PROMPT,
             &user,
+            s.backend_timeout_s(crate::net::is_loopback_base_url(&s.ollama_url)),
         )
     } else {
         Err(anyhow::anyhow!("выбранный ИИ-бэкенд не настроен"))
     };
 
     match result {
+        // Сравниваем с исходным текстом пользователя, а не с payload: результат
+        // затирает выделение, и потерянные слова уже не вернуть.
+        Ok(out) if !crate::engine::rewrite_is_grounded(input, out.trim(), min_recall) => {
+            TransformResult {
+                ok: false,
+                text: String::new(),
+                message: "ИИ потерял часть текста — преобразование отменено".into(),
+            }
+        }
         Ok(out) => TransformResult {
             ok: true,
             text: out.trim().to_string(),
@@ -893,14 +943,17 @@ pub fn install_update(
     state.engine.restore_auto_mute();
     let _ = state.engine_tx.lock().send(EngineCmd::Shutdown);
 
-    // Даём IPC-ответу уйти во фронт и закрываемся, чтобы установщик (NSIS на
-    // Windows) мог заменить работающий exe. Раньше здесь был только graceful
-    // `app.exit(0)`: если выход зависал на застрявшем потоке/обработчике, процесс
-    // не умирал, установщик не мог перезаписать файлы — пользователь видел ровно
-    // то, на что жаловались («скачалось, но ничего не происходит, зависло»).
-    // Поэтому добавлен ГАРАНТИРОВАННЫЙ форс-выход: если через 1.5 с после graceful
-    // выхода процесс всё ещё жив, завершаем его жёстко, чтобы установка не встала.
-    // Дочерний установщик уже отсоединён и переживёт завершение родителя.
+    // Сюда попадаем ТОЛЬКО когда обновление реально применено: на Windows
+    // установщик запущен отдельным процессом и пережил проверку живости, на
+    // macOS бандл уже заменён и перезапуск запланирован. Раньше выход был
+    // безусловным — приложение закрывалось даже если установщик умер сразу
+    // после старта, и пользователь видел ровно то, на что жаловался
+    // («программа закрылась полностью, и ничего не установилось»).
+    //
+    // Даём IPC-ответу уйти во фронт и закрываемся, чтобы установщик мог
+    // заменить работающие файлы. Форс-выход обязателен: если graceful `app.exit`
+    // зависнет на застрявшем потоке/обработчике, процесс не умрёт и установка
+    // встанет на залоченном exe.
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_millis(1200));
         app.exit(0);

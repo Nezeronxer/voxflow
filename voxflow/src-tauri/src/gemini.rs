@@ -29,7 +29,13 @@ pub fn available(api_key: &str) -> bool {
 /// Распознать WAV-файл через Gemini (cloud ASR). Возвращает только текст.
 ///
 /// `language` — код/название языка для подсказки модели; "auto" = определить язык.
-pub fn transcribe(api_key: &str, model: &str, wav: &Path, language: &str) -> Result<String> {
+pub fn transcribe(
+    api_key: &str,
+    model: &str,
+    wav: &Path,
+    language: &str,
+    timeout_s: u64,
+) -> Result<String> {
     // Читаем WAV и кодируем в base64.
     let bytes = std::fs::read(wav)
         .map_err(|e| anyhow!("не удалось прочитать WAV {}: {e}", wav.display()))?;
@@ -41,7 +47,7 @@ pub fn transcribe(api_key: &str, model: &str, wav: &Path, language: &str) -> Res
         }
         "ru" | "russian" => "Язык речи: русский.",
         "en" | "english" => "Язык речи: English.",
-        other => return transcribe_with_language_hint(api_key, model, wav, &b64, other),
+        other => return transcribe_with_language_hint(api_key, model, wav, &b64, other, timeout_s),
     };
     let prompt = format!(
         "Транскрибируй это аудио ДОСЛОВНО. {lang_hint} \
@@ -58,7 +64,7 @@ pub fn transcribe(api_key: &str, model: &str, wav: &Path, language: &str) -> Res
         "generationConfig": { "temperature": 0 }
     });
 
-    call(api_key, model, &body)
+    call(api_key, model, &body, timeout_s)
 }
 
 fn transcribe_with_language_hint(
@@ -67,6 +73,7 @@ fn transcribe_with_language_hint(
     _wav: &Path,
     b64: &str,
     language: &str,
+    timeout_s: u64,
 ) -> Result<String> {
     let prompt = format!(
         "Транскрибируй это аудио ДОСЛОВНО. Язык речи: {language}. \
@@ -81,27 +88,43 @@ fn transcribe_with_language_hint(
         }],
         "generationConfig": { "temperature": 0 }
     });
-    call(api_key, model, &body)
+    call(api_key, model, &body, timeout_s)
 }
 
 /// Отрефайнить текст: `system` (инструкция) + `user` (исходный текст)
 /// склеиваются в один text-part через двойной перевод строки.
-pub fn refine(api_key: &str, model: &str, system: &str, user: &str) -> Result<String> {
+pub fn refine(
+    api_key: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    timeout_s: u64,
+    max_output_tokens_cap: u32,
+) -> Result<String> {
     let combined = format!("{system}\n\n{user}");
+    // Лимит вывода считаем от длины входа: без него gemini-2.5-flash тратил
+    // бюджет на размышления и обрывал ответ по MAX_TOKENS. Рерайт — это
+    // форматирование, thinking тут не нужен и только съедает бюджет.
+    let max_output_tokens =
+        net::output_token_budget(net::estimate_tokens(&combined), max_output_tokens_cap);
 
     let body = serde_json::json!({
         "contents": [{
             "parts": [ { "text": combined } ]
         }],
-        "generationConfig": { "temperature": 0.3 }
+        "generationConfig": {
+            "temperature": 0.3,
+            "maxOutputTokens": max_output_tokens,
+            "thinkingConfig": { "thinkingBudget": 0 }
+        }
     });
 
-    call(api_key, model, &body)
+    call(api_key, model, &body, timeout_s)
 }
 
 /// Общий вызов generateContent: пишет тело в temp-файл, дёргает curl,
 /// парсит ответ и достаёт текст. Ключ передаётся ТОЛЬКО заголовком.
-fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> {
+fn call(api_key: &str, model: &str, body: &serde_json::Value, timeout_s: u64) -> Result<String> {
     let url = format!("{BASE_URL}/{model}:generateContent");
 
     // Тело запроса — во временный файл (большой base64 не влезает в argv).
@@ -119,10 +142,9 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
     net::apply_proxy(&mut cmd, "");
     cmd.arg("-s")
         .arg("-m")
-        // Рефайн — СИНХРОННЫЙ шаг перед вставкой текста: дольше ~10с он
-        // обесценивает диктовку (пользователь уже ждёт). Не успел — вставляем
-        // текст после правил (graceful-деградация выше по стеку).
-        .arg("10")
+        // Таймаут задаёт вызывающий (настройка `ai_timeout_s`). Не успел —
+        // вставляем текст после правил (graceful-деградация выше по стеку).
+        .arg(timeout_s.to_string())
         // Content-Type не секрет — остаётся в argv.
         .arg("-H")
         .arg("Content-Type: application/json")
@@ -138,7 +160,12 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
 
     if !out.status.success() && out.stdout.is_empty() {
-        // curl упал без тела (сеть/таймаут) — stderr безопасен (без ключа).
+        if net::curl_timed_out(&out.status) {
+            return Err(anyhow!(
+                "Gemini не ответила за {timeout_s} с. Увеличьте таймаут ИИ в настройках"
+            ));
+        }
+        // curl упал без тела (сеть) — stderr безопасен (без ключа).
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow!("curl завершился с ошибкой: {}", err.trim()));
     }
@@ -146,6 +173,22 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("ответ Gemini — не JSON: {e}"))?;
 
+    let text = parse_generate_content(&v)?;
+    if text.is_empty() {
+        // Возможно сработал safety/блок без поля error — отдаём диагностику без ключа.
+        log::warn!("Gemini вернул пустой текст; raw len={}", out.stdout.len());
+        return Err(anyhow!(
+            "Gemini вернул пустой ответ (нет текста в candidates)"
+        ));
+    }
+
+    Ok(text)
+}
+
+/// Текст из ответа generateContent. Обрыв по лимиту токенов
+/// (`finishReason: "MAX_TOKENS"`) — это обрубок, а не результат: раньше части
+/// просто склеивались и полфразы уходило в поле пользователя.
+fn parse_generate_content(v: &serde_json::Value) -> Result<String> {
     // Явная ошибка API.
     if let Some(err) = v.get("error") {
         let msg = err
@@ -155,10 +198,20 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
         return Err(anyhow!("Gemini error: {msg}"));
     }
 
+    let candidate = v.get("candidates").and_then(|c| c.get(0));
+    if let Some(reason) = candidate
+        .and_then(|c| c.get("finishReason"))
+        .and_then(|r| r.as_str())
+    {
+        if reason.eq_ignore_ascii_case("MAX_TOKENS") {
+            return Err(anyhow!(
+                "Gemini оборвала ответ по лимиту токенов (finishReason=MAX_TOKENS) — вставляем текст после правил"
+            ));
+        }
+    }
+
     // candidates[0].content.parts[*].text — конкатенируем все текстовые куски.
-    let parts = v
-        .get("candidates")
-        .and_then(|c| c.get(0))
+    let parts = candidate
         .and_then(|c| c.get("content"))
         .and_then(|c| c.get("parts"))
         .and_then(|p| p.as_array());
@@ -171,15 +224,29 @@ fn call(api_key: &str, model: &str, body: &serde_json::Value) -> Result<String> 
             }
         }
     }
+    Ok(text.trim().to_string())
+}
 
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        // Возможно сработал safety/блок без поля error — отдаём диагностику без ключа.
-        log::warn!("Gemini вернул пустой текст; raw len={}", out.stdout.len());
-        return Err(anyhow!(
-            "Gemini вернул пустой ответ (нет текста в candidates)"
-        ));
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_answer_is_rejected_instead_of_inserted() {
+        let truncated = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "Половина фра" }] },
+                "finishReason": "MAX_TOKENS"
+            }]
+        });
+        assert!(parse_generate_content(&truncated).is_err());
+
+        let complete = serde_json::json!({
+            "candidates": [{
+                "content": { "parts": [{ "text": "Полная " }, { "text": "фраза." }] },
+                "finishReason": "STOP"
+            }]
+        });
+        assert_eq!(parse_generate_content(&complete).unwrap(), "Полная фраза.");
     }
-
-    Ok(trimmed.to_string())
 }

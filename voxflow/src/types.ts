@@ -16,6 +16,9 @@ export interface Settings {
   verbatim: boolean;
   remove_fillers: boolean;
   auto_punct: boolean;
+  // Старое (до 2.0.12) поведение локальных «самоисправлений»: любой маркер
+  // («то есть», «нет», «точнее») режет левую часть фразы. По умолчанию выкл.
+  aggressive_self_correction: boolean;
   learn_corrections: boolean;
   // "very_casual" | "casual" | "neutral" | "work" | "formal" | "doc" | "ai"
   tone: string;
@@ -39,6 +42,12 @@ export interface Settings {
   rewrite_base_url: string;
   rewrite_model: string;
   rewrite_key: string;
+  // Верхняя граница токенов ответа рерайта (фактический лимит считается от входа).
+  rewrite_max_output_tokens: number;
+  // Доля слов диктовки, обязанных остаться в ответе модели (0..1).
+  rewrite_min_recall: number;
+  // Таймаут запроса к ИИ, секунды (локальная модель получает минимум 60).
+  ai_timeout_s: number;
   cloud_asr: boolean;
   tone_by_app: boolean;
   stream_mode: string;
@@ -141,6 +150,7 @@ export const DEFAULT_SETTINGS: Settings = {
   verbatim: false,
   remove_fillers: true,
   auto_punct: true,
+  aggressive_self_correction: false,
   learn_corrections: false,
   tone: "neutral",
   smart_prompt_enabled: true,
@@ -163,6 +173,9 @@ export const DEFAULT_SETTINGS: Settings = {
   rewrite_base_url: "",
   rewrite_model: "",
   rewrite_key: "",
+  rewrite_max_output_tokens: 4096,
+  rewrite_min_recall: 0.9,
+  ai_timeout_s: 20,
   cloud_asr: false,
   tone_by_app: true,
   stream_mode: "never",

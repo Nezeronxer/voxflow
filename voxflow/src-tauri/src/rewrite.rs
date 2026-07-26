@@ -109,7 +109,13 @@ pub fn configured(s: &crate::settings::Settings) -> bool {
 /// env REWRITE_API_KEY → OPENROUTER_API_KEY → OPENAI_API_KEY).
 /// Пустой ключ → ошибка (без вызова сети).
 pub fn refine(s: &crate::settings::Settings, system: &str, user: &str) -> Result<String> {
-    let content = chat_completion(s, system, user, 0.2, Some(1200))?;
+    // Лимит вывода — от длины входа, а не жёсткие 1200: для русского это ~2500
+    // символов, и длинная диктовка обрывалась на полуслове.
+    let max_tokens = net::output_token_budget(
+        net::estimate_tokens(system) + net::estimate_tokens(user),
+        s.rewrite_max_output_tokens,
+    );
+    let content = chat_completion(s, system, user, 0.2, Some(max_tokens))?;
     let cleaned = cleanup_rewrite_output(&content, user);
     if cleaned.is_empty() {
         return Err(anyhow!(
@@ -303,13 +309,13 @@ fn chat_completion(
     // Прокси-aware curl из общего модуля net (CREATE_NO_WINDOW уже внутри).
     // Облако из РФ: прокси берём из настроек (s.proxy_url); пустой → net::apply_proxy
     // не добавляет -x, и curl сам читает HTTPS_PROXY/HTTP_PROXY из окружения.
+    let timeout_s = s.backend_timeout_s(net::is_loopback_base_url(&base_url));
     let mut cmd = net::curl();
     cmd.arg("-s")
         .arg("-m")
-        // Рефайн — СИНХРОННЫЙ шаг перед вставкой текста: дольше ~10с он
-        // обесценивает диктовку (пользователь уже ждёт). Не успел — вставляем
-        // текст после правил (graceful-деградация выше по стеку).
-        .arg("10")
+        // Таймаут — из настроек (`ai_timeout_s`), локальный эндпоинт получает
+        // увеличенный. Не успел — вставляем текст после правил.
+        .arg(timeout_s.to_string())
         // Content-Type не секрет — остаётся в argv.
         .arg("-H")
         .arg("Content-Type: application/json")
@@ -325,7 +331,12 @@ fn chat_completion(
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
 
     if !out.status.success() && out.stdout.is_empty() {
-        // curl упал без тела (сеть/таймаут/нет прокси) — stderr безопасен (без ключа).
+        if net::curl_timed_out(&out.status) {
+            return Err(anyhow!(
+                "Модель рерайта не ответила за {timeout_s} с. Увеличьте таймаут ИИ в настройках"
+            ));
+        }
+        // curl упал без тела (сеть/нет прокси) — stderr безопасен (без ключа).
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow!("curl завершился с ошибкой: {}", err.trim()));
     }
@@ -333,6 +344,21 @@ fn chat_completion(
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("ответ рерайта — не JSON: {e}"))?;
 
+    let content = parse_chat_completion(&v)?;
+    if content.trim().is_empty() {
+        // Пустой ответ без поля error — отдаём диагностику без ключа.
+        log::warn!("Rewrite вернул пустой текст; raw len={}", out.stdout.len());
+        return Err(anyhow!(
+            "OpenAI-совместимый рерайт вернул пустой ответ (нет текста в choices[0].message.content)"
+        ));
+    }
+    Ok(content)
+}
+
+/// Текст из ответа /chat/completions. `finish_reason == "length"` означает, что
+/// ответ обрублен лимитом токенов — такой результат отвергаем, иначе в поле
+/// уходит половина фразы.
+fn parse_chat_completion(v: &serde_json::Value) -> Result<String> {
     // Явная ошибка API. Совместимые провайдеры отдают либо объект
     // {"error":{"message":"…"}}, либо строкой {"error":"…"} — обрабатываем оба.
     if let Some(err) = v.get("error") {
@@ -344,23 +370,24 @@ fn chat_completion(
         return Err(anyhow!("Rewrite API error: {msg}"));
     }
 
-    // Ответ chat-эндпоинта: choices[0].message.content.
-    let content = v
-        .get("choices")
-        .and_then(|c| c.get(0))
+    let choice = v.get("choices").and_then(|c| c.get(0));
+    if let Some(reason) = choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|r| r.as_str())
+    {
+        if reason.eq_ignore_ascii_case("length") {
+            return Err(anyhow!(
+                "Модель оборвала ответ по лимиту токенов (finish_reason=length) — вставляем текст после правил"
+            ));
+        }
+    }
+
+    Ok(choice
         .and_then(|c| c.get("message"))
         .and_then(|m| m.get("content"))
         .and_then(|c| c.as_str())
-        .unwrap_or("");
-
-    if content.trim().is_empty() {
-        // Пустой ответ без поля error — отдаём диагностику без ключа.
-        log::warn!("Rewrite вернул пустой текст; raw len={}", out.stdout.len());
-        return Err(anyhow!(
-            "OpenAI-совместимый рерайт вернул пустой ответ (нет текста в choices[0].message.content)"
-        ));
-    }
-    Ok(content.to_string())
+        .unwrap_or("")
+        .to_string())
 }
 
 fn cleanup_rewrite_output(text: &str, input: &str) -> String {
@@ -439,6 +466,34 @@ mod tests {
             "https://openrouter.ai.evil.test/api/v1"
         ));
         assert!(!is_openrouter_base("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn truncated_answer_is_rejected_instead_of_inserted() {
+        let truncated = serde_json::json!({
+            "choices": [{
+                "message": { "content": "Половина фра" },
+                "finish_reason": "length"
+            }]
+        });
+        assert!(parse_chat_completion(&truncated).is_err());
+
+        let complete = serde_json::json!({
+            "choices": [{
+                "message": { "content": "Полная фраза." },
+                "finish_reason": "stop"
+            }]
+        });
+        assert_eq!(parse_chat_completion(&complete).unwrap(), "Полная фраза.");
+    }
+
+    #[test]
+    fn output_budget_scales_with_input_and_respects_cap() {
+        let short = net::output_token_budget(net::estimate_tokens("привет"), 4096);
+        let long = net::output_token_budget(net::estimate_tokens(&"слово ".repeat(2000)), 4096);
+        assert!(long > short);
+        assert!(long <= 4096);
+        assert!(short >= 256);
     }
 
     #[test]

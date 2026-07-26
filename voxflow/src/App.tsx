@@ -150,8 +150,8 @@ export default function App() {
     );
     setNotice({
       message: result?.launched
-        ? "Установщик обновления запущен. VoxFlow сейчас закроется."
-        : "Не удалось скачать или запустить обновление.",
+        ? result.message
+        : "Не удалось скачать или установить обновление.",
       variant: result?.launched ? "warning" : "error",
     });
   }

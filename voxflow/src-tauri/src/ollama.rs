@@ -80,7 +80,7 @@ pub fn list_models(url: &str) -> Result<Vec<String>> {
 /// Отрефайнить текст: `system` (инструкция) + `user` (исходный текст) через
 /// POST /api/chat (stream=false). Размышления гибридной qwen3 глушим
 /// `/no_think` + `"think": false`, остаток `<think>…</think>` срезаем из ответа.
-pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String> {
+pub fn refine(url: &str, model: &str, system: &str, user: &str, timeout_s: u64) -> Result<String> {
     let base_url = base(url);
     net::ensure_https_or_loopback_base(&base_url, "Ollama URL")?;
     let endpoint = format!("{base_url}/api/chat");
@@ -90,6 +90,11 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
     // Глушим только нативным `think: false` + пост-очисткой (strip_think +
     // looks_like_reasoning). Систему отдаём как есть.
     let system_msg = system.to_string();
+
+    // Окно и лимит вывода считаем от фактической длины запроса. Хардкод 4096 был
+    // МЕНЬШЕ одного системного промпта (~21 КБ ≈ 6k токенов): Ollama молча
+    // срезала его начало, а на генерацию места не оставалось.
+    let (num_ctx, num_predict) = plan_context_budget(&system_msg, user);
 
     let body = serde_json::json!({
         "model": model,
@@ -104,7 +109,8 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
             "top_p": 0.8,
             "top_k": 20,
             "min_p": 0.0,
-            "num_ctx": 4096
+            "num_ctx": num_ctx,
+            "num_predict": num_predict
         }
     });
 
@@ -121,10 +127,10 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
     net::apply_proxy(&mut cmd, "");
     cmd.arg("-s")
         .arg("-m")
-        // Рефайн — СИНХРОННЫЙ шаг перед вставкой текста: дольше ~10с он
-        // обесценивает диктовку (пользователь уже ждёт). Не успел — вставляем
-        // текст после правил (graceful-деградация выше по стеку).
-        .arg("10")
+        // Таймаут задаёт вызывающий (настройка `ai_timeout_s`, для локальной
+        // модели не меньше 60 с). Фиксированные 10 с означали, что qwen3:4b на
+        // CPU не успевал НИКОГДА — рефайна де-факто не было.
+        .arg(timeout_s.to_string())
         .arg("-H")
         .arg("Content-Type: application/json")
         .arg("-X")
@@ -138,7 +144,12 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
 
     if !out.status.success() && out.stdout.is_empty() {
-        // curl упал без тела (сеть/таймаут/нет сервера) — stderr безопасен.
+        if net::curl_timed_out(&out.status) {
+            return Err(anyhow!(
+                "Ollama не ответила за {timeout_s} с (модель {model}). Увеличьте таймаут ИИ в настройках или возьмите модель полегче"
+            ));
+        }
+        // curl упал без тела (сеть/нет сервера) — stderr безопасен.
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(anyhow!("Ollama недоступна по {url}: {}", err.trim()));
     }
@@ -146,18 +157,7 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
     let v: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("ответ Ollama — не JSON: {e}"))?;
 
-    // Явная ошибка сервера (например, модель не установлена).
-    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
-        return Err(anyhow!("Ollama error: {err}"));
-    }
-
-    // Ответ чат-эндпоинта: message.content.
-    let content = v
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
-        .unwrap_or("");
-
+    let content = parse_chat_response(&v)?;
     let cleaned = strip_think(content);
     // qwen3:4b порой вываливает chain-of-thought БЕЗ тегов <think> (монолог-рассуждение
     // о задаче). Если очищенный ответ выглядит как рассуждение/эхо промпта, а не как
@@ -176,6 +176,35 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str) -> Result<String
     }
 
     Ok(cleaned)
+}
+
+/// Окно контекста и лимит генерации под конкретный запрос.
+/// Возвращает `(num_ctx, num_predict)`.
+fn plan_context_budget(system: &str, user: &str) -> (u32, u32) {
+    let input = net::estimate_tokens(system) + net::estimate_tokens(user);
+    // Верхняя граница вывода локальной модели — тот же порядок, что у облака.
+    let predict = net::output_token_budget(input, 4096);
+    let needed = input.saturating_add(predict).saturating_add(512);
+    (needed.max(16_384), predict)
+}
+
+/// Достать текст ответа чат-эндпоинта, отвергнув обрыв по лимиту токенов.
+/// `done_reason == "length"` означает обрубок: вставлять его в поле нельзя,
+/// это ровно тот «пропал кусок текста», из-за которого всё затевалось.
+fn parse_chat_response(v: &serde_json::Value) -> Result<&str> {
+    // Явная ошибка сервера (например, модель не установлена).
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return Err(anyhow!("Ollama error: {err}"));
+    }
+    if v.get("done_reason").and_then(|d| d.as_str()) == Some("length") {
+        return Err(anyhow!(
+            "Ollama оборвала ответ по лимиту токенов (done_reason=length) — вставляем текст после правил"
+        ));
+    }
+    Ok(v.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .unwrap_or(""))
 }
 
 /// Эвристика «ответ — это рассуждение/эхо промпта, а не переписанный текст».
@@ -240,4 +269,45 @@ fn strip_think(text: &str) -> String {
     // Эхо-литерал директивы: qwen3 иногда повторяет «/no_think» прямо в тексте — убираем.
     s = s.replace("/no_think", "");
     s.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_window_fits_system_prompt_and_output() {
+        let (num_ctx, num_predict) = plan_context_budget(SYSTEM_PROMPT, "[ДИКТОВКА]: привет");
+        let input =
+            net::estimate_tokens(SYSTEM_PROMPT) + net::estimate_tokens("[ДИКТОВКА]: привет");
+        assert!(num_ctx >= 16_384, "окно меньше минимума: {num_ctx}");
+        assert!(
+            num_ctx > input + num_predict,
+            "окно {num_ctx} не вмещает вход {input} + вывод {num_predict}"
+        );
+        assert!(num_predict >= 256);
+    }
+
+    #[test]
+    fn long_input_grows_the_window_above_the_minimum() {
+        let long = "слово ".repeat(20_000);
+        let (num_ctx, num_predict) = plan_context_budget(SYSTEM_PROMPT, &long);
+        assert!(num_ctx > 16_384);
+        assert!(num_ctx > net::estimate_tokens(&long) + num_predict);
+    }
+
+    #[test]
+    fn truncated_answer_is_rejected_instead_of_inserted() {
+        let truncated = serde_json::json!({
+            "message": { "content": "Половина фра" },
+            "done_reason": "length"
+        });
+        assert!(parse_chat_response(&truncated).is_err());
+
+        let complete = serde_json::json!({
+            "message": { "content": "Полная фраза." },
+            "done_reason": "stop"
+        });
+        assert_eq!(parse_chat_response(&complete).unwrap(), "Полная фраза.");
+    }
 }

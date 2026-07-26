@@ -150,15 +150,18 @@ fn cleanup_stale_temp_files_in(
         let sensitive_temp =
             extension.eq_ignore_ascii_case("wav") || extension.eq_ignore_ascii_case("json");
         // Custom updater downloads into this private tmp directory. Interrupted
-        // or already-launched installers used to survive forever (hundreds of
-        // megabytes each). Match only our fixed updater prefix; never treat an
-        // arbitrary .exe in the directory as disposable.
-        let stale_windows_installer = extension.eq_ignore_ascii_case("exe")
+        // or already-applied packages used to survive forever (hundreds of
+        // megabytes each). Match only our fixed updater prefixes; never treat an
+        // arbitrary .exe/.dmg in the directory as disposable.
+        let stale_update_package = (extension.eq_ignore_ascii_case("exe")
+            || extension.eq_ignore_ascii_case("dmg"))
             && path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("VoxFlow-Setup-"));
-        if !sensitive_temp && !stale_windows_installer {
+                .is_some_and(|name| {
+                    name.starts_with("VoxFlow-Setup-") || name.starts_with("VoxFlow-macOS-")
+                });
+        if !sensitive_temp && !stale_update_package {
             continue;
         }
         let Some(age) = metadata

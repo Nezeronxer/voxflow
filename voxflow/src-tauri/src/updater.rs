@@ -1,18 +1,15 @@
 //! GitHub Releases updater.
 //!
-//! Asset discovery is platform-specific. Windows x64 keeps the existing custom
-//! Inno Setup flow. macOS may report the matching DMG, but automatic download and
-//! launch stays disabled until a signed and notarized updater is implemented.
+//! Asset discovery is platform-specific: Windows x64 gets the Inno Setup
+//! installer, macOS gets the matching DMG. Both platforms install
+//! automatically; the platform-specific part is only *how* the verified
+//! download is applied (spawn the installer vs. swap the app bundle).
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
-#[cfg(windows)]
 use sha2::{Digest, Sha256};
-#[cfg(windows)]
 use std::io::Read;
-#[cfg(any(windows, target_os = "macos"))]
 use std::path::{Path, PathBuf};
-#[cfg(windows)]
 use std::process::Command;
 
 const OWNER: &str = "Nezeronxer";
@@ -129,7 +126,6 @@ pub fn check(proxy_url: &str) -> Result<UpdateInfo> {
     update_info_from_release_for(&release, current_update_target())
 }
 
-#[cfg(windows)]
 pub fn download_and_launch(
     asset_url: &str,
     asset_name: &str,
@@ -171,29 +167,242 @@ pub fn download_and_launch(
         let _ = std::fs::remove_file(&dest);
     })?;
 
-    Command::new(&dest)
-        .spawn()
-        .map_err(|e| anyhow!("не удалось запустить установщик обновления: {e}"))?;
+    apply_downloaded_update(&dest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&dest);
+    })
+}
+
+/// Windows: hand the verified Inno Setup package over to a *detached* process.
+///
+/// The previous version spawned a plain child and treated a successful
+/// `CreateProcess` as "installer running", then hard-killed VoxFlow 2.7 s
+/// later. Both halves of that were wrong:
+///
+/// - a plain child stays in the parent's process group and job object, so a job
+///   with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` takes the installer down together
+///   with VoxFlow — the app vanished and nothing was installed;
+/// - nothing ever checked that the installer was still alive, so *any* early
+///   failure (killed, blocked, crashed on start) still reported success and the
+///   app quit into a silent no-op.
+///
+/// Now the installer is created detached, in its own process group and broken
+/// out of any inherited job, and we only report success once it has survived a
+/// short observation window. If it died, VoxFlow stays open and shows why.
+#[cfg(windows)]
+fn apply_downloaded_update(dest: &Path) -> Result<UpdateInstallResult> {
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+
+    use std::os::windows::process::CommandExt;
+
+    let spawn_with = |flags: u32| {
+        let mut cmd = Command::new(dest);
+        cmd.creation_flags(flags);
+        // Never inherit the install directory as the working directory: a
+        // process CWD pins that directory and the installer writes into it.
+        if let Some(parent) = dest.parent() {
+            cmd.current_dir(parent);
+        }
+        cmd.spawn()
+    };
+
+    // Breakaway is refused (ERROR_ACCESS_DENIED) by jobs without
+    // JOB_OBJECT_LIMIT_BREAKAWAY_OK, so fall back instead of failing the update.
+    let mut child =
+        spawn_with(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB)
+            .or_else(|_| spawn_with(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP))
+            .map_err(|e| anyhow!("не удалось запустить установщик обновления: {e}"))?;
+
+    std::thread::sleep(INSTALLER_LIVENESS_WINDOW);
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(anyhow!(
+            "установщик обновления завершился сразу после запуска ({status}) — обновление не установлено. \
+             Проверьте антивирус и запустите пакет вручную: {}",
+            dest.display()
+        ));
+    }
 
     Ok(UpdateInstallResult {
         launched: true,
         path: dest.display().to_string(),
-        message: "Установщик обновления запущен".into(),
+        message: "Установщик обновления запущен. VoxFlow сейчас закроется.".into(),
     })
 }
 
-#[cfg(not(windows))]
-pub fn download_and_launch(
-    _asset_url: &str,
-    _asset_name: &str,
-    _expected_size: u64,
-    _expected_digest: &str,
-    _proxy_url: &str,
-) -> Result<UpdateInstallResult> {
+/// macOS: install the DMG in place instead of dumping the user on a web page.
+///
+/// Everything that can fail — mounting, identity checks, copying, the swap —
+/// happens while VoxFlow is still alive, so a failure is reported in the UI and
+/// the installed app is left untouched. Only the throwaway cleanup/relaunch step
+/// runs after we exit.
+#[cfg(target_os = "macos")]
+fn apply_downloaded_update(dest: &Path) -> Result<UpdateInstallResult> {
+    let exe = std::env::current_exe().map_err(|e| anyhow!("current executable: {e}"))?;
+    let current = enclosing_macos_app_bundle(&exe)
+        .ok_or_else(|| anyhow!("автообновление доступно только для установленного VoxFlow.app"))?;
+    let parent = current
+        .parent()
+        .ok_or_else(|| anyhow!("не удалось определить папку установки VoxFlow.app"))?
+        .to_path_buf();
+
+    let mount = hdiutil_attach(dest)?;
+    let staged = parent.join(format!(".voxflow-update-{}.app", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staged);
+    let copied = ditto(&mount.join("VoxFlow.app"), &staged)
+        .and_then(|()| verify_staged_macos_bundle(&staged));
+    hdiutil_detach(&mount);
+    if let Err(e) = copied {
+        let _ = std::fs::remove_dir_all(&staged);
+        return Err(e);
+    }
+
+    let backup = swap_macos_bundle(&current, &staged)?;
+    spawn_macos_relaunch(&current, &backup);
+    let _ = std::fs::remove_file(dest);
+
+    Ok(UpdateInstallResult {
+        launched: true,
+        path: current.display().to_string(),
+        message: "Обновление установлено. VoxFlow перезапустится.".into(),
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn apply_downloaded_update(_dest: &Path) -> Result<UpdateInstallResult> {
     Err(anyhow!(
-        "автоустановка обновлений для {} отключена: откройте релиз вручную",
+        "автоустановка обновлений для {} не поддерживается: откройте релиз вручную",
         current_update_target().label()
     ))
+}
+
+/// How long a freshly spawned Windows installer must stay alive before we are
+/// willing to shut VoxFlow down behind it.
+#[cfg(windows)]
+const INSTALLER_LIVENESS_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
+#[cfg(target_os = "macos")]
+fn hdiutil_attach(dmg: &Path) -> Result<PathBuf> {
+    let out = Command::new("/usr/bin/hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-plist"])
+        .arg(dmg)
+        .output()
+        .map_err(|e| anyhow!("не удалось запустить hdiutil: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "не удалось смонтировать образ обновления: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let value = plist::Value::from_reader_xml(std::io::Cursor::new(&out.stdout))
+        .map_err(|e| anyhow!("hdiutil вернул неожиданный ответ: {e}"))?;
+    value
+        .as_dictionary()
+        .and_then(|dict| dict.get("system-entities"))
+        .and_then(plist::Value::as_array)
+        .and_then(|entities| {
+            entities.iter().find_map(|entity| {
+                entity
+                    .as_dictionary()
+                    .and_then(|dict| dict.get("mount-point"))
+                    .and_then(plist::Value::as_string)
+                    .filter(|point| !point.is_empty())
+                    .map(PathBuf::from)
+            })
+        })
+        .ok_or_else(|| anyhow!("образ обновления смонтирован без точки монтирования"))
+}
+
+#[cfg(target_os = "macos")]
+fn hdiutil_detach(mount: &Path) {
+    let _ = Command::new("/usr/bin/hdiutil")
+        .arg("detach")
+        .arg(mount)
+        .arg("-quiet")
+        .status();
+}
+
+/// `ditto` (not `fs::copy`) — it is the only stock tool that preserves the
+/// symlinks, permissions and extended attributes an app bundle's signature
+/// depends on.
+#[cfg(target_os = "macos")]
+fn ditto(src: &Path, dst: &Path) -> Result<()> {
+    let out = Command::new("/usr/bin/ditto")
+        .arg(src)
+        .arg(dst)
+        .output()
+        .map_err(|e| anyhow!("не удалось запустить ditto: {e}"))?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "не удалось скопировать VoxFlow.app из образа: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse to install anything that is not a strictly newer, genuine VoxFlow
+/// bundle — the same identity gate the stale-copy cleanup uses.
+#[cfg(target_os = "macos")]
+fn verify_staged_macos_bundle(staged: &Path) -> Result<()> {
+    let identity = macos_bundle_identity(staged)
+        .map_err(|e| anyhow!("образ обновления не содержит корректный VoxFlow.app: {e}"))?;
+    if !is_known_voxflow_bundle(&identity) {
+        return Err(anyhow!("образ обновления содержит чужое приложение"));
+    }
+    if version_cmp(&identity.version, env!("CARGO_PKG_VERSION"))? != std::cmp::Ordering::Greater {
+        return Err(anyhow!(
+            "в образе обновления версия {} не новее установленной {}",
+            identity.version,
+            env!("CARGO_PKG_VERSION")
+        ));
+    }
+    Ok(())
+}
+
+/// Move the running bundle aside and put the new one in its place, rolling the
+/// old bundle back if the second rename fails. Renaming (not deleting) the
+/// running bundle keeps this process alive until it exits on its own.
+#[cfg(target_os = "macos")]
+fn swap_macos_bundle(current: &Path, staged: &Path) -> Result<PathBuf> {
+    let parent = current
+        .parent()
+        .ok_or_else(|| anyhow!("не удалось определить папку установки VoxFlow.app"))?;
+    let backup = parent.join(format!(".voxflow-old-{}.app", std::process::id()));
+    let _ = std::fs::remove_dir_all(&backup);
+    std::fs::rename(current, &backup).map_err(|e| {
+        anyhow!(
+            "нет прав заменить {}: {e}. Установите обновление вручную из образа.",
+            current.display()
+        )
+    })?;
+    if let Err(e) = std::fs::rename(staged, current) {
+        let _ = std::fs::rename(&backup, current);
+        let _ = std::fs::remove_dir_all(staged);
+        return Err(anyhow!("не удалось установить новую версию: {e}"));
+    }
+    Ok(backup)
+}
+
+/// Drop the old bundle and relaunch once this process is gone. Best effort by
+/// construction: the update itself is already applied when this runs.
+#[cfg(target_os = "macos")]
+fn spawn_macos_relaunch(app: &Path, backup: &Path) {
+    let script = format!(
+        "i=0; while kill -0 {pid} 2>/dev/null && [ $i -lt 300 ]; do sleep 0.2; i=$((i+1)); done; \
+         rm -rf {backup}; open {app}",
+        pid = std::process::id(),
+        backup = sh_quote(backup),
+        app = sh_quote(app),
+    );
+    if let Err(e) = Command::new("/bin/sh").arg("-c").arg(script).spawn() {
+        log::warn!("не удалось запланировать перезапуск VoxFlow: {e}");
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sh_quote(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
 
 /// Remove older VoxFlow application bundles from normal macOS install roots.
@@ -448,7 +657,7 @@ fn update_info_from_release_for(
 
     Ok(UpdateInfo {
         available,
-        auto_install: matches!(target, UpdateTarget::WindowsX64),
+        auto_install: !matches!(target, UpdateTarget::Unsupported),
         current_version,
         latest_version,
         release_name: release
@@ -569,7 +778,6 @@ fn validate_asset_digest(digest: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
 fn verify_downloaded_asset(path: &Path, expected_size: u64, expected_digest: &str) -> Result<()> {
     let actual_size = std::fs::metadata(path)
         .map_err(|e| anyhow!("скачанный установщик не найден: {e}"))?
@@ -623,7 +831,6 @@ fn is_installer_asset_name_for(name: &str, prefix: &str, suffix: &str) -> bool {
                 || name.ends_with("-x64-developer-id-notarized.dmg")))
 }
 
-#[cfg(windows)]
 fn installer_download_path(asset_name: &str) -> PathBuf {
     let safe_name: String = asset_name
         .chars()
@@ -635,8 +842,11 @@ fn installer_download_path(asset_name: &str) -> PathBuf {
             }
         })
         .collect();
-    let stem = safe_name.trim_end_matches(".exe");
-    crate::paths::unique_tmp_path(stem, "exe")
+    let (stem, ext) = match safe_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => (stem, ext),
+        _ => (safe_name.as_str(), "bin"),
+    };
+    crate::paths::unique_tmp_path(stem, ext)
 }
 
 fn normalize_version_tag(tag: &str) -> String {
@@ -788,7 +998,7 @@ mod tests {
         assert_eq!(windows.latest_version, "99.0.0");
         assert_eq!(windows.asset_name, "VoxFlow-Setup-99.0.0.exe");
         assert_eq!(mac_arm.asset_name, "VoxFlow-macOS-99.0.0-arm64-adhoc.dmg");
-        assert!(!mac_arm.auto_install);
+        assert!(mac_arm.auto_install);
         assert_eq!(mac_x64.asset_name, "VoxFlow-macOS-99.0.0-x64-adhoc.dmg");
     }
 
@@ -817,6 +1027,8 @@ mod tests {
             validate_asset_name_for("VoxFlow-Setup-99.0.0.exe", current_update_target()).is_err()
         );
 
+        // A Windows package must be rejected before anything is downloaded or
+        // executed, whatever the release JSON claims.
         let err = download_and_launch(
             "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-Setup-99.0.0.exe",
             "VoxFlow-Setup-99.0.0.exe",
@@ -825,17 +1037,182 @@ mod tests {
             "",
         )
         .unwrap_err();
-        assert!(err.to_string().contains("автоустановка"));
+        assert!(err.to_string().contains("недоверенное имя пакета"));
+    }
+
+    #[test]
+    fn keeps_the_package_extension_when_naming_the_download() {
+        assert_eq!(
+            installer_download_path("VoxFlow-Setup-2.0.11.exe")
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("exe")
+        );
+        assert_eq!(
+            installer_download_path("VoxFlow-macOS-2.0.11-arm64-adhoc.dmg")
+                .extension()
+                .and_then(|ext| ext.to_str()),
+            Some("dmg")
+        );
+    }
+
+    #[test]
+    fn every_supported_platform_installs_automatically() {
+        for target in [
+            UpdateTarget::WindowsX64,
+            UpdateTarget::MacosArm64,
+            UpdateTarget::MacosX64,
+        ] {
+            let release = serde_json::json!({
+                "tag_name": "v99.0.0",
+                "assets": [
+                    {
+                        "name": "VoxFlow-Setup-99.0.0.exe",
+                        "size": 1,
+                        "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-Setup-99.0.0.exe"
+                    },
+                    {
+                        "name": "VoxFlow-macOS-99.0.0-arm64-adhoc.dmg",
+                        "size": 2,
+                        "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-macOS-99.0.0-arm64-adhoc.dmg"
+                    },
+                    {
+                        "name": "VoxFlow-macOS-99.0.0-x64-adhoc.dmg",
+                        "size": 3,
+                        "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-macOS-99.0.0-x64-adhoc.dmg"
+                    }
+                ]
+            });
+            assert!(
+                update_info_from_release_for(&release, target)
+                    .unwrap()
+                    .auto_install,
+                "{target:?} must install without sending the user to a web page"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]
-    fn macos_cleanup_test_root() -> PathBuf {
+    #[test]
+    fn macos_staged_bundle_must_be_a_strictly_newer_voxflow() {
+        let root = macos_cleanup_test_root("staged");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let foreign =
+            write_test_macos_bundle(&root, "Foreign.app", "example.foreign", "VoxFlow", "99.0.0");
+        assert!(verify_staged_macos_bundle(&foreign)
+            .unwrap_err()
+            .to_string()
+            .contains("чужое приложение"));
+
+        let older = write_test_macos_bundle(
+            &root,
+            "Older.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "0.0.1",
+        );
+        assert!(verify_staged_macos_bundle(&older)
+            .unwrap_err()
+            .to_string()
+            .contains("не новее"));
+
+        let newer = write_test_macos_bundle(
+            &root,
+            "Newer.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "999.0.0",
+        );
+        assert!(verify_staged_macos_bundle(&newer).is_ok());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_swap_replaces_the_bundle_and_keeps_the_old_one_as_backup() {
+        let root = macos_cleanup_test_root("swap-ok");
+        std::fs::create_dir_all(&root).unwrap();
+        let current = write_test_macos_bundle(
+            &root,
+            "VoxFlow.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "1.0.0",
+        );
+        let staged = write_test_macos_bundle(
+            &root,
+            ".staged.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "2.0.0",
+        );
+
+        let backup = swap_macos_bundle(&current, &staged).unwrap();
+
+        assert_eq!(
+            macos_bundle_identity(&current).unwrap().version,
+            "2.0.0",
+            "the installed path must now hold the new version"
+        );
+        assert_eq!(
+            macos_bundle_identity(&backup).unwrap().version,
+            "1.0.0",
+            "the running bundle is moved aside, never deleted under our feet"
+        );
+        assert!(!staged.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_swap_restores_the_old_bundle_when_the_new_one_cannot_be_moved_in() {
+        let root = macos_cleanup_test_root("swap-fail");
+        std::fs::create_dir_all(&root).unwrap();
+        let current = write_test_macos_bundle(
+            &root,
+            "VoxFlow.app",
+            "com.nezeronxer.voxflow.macos",
+            "VoxFlow",
+            "1.0.0",
+        );
+        let missing = root.join(".never-staged.app");
+
+        let err = swap_macos_bundle(&current, &missing).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("не удалось установить новую версию"));
+        assert_eq!(
+            macos_bundle_identity(&current).unwrap().version,
+            "1.0.0",
+            "a failed swap must leave the working install exactly where it was"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shell_quoting_survives_paths_with_spaces_and_quotes() {
+        assert_eq!(
+            sh_quote(Path::new("/Applications/Vox Flow.app")),
+            "'/Applications/Vox Flow.app'"
+        );
+        assert_eq!(sh_quote(Path::new("/tmp/it's.app")), r"'/tmp/it'\''s.app'");
+    }
+
+    /// Per-test directory. The label keeps concurrently running tests apart:
+    /// a wall-clock suffix alone can collide, and the loser then has its
+    /// bundles deleted by the winner's teardown.
+    #[cfg(target_os = "macos")]
+    fn macos_cleanup_test_root(label: &str) -> PathBuf {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!(
-            "voxflow-app-cleanup-{}-{nanos}",
+            "voxflow-app-{label}-{}-{nanos}",
             std::process::id()
         ))
     }
@@ -871,7 +1248,7 @@ mod tests {
     fn macos_cleanup_removes_only_strictly_older_verified_bundles() {
         use std::os::unix::fs::symlink;
 
-        let root = macos_cleanup_test_root();
+        let root = macos_cleanup_test_root("cleanup");
         std::fs::create_dir_all(&root).unwrap();
         let current = write_test_macos_bundle(
             &root,
@@ -948,7 +1325,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn finds_enclosing_app_bundle_but_not_standalone_binary() {
-        let root = macos_cleanup_test_root();
+        let root = macos_cleanup_test_root("enclosing");
         std::fs::create_dir_all(&root).unwrap();
         let app = write_test_macos_bundle(
             &root,

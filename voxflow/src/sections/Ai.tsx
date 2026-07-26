@@ -457,6 +457,78 @@ export default function Ai({
           </div>
         )}
       </div>
+
+      <div className="card">
+        <div className="card-head">
+          <div className="card-title">Надёжность рерайта</div>
+          <div className="sub">
+            Рерайт синхронный: не успел или потерял слова — в поле уходит текст
+            после локальных правил.
+          </div>
+        </div>
+
+        <Field
+          label="Таймаут ответа, с"
+          hint="Сколько ждать ответа модели. Локальная Ollama получает минимум 60 с — на CPU меньше не хватает"
+        >
+          <input
+            type="number"
+            min={5}
+            max={300}
+            value={settings.ai_timeout_s}
+            onChange={(e) => {
+              const n = parseInt(e.currentTarget.value, 10);
+              update({
+                ai_timeout_s: Number.isFinite(n)
+                  ? Math.min(300, Math.max(5, n))
+                  : 20,
+              });
+            }}
+          />
+        </Field>
+
+        <Field
+          label="Сохранять слов, %"
+          hint="Какая доля слов диктовки обязана остаться в ответе модели. Ниже порога рерайт отклоняется целиком. 100% = запрет любой потери"
+        >
+          <input
+            type="number"
+            min={0}
+            max={100}
+            step={5}
+            value={Math.round(settings.rewrite_min_recall * 100)}
+            onChange={(e) => {
+              const n = parseInt(e.currentTarget.value, 10);
+              update({
+                rewrite_min_recall: Number.isFinite(n)
+                  ? Math.min(100, Math.max(0, n)) / 100
+                  : 0.9,
+              });
+            }}
+          />
+        </Field>
+
+        <Field
+          label="Максимум токенов ответа"
+          hint="Верхняя граница; фактический лимит считается от длины диктовки. Обрыв по лимиту не вставляется — отдаётся исходный текст"
+        >
+          <input
+            type="number"
+            min={256}
+            max={32768}
+            step={256}
+            value={settings.rewrite_max_output_tokens}
+            onChange={(e) => {
+              const n = parseInt(e.currentTarget.value, 10);
+              update({
+                rewrite_max_output_tokens: Number.isFinite(n)
+                  ? Math.min(32768, Math.max(256, n))
+                  : 4096,
+              });
+            }}
+          />
+        </Field>
+      </div>
     </div>
   );
 }

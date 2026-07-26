@@ -455,7 +455,13 @@ pub fn trim_silence(samples: &[f32], rate: u32) -> Vec<f32> {
 
     let (first, last) = match (first, last) {
         (Some(a), Some(b)) => (a, b),
-        _ => return samples.to_vec(),
+        _ => {
+            log::warn!(
+                "trim_silence: ни один кадр не прошёл порог RMS {THRESHOLD} — буфер оставлен целиком ({} сэмплов)",
+                samples.len()
+            );
+            return samples.to_vec();
+        }
     };
 
     // Поля ~150 мс.

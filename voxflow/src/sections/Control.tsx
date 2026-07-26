@@ -89,7 +89,7 @@ export default function Control({
       setUpdateStatus(opened ? "Страница релиза открыта" : "Не удалось открыть релиз");
       return;
     }
-    setUpdateStatus("Скачиваю установщик…");
+    setUpdateStatus("Скачиваю обновление…");
     const result = await installUpdate(
       updateInfo.asset_url,
       updateInfo.asset_name,
@@ -97,11 +97,7 @@ export default function Control({
       updateInfo.asset_digest,
     );
     setInstallingUpdate(false);
-    setUpdateStatus(
-      result?.launched
-        ? "Установщик запущен. VoxFlow закроется."
-        : "Не удалось запустить установщик",
-    );
+    setUpdateStatus(result?.launched ? result.message : "Не удалось установить обновление");
   }
 
   return (
