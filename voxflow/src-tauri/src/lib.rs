@@ -151,6 +151,8 @@ pub fn run() {
                 recording,
                 hotkey_capture_active,
                 overlay_hit: overlay_hit.clone(),
+                // Выведется из окна при первой смене режима (см. overlay_box).
+                overlay_anchor: Mutex::new(None),
                 lang_menu: Mutex::new(None), // заполнит build_tray ниже
             });
 
@@ -1049,6 +1051,9 @@ pub(crate) fn commit_overlay_position(app: &tauri::AppHandle) -> Result<(), Stri
     let Some(state) = app.try_state::<AppState>() else {
         return Err("VoxFlow state is unavailable".into());
     };
+    // В память — чтобы следующая смена режима считала позицию от НОВОГО места,
+    // а не вернула плашку туда, где она была до перетаскивания.
+    *state.overlay_anchor.lock() = Some(anchor);
     db::kv_set(
         &state.db.lock(),
         "overlay_anchor",
@@ -1099,8 +1104,10 @@ fn setup_overlay(app: &tauri::AppHandle) {
         let mut placed = false;
         let win_w_i = win_w.round() as i32;
         let win_h_i = win_h.round() as i32;
+        // Та же формула, что при смене режима, — иначе стартовая позиция и
+        // позиция после первой диктовки могут разойтись на пиксель.
         let saved_position = saved_anchor
-            .map(|(center_x, bottom_y)| (center_x - win_w_i / 2, bottom_y - win_h_i))
+            .map(|anchor| commands::overlay_box_position(anchor, (win_w_i, win_h_i)))
             .or(saved_legacy);
         if let (Some((x, y)), Ok(monitors)) = (saved_position, ov.available_monitors()) {
             let visible = monitors.iter().any(|mon| {

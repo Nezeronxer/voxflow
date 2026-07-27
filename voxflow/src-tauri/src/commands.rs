@@ -49,6 +49,13 @@ pub struct AppState {
     /// окно должно ловить мышь. Вне её окно click-through (фуллскрин-приложения
     /// под оверлеем остаются кликабельными). Обновляет фронт (overlay_hit).
     pub overlay_hit: Arc<Mutex<OverlayHitRect>>,
+    /// Устойчивый якорь плашки (центр X, нижняя грань) в физических px.
+    /// Смена режима меняет размер окна, и позицию НЕЛЬЗЯ считать цепочкой от
+    /// предыдущей: `(old_w - new_w) / 2` — целочисленное деление, и при нечётной
+    /// разнице каждый переход терял по половине пикселя в одну сторону. При
+    /// `overlay_scale != 1.0` ширины становятся нечётными, и плашка уезжала
+    /// ровно на 1 px за диктовку (см. overlay_box_position).
+    pub overlay_anchor: Mutex<Option<(i32, i32)>>,
     /// Подменю «Язык» трея; None до build_tray. Синхронизируется в save_settings.
     pub lang_menu: Mutex<Option<LangMenu>>,
 }
@@ -965,6 +972,125 @@ pub fn install_update(
 }
 
 #[cfg(test)]
+mod overlay_box_tests {
+    use super::overlay_box_position;
+
+    /// Физический размер окна режима: логический BOX × overlay_scale × DPI.
+    /// Значения BOX синхронизированы с Overlay.tsx (контракт overlay-geometry.test.mjs).
+    fn window_px(logical: (i32, i32), user_scale: f64, dpi: f64) -> (i32, i32) {
+        let px = |v: i32| (f64::from(v) * user_scale * dpi).round().max(1.0) as i32;
+        (px(logical.0), px(logical.1))
+    }
+
+    const IDLE: (i32, i32) = (266, 60);
+    const REC: (i32, i32) = (260, 66);
+    const TRANS: (i32, i32) = (256, 64);
+    const LATCH: (i32, i32) = (264, 66);
+    const STREAM: (i32, i32) = (384, 104);
+
+    /// Модель ПРЕЖНЕГО поведения: позиция считалась цепочкой от предыдущей.
+    /// Нужна, чтобы тест доказывал регрессию, а не проверял сам себя.
+    fn chained_position(
+        prev_pos: (i32, i32),
+        prev_size: (i32, i32),
+        new_size: (i32, i32),
+    ) -> (i32, i32) {
+        (
+            prev_pos.0 + (prev_size.0 - new_size.0) / 2,
+            prev_pos.1 + (prev_size.1 - new_size.1),
+        )
+    }
+
+    /// Прогнать N циклов диктовки и вернуть позицию окна в состоянии idle.
+    fn idle_position_after(cycles: usize, user_scale: f64, dpi: f64, chained: bool) -> (i32, i32) {
+        let anchor = (1710, 1992);
+        let modes = [IDLE, LATCH, REC, TRANS, STREAM, IDLE];
+        let idle_px = window_px(IDLE, user_scale, dpi);
+        let mut pos = overlay_box_position(anchor, idle_px);
+        let mut size = idle_px;
+        for _ in 0..cycles {
+            for logical in modes {
+                let next = window_px(logical, user_scale, dpi);
+                if next == size {
+                    continue; // overlay_box выходит раньше, если размер тот же
+                }
+                pos = if chained {
+                    chained_position(pos, size, next)
+                } else {
+                    overlay_box_position(anchor, next)
+                };
+                size = next;
+            }
+        }
+        pos
+    }
+
+    /// Плашка не должна уезжать, сколько бы диктовок подряд ни было.
+    ///
+    /// Регрессия: позиция считалась цепочкой `x += (old_w - new_w) / 2`, и при
+    /// нечётной разнице усечение к нулю копило по пикселю за цикл. При
+    /// overlay_scale = 0.9 на Retina ширины 479/468/461 — плашка уползала влево
+    /// и в итоге выходила за край экрана.
+    #[test]
+    fn pill_does_not_drift_across_repeated_dictations() {
+        for (user_scale, dpi) in [(0.9, 2.0), (1.0, 2.0), (1.25, 2.0), (0.8, 1.0), (1.1, 1.5)] {
+            let start = idle_position_after(0, user_scale, dpi, false);
+            let after = idle_position_after(200, user_scale, dpi, false);
+            assert_eq!(
+                after, start,
+                "плашка уехала при overlay_scale={user_scale}, dpi={dpi}"
+            );
+        }
+    }
+
+    /// Тот же прогон на прежней реализации обязан уезжать — иначе тест выше
+    /// ничего не стережёт. Дрейф ловится ровно на пользовательском масштабе.
+    #[test]
+    fn chained_positioning_is_what_used_to_drift() {
+        let start = idle_position_after(0, 0.9, 2.0, true);
+        let after = idle_position_after(200, 0.9, 2.0, true);
+        assert!(
+            after.0 < start.0 - 100,
+            "ожидали заметный увод влево, получили {} → {}",
+            start.0,
+            after.0
+        );
+        assert_eq!(after.1, start.1, "по вертикали цепочка не копила ошибку");
+
+        // На дефолтном масштабе все ширины чётные — поэтому баг и не ловился.
+        assert_eq!(
+            idle_position_after(200, 1.0, 2.0, true),
+            idle_position_after(0, 1.0, 2.0, true)
+        );
+    }
+
+    /// Низ окна и центр держатся на якоре: пилюля растёт вверх и не съезжает вбок.
+    #[test]
+    fn anchor_keeps_bottom_edge_and_horizontal_center() {
+        let anchor = (1000, 800);
+        for size in [(479, 108), (468, 119), (691, 187)] {
+            let (x, y) = overlay_box_position(anchor, size);
+            assert_eq!(y + size.1, anchor.1, "нижняя грань обязана стоять на якоре");
+            let center_error = (x + size.0 / 2 - anchor.0).abs();
+            assert!(
+                center_error <= 1,
+                "центр уехал на {center_error} px при размере {size:?}"
+            );
+        }
+    }
+
+    /// Якорь у верхнего/левого края экрана не должен уводить окно в переполнение.
+    #[test]
+    fn anchor_near_screen_origin_does_not_overflow() {
+        let (x, y) = overlay_box_position((0, 0), (479, 108));
+        assert_eq!((x, y), (-239, -108));
+        // Абсурдный якорь зажимается в границу типа, а не переполняется в панику.
+        let (x, y) = overlay_box_position((i32::MIN, i32::MIN), (479, 108));
+        assert_eq!((x, y), (i32::MIN, i32::MIN));
+    }
+}
+
+#[cfg(test)]
 mod prompt_rewrite_tests {
     use super::build_prompt_rewrite_request;
 
@@ -1055,11 +1181,27 @@ pub fn corrections_delete(state: State<AppState>, id: i64) -> R<()> {
     Ok(())
 }
 
+/// Позиция окна плашки под новый размер: центр X и нижняя грань берутся из
+/// ЯКОРЯ, а не из предыдущей позиции окна.
+///
+/// Так каждый режим всегда попадает в один и тот же пиксель, сколько бы раз
+/// плашка ни меняла размер. Прежний вариант складывал `(old_w - new_w) / 2` от
+/// шага к шагу; при нечётной разнице усечение к нулю съедало полпикселя, и за
+/// цикл диктовки idle→rec→trans набегал ровно 1 px влево. Ширины становятся
+/// нечётными при `overlay_scale != 1.0` (у 0.9 на Retina: 479/468/461), поэтому
+/// на дефолтном масштабе дрейфа не было и баг не воспроизводился.
+pub(crate) fn overlay_box_position(anchor: (i32, i32), new_size: (i32, i32)) -> (i32, i32) {
+    (
+        anchor.0.saturating_sub(new_size.0 / 2),
+        anchor.1.saturating_sub(new_size.1),
+    )
+}
+
 /// Подогнать окно overlay под текущий размер пилюли (логические px от фронта).
-/// Низ окна держим на месте (пилюля растёт вверх), X — по центру прежнего окна,
-/// чтобы перетащенная пользователем позиция не сбрасывалась при смене состояния.
+/// Низ окна держим на месте (пилюля растёт вверх), X — по центру якоря, чтобы
+/// перетащенная пользователем позиция не сбрасывалась при смене состояния.
 #[tauri::command]
-pub fn overlay_box(app: AppHandle, w: f64, h: f64) -> R<()> {
+pub fn overlay_box(app: AppHandle, state: State<AppState>, w: f64, h: f64) -> R<()> {
     use tauri::{PhysicalPosition, PhysicalSize};
     let Some(ov) = app.get_webview_window("overlay") else {
         return Ok(());
@@ -1074,8 +1216,17 @@ pub fn overlay_box(app: AppHandle, w: f64, h: f64) -> R<()> {
     if old_size.width as i32 == new_w && old_size.height as i32 == new_h {
         return Ok(());
     }
-    let x = old_pos.x + (old_size.width as i32 - new_w) / 2;
-    let y = old_pos.y + (old_size.height as i32 - new_h);
+
+    // Якорь берём из состояния; при первой смене режима после старта выводим его
+    // из текущего окна — дальше он живёт сам и от размеров уже не зависит.
+    let anchor = {
+        let mut stored = state.overlay_anchor.lock();
+        *stored.get_or_insert((
+            old_pos.x + old_size.width as i32 / 2,
+            old_pos.y + old_size.height as i32,
+        ))
+    };
+    let (x, y) = overlay_box_position(anchor, (new_w, new_h));
     let _ = ov.set_size(PhysicalSize::new(new_w as u32, new_h as u32));
     let _ = ov.set_position(PhysicalPosition::new(x, y));
     Ok(())
