@@ -423,3 +423,71 @@
 - **Зелёные прогоны**: `cargo fmt --check` exit 0; `cargo clippy --all-targets -- -D warnings`
   без новых предупреждений; `cargo test` 323 passed / 0 failed; `npm test` 21/21;
   `npx tsc --noEmit` + `npm run build` exit 0; `python3 script/check_versions.py` → 2.0.11. ✅
+
+## 2026-08-06 — Плашка ≠ вставка, раздел «Промпты», WER-бенч
+
+Решение и границы — `DECISIONS.md`, D-025.
+
+- **Кружок показывал не то, что вставляется** (главный симптом). Корень: живой preview
+  пропускал шаг определения языка, который делает финал. `maybe_start_partial_loop` в двух
+  ветках (`auto` + gigaam; macOS whisper_server + ru/auto) поднимал GigaAM с
+  `fixed_lang: Some("ru")` ради каденса — на английской и смешанной речи плашка показывала
+  кириллический мусор, а в поле приезжал верный текст от другого движка. `LocalLoopTuning`
+  получил флаг `speculative`; такие маршруты пропускают текст через `preview_text_trusted` —
+  то же правило доверия (`gigaam_auto_final_trusted`), которым финал решает, верить ли GigaAM.
+  Тест `speculative_preview_shows_only_what_the_final_would_accept`. ✅
+- **Раздел «Промпты»** — новая вкладка `sections/Prompts.tsx`. Модель определяется
+  автоматически: `app_context::ai_target` по тем же маркерам, что и профиль `"ai"`.
+  Правила оформления по вендорам — `engine::builtin_prompt_rules`; включаются настройкой
+  `prompt_rebuild` (по умолчанию выкл, потому что режим ждёт ответ LLM перед вставкой).
+  Переопределения пользователя пишутся в существующий `ai_prompt_rules`, нового хранилища
+  и миграции не потребовалось. Лимит раздувания ответа стал параметром
+  (`REWRITE_MAX_EXPANSION` = 2, `PROMPT_REBUILD_MAX_EXPANSION` = 4) — структурный промпт под
+  2× не влезал; проверка на потерю содержания не ослаблена. Тесты
+  `ai_target_names_the_model_behind_the_ai_profile`, `prompt_rebuild_is_opt_in_and_carries_vendor_rules`,
+  `user_rule_replaces_builtin_prompt_rules`,
+  `prompt_rebuild_allows_structure_but_still_rejects_lost_content`. ✅
+- **`voxflow --wer-bench [каталог] [сколько файлов]`** — пословный WER по всем доступным
+  маршрутам, whisper с постобработкой отдельной строкой. Эталон — `<имя>.txt` рядом с
+  `<имя>.wav`; `samples.text` эталоном быть не может (там вывод самого ASR). Без эталонов
+  печатает расхождение маршрутов между собой. По умолчанию 40 последних файлов из `dataset/`,
+  сколько пропущено — печатается. Тест `wer_counts_words_not_punctuation_or_case`. ✅
+- **Правки параметров ASR НЕ сделаны** — сознательно. В `dataset/` 490 записей и ноль
+  эталонов, то есть подтвердить улучшение нечем, а D-016 — ровно история о том, как beam
+  search и праймящий prompt крутили вслепую и стало хуже. Кандидаты перечислены в D-025.
+- **Найдено попутно:** `whisper-cli` из `paths::whisper_dir_standalone()` падает с SIGSEGV —
+  видно в выводе бенча. Основной маршрут приложения (`whisper_server`) не затронут.
+- **Зелёные прогоны:** `cargo fmt --check` exit 0; `cargo clippy --all-targets` без новых
+  предупреждений; `cargo test` 339 passed / 0 failed; `npm test` 21/21; `npx tsc --noEmit`
+  и `npm run build` exit 0; `python3 script/check_versions.py` → 2.0.13. ✅
+
+## 2026-08-06 (продолжение) — правила промпта по номеру модели + автообновление
+
+Решение и границы — `DECISIONS.md`, D-026.
+
+- **Проверено до проектирования:** заголовок окна приложения Claude = `Claude`, дерево
+  доступности окна = 0 элементов, VoxFlow видит только exe/заголовок/сфокусированное поле.
+  Номер модели автоматически определить нечем → сервис детектится сам, модель выбирается
+  в разделе. ✅
+- **Правила стали данными:** `src-tauri/src/prompt_rules.json` (вшит `include_str!`) — каталог
+  моделей с id, сервисом, URL документации и текстом правил. Составлен по документации Anthropic
+  (отдельные страницы Opus 5 и Sonnet 5), OpenAI (GPT-5.1/5.2, Codex) и Google (Gemini 3). ✅
+- **Автообновление:** `prompt_rules.rs` качает страницу документации, считает SHA-256, сравнивает
+  с хешем прошлой пересборки; изменился — выжимает правила настроенным бэкендом в
+  `data_dir/prompt_rules_cache.json`. Anthropic отдаёт `.md`, HTML не парсим. Раз в сутки, только
+  при включённой пересборке, без бэкенда — выход сразу без сети. Выжимка вне 80–900 символов
+  отклоняется. ✅
+- **`engine::ask_configured_llm`** — разовый запрос к настроенному бэкенду через существующий
+  `configured_rewrite_backend`. Прямой вызов `rewrite::refine` работал бы только у пользователей
+  OpenAI-совместимого маршрута. ✅
+- **UI:** выбор модели по сервису, действующий текст правил, ссылка на источник, дата проверки и
+  кнопка «Проверить документацию» (`commands::prompt_models`, `commands::refresh_prompt_rules`).
+- **Тесты:** `bundled_catalog_parses_and_covers_detected_services`, `claude_tiers_carry_different_rules`,
+  `selected_model_falls_back_to_first_of_service`, `doc_hash_changes_with_the_document`,
+  `recent_check_is_skipped_but_missing_or_broken_timestamp_is_not`,
+  `refresh_without_a_backend_does_not_touch_the_network` (герметичный),
+  обновлён `prompt_rebuild_is_opt_in_and_carries_vendor_rules` — теперь проверяет, что
+  переключение Claude с Opus на Sonnet меняет правила. ✅
+- **Зелёные прогоны:** `cargo fmt --check` exit 0; `cargo clippy --all-targets` чисто;
+  `cargo test` 345 passed / 0 failed; `npm test` 21/21; `npx tsc --noEmit` и `npm run build`
+  exit 0. ✅

@@ -367,6 +367,38 @@ fn value_from_window_id<'a>(window_id: &'a str, key: &str) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
+/// Какая именно нейросеть на том конце: `"claude"`, `"chatgpt"`, `"gemini"`…
+///
+/// Категория [`classify`] сваливает все AI-чаты в один профиль `"ai"`, но
+/// правила оформления промпта у вендоров разные, поэтому разделу «Промпты»
+/// нужна конкретная цель. Маркеры — те же подстроки, что и в правиле `"ai"`
+/// таблицы `classify`; отдельного детекта не заводим.
+///
+/// Порядок проверки важен: специфичное раньше общего (вкладка Codex живёт на
+/// том же домене, что и ChatGPT). Неизвестный AI-чат → `None`: он получит
+/// только общую AI-подводку без вендорских правил.
+pub fn ai_target(exe: &str, title: &str) -> Option<&'static str> {
+    const TARGETS: &[(&str, &[&str])] = &[
+        ("codex", &["codex"]),
+        ("claude", &["claude"]),
+        ("chatgpt", &["chatgpt", "chat.openai", "openai"]),
+        ("gemini", &["gemini.google", "gemini", "bard"]),
+        ("perplexity", &["perplexity"]),
+        ("grok", &["grok", "x.ai"]),
+        ("deepseek", &["deepseek"]),
+        ("copilot", &["copilot"]),
+        ("mistral", &["mistral", "le chat"]),
+    ];
+    let exe = exe.to_lowercase();
+    let title = title.to_lowercase();
+    TARGETS.iter().find_map(|(id, markers)| {
+        markers
+            .iter()
+            .any(|m| exe.contains(m) || title.contains(m))
+            .then_some(*id)
+    })
+}
+
 /// Классифицирует приложение по имени exe и заголовку окна.
 ///
 /// Оба аргумента уже должны быть в нижнем регистре. Маршрутизация задана
@@ -603,7 +635,7 @@ pub fn category_for(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::category_for;
+    use super::{ai_target, category_for};
     use crate::settings::ProfileOverride;
 
     fn ov(pattern: &str, profile: &str) -> ProfileOverride {
@@ -629,6 +661,25 @@ mod tests {
     fn empty_and_invalid_overrides_are_skipped() {
         let rules = vec![ov("  ", "formal"), ov("telegram", "unknown")];
         assert_eq!(category_for("telegram.exe", "Chat", &rules), "casual");
+    }
+
+    /// Раздел «Промпты» опирается на конкретную модель, а не на общий профиль
+    /// `"ai"`: правила оформления у вендоров разные.
+    #[test]
+    fn ai_target_names_the_model_behind_the_ai_profile() {
+        assert_eq!(ai_target("chrome.exe", "Claude"), Some("claude"));
+        assert_eq!(ai_target("chrome.exe", "ChatGPT"), Some("chatgpt"));
+        assert_eq!(ai_target("chrome.exe", "Gemini"), Some("gemini"));
+        // Регистр не важен — окна приходят как есть.
+        assert_eq!(ai_target("Chrome.exe", "Perplexity AI"), Some("perplexity"));
+        // Codex живёт на домене ChatGPT, поэтому проверяется раньше.
+        assert_eq!(
+            ai_target("chrome.exe", "Codex - chatgpt.com"),
+            Some("codex")
+        );
+        // Не AI-окно и незнакомый чат вендорских правил не получают.
+        assert_eq!(ai_target("telegram.exe", "Chat"), None);
+        assert_eq!(ai_target("chrome.exe", "Poe"), None);
     }
 
     #[test]

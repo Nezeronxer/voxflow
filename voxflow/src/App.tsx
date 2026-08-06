@@ -37,9 +37,16 @@ import { ErrorBoundary } from "./ErrorBoundary";
 const History = lazy(() => import("./sections/History"));
 const Dictionary = lazy(() => import("./sections/Dictionary"));
 const Snippets = lazy(() => import("./sections/Snippets"));
+const Prompts = lazy(() => import("./sections/Prompts"));
 const SettingsHub = lazy(() => import("./sections/SettingsHub"));
 
-type TabId = "dashboard" | "history" | "dictionary" | "snippets" | "settings";
+type TabId =
+  | "dashboard"
+  | "history"
+  | "dictionary"
+  | "snippets"
+  | "prompts"
+  | "settings";
 
 const NAV: {
   id: Exclude<TabId, "settings">;
@@ -50,6 +57,7 @@ const NAV: {
   { id: "history", label: "История", icon: Icon.Clock },
   { id: "dictionary", label: "Словарь", icon: Icon.Book },
   { id: "snippets", label: "Сниппеты", icon: Icon.Code },
+  { id: "prompts", label: "Промпты", icon: Icon.Sparkles },
 ];
 
 type Route = { tab: TabId; settingsPage?: SettingsPageId };
@@ -376,6 +384,9 @@ export default function App() {
               {tab === "history" && <History />}
               {tab === "dictionary" && <Dictionary />}
               {tab === "snippets" && <Snippets />}
+              {tab === "prompts" && (
+                <Prompts settings={settings} update={update} />
+              )}
               {tab === "settings" && (
                 <SettingsHub
                   page={settingsPage}
