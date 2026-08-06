@@ -15,6 +15,8 @@ import type {
   CorrectionEntry,
   ActiveAppContext,
   ProfileOverride,
+  PromptModelView,
+  PromptRulesRefresh,
   TransformResult,
   UpdateInfo,
   UpdateInstallResult,
@@ -363,6 +365,18 @@ export function showMainWindow(): Promise<void> {
   return safe<void>(async () => {
     await invoke("show_main_window");
   }, undefined);
+}
+
+export function promptModels(): Promise<PromptModelView[]> {
+  if (!IS_TAURI_RUNTIME) return Promise.resolve([]);
+  return safe<PromptModelView[]>(
+    async () => await invoke<PromptModelView[]>("prompt_models"),
+    [],
+  );
+}
+
+export function refreshPromptRules(): Promise<PromptRulesRefresh> {
+  return invoke<PromptRulesRefresh>("refresh_prompt_rules");
 }
 
 export function activeAppContext(): Promise<ActiveAppContext> {

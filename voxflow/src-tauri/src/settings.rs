@@ -171,6 +171,29 @@ pub struct Settings {
     /// Пользовательские правила превращения диктовки в промпт для отдельных
     /// нейросетей/AI-чатов. Пустой список = только общий smart prompt.
     pub ai_prompt_rules: Vec<AiPromptRule>,
+    /// Пересобирать диктовку в структурный промпт по встроенным правилам той
+    /// нейросети, в которую пишет пользователь (раздел «Промпты»).
+    ///
+    /// По умолчанию ВЫКЛ: режим ждёт ответ LLM перед вставкой, а встроенный
+    /// AI-контекст намеренно оставлен быстрым (см. тест
+    /// `builtin_ai_context_does_not_block_final_insert_on_rewrite`). Своё
+    /// правило для приложения перекрывает встроенное и работает независимо
+    /// от этого флага.
+    pub prompt_rebuild: bool,
+    /// Какая модель выбрана для каждого сервиса: у Opus и Sonnet правила
+    /// оформления промпта разные, а автоматически номер модели не определить —
+    /// ни заголовок окна, ни дерево доступности его не содержат. Пусто для
+    /// сервиса → берётся первая модель сервиса из каталога `prompt_rules.json`.
+    pub prompt_models: Vec<PromptModelChoice>,
+}
+
+/// Выбор конкретной модели внутри сервиса: `claude` → `claude-opus-5`.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct PromptModelChoice {
+    /// Сервис из `app_context::ai_target`: claude, chatgpt, gemini…
+    pub service: String,
+    /// `id` модели из каталога `prompt_rules.json`.
+    pub model: String,
 }
 
 /// Пользовательское правило: если `pattern` встречается в имени exe или заголовке
@@ -263,6 +286,8 @@ impl Default for Settings {
             proxy_url: String::new(),
             app_profile_overrides: Vec::new(),
             ai_prompt_rules: Vec::new(),
+            prompt_rebuild: false,
+            prompt_models: Vec::new(),
         }
     }
 }

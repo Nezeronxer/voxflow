@@ -18,6 +18,7 @@ mod ollama;
 mod parakeet;
 mod paths;
 mod postprocess;
+mod prompt_rules;
 mod rewrite;
 mod settings;
 mod system_audio;
@@ -51,6 +52,13 @@ pub fn run() {
         }
         if args.len() >= 3 && args[1] == "--lid-selftest" {
             lid_selftest(&args[2]);
+            return;
+        }
+        // Каталог и лимит необязательны: `--wer-bench [каталог] [сколько файлов]`.
+        if args.len() >= 2 && args[1] == "--wer-bench" {
+            let dir = args.get(2).map(String::as_str).unwrap_or("");
+            let limit = args.get(3).and_then(|v| v.parse::<usize>().ok());
+            wer_bench(dir, limit);
             return;
         }
     }
@@ -170,6 +178,10 @@ pub fn run() {
             // блокировать setup и задерживать показ окна.
             spawn_autostart_reconcile(handle.clone(), want_autostart);
 
+            // Документация вендоров меняется — правила оформления промпта
+            // подтягиваются из неё сами, не дожидаясь обновления приложения.
+            spawn_prompt_rules_refresh(startup_settings.clone());
+
             // Показать окно настроек при запуске, НО не при автозапуске (тогда — в трей).
             if !autostarted {
                 if let Some(main) = handle.get_webview_window("main") {
@@ -217,6 +229,8 @@ pub fn run() {
             commands::transform_text,
             commands::default_app_profile_presets,
             commands::stt_test,
+            commands::prompt_models,
+            commands::refresh_prompt_rules,
             commands::check_for_update,
             commands::install_update,
             commands::corrections_list,
@@ -255,6 +269,34 @@ fn spawn_stale_temp_cleanup() {
         })
     {
         log::warn!("не удалось запустить startup cleanup: {e}");
+    }
+}
+
+/// Фоновая проверка вендорской документации на старте.
+///
+/// Условия намеренно узкие. Пересборка правил зовёт настроенную пользователем
+/// LLM и ходит в сеть, поэтому запускается только когда пересборка промптов
+/// реально включена — иначе приложение тратило бы чужие токены и светило
+/// запросами ради функции, которой не пользуются. Внутри ещё и суточный
+/// throttle по отметке времени в кэше, так что частые перезапуски безвредны.
+fn spawn_prompt_rules_refresh(settings: settings::Settings) {
+    if !settings.prompt_rebuild {
+        return;
+    }
+    if let Err(e) = std::thread::Builder::new()
+        .name("voxflow-prompt-rules".into())
+        .spawn(move || {
+            let report =
+                prompt_rules::refresh(&settings, &prompt_rules::catalog(), /* force */ false);
+            if !report.updated.is_empty() {
+                log::info!(
+                    "правила промптов обновлены из документации: {}",
+                    report.updated.join(", ")
+                );
+            }
+        })
+    {
+        log::warn!("не удалось запустить проверку правил промптов: {e}");
     }
 }
 
@@ -820,6 +862,241 @@ fn read_wav_mono_16k(wav_path: &str) -> Vec<f32> {
     audio::resample_to_16k(&mono, spec.sample_rate)
 }
 
+/// Сколько записей берёт бенч без явного лимита. Полный `dataset/` — сотни
+/// файлов на три маршрута, это часы; для сравнения «до/после» хватает хвоста.
+const WER_BENCH_DEFAULT_LIMIT: usize = 40;
+
+/// Слова для WER: регистр, ё/е и пунктуация ошибкой распознавания не являются.
+fn wer_words(text: &str) -> Vec<String> {
+    text.to_lowercase()
+        .replace('ё', "е")
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Пословный WER: расстояние Левенштейна к эталону / число слов эталона.
+/// `None` — эталон пуст, считать не от чего.
+fn wer(reference: &str, hypothesis: &str) -> Option<f64> {
+    let r = wer_words(reference);
+    let h = wer_words(hypothesis);
+    if r.is_empty() {
+        return None;
+    }
+    let mut prev: Vec<usize> = (0..=h.len()).collect();
+    let mut cur = vec![0usize; h.len() + 1];
+    for (i, rw) in r.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, hw) in h.iter().enumerate() {
+            let substitute = prev[j] + usize::from(rw != hw);
+            cur[j + 1] = substitute.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    Some(prev[h.len()] as f64 / r.len() as f64)
+}
+
+/// Замер распознавания на СВОИХ записях. Без него любая правка параметров ASR —
+/// угадайка: в `DECISIONS.md` (D-016) уже записан заход, где beam search,
+/// `--suppress-nst` и праймящий prompt распознавание ухудшили.
+///
+/// Запуск: `voxflow --wer-bench [каталог] [сколько файлов]`. Без аргументов —
+/// `dataset/` (записи, которые приложение сохраняет при включённой
+/// персонализации) и последние [`WER_BENCH_DEFAULT_LIMIT`] файлов: прогон всех
+/// сотен записей через три маршрута занимает часы, а сколько именно файлов
+/// взято, печатается в шапке.
+///
+/// Эталон — файл `<имя>.txt` рядом с `<имя>.wav`, где написано, что было
+/// сказано на самом деле. Столбец `samples.text` в БД эталоном служить НЕ может:
+/// там лежит вывод самого ASR, сравнение с ним всегда даст ноль ошибок.
+/// Без эталонов бенч печатает расхождение маршрутов между собой — этого хватает,
+/// чтобы увидеть выпадающий маршрут и написать эталоны только для спорных файлов.
+pub fn wer_bench(dir: &str, limit: Option<usize>) {
+    use std::path::{Path, PathBuf};
+    use std::time::Instant;
+
+    let s = cli_load_settings("wer");
+    let root: PathBuf = if dir.trim().is_empty() {
+        paths::dataset_dir()
+    } else {
+        PathBuf::from(dir)
+    };
+    let mut wavs: Vec<PathBuf> = match std::fs::read_dir(&root) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("wav"))
+            .collect(),
+        Err(e) => {
+            eprintln!("[wer] каталог {root:?} не прочитан: {e}");
+            return;
+        }
+    };
+    wavs.sort();
+    if wavs.is_empty() {
+        eprintln!("[wer] в {root:?} нет ни одного .wav");
+        return;
+    }
+    // Отбрасываем ЯВНО: молчаливое усечение выглядело бы как «прогнали всё».
+    let found = wavs.len();
+    let limit = limit.unwrap_or(WER_BENCH_DEFAULT_LIMIT).max(1);
+    if found > limit {
+        wavs = wavs.split_off(found - limit);
+        eprintln!(
+            "[wer] каталог {root:?}: найдено {found}, взяты {limit} последних — \
+             остальные пропущены (третий аргумент задаёт другое число)"
+        );
+    } else {
+        eprintln!("[wer] каталог {root:?}, файлов: {found}");
+    }
+
+    let threads = s.effective_threads() as usize;
+    let mut gigaam = gigaam::dir_ready(&paths::gigaam_dir())
+        .then(|| gigaam::GigaAm::load(&paths::gigaam_dir(), threads).ok())
+        .flatten();
+    let mut parakeet = parakeet::dir_ready(&paths::parakeet_dir())
+        .then(|| parakeet::Parakeet::load(&paths::parakeet_dir(), threads).ok())
+        .flatten();
+    let whisper_dir = paths::whisper_dir_standalone();
+    let whisper_model = paths::model_path(&s.model);
+    let whisper_ready = whisper_model.exists();
+    eprintln!(
+        "[wer] маршруты: gigaam={} parakeet={} whisper={}",
+        gigaam.is_some(),
+        parakeet.is_some(),
+        whisper_ready
+    );
+    if let (Some(g), Some(p)) = (gigaam.as_mut(), parakeet.as_mut()) {
+        let _ = g.transcribe(&vec![0.0f32; 8000]);
+        let _ = p.transcribe(&vec![0.0f32; 8000]);
+    }
+
+    // (маршрут, сумма WER, файлов с эталоном, суммарное время мс)
+    let mut totals: Vec<(String, f64, usize, u128)> = Vec::new();
+    let mut add = |route: &str, w: Option<f64>, ms: u128| {
+        let slot = match totals.iter_mut().find(|(name, ..)| name == route) {
+            Some(slot) => slot,
+            None => {
+                totals.push((route.to_string(), 0.0, 0, 0));
+                totals.last_mut().expect("только что добавлен")
+            }
+        };
+        slot.3 += ms;
+        if let Some(w) = w {
+            slot.1 += w;
+            slot.2 += 1;
+        }
+    };
+
+    let mut with_reference = 0usize;
+    for wav in &wavs {
+        let name = wav.file_name().unwrap_or_default().to_string_lossy();
+        let reference = std::fs::read_to_string(wav.with_extension("txt"))
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+        if reference.is_some() {
+            with_reference += 1;
+        }
+        println!("\n== {name}");
+        if let Some(r) = reference.as_deref() {
+            println!("   эталон   : {r}");
+        }
+
+        let audio = read_wav_mono_16k(&wav.to_string_lossy());
+        let mut hyps: Vec<(String, String)> = Vec::new();
+
+        // Упавший маршрут ОБЯЗАН выглядеть как ошибка, а не как пустая
+        // расшифровка: молча подставленная пустая строка даёт 100% WER и
+        // читается как «этот движок ужасен», хотя он просто не запустился.
+        let mut run = |route: &str, ms: u128, result: anyhow::Result<String>| -> Option<String> {
+            match result {
+                Ok(text) => {
+                    let w = reference.as_deref().and_then(|r| wer(r, &text));
+                    report_route(route, &text, w, ms);
+                    add(route, w, ms);
+                    Some(text)
+                }
+                Err(e) => {
+                    println!("   {route:<13} ОШИБКА: {e:#}");
+                    None
+                }
+            }
+        };
+
+        if let Some(g) = gigaam.as_mut() {
+            let t = Instant::now();
+            let out = g.transcribe(&audio);
+            if let Some(text) = run("gigaam", t.elapsed().as_millis(), out) {
+                hyps.push(("gigaam".into(), text));
+            }
+        }
+        if let Some(p) = parakeet.as_mut() {
+            let t = Instant::now();
+            let out = p.transcribe(&audio);
+            if let Some(text) = run("parakeet", t.elapsed().as_millis(), out) {
+                hyps.push(("parakeet".into(), text));
+            }
+        }
+        if whisper_ready {
+            let t = Instant::now();
+            let out = asr::transcribe_cli(&asr::AsrParams {
+                whisper_dir: &whisper_dir,
+                model_path: &whisper_model,
+                wav_path: Path::new(wav),
+                language: &s.language,
+                threads: s.effective_threads(),
+                initial_prompt: None,
+            });
+            if let Some(text) = run("whisper", t.elapsed().as_millis(), out) {
+                // Постобработка меряется отдельно: она уже один раз съедала слова
+                // (см. PROMPT_OPUS5_TEXT_LOSS.md), и по одной цифре «итогового»
+                // WER было бы не понять, ASR это или правила.
+                let clean = postprocess::process(&text, &s, &[], &[]);
+                if clean.trim() != text.trim() {
+                    run("whisper+post", 0, Ok(clean));
+                }
+                hyps.push(("whisper".into(), text));
+            }
+        }
+
+        // Эталона нет — показываем расхождение маршрутов между собой.
+        if reference.is_none() && hyps.len() > 1 {
+            let (base_name, base_text) = &hyps[0];
+            for (name, text) in hyps.iter().skip(1) {
+                if let Some(d) = wer(base_text, text) {
+                    println!("   расхождение {name} к {base_name}: {:.0}%", d * 100.0);
+                }
+            }
+        }
+    }
+
+    println!("\n== итого (эталонов: {with_reference} из {})", wavs.len());
+    for (route, sum, count, ms) in &totals {
+        if *count > 0 {
+            println!(
+                "   {route:<13} WER {:.1}%  файлов {count}  {ms} мс",
+                sum / *count as f64 * 100.0
+            );
+        } else {
+            println!("   {route:<13} WER —  (нет эталонов)  {ms} мс");
+        }
+    }
+    if with_reference == 0 {
+        println!(
+            "   Эталонов нет: положите рядом с каждым .wav файл .txt с тем, что было сказано."
+        );
+    }
+}
+
+fn report_route(route: &str, text: &str, w: Option<f64>, ms: u128) {
+    match w {
+        Some(w) => println!("   {route:<13} WER {:>5.1}%  {ms:>5} мс  {text}", w * 100.0),
+        None => println!("   {route:<13} WER     —  {ms:>5} мс  {text}"),
+    }
+}
+
 fn request_shutdown(app: &tauri::AppHandle) {
     static SHUTDOWN_SENT: AtomicBool = AtomicBool::new(false);
     if SHUTDOWN_SENT.swap(true, Ordering::SeqCst) {
@@ -1263,8 +1540,26 @@ fn overlay_snap_position_in_work_area(
 mod lib_tests {
     use super::{
         overlay_best_work_area, overlay_position_visible, overlay_snap_position,
-        overlay_snap_position_in_work_area, OVERLAY_IDLE_BOX,
+        overlay_snap_position_in_work_area, wer, OVERLAY_IDLE_BOX,
     };
+
+    /// WER бенча меряет распознавание, а не оформление: регистр, ё/е и
+    /// пунктуация ошибкой не считаются, иначе цифры перестанут быть сравнимыми
+    /// между маршрутами с разной постобработкой.
+    #[test]
+    fn wer_counts_words_not_punctuation_or_case() {
+        assert_eq!(wer("Привет, мир!", "привет мир"), Some(0.0));
+        assert_eq!(wer("ещё раз", "еще раз"), Some(0.0));
+
+        // Одно слово из трёх заменено, одно вставлено, одно пропало.
+        assert_eq!(wer("один два три", "один пять три"), Some(1.0 / 3.0));
+        assert_eq!(wer("один два три", "один два три четыре"), Some(1.0 / 3.0));
+        assert_eq!(wer("один два три", "один три"), Some(1.0 / 3.0));
+
+        // Полный промах и пустая гипотеза — 100%, не деление на ноль.
+        assert_eq!(wer("один два", ""), Some(1.0));
+        assert_eq!(wer("", "что-то"), None);
+    }
 
     #[test]
     fn overlay_position_accepts_visible_saved_position() {

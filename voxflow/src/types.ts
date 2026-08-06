@@ -64,11 +64,42 @@ export interface Settings {
   proxy_url: string;
   app_profile_overrides: ProfileOverride[];
   ai_prompt_rules: AiPromptRule[];
+  /** Пересобирать диктовку в промпт по правилам целевой нейросети. */
+  prompt_rebuild: boolean;
+  /** Какая модель выбрана для каждого сервиса. */
+  prompt_models: PromptModelChoice[];
 }
 
 export interface ProfileOverride {
   match: string; // подстрока в exe/заголовке (lowercase)
   profile: string; // verbatim|code|ai|formal|work|casual|doc|neutral
+}
+
+/** Модель из каталога `prompt_rules.json` с действующими правилами. */
+export interface PromptModelView {
+  id: string;
+  service: string;
+  label: string;
+  /** Страница документации вендора; пусто — обновлять нечего. */
+  doc: string;
+  rules: string;
+  /** Правила пересобраны из документации, а не взяты из сборки. */
+  refreshed: boolean;
+  /** Когда последний раз проверяли документацию (RFC3339, пусто — ни разу). */
+  checked: string;
+}
+
+export interface PromptRulesRefresh {
+  checked: number;
+  updated: string[];
+  skipped: string[];
+  failed: string[];
+}
+
+/** Выбор конкретной модели внутри сервиса: claude → claude-opus-5. */
+export interface PromptModelChoice {
+  service: string;
+  model: string;
 }
 
 export interface AiPromptRule {
@@ -191,6 +222,8 @@ export const DEFAULT_SETTINGS: Settings = {
   proxy_url: "",
   app_profile_overrides: [],
   ai_prompt_rules: [],
+  prompt_rebuild: false,
+  prompt_models: [],
 };
 
 export interface ModelInfo {

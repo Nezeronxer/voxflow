@@ -847,6 +847,18 @@ fn gigaam_auto_final_trusted(text: &str) -> bool {
     !t.is_empty() && crate::parakeet::is_mostly_cyrillic(t)
 }
 
+/// Пускать ли кусок живого preview в плашку.
+///
+/// Неспекулятивный маршрут (preview и финал — один движок) отдаёт всё: что
+/// показано, то и вставится. Спекулятивный (быстрый GigaAM ради каденса, а финал
+/// делает LID) обязан применять то же правило доверия, что и финал
+/// ([`gigaam_auto_final_trusted`]): текст, который финал отправил бы на
+/// whisper-уточнение, в плашке показывать нельзя — иначе пользователь видит
+/// русский мусор на английской речи, а в поле приезжает верный текст.
+fn preview_text_trusted(speculative: bool, text: &str) -> bool {
+    !speculative || gigaam_auto_final_trusted(text)
+}
+
 fn should_probe_gigaam_for_auto(whisper_text: &str) -> bool {
     let whisper = whisper_text.trim();
     if whisper.is_empty() {
@@ -1296,6 +1308,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                     tick_ms: 220,
                     max_seg_samples: 8 * 16000,
                     fixed_lang: Some("ru"),
+                    speculative: true,
                 },
             );
             return;
@@ -1325,6 +1338,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                 tick_ms: 260,
                 max_seg_samples: 8 * 16000,
                 fixed_lang: Some("ru"),
+                speculative: true,
             },
         );
         return;
@@ -1338,6 +1352,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                 return;
             }
             // GigaAM-маршрут = заведомо русский → фиксированный бейдж "ru".
+            // Финал идёт тем же GigaAM, поэтому текст preview не спекулятивен.
             start_local_partial_loop(
                 capture,
                 ctx,
@@ -1348,6 +1363,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                     tick_ms: 220,
                     max_seg_samples: 8 * 16000,
                     fixed_lang: Some("ru"),
+                    speculative: false,
                 },
             );
             return;
@@ -1367,6 +1383,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                         tick_ms: 500,
                         max_seg_samples: 20 * 16000,
                         fixed_lang: None,
+                        speculative: false,
                     },
                 );
                 return;
@@ -2007,6 +2024,12 @@ struct LocalLoopTuning {
     /// Some("ru") — бейдж языка фиксирован (GigaAM-маршрут);
     /// None — определяется по скрипту текущего текста (Parakeet en/auto).
     fixed_lang: Option<&'static str>,
+    /// Preview идёт НЕ тем движком, что финал: GigaAM выбран ради скорости, а
+    /// финал делает LID (Parakeet/whisper). Такой текст пускаем в плашку только
+    /// если финал его тоже принял бы — см. [`gigaam_auto_final_trusted`].
+    /// Иначе плашка показывала бы русский мусор на английской речи, а в поле
+    /// приезжал корректный текст от другого движка.
+    speculative: bool,
 }
 
 /// Аргументы петли живых партиалов локального резидентного движка
@@ -2211,7 +2234,11 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             let txt = gm.transcribe(&mono16[seg_start..bound]).unwrap_or_default();
             drop(g);
             let t = txt.trim().to_string();
-            if !t.is_empty() {
+            // Спекулятивный маршрут: сегмент, которому финал не поверил бы,
+            // в плашку не попадает вовсе — его покажет финальный preview.
+            // Ledger при этом не рвётся: спекулятивный preview всегда
+            // stream_mode == "never", в поле он ничего не печатает.
+            if !t.is_empty() && preview_text_trusted(a.tuning.speculative, &t) {
                 // Длинная пауза перед сегментом -> абзац. Пауза сама по себе
                 // никогда не удаляет предыдущий сегмент.
                 let gap = cur_seg_first_speech
@@ -2231,9 +2258,14 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
         } else {
             let txt = gm.transcribe(&mono16[seg_start..]).unwrap_or_default();
             drop(g);
+            let volatile = txt.trim();
             (
                 render_segments_for_postprocess(&committed_segs),
-                txt.trim().to_string(),
+                if preview_text_trusted(a.tuning.speculative, volatile) {
+                    volatile.to_string()
+                } else {
+                    String::new()
+                },
             )
         };
 
@@ -3746,8 +3778,11 @@ fn process_utterance(
     // verbatim/neutral и встроенный AI-профиль LLM не зовут: вставка должна быть
     // мгновенной. Явный smart prompt / правило для конкретной нейросети остаётся
     // opt-in и может синхронно отрефайнить текст.
-    let explicit_smart_instruction =
-        ai_prompt_rule_for_app(&s, &actx).is_some() || effective_smart_instruction(&s).is_some();
+    // Включённая пересборка промпта — такой же явный opt-in, как своё правило:
+    // пользователь сам попросил ждать LLM ради структурного промпта.
+    let explicit_smart_instruction = ai_prompt_rule_for_app(&s, &actx).is_some()
+        || prompt_rebuild_rules_for_app(&s, &actx).is_some()
+        || effective_smart_instruction(&s).is_some();
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
     let context_hint = rewrite_context_hint(ctx, &actx, None, &field_before_context, live_inserted);
@@ -5776,6 +5811,22 @@ mod seg_tests {
         assert!(!gigaam_auto_final_trusted("123 456."));
     }
 
+    /// Плашка не имеет права показать текст, который финал бы не вставил.
+    /// Спекулятивный preview (быстрый GigaAM при language=auto, финал делает LID)
+    /// на английской речи отдаёт латиницу/мусор — такой кусок в плашку не идёт.
+    /// Неспекулятивный маршрут (движок preview == движок финала) отдаёт всё.
+    #[test]
+    fn speculative_preview_shows_only_what_the_final_would_accept() {
+        assert!(preview_text_trusted(true, "привет как дела"));
+        assert!(!preview_text_trusted(true, "hello how are you"));
+        assert!(!preview_text_trusted(true, ""));
+
+        // Тот же движок в preview и финале — доверяем без проверки скрипта,
+        // иначе английский Parakeet-маршрут остался бы с пустой плашкой.
+        assert!(preview_text_trusted(false, "hello how are you"));
+        assert!(preview_text_trusted(false, "привет как дела"));
+    }
+
     #[test]
     fn cloud_fallback_preserves_selected_local_route() {
         let mut s = Settings {
@@ -6667,6 +6718,26 @@ fn builtin_ai_context(actx: &crate::app_context::AppContext) -> bool {
     crate::app_context::classify(&actx.exe.to_lowercase(), &actx.title.to_lowercase()) == "ai"
 }
 
+/// Правила оформления промпта для активного окна — если пересборка включена в
+/// разделе «Промпты» и пользователь не задал своё правило.
+///
+/// Правила приходят из [`crate::prompt_rules`]: под КОНКРЕТНУЮ модель (у Opus и
+/// Sonnet они разные), с подхватом обновлений вендорской документации. Какая
+/// модель выбрана внутри сервиса — из настроек: заголовок окна номера модели не
+/// содержит, определить автоматически нечем.
+fn prompt_rebuild_rules_for_app(
+    s: &Settings,
+    actx: &crate::app_context::AppContext,
+) -> Option<String> {
+    if !s.prompt_rebuild || ai_prompt_rule_for_app(s, actx).is_some() {
+        return None;
+    }
+    let service = crate::app_context::ai_target(&actx.exe, &actx.title)?;
+    let model = crate::prompt_rules::selected_model(s, service)?;
+    let rules = crate::prompt_rules::rules_for(&model);
+    (!rules.trim().is_empty()).then_some(rules)
+}
+
 fn style_hint_for_prompt(tone: &str) -> Option<&'static str> {
     match tone {
         "formal" => Some("Стиль для этого приложения: формальный."),
@@ -6698,6 +6769,8 @@ fn effective_smart_instruction_for_app(
             "Правила пользователя для этой нейросети: {}",
             one_line_instruction(&rule.prompt)
         ));
+    } else if let Some(rules) = prompt_rebuild_rules_for_app(s, actx) {
+        parts.push(format!("Правила оформления промпта: {rules}"));
     }
     if let Some(global) = effective_smart_instruction(s) {
         parts.push(format!(
@@ -6791,6 +6864,44 @@ fn configured_rewrite_backend(s: &Settings) -> Option<RewriteBackendRoute> {
     }
 }
 
+/// Настроен ли бэкенд ИИ. Дешёвая проверка без сетевого запроса — чтобы
+/// служебные задачи не ходили в сеть за данными, обработать которые всё равно
+/// будет нечем.
+pub(crate) fn rewrite_backend_configured(s: &Settings) -> bool {
+    configured_rewrite_backend(s).is_some()
+}
+
+/// Один разовый запрос к бэкенду, который пользователь уже настроил.
+///
+/// Нужен служебным задачам вне конвейера диктовки — сейчас это пересборка
+/// правил промпта из обновившейся документации ([`crate::prompt_rules`]).
+/// Маршрут выбирается тем же [`configured_rewrite_backend`], поэтому проверки
+/// «ключ есть», «URL настроен» не дублируются, а «бэкенд выключен» честно
+/// становится ошибкой, а не молчаливым пропуском.
+pub(crate) fn ask_configured_llm(s: &Settings, system: &str, user: &str) -> anyhow::Result<String> {
+    let Some(route) = configured_rewrite_backend(s) else {
+        return Err(anyhow::anyhow!("бэкенд ИИ не настроен"));
+    };
+    match route {
+        RewriteBackendRoute::Gemini => crate::gemini::refine(
+            &s.ai_api_key,
+            &s.ai_model,
+            system,
+            user,
+            s.backend_timeout_s(false),
+            s.rewrite_max_output_tokens,
+        ),
+        RewriteBackendRoute::OpenAiCompat => crate::rewrite::refine(s, system, user),
+        RewriteBackendRoute::Ollama => crate::ollama::refine(
+            &s.ollama_url,
+            &s.ollama_model,
+            system,
+            user,
+            s.backend_timeout_s(crate::net::is_loopback_base_url(&s.ollama_url)),
+        ),
+    }
+}
+
 /// Основа слова для сравнения содержания: нижний регистр, ё→е и обрезка до
 /// первых четырёх символов, чтобы «модуль»/«модуля», «файл»/«файла» и
 /// «Алиса»/«Алису» считались одним словом — иначе гард отклонял бы штатное
@@ -6837,10 +6948,24 @@ struct RewriteGrounding {
 /// симметричное сравнение «1-в-1 и по порядку» из 2.0.x отклоняло вообще любой
 /// полезный рерайт, и в поле всё равно уходил сырой текст. Раздувать текст
 /// вдвое по-прежнему запрещено.
-fn rewrite_grounding(input: &str, output: &str, min_recall: f64) -> RewriteGrounding {
+/// Обычный рерайт — правка формулировки: ответ длиннее входа вдвое означает,
+/// что модель начала отвечать, а не переписывать.
+const REWRITE_MAX_EXPANSION: usize = 2;
+/// Пересборка в промпт (поле нейросети) легально добавляет структуру — теги,
+/// критерии готовности, требуемый формат ответа. Под 2× не влезает даже
+/// короткая просьба, поэтому порог выше; защита от «модель начала отвечать»
+/// остаётся на recall, который здесь не ослаблен.
+const PROMPT_REBUILD_MAX_EXPANSION: usize = 4;
+
+fn rewrite_grounding(
+    input: &str,
+    output: &str,
+    min_recall: f64,
+    max_expansion: usize,
+) -> RewriteGrounding {
     let input_chars = input.chars().count();
     let output_chars = output.chars().count();
-    if output_chars > input_chars.saturating_mul(2).saturating_add(32) {
+    if output_chars > input_chars.saturating_mul(max_expansion).saturating_add(32) {
         return RewriteGrounding {
             grounded: false,
             recall: 0.0,
@@ -6883,7 +7008,7 @@ fn rewrite_grounding(input: &str, output: &str, min_recall: f64) -> RewriteGroun
 /// `min_recall = 0.0` для намеренно сокращающих преобразований: остаётся только
 /// проверка на раздувание, обрыв ловится по finish_reason в клиентах.
 pub(crate) fn rewrite_is_grounded(input: &str, output: &str, min_recall: f64) -> bool {
-    let grounding = rewrite_grounding(input, output, min_recall);
+    let grounding = rewrite_grounding(input, output, min_recall, REWRITE_MAX_EXPANSION);
     if !grounding.grounded {
         log::warn!(
             "ответ модели отклонён: recall={:.2} < {:.2}, пропали: {}",
@@ -6970,12 +7095,20 @@ fn refine_text_with_fallback(
         None => {}
     }
 
+    // Поле нейросети: ответ — это промпт со структурой, он законно длиннее
+    // диктовки. Проверка «ничего из сказанного не пропало» при этом не слабеет.
+    let max_expansion = if target_tone == "ai" {
+        PROMPT_REBUILD_MAX_EXPANSION
+    } else {
+        REWRITE_MAX_EXPANSION
+    };
     let mut failure: Option<String> = None;
     for attempt in attempts {
         match attempt() {
             Ok(r) if !r.trim().is_empty() => {
                 let refined = postprocess::normalize_spaces(r.trim());
-                let grounding = rewrite_grounding(text, &refined, s.rewrite_min_recall);
+                let grounding =
+                    rewrite_grounding(text, &refined, s.rewrite_min_recall, max_expansion);
                 if grounding.grounded {
                     return (refined, true, None);
                 }
@@ -7067,8 +7200,12 @@ mod smart_prompt_tests {
     use super::*;
 
     fn app(title: &str) -> crate::app_context::AppContext {
+        app_exe("chrome.exe", title)
+    }
+
+    fn app_exe(exe: &str, title: &str) -> crate::app_context::AppContext {
         crate::app_context::AppContext {
-            exe: "chrome.exe".to_string(),
+            exe: exe.to_string(),
             title: title.to_string(),
             window_id: "test-window".to_string(),
             category: "ai".to_string(),
@@ -7366,6 +7503,98 @@ mod smart_prompt_tests {
         assert!(instruction
             .expect("ai default instruction")
             .contains("готовый промпт"));
+    }
+
+    /// Раздел «Промпты»: пересборка выключена — поведение ровно как раньше,
+    /// вставка не ждёт LLM. Включена — правила целевой модели попадают в
+    /// инструкцию и это считается явным opt-in на синхронный рерайт.
+    #[test]
+    fn prompt_rebuild_is_opt_in_and_carries_vendor_rules() {
+        let off = Settings {
+            ai_backend: "ollama".into(),
+            smart_prompt_enabled: false,
+            ..Settings::default()
+        };
+        assert!(prompt_rebuild_rules_for_app(&off, &app("Claude")).is_none());
+
+        let mut on = Settings {
+            prompt_rebuild: true,
+            ..off.clone()
+        };
+        let opus = prompt_rebuild_rules_for_app(&on, &app("Claude")).expect("claude rules");
+        let gpt = prompt_rebuild_rules_for_app(&on, &app("ChatGPT")).expect("chatgpt rules");
+        assert_ne!(opus, gpt, "у разных сервисов разные правила оформления");
+
+        // Главное требование: правила различаются по НОМЕРУ модели, а не только
+        // по семейству. Переключаем Claude на Sonnet — текст обязан смениться.
+        on.prompt_models = vec![crate::settings::PromptModelChoice {
+            service: "claude".into(),
+            model: "claude-sonnet-5".into(),
+        }];
+        let sonnet = prompt_rebuild_rules_for_app(&on, &app("Claude")).expect("sonnet rules");
+        assert_ne!(
+            opus, sonnet,
+            "Opus и Sonnet обязаны получать разные правила"
+        );
+
+        let (instruction, is_ai) = effective_smart_instruction_for_app(&on, &app("Claude"), "ai");
+        let instruction = instruction.expect("instruction");
+        assert!(is_ai);
+        assert!(instruction.contains(sonnet.split(' ').next().expect("первое слово правил")));
+        assert!(final_rewrite_eligible(&on, "ai", true, true));
+
+        // Не-AI окно пересборку не получает вовсе.
+        assert!(prompt_rebuild_rules_for_app(&on, &app_exe("telegram.exe", "Чат")).is_none());
+    }
+
+    /// Своё правило пользователя перекрывает встроенное целиком: иначе в
+    /// инструкцию уехали бы обе версии и модель получила противоречие.
+    #[test]
+    fn user_rule_replaces_builtin_prompt_rules() {
+        let s = Settings {
+            prompt_rebuild: true,
+            ai_backend: "ollama".into(),
+            smart_prompt_enabled: false,
+            ai_prompt_rules: vec![crate::settings::AiPromptRule {
+                pattern: "claude".to_string(),
+                prompt: "Только один абзац, без тегов.".to_string(),
+            }],
+            ..Settings::default()
+        };
+
+        assert!(prompt_rebuild_rules_for_app(&s, &app("Claude")).is_none());
+        let (instruction, _) = effective_smart_instruction_for_app(&s, &app("Claude"), "ai");
+        let instruction = instruction.expect("instruction");
+        assert!(instruction.contains("Только один абзац"));
+
+        let builtin = crate::prompt_rules::selected_model(&s, "claude")
+            .map(|m| crate::prompt_rules::rules_for(&m))
+            .expect("встроенные правила");
+        assert!(
+            !instruction.contains(&builtin),
+            "встроенные правила не должны ехать вместе с пользовательскими"
+        );
+    }
+
+    /// Промпт со структурой длиннее диктовки в разы — обычный лимит 2× его
+    /// зарубал бы. Ослаблен только лимит длины: потеря содержания по-прежнему
+    /// отклоняется.
+    #[test]
+    fn prompt_rebuild_allows_structure_but_still_rejects_lost_content() {
+        let said = "сделай кнопку красной";
+        let structured = "<задача>Сделать кнопку красной</задача>\n<требования>\n- изменить цвет кнопки на красный\n</требования>";
+
+        assert!(
+            !rewrite_grounding(said, structured, RECALL, REWRITE_MAX_EXPANSION).grounded,
+            "обычный лимит 2× не пропускает структурный промпт"
+        );
+        assert!(rewrite_grounding(said, structured, RECALL, PROMPT_REBUILD_MAX_EXPANSION).grounded);
+
+        let lost = "<задача>Сделать кнопку</задача>\n<требования>\n- поменять оформление кнопки\n</требования>";
+        assert!(
+            !rewrite_grounding(said, lost, RECALL, PROMPT_REBUILD_MAX_EXPANSION).grounded,
+            "выпавшее содержательное слово отклоняется и при высоком лимите"
+        );
     }
 
     #[test]

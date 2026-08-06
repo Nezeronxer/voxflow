@@ -920,6 +920,59 @@ pub async fn stt_test(state: State<'_, AppState>) -> Result<String, String> {
     }
 }
 
+// ─────────────────────────── Промпты под модель ───────────────────────────
+
+#[derive(Serialize)]
+pub struct PromptModelView {
+    id: String,
+    service: String,
+    label: String,
+    doc: String,
+    /// Действующие правила: пересобранные из свежей документации либо базовые.
+    rules: String,
+    /// true — правила пересобраны из документации, а не взяты из сборки.
+    refreshed: bool,
+    /// Когда последний раз проверяли документацию (RFC3339, пусто — ни разу).
+    checked: String,
+}
+
+fn prompt_model_view(model: &crate::prompt_rules::PromptModel) -> PromptModelView {
+    let (rules, cached) = crate::prompt_rules::status_for(model);
+    PromptModelView {
+        id: model.id.clone(),
+        service: model.service.clone(),
+        label: model.label.clone(),
+        doc: model.doc.clone(),
+        rules,
+        refreshed: cached
+            .as_ref()
+            .map(|c| !c.rules.trim().is_empty())
+            .unwrap_or(false),
+        checked: cached.map(|c| c.checked).unwrap_or_default(),
+    }
+}
+
+/// Каталог моделей с действующими правилами — для раздела «Промпты».
+#[tauri::command]
+pub fn prompt_models() -> Vec<PromptModelView> {
+    crate::prompt_rules::catalog()
+        .iter()
+        .map(prompt_model_view)
+        .collect()
+}
+
+/// Кнопка «Проверить документацию»: обходит документы всех моделей каталога
+/// без суточного throttle и пересобирает правила изменившихся.
+#[tauri::command]
+pub fn refresh_prompt_rules(state: State<AppState>) -> R<crate::prompt_rules::RefreshReport> {
+    let s = state.settings.lock().clone();
+    Ok(crate::prompt_rules::refresh(
+        &s,
+        &crate::prompt_rules::catalog(),
+        true,
+    ))
+}
+
 // ─────────────────────────── Обновления ───────────────────────────
 
 #[tauri::command]
