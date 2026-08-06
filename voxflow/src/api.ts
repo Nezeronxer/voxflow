@@ -17,6 +17,7 @@ import type {
   ProfileOverride,
   PromptModelView,
   PromptRulesRefresh,
+  LocalAiState,
   TransformResult,
   UpdateInfo,
   UpdateInstallResult,
@@ -365,6 +366,25 @@ export function showMainWindow(): Promise<void> {
   return safe<void>(async () => {
     await invoke("show_main_window");
   }, undefined);
+}
+
+export function localAiDetect(): Promise<LocalAiState> {
+  const empty: LocalAiState = {
+    engines: [],
+    machine: { ram_gb: 0, cpu_cores: 0, accel: { kind: "cpu_only" } },
+    shortlist: [],
+    too_heavy: [],
+    can_pull: false,
+    suggestion: null,
+  };
+  if (!IS_TAURI_RUNTIME) return Promise.resolve(empty);
+  return safe<LocalAiState>(async () => await invoke<LocalAiState>("local_ai_detect"), empty);
+}
+
+// Ошибку скачивания НЕ глушим: пользователь нажал кнопку и должен увидеть,
+// почему она не сработала.
+export function localAiPull(tag: string): Promise<void> {
+  return invoke<void>("local_ai_pull", { tag });
 }
 
 export function promptModels(): Promise<PromptModelView[]> {

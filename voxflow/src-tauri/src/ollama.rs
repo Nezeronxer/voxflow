@@ -77,6 +77,120 @@ pub fn list_models(url: &str) -> Result<Vec<String>> {
     Ok(models)
 }
 
+/// Что означает очередная строка потока `POST /api/pull`.
+#[derive(Debug, PartialEq)]
+pub enum PullEvent {
+    /// Сколько байт скачано из скольких.
+    Progress { completed: u64, total: u64 },
+    /// Слой докачан, сервер подтвердил успех.
+    Done,
+    /// Служебные строки («pulling manifest», «verifying sha256») — показывать
+    /// нечего, но и ошибкой это не является.
+    Other,
+    /// Сервер вернул ошибку в теле потока.
+    Failed(String),
+}
+
+/// Разобрать одну строку NDJSON из `/api/pull`.
+///
+/// Поток идёт построчно и до конца загрузки может оборваться на середине строки,
+/// поэтому нечитаемую строку трактуем как служебную, а не как сбой: рвать
+/// многогигабайтную загрузку из-за одного битого чанка нельзя.
+pub fn parse_pull_line(line: &str) -> PullEvent {
+    let line = line.trim();
+    if line.is_empty() {
+        return PullEvent::Other;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+        return PullEvent::Other;
+    };
+    if let Some(err) = v.get("error").and_then(|e| e.as_str()) {
+        return PullEvent::Failed(err.to_string());
+    }
+    let status = v.get("status").and_then(|s| s.as_str()).unwrap_or("");
+    if status == "success" {
+        return PullEvent::Done;
+    }
+    match (
+        v.get("completed").and_then(|c| c.as_u64()),
+        v.get("total").and_then(|t| t.as_u64()),
+    ) {
+        (Some(completed), Some(total)) if total > 0 => PullEvent::Progress { completed, total },
+        _ => PullEvent::Other,
+    }
+}
+
+/// Скачать модель через `POST /api/pull`, транслируя прогресс в те же события,
+/// что и загрузка моделей распознавания (`model:progress` / `model:done` /
+/// `model:error`), — индикатор в интерфейсе переиспользуется целиком.
+pub fn pull(app: &tauri::AppHandle, url: &str, tag: &str) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    use tauri::Emitter;
+
+    let base_url = base(url);
+    net::ensure_https_or_loopback_base(&base_url, "Ollama URL")?;
+    let tag = tag.trim();
+    if tag.is_empty() {
+        return Err(anyhow!("не указана модель"));
+    }
+
+    let body = serde_json::json!({ "model": tag }).to_string();
+    let mut cmd = net::curl();
+    net::apply_proxy(&mut cmd, "");
+    // -N отключает буферизацию: без него прогресс приезжал бы пачкой в конце.
+    cmd.arg("-sN")
+        .arg("-X")
+        .arg("POST")
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-d")
+        .arg(&body)
+        .arg(format!("{base_url}/api/pull"))
+        .stdout(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("нет потока вывода curl"))?;
+
+    let mut failure: Option<String> = None;
+    let mut saw_done = false;
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        match parse_pull_line(&line) {
+            PullEvent::Progress { completed, total } => {
+                let _ = app.emit(
+                    "model:progress",
+                    serde_json::json!({ "name": tag, "received": completed, "total": total }),
+                );
+            }
+            PullEvent::Done => saw_done = true,
+            PullEvent::Failed(err) => failure = Some(err),
+            PullEvent::Other => {}
+        }
+    }
+    let status = child.wait().map_err(|e| anyhow!("curl: {e}"))?;
+
+    if let Some(err) = failure {
+        return Err(anyhow!("Ollama: {err}"));
+    }
+    if !status.success() {
+        return Err(anyhow!("загрузка прервалась ({status})"));
+    }
+    if !saw_done {
+        // Поток кончился без подтверждения — модель может быть неполной, и
+        // молча объявлять успех нельзя.
+        return Err(anyhow!(
+            "загрузка оборвалась без подтверждения — повторите попытку"
+        ));
+    }
+
+    let _ = app.emit("model:done", serde_json::json!({ "name": tag }));
+    Ok(())
+}
+
 /// Отрефайнить текст: `system` (инструкция) + `user` (исходный текст) через
 /// POST /api/chat (stream=false). Размышления гибридной qwen3 глушим
 /// `/no_think` + `"think": false`, остаток `<think>…</think>` срезаем из ответа.
@@ -309,5 +423,38 @@ mod tests {
             "done_reason": "stop"
         });
         assert_eq!(parse_chat_response(&complete).unwrap(), "Полная фраза.");
+    }
+
+    /// Поток `/api/pull` смешивает служебные строки, прогресс и подтверждение,
+    /// а на обрыве отдаёт огрызок. Ни то, ни другое не должно ронять загрузку.
+    #[test]
+    fn pull_stream_is_parsed_and_survives_a_broken_line() {
+        assert_eq!(
+            parse_pull_line(r#"{"status":"downloading","completed":512,"total":2048}"#),
+            PullEvent::Progress {
+                completed: 512,
+                total: 2048
+            }
+        );
+        assert_eq!(parse_pull_line(r#"{"status":"success"}"#), PullEvent::Done);
+
+        // Служебное: показывать нечего, но это не сбой.
+        assert_eq!(
+            parse_pull_line(r#"{"status":"pulling manifest"}"#),
+            PullEvent::Other
+        );
+        // Обрыв ровно посреди строки — тоже не сбой.
+        assert_eq!(parse_pull_line(r#"{"status":"downl"#), PullEvent::Other);
+        assert_eq!(parse_pull_line(""), PullEvent::Other);
+        // total = 0 не должен приводить к делению на ноль в индикаторе.
+        assert_eq!(
+            parse_pull_line(r#"{"completed":0,"total":0}"#),
+            PullEvent::Other
+        );
+
+        assert_eq!(
+            parse_pull_line(r#"{"error":"model not found"}"#),
+            PullEvent::Failed("model not found".to_string())
+        );
     }
 }

@@ -185,6 +185,10 @@ pub struct Settings {
     /// ни заголовок окна, ни дерево доступности его не содержат. Пусто для
     /// сервиса → берётся первая модель сервиса из каталога `prompt_rules.json`.
     pub prompt_models: Vec<PromptModelChoice>,
+    /// Пользователь нажал «Выключить» на предложении включить найденный
+    /// локальный ИИ. Значит больше не предлагаем — навязываться при каждом
+    /// запуске нельзя.
+    pub local_ai_dismissed: bool,
 }
 
 /// Выбор конкретной модели внутри сервиса: `claude` → `claude-opus-5`.
@@ -288,6 +292,7 @@ impl Default for Settings {
             ai_prompt_rules: Vec::new(),
             prompt_rebuild: false,
             prompt_models: Vec::new(),
+            local_ai_dismissed: false,
         }
     }
 }

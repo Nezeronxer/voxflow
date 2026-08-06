@@ -920,6 +920,58 @@ pub async fn stt_test(state: State<'_, AppState>) -> Result<String, String> {
     }
 }
 
+// ─────────────────────────── Локальный ИИ ───────────────────────────
+
+#[derive(Serialize)]
+pub struct LocalAiState {
+    #[serde(flatten)]
+    detection: crate::local_ai::Detection,
+    /// Что предлагаем включить; `null` — предлагать нечего.
+    suggestion: Option<crate::local_ai::Suggestion>,
+}
+
+/// Опросить локальные порты и посчитать ряд моделей под эту машину.
+#[tauri::command]
+pub fn local_ai_detect(state: State<AppState>) -> LocalAiState {
+    let detection = crate::local_ai::detect();
+    let suggestion = {
+        let s = state.settings.lock();
+        crate::local_ai::suggest(&detection, &s)
+    };
+    LocalAiState {
+        detection,
+        suggestion,
+    }
+}
+
+// «Оставить» и «Выключить» отдельными командами не сделаны намеренно: это
+// обычная запись настроек, и фронт делает её тем же `update`, что и любое другое
+// поле. Второй путь к тем же полям пришлось бы держать синхронным с первым.
+
+/// Скачать модель через Ollama. Прогресс уходит теми же событиями
+/// `model:progress` / `model:done` / `model:error`, что и модели распознавания.
+#[tauri::command]
+pub fn local_ai_pull(app: AppHandle, state: State<AppState>, tag: String) -> R<()> {
+    let url = {
+        let s = state.settings.lock();
+        if s.ollama_url.trim().is_empty() {
+            "http://localhost:11434".to_string()
+        } else {
+            s.ollama_url.clone()
+        }
+    };
+    std::thread::spawn(move || {
+        if let Err(e) = crate::ollama::pull(&app, &url, &tag) {
+            log::error!("pull {tag}: {e:#}");
+            let _ = app.emit(
+                "model:error",
+                serde_json::json!({ "name": tag, "error": e.to_string(), "message": e.to_string() }),
+            );
+        }
+    });
+    Ok(())
+}
+
 // ─────────────────────────── Промпты под модель ───────────────────────────
 
 #[derive(Serialize)]

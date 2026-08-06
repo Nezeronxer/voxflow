@@ -68,11 +68,65 @@ export interface Settings {
   prompt_rebuild: boolean;
   /** Какая модель выбрана для каждого сервиса. */
   prompt_models: PromptModelChoice[];
+  /** Пользователь отказался включать найденный локальный ИИ. */
+  local_ai_dismissed: boolean;
 }
 
 export interface ProfileOverride {
   match: string; // подстрока в exe/заголовке (lowercase)
   profile: string; // verbatim|code|ai|formal|work|casual|doc|neutral
+}
+
+/** Модель из каталога локального ИИ. */
+export interface LocalAiModel {
+  tag: string;
+  label: string;
+  size_gb: number;
+  /** С какого объёма памяти модель имеет смысл предлагать. */
+  min_ram_gb: number;
+}
+
+export interface LocalAiEngine {
+  engine: string;
+  label: string;
+  url: string;
+  models: string[];
+}
+
+/** Что предлагается включить; приходит и событием `local-ai:found`. */
+export interface LocalAiSuggestion {
+  engine: string;
+  label: string;
+  /** Значение ai_backend: "ollama" либо "openai_compat". */
+  backend: string;
+  url: string;
+  model: string;
+}
+
+/** Чем машина считает модель — главный вопрос, а не объём ОЗУ. */
+export type LocalAiAccel =
+  | { kind: "apple_silicon" }
+  /** vram_gb = 0 — карта есть, объём выяснить не удалось. */
+  | { kind: "nvidia"; vram_gb: number }
+  | { kind: "cpu_only" };
+
+export interface LocalAiMachine {
+  /** Полный объём памяти, ГБ. 0 — определить не удалось. */
+  ram_gb: number;
+  cpu_cores: number;
+  accel: LocalAiAccel;
+}
+
+export interface LocalAiState {
+  engines: LocalAiEngine[];
+  machine: LocalAiMachine;
+  /** Ряд моделей, подходящих этой машине. */
+  shortlist: LocalAiModel[];
+  /** Не влезающие — показываем с пометкой, а не прячем. */
+  too_heavy: LocalAiModel[];
+  /** Только Ollama умеет ставить модели по кнопке. */
+  can_pull: boolean;
+  suggestion: LocalAiSuggestion | null;
 }
 
 /** Модель из каталога `prompt_rules.json` с действующими правилами. */
@@ -224,6 +278,7 @@ export const DEFAULT_SETTINGS: Settings = {
   ai_prompt_rules: [],
   prompt_rebuild: false,
   prompt_models: [],
+  local_ai_dismissed: false,
 };
 
 export interface ModelInfo {

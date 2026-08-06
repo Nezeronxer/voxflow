@@ -491,3 +491,47 @@
 - **Зелёные прогоны:** `cargo fmt --check` exit 0; `cargo clippy --all-targets` чисто;
   `cargo test` 345 passed / 0 failed; `npm test` 21/21; `npx tsc --noEmit` и `npm run build`
   exit 0. ✅
+
+## 2026-08-06 (продолжение) — автоопределение локального ИИ
+
+Решение и границы — `DECISIONS.md`, D-028.
+
+- **`local_ai.rs`** — проба Ollama, LM Studio и llama.cpp на их локальных портах, только петля.
+  LM Studio и llama.cpp подключаются существующим OpenAI-совместимым маршрутом `rewrite.rs` —
+  отдельного бэкенда им не потребовалось. ✅
+- **Ряд моделей подстраивается под машину:** каталог с ярусами `min_ram_gb`, показываются три
+  самые крупные подходящие. 8 ГБ → `qwen2.5:3b`; 16 ГБ → четырёхмиллиардные; 32 ГБ → 8B и 12B.
+  Не влезающие показываются с пометкой, а не прячутся. Память — `sysctl hw.memsize` / 
+  `GlobalMemoryStatusEx`, без новой зависимости. ✅
+- **Скачивание кнопкой** — `ollama::pull` через `POST /api/pull`, прогресс транслируется в
+  существующие `model:progress` / `model:done` / `model:error`. Обрыв без подтверждения
+  `success` — ошибка, а не успех. ✅
+- **Предложение, а не самоуправство:** на старте `spawn_local_ai_detect` ищет движок и шлёт
+  `local-ai:found`; настройки меняются только по кнопке «Оставить». «Выключить» ставит
+  `local_ai_dismissed` навсегда. Настроенный бэкенд не трогается вообще. ✅
+- **Найденный баг в своей же карточке:** события `model:*` общие с загрузкой моделей
+  распознавания — без сверки имени скачивание whisper показывало бы прогресс в карточке ИИ.
+  Добавлена фильтрация по тегу. ✅
+- **Тесты:** `shortlist_follows_the_machine` (8/16/32 ГБ и «память не определилась»),
+  `too_heavy_is_shown_not_hidden`, `pick_installed_takes_the_largest_that_fits` (в том числе
+  что `gemma3:12b` не считается за `gemma3:4b`), `suggest_never_overrides_a_configured_backend`,
+  `openai_compatible_engines_reuse_the_existing_route`,
+  `pull_stream_is_parsed_and_survives_a_broken_line`. ✅
+- **Не проверено вживую:** Ollama на машине не установлена — пройден только путь «не найден».
+- **Зелёные прогоны:** `cargo fmt --check` exit 0; clippy чисто; `cargo test` 351 passed / 0
+  failed; `npm test` 21/21; `npx tsc --noEmit` и `npm run build` exit 0; `check_versions.py` → 2.0.14. ✅
+
+## 2026-08-06 (уточнение) — подбор по конфигурации, а не по одной памяти
+
+- **Найден изъян в собственной первой версии:** подбор смотрел только на ОЗУ. На десктопе с
+  дискретной картой это занижало ряд — там решает VRAM, а не системная память.
+- Введён `local_ai::Machine` (память, ядра, ускоритель) и правило `fits_machine`: NVIDIA — по
+  VRAM с запасом 1.5 ГБ на контекст; общая память и карта с неизвестным объёмом — по ярусам;
+  без ускорителя — потолок 2.5 ГБ независимо от памяти. Ускоритель: `hw.optional.arm64` на
+  macOS, `has_nvidia()` + `nvidia-smi` на остальных. ✅
+- Профиль машины показывается в карточке целиком, чтобы был виден повод для такого ряда. ✅
+- **Тесты:** `discrete_gpu_is_judged_by_vram_not_system_ram` (16 ГБ VRAM тянут 12B, те же 16 ГБ
+  общей — нет; слабая карта при 64 ГБ ОЗУ 12B не тянет; неизвестный объём падает на ярусы),
+  `cpu_only_machine_is_capped_regardless_of_ram`. ✅
+- **Зелёные прогоны:** clippy чисто, `cargo test` 353 passed / 0 failed; `npm test` 21/21; tsc и
+  сборка exit 0. ✅

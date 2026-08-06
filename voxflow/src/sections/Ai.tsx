@@ -3,6 +3,7 @@ import { aiTest, saveSettings, type AiModelOption } from "../api";
 import { PageHead, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
 import SecretControl from "../components/SecretControl";
+import LocalAiCard from "../components/LocalAiCard";
 
 type Option = AiModelOption;
 
@@ -157,6 +158,8 @@ export default function Ai({
         title="ИИ"
         desc="Подключите нейросеть для умной обработки текста и облачного распознавания."
       />
+
+      <LocalAiCard settings={settings} update={update} />
 
       <div className="card">
         <div className="card-head">

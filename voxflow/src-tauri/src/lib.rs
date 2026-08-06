@@ -11,6 +11,7 @@ mod gemini;
 mod gigaam;
 mod hotkey;
 mod inject;
+mod local_ai;
 mod macos_permissions;
 mod models;
 mod net;
@@ -182,6 +183,8 @@ pub fn run() {
             // подтягиваются из неё сами, не дожидаясь обновления приложения.
             spawn_prompt_rules_refresh(startup_settings.clone());
 
+            spawn_local_ai_detect(handle.clone(), startup_settings.clone());
+
             // Показать окно настроек при запуске, НО не при автозапуске (тогда — в трей).
             if !autostarted {
                 if let Some(main) = handle.get_webview_window("main") {
@@ -229,6 +232,8 @@ pub fn run() {
             commands::transform_text,
             commands::default_app_profile_presets,
             commands::stt_test,
+            commands::local_ai_detect,
+            commands::local_ai_pull,
             commands::prompt_models,
             commands::refresh_prompt_rules,
             commands::check_for_update,
@@ -297,6 +302,36 @@ fn spawn_prompt_rules_refresh(settings: settings::Settings) {
         })
     {
         log::warn!("не удалось запустить проверку правил промптов: {e}");
+    }
+}
+
+/// Поискать локальный ИИ на старте и, если нашёлся, предложить его включить.
+///
+/// В фоне, потому что это опрос трёх портов с таймаутом: держать на нём показ
+/// окна незачем. Наружу не ходит — только петля.
+fn spawn_local_ai_detect(handle: tauri::AppHandle, settings: settings::Settings) {
+    if settings.local_ai_dismissed || settings.ai_backend.trim() != "off" {
+        return; // предлагать нечего: либо отказались, либо бэкенд уже выбран
+    }
+    if let Err(e) = std::thread::Builder::new()
+        .name("voxflow-local-ai".into())
+        .spawn(move || {
+            let detection = local_ai::detect();
+            let Some(suggestion) = local_ai::suggest(&detection, &settings) else {
+                return;
+            };
+            log::info!(
+                "локальный ИИ найден: {}, модель {}",
+                suggestion.label,
+                suggestion.model
+            );
+            // Настройки не меняем сами — показываем предложение. Решение
+            // «оставить или выключить» остаётся за пользователем.
+            use tauri::Emitter;
+            let _ = handle.emit("local-ai:found", &suggestion);
+        })
+    {
+        log::warn!("не удалось запустить поиск локального ИИ: {e}");
     }
 }
 
