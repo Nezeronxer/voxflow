@@ -92,7 +92,7 @@ export default function SettingsHub({
           <Icon.Check className="ico" />
           Локальный режим · данные не покидают устройство
         </span>
-        <span>VoxFlow 2.0.14</span>
+        <span>VoxFlow 2.0.15</span>
       </footer>
     </div>
   );

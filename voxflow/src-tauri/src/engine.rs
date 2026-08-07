@@ -2118,7 +2118,6 @@ fn start_local_partial_loop<T: LocalStt + Send + 'static>(
 /// не распознаём.
 fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
     const SPEECH_PROB: f32 = 0.35;
-    const SIL_BOUND_MS: usize = 600;
     const SETTLED_MS: usize = 3000;
     let tick_ms = a.tuning.tick_ms;
     let max_seg_samples = a.tuning.max_seg_samples;
@@ -2132,6 +2131,8 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
     let mut prev_seg_end = 0usize; // конец речи последнего ЗАКРЫТОГО сегмента
     let mut cur_seg_first_speech: Option<usize> = None;
     let mut seg_has_speech = false;
+    let mut gap_start: Option<usize> = None; // начало текущей микропаузы
+    let mut last_gap_cut: Option<usize> = None; // рез по последней микропаузе сегмента
     let mut last_emitted: Option<(String, String)> = None;
     let mut settled_emitted_for_end = 0usize;
 
@@ -2186,6 +2187,16 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                     }
                     last_speech_end = vad_pos;
                     seg_has_speech = true;
+                    gap_start = None;
+                } else if seg_has_speech {
+                    // Микропауза внутри фразы — единственная безопасная точка реза
+                    // для сегмента, переросшего лимит (см. segment_cut_bound).
+                    // Режем по середине паузы: хвост последнего слова не срезан,
+                    // начало следующего не откушено.
+                    let from = *gap_start.get_or_insert(vad_pos - crate::vad::CHUNK);
+                    if vad_pos - from >= SEG_GAP_MIN_SAMPLES {
+                        last_gap_cut = Some((from + vad_pos) / 2);
+                    }
                 }
             }
         }
@@ -2219,18 +2230,22 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             }
             continue; // в активном сегменте речи ещё нет — ASR не дёргаем
         }
-        let silence_samples = vad_pos.saturating_sub(last_speech_end);
-        let close_segment = silence_samples >= SIL_BOUND_MS * 16
-            || mono16.len().saturating_sub(seg_start) >= max_seg_samples;
+        let cut = segment_cut_bound(
+            seg_start,
+            mono16.len(),
+            vad_pos.saturating_sub(last_speech_end),
+            last_speech_end,
+            last_gap_cut,
+            max_seg_samples,
+        );
 
         // try_lock: финал уже забрал модель → тик пропускаем.
         let Some(mut g) = a.engine.try_lock() else {
             continue;
         };
         let Some(gm) = g.as_mut() else { continue };
-        let (committed_raw, volatile_raw) = if close_segment {
-            // Граница: последний речевой чанк + 300 мс хвоста.
-            let bound = (last_speech_end + 4800).min(mono16.len());
+        let (committed_raw, volatile_raw) = if let Some(bound) = cut {
+            let bound = bound.clamp(seg_start, mono16.len());
             let txt = gm.transcribe(&mono16[seg_start..bound]).unwrap_or_default();
             drop(g);
             let t = txt.trim().to_string();
@@ -2247,10 +2262,14 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                 let para = gap_starts_paragraph(!committed_segs.is_empty(), gap);
                 push_dictation_segment(&mut committed_segs, para, t);
             }
-            prev_seg_end = last_speech_end;
+            prev_seg_end = last_speech_end.min(bound);
             seg_start = bound;
-            seg_has_speech = false;
-            cur_seg_first_speech = None;
+            // Рез по микропаузе: речь после него уже была — новый сегмент
+            // стартует не с нуля, иначе тик ждал бы её повторно.
+            seg_has_speech = last_speech_end > bound;
+            cur_seg_first_speech = seg_has_speech.then_some(bound);
+            gap_start = None;
+            last_gap_cut = None;
             (
                 render_segments_for_postprocess(&committed_segs),
                 String::new(),
@@ -5016,9 +5035,309 @@ fn gap_starts_paragraph(has_previous_segment: bool, gap_samples: usize) -> bool 
     has_previous_segment && gap_samples >= PARAGRAPH_GAP_SAMPLES
 }
 
+/// Хвост после конца речи, чтобы не срезать затухание последнего слова.
+const SEG_TAIL_SAMPLES: usize = 300 * 16;
+/// Короткая пауза, по которой можно резать фразу. Провал VAD в один-два чанка —
+/// это чаще смычка внутри слова, чем промежуток между словами: рез по такой
+/// «паузе» портит слово ровно так же, как рез по счётчику (замерено на dataset).
+const SEG_GAP_MIN_SAMPLES: usize = 160 * 16;
+/// Насколько сегмент должен быть заполнен, чтобы рез по микропаузе засчитался.
+/// Микропауза, найденная сильно раньше лимита, оставляет короткий сегмент, а
+/// короткий сегмент ASR распознаёт хуже длинного — выгоднее дождаться следующей.
+const SEG_MIN_FILL_NUM: usize = 3;
+const SEG_MIN_FILL_DEN: usize = 4;
+/// Пауза, закрывающая сегмент живого превью.
+const SEG_SILENCE_SAMPLES: usize = 600 * 16;
+/// Насколько сегменту позволено перерасти лимит, пока ждём микропаузу.
+const SEG_CAP_OVERRUN_SAMPLES: usize = 4000 * 16;
+
+/// Куда резать активный сегмент живого превью — или `None`, если резать рано.
+///
+/// Сегмент закрывается по паузе (тогда рез приходится на границу слов) либо по
+/// лимиту длины. Рез ровно по счётчику попадал в середину слова: половинка
+/// уходила в committed навсегда — сегмент больше не перераспознаётся, — вторая
+/// половина портила начало следующего сегмента, а финал декодирует запись
+/// целиком и вставлял слово верно. Отсюда «плашка показывает не то, что
+/// вставилось» на фразах длиннее лимита без пауз.
+///
+/// Финал в такой ситуации уже отходит назад до ближайшей тишины (см. дорезку
+/// длинных unit-ов в `local_asr_segmented`); превью теперь делает то же —
+/// переросший сегмент ждёт микропаузу. Потолок overrun держит стоимость тика
+/// ограниченной, когда пауз нет вообще.
+fn segment_cut_bound(
+    seg_start: usize,
+    seg_end: usize,
+    silence: usize,
+    last_speech_end: usize,
+    last_gap_cut: Option<usize>,
+    max_seg_samples: usize,
+) -> Option<usize> {
+    if silence >= SEG_SILENCE_SAMPLES {
+        return Some(last_speech_end + SEG_TAIL_SAMPLES);
+    }
+    let seg_len = seg_end.saturating_sub(seg_start);
+    if seg_len < max_seg_samples {
+        return None;
+    }
+    if let Some(cut) = last_gap_cut {
+        let fill = max_seg_samples * SEG_MIN_FILL_NUM / SEG_MIN_FILL_DEN;
+        if cut.saturating_sub(seg_start) >= fill {
+            return Some(cut);
+        }
+    }
+    (seg_len >= max_seg_samples + SEG_CAP_OVERRUN_SAMPLES)
+        .then_some(last_speech_end + SEG_TAIL_SAMPLES)
+}
+
 #[cfg(test)]
 mod seg_tests {
     use super::*;
+
+    const MAX_SEG: usize = 8 * 16000;
+
+    #[test]
+    fn overlong_segment_is_cut_at_a_micro_pause_never_mid_word() {
+        // Пауза закрывает сегмент независимо от длины — рез по концу речи.
+        assert_eq!(
+            segment_cut_bound(0, 16000, SEG_SILENCE_SAMPLES, 12000, None, MAX_SEG),
+            Some(12000 + SEG_TAIL_SAMPLES)
+        );
+        // Короткий сегмент без паузы не режем.
+        assert_eq!(segment_cut_bound(0, 16000, 320, 15000, None, MAX_SEG), None);
+        // Лимит достигнут, микропауза рядом с ним — режем ПО НЕЙ, не по счётчику.
+        assert_eq!(
+            segment_cut_bound(0, MAX_SEG, 320, MAX_SEG, Some(7 * 16000), MAX_SEG),
+            Some(7 * 16000)
+        );
+        // Та же микропауза, но сегмент начался позже: рез оставил бы огрызок в
+        // одну секунду — ждём следующую паузу, короткий кусок ASR читает хуже.
+        assert_eq!(
+            segment_cut_bound(
+                6 * 16000,
+                14 * 16000,
+                320,
+                MAX_SEG,
+                Some(7 * 16000),
+                MAX_SEG
+            ),
+            None
+        );
+        // Лимит достигнут, паузы ещё не было — ждём, а не пилим слово пополам.
+        assert_eq!(
+            segment_cut_bound(0, MAX_SEG + 16000, 320, MAX_SEG, None, MAX_SEG),
+            None
+        );
+        // Речь без единой паузы: потолок overrun держит стоимость тика конечной.
+        assert_eq!(
+            segment_cut_bound(
+                0,
+                MAX_SEG + SEG_CAP_OVERRUN_SAMPLES,
+                320,
+                190_000,
+                None,
+                MAX_SEG
+            ),
+            Some(190_000 + SEG_TAIL_SAMPLES)
+        );
+    }
+
+    /// Пословная VAD-разметка записи — то же, что стриминговый VAD петли.
+    fn speech_track(vad: &mut crate::vad::SileroVad, samples: &[f32]) -> Vec<bool> {
+        vad.reset();
+        samples
+            .chunks_exact(crate::vad::CHUNK)
+            .map(|c| vad.process_chunk(c).unwrap_or(0.0) >= 0.35)
+            .collect()
+    }
+
+    /// Сегментация живого превью по готовой VAD-разметке: тот же порядок, что в
+    /// [`local_partial_loop`], но без тиков реального времени (рез проверяется на
+    /// каждом чанке, а не раз в 220–420 мс — обоим правилам одинаково).
+    /// `wait_for_gap = false` — правило до фикса: рез ровно по лимиту длины.
+    fn preview_pill_text(
+        g: &mut crate::gigaam::GigaAm,
+        samples: &[f32],
+        speech: &[bool],
+        wait_for_gap: bool,
+    ) -> String {
+        const MAX_SEG: usize = 8 * 16000;
+        let mut segs: Vec<String> = Vec::new();
+        let mut seg_start = 0usize;
+        let mut last_speech_end = 0usize;
+        let mut seg_has_speech = false;
+        let mut gap_start: Option<usize> = None;
+        let mut last_gap_cut: Option<usize> = None;
+        let mut decode = |g: &mut crate::gigaam::GigaAm, from: usize, to: usize| {
+            let t = g.transcribe(&samples[from..to]).unwrap_or_default();
+            if std::env::var_os("VOXFLOW_PREVIEW_CUTS").is_some() {
+                println!(
+                    "    [{}] {:.2}–{:.2}c {t:?}",
+                    if wait_for_gap {
+                        "новое"
+                    } else {
+                        "было "
+                    },
+                    from as f32 / 16000.0,
+                    to as f32 / 16000.0
+                );
+            }
+            if !t.trim().is_empty() {
+                segs.push(t.trim().to_string());
+            }
+        };
+        for (i, &voiced) in speech.iter().enumerate() {
+            let pos = (i + 1) * crate::vad::CHUNK;
+            if voiced {
+                last_speech_end = pos;
+                seg_has_speech = true;
+                gap_start = None;
+            } else if seg_has_speech {
+                let from = *gap_start.get_or_insert(pos - crate::vad::CHUNK);
+                if pos - from >= SEG_GAP_MIN_SAMPLES {
+                    last_gap_cut = Some((from + pos) / 2);
+                }
+            }
+            if !seg_has_speech {
+                continue;
+            }
+            let silence = pos.saturating_sub(last_speech_end);
+            let seg_len = pos.saturating_sub(seg_start);
+            let cut = if wait_for_gap {
+                segment_cut_bound(
+                    seg_start,
+                    pos,
+                    silence,
+                    last_speech_end,
+                    last_gap_cut,
+                    MAX_SEG,
+                )
+            } else {
+                (silence >= SEG_SILENCE_SAMPLES || seg_len >= MAX_SEG)
+                    .then_some(last_speech_end + SEG_TAIL_SAMPLES)
+            };
+            let Some(bound) = cut else { continue };
+            let bound = bound.clamp(seg_start, samples.len());
+            decode(g, seg_start, bound);
+            seg_start = bound;
+            seg_has_speech = last_speech_end > bound;
+            gap_start = None;
+            last_gap_cut = None;
+        }
+        // Активный сегмент показан в плашке серым хвостом.
+        if seg_start < samples.len() {
+            decode(g, seg_start, samples.len());
+        }
+        segs.join(" ")
+    }
+
+    fn read_wav_16k(path: &std::path::Path) -> Vec<f32> {
+        let r = hound::WavReader::open(path).expect("открыть WAV");
+        let spec = r.spec();
+        let raw: Vec<f32> = match spec.sample_format {
+            hound::SampleFormat::Float => {
+                r.into_samples::<f32>().map(|x| x.unwrap_or(0.0)).collect()
+            }
+            hound::SampleFormat::Int => {
+                let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
+                r.into_samples::<i32>()
+                    .map(|x| x.unwrap_or(0) as f32 / max)
+                    .collect()
+            }
+        };
+        let chans = spec.channels as usize;
+        let mono: Vec<f32> = if chans <= 1 {
+            raw
+        } else {
+            raw.chunks(chans)
+                .map(|f| f.iter().sum::<f32>() / f.len() as f32)
+                .collect()
+        };
+        crate::audio::resample_to_16k(&mono, spec.sample_rate)
+    }
+
+    /// Плашка против вставки на РЕАЛЬНЫХ записях — то, чем проверялся рез
+    /// переросшего сегмента. Каждая запись гоняется двумя правилами, считается
+    /// пословное расхождение живого текста с финалом. Модели и датасет
+    /// приватные, в CI их нет, поэтому #[ignore].
+    ///
+    /// `cargo test --lib preview_pill -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local GigaAM models and the private dataset"]
+    fn preview_pill_diverges_less_from_the_final_after_the_micro_pause_cut() {
+        const FILES: usize = 60;
+        let dir = crate::paths::gigaam_dir();
+        assert!(
+            crate::gigaam::dir_ready(&dir),
+            "модели GigaAM не найдены в {dir:?}"
+        );
+        let threads = Settings::default().effective_threads() as usize;
+        let mut g = crate::gigaam::GigaAm::load(&dir, threads).expect("gigaam");
+        let mut vad =
+            crate::vad::SileroVad::load(&crate::paths::vad_model_path(None)).expect("vad");
+        let _ = g.transcribe(&vec![0.0f32; 8000]);
+
+        let mut wavs: Vec<std::path::PathBuf> = std::fs::read_dir(crate::paths::dataset_dir())
+            .expect("dataset")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("wav"))
+            .collect();
+        wavs.sort();
+        let wavs = wavs.split_off(wavs.len().saturating_sub(FILES));
+
+        let (mut old_sum, mut new_sum, mut counted) = (0.0_f64, 0.0_f64, 0usize);
+        for wav in &wavs {
+            let samples = read_wav_16k(wav);
+            // Короче лимита сегмента — резать нечего, разницы не будет.
+            if samples.len() < 9 * 16000 {
+                continue;
+            }
+            let final_text = g.transcribe(&samples).unwrap_or_default();
+            if final_text.trim().is_empty() {
+                continue;
+            }
+            let speech = speech_track(&mut vad, &samples);
+            let old = preview_pill_text(&mut g, &samples, &speech, false);
+            let new = preview_pill_text(&mut g, &samples, &speech, true);
+            let (Some(o), Some(n)) = (crate::wer(&final_text, &old), crate::wer(&final_text, &new))
+            else {
+                continue;
+            };
+            counted += 1;
+            old_sum += o;
+            new_sum += n;
+            println!(
+                "{:?} {:.1}c: было {:.3}, стало {:.3}{}",
+                wav.file_name().unwrap_or_default(),
+                samples.len() as f32 / 16000.0,
+                o,
+                n,
+                if n < o {
+                    " ←"
+                } else if n > o {
+                    " ХУЖЕ"
+                } else {
+                    ""
+                }
+            );
+            if n > o {
+                println!("  финал:  {final_text}\n  было:   {old}\n  стало:  {new}");
+            }
+        }
+        assert!(
+            counted > 0,
+            "в датасете нет записей длиннее лимита сегмента"
+        );
+        println!(
+            "расхождение плашки с финалом на {counted} записях: было {:.3}, стало {:.3}",
+            old_sum / counted as f64,
+            new_sum / counted as f64
+        );
+        assert!(
+            new_sum <= old_sum,
+            "рез по микропаузе не должен уводить плашку дальше от финала"
+        );
+    }
 
     #[test]
     fn final_local_asr_reuses_the_compacted_audio_written_to_wav() {
