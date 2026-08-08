@@ -146,6 +146,10 @@ pub fn total_ram_gb() -> u32 {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Accel {
     /// Apple Silicon: память общая, GPU берёт из тех же гигабайт, что и всё остальное.
+    ///
+    /// Вне macOS не конструируется (симметрично `Nvidia` ниже), но в правилах
+    /// подбора и тестах участвует на всех платформах.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     AppleSilicon,
     /// Дискретная NVIDIA. `vram_gb == 0` — карта есть, объём выяснить не удалось.
     ///
