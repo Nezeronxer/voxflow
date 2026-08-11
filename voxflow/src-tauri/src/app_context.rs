@@ -131,6 +131,12 @@ impl TargetFingerprint {
         )
     }
 
+    /// Имя исполняемого файла цели: движку нужно отличать «то же приложение,
+    /// пересоздавшее окно» от «пользователь ушёл в другую программу».
+    pub fn exe(&self) -> &str {
+        &self.exe
+    }
+
     pub fn is_own_app(&self) -> bool {
         is_own_app_parts(&self.exe, &self.window_id)
     }
@@ -200,11 +206,67 @@ impl TargetFingerprint {
         } else {
             self.exe == current.exe && self.title == current.title
         };
-        same_window
-            && (self.field_id.is_empty()
-                || current.field_id.is_empty()
-                || self.field_id == current.field_id)
+        // Пустой id с любой стороны по-прежнему отключает строгую проверку поля,
+        // а геометрические идентификаторы сравниваются без координат: поле ввода
+        // в мессенджере/AI-чате растёт по мере набора текста, и его прямоугольник
+        // меняется, хотя поле остаётся тем же самым.
+        let same_field = self.field_id.is_empty()
+            || current.field_id.is_empty()
+            || self.field_id == current.field_id
+            || (field_id_is_geometric(&self.field_id)
+                && field_id_is_geometric(&current.field_id)
+                && field_id_core(&self.field_id) == field_id_core(&current.field_id));
+        same_window && same_field
     }
+}
+
+/// Префикс Windows-фолбэка `field_identity` (см. platform-модуль).
+const UIA_FRAME_PREFIX: &str = "uia:frame:";
+
+/// Идентификатор поля построен из геометрии, а не из стабильного id.
+///
+/// `matches` кроссплатформенный, поэтому понимает оба формата фолбэка:
+/// Windows — `uia:frame:{role}:{class}:{left},{top},{right},{bottom}`,
+/// macOS — `role=…;subrole=…;pos={x},{y};size={w}x{h}`. Стабильные id
+/// (`uia:id:…`, `id=…`) геометрическими не считаются и сравниваются строго.
+fn field_id_is_geometric(id: &str) -> bool {
+    id.starts_with(UIA_FRAME_PREFIX) || (id.contains(";pos=") && id.contains(";size="))
+}
+
+/// Опорная часть геометрического идентификатора — без координат.
+///
+/// Для `uia:frame:{role}:{class}:{l},{t},{r},{b}` остаётся `uia:frame:{role}:{class}`,
+/// для `role=…;subrole=…;pos=…;size=…` — `role=…;subrole=…`. Именно эта часть
+/// опознаёт поле; координаты — шум, который меняется при росте поля и переносе окна.
+fn field_id_core(id: &str) -> &str {
+    if let Some(rest) = id.strip_prefix(UIA_FRAME_PREFIX) {
+        // Отрезаем именно координатный хвост, а не берём N первых `:`-полей:
+        // имя класса окна теоретически может само содержать двоеточие.
+        return match rest.rfind(':') {
+            Some(index) if is_frame_coordinates(&rest[index + 1..]) => {
+                &id[..UIA_FRAME_PREFIX.len() + index]
+            }
+            _ => id,
+        };
+    }
+    match id.find(";pos=") {
+        Some(index) => &id[..index],
+        None => id,
+    }
+}
+
+/// `left,top,right,bottom` — ровно четыре целых числа (минус возможен на
+/// мультимониторной раскладке с отрицательными координатами).
+fn is_frame_coordinates(value: &str) -> bool {
+    let mut count = 0usize;
+    for part in value.split(',') {
+        let digits = part.strip_prefix('-').unwrap_or(part);
+        if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+            return false;
+        }
+        count += 1;
+    }
+    count == 4
 }
 
 fn tail_chars(value: &str, max_chars: usize) -> String {
@@ -744,25 +806,84 @@ mod tests {
         assert!(!known.target_fingerprint().matches(&unknown));
     }
 
+    /// Одно и то же окно, разные поля: `field_id` задаётся отдельно от `ctx`.
+    fn field_ctx(field_id: &str) -> super::AppContext {
+        let mut context = ctx("chrome.exe", "Form", "window-1");
+        context.field_id = field_id.into();
+        context
+    }
+
     #[test]
     fn target_fingerprint_rejects_another_field_in_the_same_window() {
-        let mut start_context = ctx("chrome.exe", "Form", "window-1");
-        start_context.field_id = "field-a".into();
-        let start = start_context.target_fingerprint();
+        let start = field_ctx("uia:id:Chrome:Chrome_WidgetWin_1:field-a").target_fingerprint();
 
-        let mut same_field = ctx("chrome.exe", "Form", "window-1");
-        same_field.field_id = "field-a".into();
-        assert!(start.matches(&same_field));
-
-        let mut other_field = ctx("chrome.exe", "Form", "window-1");
-        other_field.field_id = "field-b".into();
-        assert!(!start.matches(&other_field));
+        assert!(start.matches(&field_ctx("uia:id:Chrome:Chrome_WidgetWin_1:field-a")));
+        assert!(!start.matches(&field_ctx("uia:id:Chrome:Chrome_WidgetWin_1:field-b")));
 
         let unknown_field = ctx("chrome.exe", "Form", "window-1");
         assert!(
             start.matches(&unknown_field),
             "best-effort id may be unavailable"
         );
+    }
+
+    /// Регресс на потерю надиктованного текста: поле ввода в Telegram/Claude/ChatGPT
+    /// растёт по мере набора, и UIA-фолбэк без AutomationId отдаёт новый
+    /// прямоугольник. Окно и поле те же — отменять вставку нельзя.
+    #[test]
+    fn target_fingerprint_ignores_geometry_drift_of_the_windows_field() {
+        let start = field_ctx("uia:frame:UIADocument:Chrome_RenderWidgetHostHWND:10,20,410,120")
+            .target_fingerprint();
+
+        assert!(start.matches(&field_ctx(
+            "uia:frame:UIADocument:Chrome_RenderWidgetHostHWND:10,-40,410,220"
+        )));
+    }
+
+    /// То же для macOS-фолбэка: меняются только `pos`/`size`.
+    #[test]
+    fn target_fingerprint_ignores_geometry_drift_of_the_macos_field() {
+        let start = field_ctx("role=AXTextArea;subrole=AXSearchField;pos=120,240;size=600x40")
+            .target_fingerprint();
+
+        assert!(start.matches(&field_ctx(
+            "role=AXTextArea;subrole=AXSearchField;pos=120,180;size=600x100"
+        )));
+    }
+
+    /// Смягчение касается только координат: разные role/class (role/subrole)
+    /// остаются разными полями.
+    #[test]
+    fn geometric_ids_still_separate_different_fields() {
+        let windows = field_ctx("uia:frame:UIAEdit:Edit:0,0,100,20").target_fingerprint();
+        assert!(!windows.matches(&field_ctx("uia:frame:UIAEdit:RichEditD2DPT:0,0,100,20")));
+        assert!(!windows.matches(&field_ctx("uia:frame:UIADocument:Edit:0,0,100,20")));
+
+        let macos = field_ctx("role=AXTextField;subrole=AXSearchField;pos=0,0;size=100x20")
+            .target_fingerprint();
+        assert!(!macos.matches(&field_ctx(
+            "role=AXTextArea;subrole=AXSearchField;pos=0,0;size=100x20"
+        )));
+        assert!(!macos.matches(&field_ctx(
+            "role=AXTextField;subrole=AXTextArea;pos=0,0;size=100x20"
+        )));
+    }
+
+    /// Геометрический id против стабильного — это разные типы идентификаторов,
+    /// послабление на них не распространяется.
+    #[test]
+    fn geometric_and_stable_ids_never_match_each_other() {
+        let windows_stable = field_ctx("uia:id:Chrome:Chrome_RenderWidgetHostHWND:prompt-textarea")
+            .target_fingerprint();
+        assert!(!windows_stable.matches(&field_ctx(
+            "uia:frame:UIADocument:Chrome_RenderWidgetHostHWND:10,20,410,120"
+        )));
+
+        let macos_stable = field_ctx("id=prompt-textarea;role=AXTextArea;subrole=AXSearchField")
+            .target_fingerprint();
+        assert!(!macos_stable.matches(&field_ctx(
+            "role=AXTextArea;subrole=AXSearchField;pos=0,0;size=100x20"
+        )));
     }
 
     #[test]

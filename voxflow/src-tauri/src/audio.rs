@@ -5,6 +5,7 @@
 //! - запуск захвата с микрофона в моно f32 (`start_capture` + [`Capture`]);
 //! - ресэмплинг в 16 кГц (`resample_to_16k`, инкрементальный [`Resampler16k`]
 //!   для партиал-петель);
+//! - нормализацию уровня перед ASR (`normalize_for_asr`);
 //! - обрезку тишины по краям (`trim_silence`);
 //! - запись WAV 16 кГц / моно / 16 бит (`write_wav_16k_mono`).
 //!
@@ -419,33 +420,189 @@ impl Resampler16k {
     }
 }
 
-/// Обрезает тишину по краям по RMS-энергии (простой VAD).
+/// Целевой уровень речи (95-й перцентиль покадрового RMS), на котором штатно
+/// работают и VAD, и ASR. ~ -24 dBFS: заметно выше шумовой полки, но далеко от
+/// клиппинга.
+const ASR_TARGET_LEVEL: f32 = 0.06;
+/// Ниже этого уровня усиливать нечего: это мёртвый вход или чистая тишина, и
+/// любое усиление лишь раскачает шумовую полку до «речи».
+const ASR_SILENCE_LEVEL: f32 = 5e-4;
+/// Потолок усиления. Выше него мы поднимаем уже не речь, а шум тракта.
+const ASR_MAX_GAIN: f32 = 20.0;
+/// Пик после усиления не должен подходить к 1.0 вплотную.
+const ASR_PEAK_CEILING: f32 = 0.95;
+
+/// Уровень речи на входе и усиление, применённое перед ASR.
+#[derive(Clone, Copy, Debug)]
+pub struct InputGain {
+    pub speech_level: f32, // 95-й перцентиль покадрового RMS до усиления
+    pub gain: f32,         // применённый множитель (1.0 — не трогали)
+}
+
+/// Приводит тихую запись к уровню, на котором штатно работают VAD и ASR.
 ///
-/// Кадр ~20 мс (`rate/50` сэмплов). Находим первый и последний кадр с
-/// RMS >= 0.01, оставляем поля ~150 мс с каждой стороны. Если ни один кадр
-/// не прошёл порог — возвращаем вход без изменений.
+/// Работает с буфером 16 кГц моно (кадры по 20 мс). Уровень речи меряем
+/// 95-м перцентилем покадрового RMS: бóльшая часть буфера — паузы, поэтому
+/// среднее и медиана занизили бы речь в разы (у тихого микрофона средний RMS
+/// 0.002 при речевых кадрах 0.005–0.018).
+///
+/// Функция чистая: возвращает новый `Vec`, вход не мутирует. Это важно — в
+/// live-петлях она зовётся на накопительном буфере каждый тик, и повторное
+/// усиление уже усиленного было бы лавиной.
+pub fn normalize_for_asr(samples: &[f32]) -> (Vec<f32>, InputGain) {
+    // Функция работает только с 16 кГц моно, частоту не принимает.
+    const RATE: usize = 16000;
+
+    if samples.is_empty() {
+        return (
+            Vec::new(),
+            InputGain {
+                speech_level: 0.0,
+                gain: 1.0,
+            },
+        );
+    }
+
+    let frame = RATE / 50; // 20 мс
+    let mut levels = frame_rms(samples, frame);
+    let speech_level = if levels.is_empty() {
+        // Буфер короче одного кадра — меряем RMS целиком.
+        rms(samples)
+    } else {
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        percentile_sorted(&levels, 0.95)
+    };
+
+    // Уже достаточно громко — или практически тишина, где усиливать нечего.
+    let already_loud = speech_level >= ASR_TARGET_LEVEL;
+    let nothing_to_lift = speech_level < ASR_SILENCE_LEVEL;
+    if already_loud || nothing_to_lift {
+        return (
+            samples.to_vec(),
+            InputGain {
+                speech_level,
+                gain: 1.0,
+            },
+        );
+    }
+
+    // Усиление ограничено и абсолютным потолком, и запасом до клиппинга.
+    // Пик считаем робастно — 99-й перцентиль покадровых пиков, а не абсолютный
+    // максимум: один щелчок мыши или стук по клавише иначе диктует усиление на
+    // всю диктовку (в замере на реальной записи ×14 схлопывалось до ×3.8, и
+    // речь оставалась тихой). Сам щелчок срежет кламп ниже — потеря нулевая.
+    let mut peaks = frame_peaks(samples, frame);
+    let robust_peak = if peaks.is_empty() {
+        samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
+    } else {
+        peaks.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // Отбрасываем верхний процент кадров, но не меньше одного: на коротком
+        // буфере перцентиль сам по себе вернул бы тот самый выброс.
+        let dropped = (peaks.len() / 100).max(1);
+        peaks[peaks.len().saturating_sub(dropped + 1)]
+    };
+    let peak_cap = if robust_peak > 0.0 {
+        ASR_PEAK_CEILING / robust_peak
+    } else {
+        ASR_MAX_GAIN
+    };
+    let gain = (ASR_TARGET_LEVEL / speech_level)
+        .min(ASR_MAX_GAIN)
+        .min(peak_cap)
+        .max(1.0);
+
+    // Кламп — страховка от редких транзиентов выше потолка пика.
+    let out = samples
+        .iter()
+        .map(|&s| (s * gain).clamp(-1.0, 1.0))
+        .collect();
+
+    (out, InputGain { speech_level, gain })
+}
+
+/// RMS по всему срезу; пустой срез — 0.0.
+fn rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|&s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+/// Покадровый RMS: кадры ровно по `frame` сэмплов, хвост короче кадра
+/// отбрасывается. Пустой результат означает «буфер короче одного кадра».
+fn frame_rms(samples: &[f32], frame: usize) -> Vec<f32> {
+    let frame = frame.max(1);
+    let num_frames = samples.len() / frame;
+    (0..num_frames)
+        .map(|f| rms(&samples[f * frame..(f + 1) * frame]))
+        .collect()
+}
+
+/// Покадровый пик (максимум модуля). Кадры те же, что у [`frame_rms`].
+fn frame_peaks(samples: &[f32], frame: usize) -> Vec<f32> {
+    let frame = frame.max(1);
+    let num_frames = samples.len() / frame;
+    (0..num_frames)
+        .map(|f| {
+            samples[f * frame..(f + 1) * frame]
+                .iter()
+                .fold(0.0f32, |m, &s| m.max(s.abs()))
+        })
+        .collect()
+}
+
+/// Перцентиль `p` (0.0..=1.0) по УЖЕ отсортированному по возрастанию срезу.
+/// Пустой срез — 0.0.
+fn percentile_sorted(sorted: &[f32], p: f32) -> f32 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let idx = ((sorted.len() - 1) as f32 * p.clamp(0.0, 1.0)).round() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
+/// Обрезает тишину по краям по RMS-энергии (грубый VAD перед точным Silero).
+///
+/// Кадр ~20 мс (`rate/50` сэмплов). Порог считается от статистики самой
+/// записи — `clamp(медиана * 2.5, ABS_FLOOR, p95 * 0.3)`, — а не константой:
+/// на тихом микрофоне (покадровый RMS речи 0.005–0.018) прежний жёсткий порог
+/// 0.01 срезал 32 секунды диктовки до 0.35 с. Находим первый и последний
+/// кадр выше порога, оставляем поля ~150 мс с каждой стороны.
+///
+/// Fail-open: если от записи длиннее секунды осталось меньше четверти —
+/// возвращаем буфер целиком. Точную сегментацию делает Silero VAD выше по
+/// стеку, а грубая обрезка не имеет права выбрасывать диктовку. Если ни один
+/// кадр не прошёл порог — вход тоже возвращается без изменений.
 pub fn trim_silence(samples: &[f32], rate: u32) -> Vec<f32> {
-    const THRESHOLD: f32 = 0.01;
+    // Маленький абсолютный пол: защита от полностью нулевого буфера, где вся
+    // статистика вырождается в ноль и порогом стал бы сам ноль.
+    const ABS_FLOOR: f32 = 0.0015;
 
     if samples.is_empty() || rate == 0 {
         return samples.to_vec();
     }
 
     let frame = (rate as usize / 50).max(1);
-    let num_frames = samples.len() / frame;
-    if num_frames == 0 {
+    let levels = frame_rms(samples, frame);
+    if levels.is_empty() {
         return samples.to_vec();
     }
+
+    let mut sorted = levels.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Медиана — оценка шумовой полки, p95 — оценка уровня речи. Порог держим
+    // над полкой, но обязательно НИЖЕ речи: в записи почти без пауз медиана
+    // сама попадает в речь, и `median * 2.5` срезал бы саму диктовку.
+    let threshold = (percentile_sorted(&sorted, 0.5) * 2.5)
+        .min(percentile_sorted(&sorted, 0.95) * 0.3)
+        .max(ABS_FLOOR);
 
     let mut first: Option<usize> = None;
     let mut last: Option<usize> = None;
 
-    for f in 0..num_frames {
-        let start = f * frame;
-        let slice = &samples[start..start + frame];
-        let sum_sq: f32 = slice.iter().map(|&s| s * s).sum();
-        let rms = (sum_sq / frame as f32).sqrt();
-        if rms >= THRESHOLD {
+    for (f, &level) in levels.iter().enumerate() {
+        if level >= threshold {
             if first.is_none() {
                 first = Some(f);
             }
@@ -457,7 +614,7 @@ pub fn trim_silence(samples: &[f32], rate: u32) -> Vec<f32> {
         (Some(a), Some(b)) => (a, b),
         _ => {
             log::warn!(
-                "trim_silence: ни один кадр не прошёл порог RMS {THRESHOLD} — буфер оставлен целиком ({} сэмплов)",
+                "trim_silence: ни один кадр не прошёл адаптивный порог RMS {threshold:.5} — буфер оставлен целиком ({} сэмплов)",
                 samples.len()
             );
             return samples.to_vec();
@@ -469,6 +626,16 @@ pub fn trim_silence(samples: &[f32], rate: u32) -> Vec<f32> {
 
     let start = (first * frame).saturating_sub(margin);
     let end = ((last + 1) * frame + margin).min(samples.len());
+
+    // Fail-open: грубая обрезка не имеет права съесть почти всю диктовку.
+    let kept = end - start;
+    if samples.len() > rate as usize && kept * 4 < samples.len() {
+        log::warn!(
+            "trim_silence: обрезка оставила {kept} из {} сэмплов при пороге RMS {threshold:.5} — буфер оставлен целиком",
+            samples.len()
+        );
+        return samples.to_vec();
+    }
 
     samples[start..end].to_vec()
 }
@@ -519,6 +686,20 @@ mod tests {
         (0..n)
             .map(|i| (i as f32 * 0.013).sin() * 0.6 + (i as f32 * 0.071).cos() * 0.3)
             .collect()
+    }
+
+    /// Синус ~509 Гц амплитудой `amp` на сетке 16 кГц. Покадровый RMS такого
+    /// сигнала — `amp / sqrt(2)` с точностью до 1 %.
+    fn sine(n: usize, amp: f32) -> Vec<f32> {
+        (0..n).map(|i| (i as f32 * 0.2).sin() * amp).collect()
+    }
+
+    /// Уровень речи (95-й перцентиль покадрового RMS) буфера 16 кГц — тем же
+    /// способом, каким его меряет normalize_for_asr.
+    fn speech_level_16k(samples: &[f32]) -> f32 {
+        let mut levels = frame_rms(samples, 320);
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        percentile_sorted(&levels, 0.95)
     }
 
     /// Инкрементальный ресэмпл по рваным кускам == пакетный на общей длине;
@@ -665,5 +846,186 @@ mod tests {
         assert_eq!(tail, vec![1.0, 2.0, 3.0]);
         assert_eq!(cur, 3);
         assert!(!ovf.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn normalize_for_asr_survives_a_single_loud_transient() {
+        // Тихая речь + один щелчок (клавиша/мышь) громче речи в 25 раз.
+        // По абсолютному пику усиление схлопнулось бы почти до 1.0, и диктовка
+        // осталась бы тихой; робастный пик (p99 покадровых) это игнорирует.
+        let mut buf = sine(16000, 0.01);
+        for (i, sample) in buf.iter_mut().enumerate().skip(8000).take(320) {
+            *sample = if i % 2 == 0 { 0.25 } else { -0.25 };
+        }
+
+        let (out, gain) = normalize_for_asr(&buf);
+
+        assert!(
+            gain.gain > 4.0,
+            "один щелчок не должен диктовать усиление всей диктовки: {gain:?}"
+        );
+        let after = speech_level_16k(&out);
+        assert!(
+            after > ASR_TARGET_LEVEL / 2.0,
+            "после усиления речь всё ещё тихая: {after}"
+        );
+        assert!(
+            out.iter().all(|s| s.abs() <= 1.0),
+            "щелчок должен срезаться клампом, а не выходить за пределы"
+        );
+    }
+
+    #[test]
+    fn normalize_for_asr_lifts_quiet_speech_to_target() {
+        // 1 с: 0.2 с тишины, 0.6 с очень тихой «речи», 0.2 с тишины.
+        let mut buf = vec![0.0f32; 3200];
+        buf.extend(sine(9600, 0.01));
+        buf.extend(vec![0.0f32; 3200]);
+
+        let (out, gain) = normalize_for_asr(&buf);
+
+        assert_eq!(out.len(), buf.len());
+        assert!(gain.gain > 1.0, "тихий вход должен усиливаться: {gain:?}");
+        assert!(
+            (gain.speech_level - 0.00707).abs() < 0.001,
+            "уровень речи померен неверно: {gain:?}"
+        );
+        // Уровень доехал до целевого, клиппинга при этом нет.
+        let after = speech_level_16k(&out);
+        assert!(
+            (after - ASR_TARGET_LEVEL).abs() < 0.012,
+            "после усиления уровень {after}, ждали ~{ASR_TARGET_LEVEL}"
+        );
+        assert!(
+            out.iter().all(|s| s.abs() <= 1.0),
+            "усиление вышло за пределы -1.0..=1.0"
+        );
+
+        // Функция чистая: вход не тронут, повторный вызов не усиливает снова
+        // (в live-петлях она зовётся на накопительном буфере каждый тик).
+        assert!((speech_level_16k(&buf) - gain.speech_level).abs() < 1e-6);
+        let (_, gain2) = normalize_for_asr(&out);
+        assert!(
+            gain2.gain < 1.001,
+            "повторное усиление уже усиленного буфера: {gain2:?}"
+        );
+    }
+
+    #[test]
+    fn normalize_for_asr_leaves_loud_input_untouched() {
+        let buf = sine(16000, 0.3);
+        let (out, gain) = normalize_for_asr(&buf);
+
+        assert_eq!(gain.gain, 1.0, "громкий вход трогать нельзя: {gain:?}");
+        assert!(gain.speech_level > ASR_TARGET_LEVEL);
+        assert_eq!(out, buf);
+    }
+
+    #[test]
+    fn normalize_for_asr_does_not_amplify_silence() {
+        // Полная тишина.
+        let quiet = vec![0.0f32; 16000];
+        let (out, gain) = normalize_for_asr(&quiet);
+        assert_eq!(gain.gain, 1.0, "тишину усиливать нечем: {gain:?}");
+        assert_eq!(out, quiet);
+
+        // Мёртвый вход: шумовая полка ниже порога тишины — не раскачиваем её.
+        let noise = sine(16000, 1e-5);
+        let (out, gain) = normalize_for_asr(&noise);
+        assert!(gain.speech_level < ASR_SILENCE_LEVEL);
+        assert_eq!(gain.gain, 1.0, "шумовая полка не должна расти: {gain:?}");
+        assert_eq!(out, noise);
+    }
+
+    #[test]
+    fn trim_silence_keeps_quiet_dictation() {
+        // Регресс на баг тихого микрофона: 3 с записи, посередине 0.8 с речи
+        // амплитудой 0.008 (покадровый RMS ~0.0057), по краям тишина.
+        let mut buf = vec![0.0f32; 17600];
+        buf.extend(sine(12800, 0.008));
+        buf.extend(vec![0.0f32; 17600]);
+        // Пара громких слогов внутри тихой речи: прежний жёсткий порог 0.01
+        // цеплялся только за них и схлопывал диктовку до ~0.36 с.
+        for s in &mut buf[23680..24640] {
+            *s *= 3.75;
+        }
+
+        let trimmed = trim_silence(&buf, 16000);
+
+        assert!(
+            trimmed.len() >= 12800,
+            "тихая диктовка схлопнута: {} из {} сэмплов",
+            trimmed.len(),
+            buf.len()
+        );
+        assert!(
+            trimmed.len() < buf.len(),
+            "края тишины всё же должны срезаться: {}",
+            trimmed.len()
+        );
+    }
+
+    #[test]
+    fn trim_silence_still_cuts_silent_edges() {
+        // 3 с: секунда тишины, секунда нормальной по громкости речи, секунда
+        // тишины. Остаться должна речь плюс поля по 150 мс.
+        let mut buf = vec![0.0f32; 16000];
+        buf.extend(sine(16000, 0.3));
+        buf.extend(vec![0.0f32; 16000]);
+
+        let trimmed = trim_silence(&buf, 16000);
+
+        assert!(
+            trimmed.len() >= 16000,
+            "речь обрезана: {} сэмплов",
+            trimmed.len()
+        );
+        // 1 с речи + поля по 150 мс + запас на кадр 20 мс.
+        assert!(
+            trimmed.len() <= 16000 + 2 * 2400 + 640,
+            "тишина по краям не срезана: {} сэмплов",
+            trimmed.len()
+        );
+    }
+
+    #[test]
+    fn trim_silence_fails_open_when_trim_would_eat_dictation() {
+        // 3 с почти тишины с одним коротким щелчком: обрезка оставила бы ~11 %
+        // буфера. Грубый VAD не имеет права выбрасывать диктовку — точную
+        // сегментацию делает Silero выше по стеку.
+        let mut buf = vec![0.0f32; 48000];
+        buf[24000..24320].copy_from_slice(&sine(320, 0.5));
+
+        let trimmed = trim_silence(&buf, 16000);
+
+        assert_eq!(
+            trimmed.len(),
+            buf.len(),
+            "fail-open не сработал: {} из {} сэмплов",
+            trimmed.len(),
+            buf.len()
+        );
+    }
+
+    #[test]
+    fn empty_and_degenerate_input_does_not_panic() {
+        let (out, gain) = normalize_for_asr(&[]);
+        assert!(out.is_empty());
+        assert_eq!(gain.gain, 1.0);
+        assert_eq!(gain.speech_level, 0.0);
+        assert!(trim_silence(&[], 16000).is_empty());
+
+        // Буфер короче одного кадра 20 мс.
+        let (short, _) = normalize_for_asr(&[0.1, -0.1]);
+        assert_eq!(short.len(), 2);
+        assert_eq!(trim_silence(&[0.1, -0.1], 16000).len(), 2);
+
+        // Полностью нулевой буфер: ни один кадр не проходит абсолютный пол
+        // порога — возвращаем всё как есть.
+        let silence = vec![0.0f32; 16000];
+        assert_eq!(trim_silence(&silence, 16000).len(), silence.len());
+
+        // Нулевая частота — тоже без паники.
+        assert_eq!(trim_silence(&silence, 0).len(), silence.len());
     }
 }

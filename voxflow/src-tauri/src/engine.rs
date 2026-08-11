@@ -568,6 +568,33 @@ mod external_target_watcher_tests {
     }
 }
 
+/// Одно и то же приложение (без учёта регистра exe), пустой exe — не в счёт.
+fn same_app_target(target_fp: &TargetFingerprint, current_fp: &TargetFingerprint) -> bool {
+    let target_exe = target_fp.exe();
+    !target_exe.is_empty() && target_exe.eq_ignore_ascii_case(current_fp.exe())
+}
+
+/// Живо ли ещё окно, снятое при нажатии. На Windows это прямой ответ IsWindow;
+/// на macOS дешёвого достоверного аналога нет, поэтому окно считаем живым и
+/// цель не переносим — поведение там остаётся прежним.
+#[cfg(windows)]
+fn target_window_still_alive(target_fp: &TargetFingerprint) -> bool {
+    #[link(name = "user32")]
+    extern "system" {
+        fn IsWindow(hwnd: isize) -> i32;
+    }
+
+    match target_fp.windows_hwnd() {
+        Some(hwnd) => unsafe { IsWindow(hwnd) != 0 },
+        None => true,
+    }
+}
+
+#[cfg(not(windows))]
+fn target_window_still_alive(_target_fp: &TargetFingerprint) -> bool {
+    true
+}
+
 fn current_or_restored_target(
     ctx: &EngineCtx,
     target_fp: &mut TargetFingerprint,
@@ -613,6 +640,24 @@ fn current_or_restored_target(
                 break;
             }
         }
+    }
+
+    // Electron-приложения (Claude, ChatGPT) пересоздают окно: exe тот же, а
+    // HWND, снятый при нажатии, уже мёртв. Раньше это стоило пользователю всей
+    // диктовки — текст уходил в буфер обмена с тостом. Если целевое окно
+    // физически исчезло, а впереди то же приложение, переносим цель на него.
+    if !target_fp.is_own_app()
+        && cur.is_usable_dictation_target()
+        && same_app_target(target_fp, &cur_fp)
+        && !target_window_still_alive(target_fp)
+    {
+        dbg_log(&format!(
+            "финал: окно цели пересоздано ({stage}) — переносим цель на текущее окно {}",
+            cur_fp.describe()
+        ));
+        *target_fp = cur_fp.clone();
+        remember_external_target(ctx, target_fp);
+        return Some(cur);
     }
 
     if target_fp.is_own_app() {
@@ -1643,7 +1688,10 @@ fn cloud_partial_loop(
             continue;
         }
         idle = 0;
-        let trimmed = audio::trim_silence(&mono16, 16000);
+        // Тихий микрофон нормализуем на копии: mono16 накопительный, усиливать
+        // его на месте нельзя (следующий тик усилил бы уже усиленное).
+        let (boosted, _) = audio::normalize_for_asr(&mono16);
+        let trimmed = audio::trim_silence(&boosted, 16000);
         if trimmed.len() < 16000 {
             continue; // <1с полезного звука — рано
         }
@@ -2436,8 +2484,10 @@ fn partial_loop(a: PartialLoopArgs) {
         // пропущенный тик (занят asr_lock / звук обрезан в тишину) «съедал» бы порог
         // и партиал откладывался до накопления ещё 0.3 c звука.
 
-        // Лёгкая обрезка тишины; слишком короткий звук пропускаем.
-        let trimmed = audio::trim_silence(&mono16, 16000);
+        // Тихий вход подтягиваем до рабочего уровня (на копии: mono16 копится
+        // между тиками), затем лёгкая обрезка тишины; короткий звук пропускаем.
+        let (boosted, _) = audio::normalize_for_asr(&mono16);
+        let trimmed = audio::trim_silence(&boosted, 16000);
         if trimmed.len() < 16000 * 3 / 10 {
             continue; // < ~0.3 c полезного звука
         }
@@ -3445,6 +3495,30 @@ fn erase_live_draft_on_error<T>(
     result
 }
 
+/// Даже после усиления сигнал может остаться ниже рабочего уровня — это уже не
+/// софт, а тракт записи: уровень микрофона в системе, расстояние, не тот вход.
+/// Подсказываем один раз за запуск и только на осмысленной по длине диктовке,
+/// чтобы не мигать тостом на каждом коротком tap.
+fn warn_about_quiet_mic_once(ctx: &EngineCtx, gain: &audio::InputGain, capture_ms: u64) {
+    const CRITICAL_LEVEL: f32 = 0.003;
+    static HINTED: AtomicBool = AtomicBool::new(false);
+
+    if capture_ms < 1500 || gain.speech_level <= 0.0 || gain.speech_level >= CRITICAL_LEVEL {
+        return;
+    }
+    if HINTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    dbg_log(&format!(
+        "микрофон очень тихий: уровень речи {:.4}, усиление ×{:.1} упёрлось в потолок",
+        gain.speech_level, gain.gain
+    ));
+    emit_error(
+        &ctx.app,
+        "Микрофон очень тихий — поднимите уровень записи в настройках звука",
+    );
+}
+
 fn process_utterance(
     ctx: &EngineCtx,
     samples: Vec<f32>,
@@ -3479,18 +3553,25 @@ fn process_utterance(
     let t_all = Instant::now();
     let mut context_ms = 0u64;
     let t_pre = Instant::now();
-    let mono16 = audio::resample_to_16k(&samples, rate);
+    let raw16 = audio::resample_to_16k(&samples, rate);
+    // Тихий микрофон — главная причина «съеденных» диктовок: пока уровень речи
+    // был ниже порога обрезки, от тридцати секунд доезжал один громкий слог.
+    // Поднимаем уровень ДО того, как за буфер возьмутся trim_silence, VAD и ASR.
+    let (mono16, gain) = audio::normalize_for_asr(&raw16);
     let trimmed = audio::trim_silence(&mono16, 16000);
     let speech_trimmed = compact_speech_for_final_asr(&ctx.vad_final, &trimmed);
     let pre_ms = t_pre.elapsed().as_millis() as u64;
     let capture_ms = samples.len().saturating_mul(1000) as u64 / rate.max(1) as u64;
     dbg_log(&format!(
-        "финал: audio raw={}мс mono={}мс trimmed={}мс speech={}мс",
+        "финал: audio raw={}мс mono={}мс trimmed={}мс speech={}мс level={:.4} gain=×{:.1}",
         capture_ms,
         mono16.len().saturating_mul(1000) as u64 / 16000,
         trimmed.len().saturating_mul(1000) as u64 / 16000,
-        speech_trimmed.len().saturating_mul(1000) as u64 / 16000
+        speech_trimmed.len().saturating_mul(1000) as u64 / 16000,
+        gain.speech_level,
+        gain.gain
     ));
+    warn_about_quiet_mic_once(ctx, &gain, capture_ms);
     if speech_trimmed.len() < 16000 / 5 {
         // < ~0.2 c полезного звука — считаем, что речи не было
         dbg_log("финал: VAD не нашёл речь — распознавание пропущено");
