@@ -3,7 +3,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { EventCallback } from "@tauri-apps/api/event";
 import type {
   Settings,
@@ -513,6 +513,51 @@ export function installUpdate(
       }),
     null,
   );
+}
+
+/**
+ * Открыть внешнюю страницу в системном браузере: `<a target="_blank">` внутри
+ * вебвью Tauri молча ничего не делает. Пускаем только https (и loopback для
+ * локальных панелей вроде LM Studio) — адреса приходят из наших же констант.
+ */
+export async function openExternalUrl(url: string): Promise<boolean> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  const loopback = parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+  if (parsed.protocol !== "https:" && !(parsed.protocol === "http:" && loopback)) {
+    return false;
+  }
+  if (!IS_TAURI_RUNTIME) {
+    window.open(url, "_blank", "noopener,noreferrer");
+    return true;
+  }
+  try {
+    await openUrl(url);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Куда VoxFlow кладёт скачанные модели (раздел «Модели» показывает путь). */
+export function modelsDir(): Promise<string> {
+  if (!IS_TAURI_RUNTIME) return Promise.resolve("~/Library/Application Support/VoxFlow/models");
+  return safe<string>(() => invoke<string>("models_dir"), "");
+}
+
+/** Показать папку в Finder/Проводнике (opener:default разрешает reveal). */
+export async function revealPath(path: string): Promise<boolean> {
+  if (!path || !IS_TAURI_RUNTIME) return false;
+  try {
+    await revealItemInDir(path);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function openReleaseUrl(url: string): Promise<boolean> {

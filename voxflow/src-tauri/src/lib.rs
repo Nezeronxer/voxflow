@@ -212,6 +212,7 @@ pub fn run() {
             commands::clear_secret,
             commands::list_audio_devices,
             commands::list_models,
+            commands::models_dir,
             commands::download_model,
             commands::delete_model,
             commands::toggle_dictation,

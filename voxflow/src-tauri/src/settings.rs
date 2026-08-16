@@ -150,6 +150,10 @@ pub struct Settings {
     /// API-ключ rewrite (заголовок Authorization: Bearer).
     /// Пусто → env REWRITE_API_KEY / OPENAI_API_KEY. НИКОГДА не логируется.
     pub rewrite_key: String,
+    /// ИМЯ HTTP-заголовка, в котором провайдер ждёт ключ ("x-api-key", "api-key").
+    /// Пусто или "Authorization" → `Authorization: Bearer {key}` как раньше.
+    /// Нужно для сервисов вне OpenAI-конвенции в режиме «Своё».
+    pub rewrite_auth_header: String,
     /// Верхняя граница токенов ответа рерайта. Фактический лимит считается от
     /// длины входа (см. `net::output_token_budget`) и упирается в это число.
     pub rewrite_max_output_tokens: u32,
@@ -284,6 +288,7 @@ impl Default for Settings {
             rewrite_base_url: String::new(),
             rewrite_model: String::new(),
             rewrite_key: String::new(),
+            rewrite_auth_header: String::new(),
             rewrite_max_output_tokens: 4096,
             rewrite_min_recall: 0.9,
             ai_timeout_s: 20,
@@ -335,6 +340,7 @@ impl Settings {
         };
         self.rewrite_max_output_tokens = self.rewrite_max_output_tokens.clamp(256, 32_768);
         self.ai_timeout_s = self.ai_timeout_s.clamp(5, 300);
+        self.rewrite_auth_header = sanitized_header_name(&self.rewrite_auth_header);
     }
 
     /// Таймаут синхронного запроса к ИИ. Локальная модель на CPU физически
@@ -467,13 +473,42 @@ fn host_from_url(url: &str) -> Option<String> {
     }
 }
 
+/// Имя HTTP-заголовка для ключа: только RFC-token символы. Мусор (пробелы,
+/// двоеточие, CR/LF, юникод) отбрасываем целиком — пустое значение означает
+/// дефолтный `Authorization: Bearer`, а не заголовок с дырой.
+fn sanitized_header_name(raw: &str) -> String {
+    let name = raw.trim();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return String::new();
+    }
+    name.to_string()
+}
+
 fn trusted_openai_compat_host(base_url: &str) -> bool {
     if crate::net::is_loopback_base_url(base_url) {
         return true;
     }
+    // Только для подхвата ключа из ПЕРЕМЕННЫХ ОКРУЖЕНИЯ: чужому хосту env-ключ
+    // не отдаём. Ключ, введённый в настройках вручную, работает с любым хостом.
     matches!(
         host_from_url(base_url).as_deref(),
-        Some("openrouter.ai" | "api.groq.com" | "api.openai.com" | "api.aqua.sh")
+        Some(
+            "openrouter.ai"
+                | "api.groq.com"
+                | "api.openai.com"
+                | "api.aqua.sh"
+                | "api.deepseek.com"
+                | "api.mistral.ai"
+                | "api.together.xyz"
+                | "api.cerebras.ai"
+                | "api.x.ai"
+                | "api.anthropic.com"
+                | "generativelanguage.googleapis.com"
+        )
     )
 }
 
@@ -716,9 +751,38 @@ mod tests {
     }
 
     #[test]
+    fn custom_auth_header_keeps_token_names_and_drops_garbage() {
+        let mut s = Settings {
+            rewrite_auth_header: "  x-api-key  ".into(),
+            ..Settings::default()
+        };
+        s.normalize_user_values();
+        assert_eq!(s.rewrite_auth_header, "x-api-key");
+
+        for garbage in [
+            "x-api-key: value",
+            "x api key",
+            "x-api-key\r\nurl = http://evil.test",
+            "ключ",
+        ] {
+            let mut s = Settings {
+                rewrite_auth_header: garbage.into(),
+                ..Settings::default()
+            };
+            s.normalize_user_values();
+            assert_eq!(s.rewrite_auth_header, "", "must reject {garbage:?}");
+        }
+    }
+
+    #[test]
     fn env_fallback_only_for_known_or_loopback_hosts() {
         assert!(trusted_openai_compat_host("https://api.groq.com/openai/v1"));
         assert!(trusted_openai_compat_host("https://api.openai.com/v1"));
+        assert!(trusted_openai_compat_host("https://api.deepseek.com/v1"));
+        assert!(trusted_openai_compat_host("https://api.mistral.ai/v1"));
+        assert!(trusted_openai_compat_host(
+            "https://generativelanguage.googleapis.com/v1beta/openai"
+        ));
         assert!(trusted_openai_compat_host("http://localhost:11434/v1"));
         assert!(!trusted_openai_compat_host(
             "https://api.groq.com.evil.test/v1"

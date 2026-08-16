@@ -159,6 +159,7 @@ export const HOTKEY_LABELS: Record<string, string> = {
   AltRight: IS_APPLE_PLATFORM ? "Right Option" : "Right Alt",
   MetaLeft: IS_APPLE_PLATFORM ? "Left Cmd" : "Left Win",
   MetaRight: IS_APPLE_PLATFORM ? "Right Cmd" : "Right Win",
+  Fn: "Fn / 🌐",
   CapsLock: "Caps Lock", Insert: "Insert", ScrollLock: "Scroll Lock",
   Pause: "Pause", PrintScreen: "Print Screen", NumLock: "Num Lock",
   Enter: "Enter", Space: "Space", Tab: "Tab", Backspace: "Backspace", Delete: "Delete",
@@ -180,7 +181,9 @@ const SUPPORTED_HOTKEYS = new Set<string>([
   "ControlLeft", "ControlRight", "ShiftLeft", "ShiftRight",
   "AltLeft", "AltRight", "MetaLeft", "MetaRight",
   "CapsLock", "NumLock",
-  ...(IS_APPLE_PLATFORM ? [] : ["Insert", "ScrollLock", "Pause", "PrintScreen"]),
+  // Fn ловит только macOS-хук (CGEventTap, keycode 63). На Windows/Linux она
+  // обрабатывается прошивкой клавиатуры и до ОС не доходит.
+  ...(IS_APPLE_PLATFORM ? ["Fn"] : ["Insert", "ScrollLock", "Pause", "PrintScreen"]),
   "Enter", "Space", "Tab", "Backspace", "Delete",
   "Home", "End", "PageUp", "PageDown",
   "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
@@ -362,8 +365,27 @@ export function HotkeyCapture({
       >
         {saving ? "Сохраняю…" : capturing ? "Нажмите любую клавишу…" : prettyHotkey(value)}
       </button>
+      {/* Fn нажатием не поймать: вебвью не отдаёт для неё keydown/keyup —
+          событие живёт только в системном слое. Назначаем кнопкой. */}
+      {IS_APPLE_PLATFORM && value !== "Fn" && (
+        <button
+          type="button"
+          className="link-btn"
+          style={{ fontSize: 11.5 }}
+          disabled={saving}
+          onClick={() => void captureCode("Fn")}
+        >
+          назначить Fn / 🌐
+        </button>
+      )}
       {error ? (
         <div className="hotkey-error">{error}</div>
+      ) : value === "Fn" ? (
+        <div className="hotkey-error">
+          Если Fn/🌐 в системных настройках переключает язык или открывает эмодзи —
+          поставьте «Ничего не делать» (Настройки → Клавиатура), иначе система
+          откроет свою панель поверх диктовки.
+        </div>
       ) : printableWarn ? (
         <div className="hotkey-error">
           Печатная клавиша: в режиме «Удержание» будет печататься символ в активном

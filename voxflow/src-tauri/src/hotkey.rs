@@ -48,6 +48,9 @@ pub enum Key {
     MetaLeft,
     MetaRight,
     CapsLock,
+    /// Fn/🌐 (keycode 63). Имя совпадает с `rdev::Key::Function`, чтобы общий
+    /// код (`parse_key`, `key_can_signal_manual_edit`) собирался на всех ОС.
+    Function,
     Insert,
     ScrollLock,
     Pause,
@@ -261,6 +264,7 @@ fn key_can_signal_manual_edit(
         | Key::F10
         | Key::F11
         | Key::F12
+        | Key::Function
         | Key::Home
         | Key::Insert
         | Key::KpReturn
@@ -729,6 +733,9 @@ pub fn parse_key(name: &str) -> Option<Key> {
         "MetaLeft" | "WinLeft" | "Super" => Key::MetaLeft,
         "MetaRight" | "WinRight" => Key::MetaRight,
         "CapsLock" => Key::CapsLock,
+        // Fn/🌐 — только macOS: на Windows/Linux клавиша обрабатывается прошивкой
+        // клавиатуры и до ОС не доходит (см. parsed_assignable_key).
+        "Fn" => Key::Function,
         // --- спец-клавиши, удобные для hold-to-talk ---
         "Insert" => Key::Insert,
         "ScrollLock" => Key::ScrollLock,
@@ -848,6 +855,13 @@ fn parsed_assignable_key(name: &str) -> Option<Key> {
     ) {
         return None;
     }
+    // Fn существует как назначаемая клавиша только на macOS: там её отдаёт
+    // CGEventTap (keycode 63). На остальных платформах она не порождает событий,
+    // и назначение выглядело бы как тихий отказ хоткея.
+    #[cfg(not(target_os = "macos"))]
+    if key == Key::Function {
+        return None;
+    }
     Some(key)
 }
 
@@ -942,6 +956,7 @@ mod macos {
     const K_CG_EVENT_FLAG_MASK_CONTROL: u64 = 1 << 18;
     const K_CG_EVENT_FLAG_MASK_ALTERNATE: u64 = 1 << 19;
     const K_CG_EVENT_FLAG_MASK_COMMAND: u64 = 1 << 20;
+    const K_CG_EVENT_FLAG_MASK_SECONDARY_FN: u64 = 1 << 23;
 
     #[link(name = "ApplicationServices", kind = "framework")]
     extern "C" {
@@ -1224,6 +1239,9 @@ mod macos {
             Key::ControlLeft | Key::ControlRight => K_CG_EVENT_FLAG_MASK_CONTROL,
             Key::Alt | Key::AltGr => K_CG_EVENT_FLAG_MASK_ALTERNATE,
             Key::MetaLeft | Key::MetaRight => K_CG_EVENT_FLAG_MASK_COMMAND,
+            // Fn/🌐 приходит только через flagsChanged; на внешних клавиатурах
+            // HID-состояние keycode 63 бывает пустым, и без флага press терялся.
+            Key::Function => K_CG_EVENT_FLAG_MASK_SECONDARY_FN,
             // Caps/Num Lock are toggles, so their persistent logical flag cannot
             // serve as a press fallback. Their exact HID state remains authoritative.
             _ => 0,
@@ -1317,6 +1335,7 @@ mod macos {
             60 => Key::ShiftRight,
             61 => Key::AltGr,
             62 => Key::ControlRight,
+            63 => Key::Function,
             65 => Key::KpDelete,
             67 => Key::KpMultiply,
             69 => Key::KpPlus,
@@ -2092,6 +2111,16 @@ mod tests {
             "hold",
         );
         assert!(matches!(rx.try_recv(), Ok(EngineCmd::Stop)));
+    }
+
+    #[test]
+    fn fn_key_is_assignable_on_macos_only() {
+        assert!(matches!(parse_key("Fn"), Some(Key::Function)));
+        let assignable = parsed_assignable_key("Fn");
+        #[cfg(target_os = "macos")]
+        assert_eq!(assignable, Some(Key::Function));
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(assignable, None);
     }
 
     #[test]

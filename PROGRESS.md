@@ -552,3 +552,32 @@
   (11 записей лучше, 4 без изменений, 4 чуть хуже). Пороги выбраны прогоном, не на глаз. ✅
 - **Зелёные прогоны:** `cargo test --lib` 354 passed / 0 failed (6 ignored — модели и датасет),
   fmt и clippy чисто. ✅
+
+## 2026-08-15 — свои провайдеры постобработки, любой заголовок ключа, Fn
+
+- **Запрос:** подключать к постобработке сторонние сервисы и любые API-ключи, видеть известных
+  провайдеров списком со ссылкой «где взять ключ», плюс Fn как клавишу диктовки.
+- **Найдено в коде:** ветка `openai_compat` умела произвольный `/chat/completions`, но поля
+  Base URL в интерфейсе не было вообще, а `providerFromBaseUrl` при незнакомом адресе молча
+  возвращала OpenRouter — свой сервис подписывался чужим именем. ✅ починено
+- Каталог провайдеров вынесен в `src/aiProviders.ts`: OpenRouter, Groq, OpenAI, DeepSeek,
+  Mistral, Together, Cerebras, xAI, Gemini/Anthropic в OpenAI-режиме, Aqua, LM Studio + «Своё»
+  (свой Base URL, модель и заголовок ключа). ✅
+- Поле модели — текст с `datalist`: подсказки есть, ввод не заперт (списки моделей у провайдеров
+  живут своей жизнью). ✅
+- `rewrite_auth_header` в настройках + `rewrite::auth_header_line`: пусто/`Authorization` →
+  `Authorization: Bearer`, иначе `x-api-key: <ключ>` и любой другой заголовок. Мусорное имя
+  (двоеточие, CR/LF, юникод) отбрасывается в `normalize_user_values`. ✅
+- Ссылки «где взять ключ» открываются через `openExternalUrl` — `<a target="_blank">` в вебвью
+  Tauri не работал, прежние подсказки со ссылками были мёртвыми. ✅
+- Раздел «Модели»: путь к папке моделей + «открыть», отметка про huggingface.co и SHA-256. ✅
+- **Fn:** keycode 63 + флаг `SecondaryFn` в macOS-тапе, `parse_key("Fn")`, отказ вне macOS.
+  Назначается кнопкой «назначить Fn / 🌐» — вебвью не отдаёт для Fn клавиатурных событий. ✅
+- **Тесты:** `custom_auth_header_keeps_token_names_and_drops_garbage`,
+  `custom_header_name_replaces_bearer_convention`, `fn_key_is_assignable_on_macos_only`,
+  `env_fallback_only_for_known_or_loopback_hosts` (расширен) и новый
+  `tests/ai-providers.test.mjs` (незнакомый адрес → «Своё», https/loopback у всех пресетов). ✅
+- **Зелёные прогоны:** `cargo test` 357 passed / 0 failed (6 ignored), fmt и clippy чисто;
+  `npm test` 24/24, tsc и сборка exit 0. ✅
+- **Проверено в интерфейсе** (vite-превью, mock-режим): переключение провайдеров, поля режима
+  «Своё», подсказка env-переменных, путь к моделям, назначение Fn кнопкой. ✅

@@ -747,6 +747,19 @@ body {
 .field-control {
   flex: none;
 }
+/* Ссылка наружу. Именно кнопка, а не <a>: вебвью Tauri не открывает
+   target="_blank" — переход идёт через openExternalUrl → системный браузер. */
+.link-btn {
+  border: 0;
+  background: none;
+  padding: 0;
+  font: inherit;
+  color: var(--accent-hover);
+  cursor: pointer;
+}
+.link-btn:hover {
+  text-decoration: underline;
+}
 
 /* STT provider picker */
 .cloud-card {

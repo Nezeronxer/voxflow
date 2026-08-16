@@ -194,6 +194,13 @@ pub fn list_models() -> Vec<models::ModelInfo> {
     models::list()
 }
 
+/// Куда кладутся модели. UI показывает путь и открывает папку — иначе
+/// «где вообще лежат модели» выясняется только из исходников.
+#[tauri::command]
+pub fn models_dir() -> String {
+    crate::paths::models_dir().to_string_lossy().into_owned()
+}
+
 #[tauri::command]
 pub fn download_model(app: AppHandle, name: String) -> R<()> {
     models::start_download(app, name).map_err(err)

@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
-import { aiTest, saveSettings, type AiModelOption } from "../api";
+import { aiTest, openExternalUrl, saveSettings, type AiModelOption } from "../api";
 import { PageHead, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
+import {
+  CUSTOM_PROVIDER,
+  OPENAI_COMPAT_PROVIDERS,
+  providerFromBaseUrl,
+} from "../aiProviders";
 import SecretControl from "../components/SecretControl";
 import LocalAiCard from "../components/LocalAiCard";
 
@@ -21,65 +26,12 @@ const OLLAMA_MODELS: Option[] = [
   { value: "voiceflow", label: "VoiceFlow profile" },
 ];
 
-const OPENAI_COMPAT_PROVIDERS = [
-  {
-    value: "openrouter",
-    label: "OpenRouter",
-    baseUrl: "https://openrouter.ai/api/v1",
-    hint: "Много моделей через один OpenAI-compatible API.",
-    keyHint: "OPENROUTER_API_KEY",
-    models: [],
-  },
-  {
-    value: "groq",
-    label: "Groq",
-    baseUrl: "https://api.groq.com/openai/v1",
-    hint: "Быстрые OpenAI-compatible модели Groq.",
-    keyHint: "REWRITE_API_KEY",
-    models: [
-      { value: "llama-3.3-70b-versatile", label: "Llama 3.3 70B Versatile" },
-      { value: "llama-3.1-8b-instant", label: "Llama 3.1 8B Instant" },
-    ],
-  },
-  {
-    value: "openai",
-    label: "OpenAI",
-    baseUrl: "https://api.openai.com/v1",
-    hint: "Официальный OpenAI API.",
-    keyHint: "OPENAI_API_KEY",
-    models: [
-      { value: "gpt-4o-mini", label: "GPT-4o mini" },
-      { value: "gpt-4o", label: "GPT-4o" },
-      { value: "gpt-4.1-mini", label: "GPT-4.1 mini" },
-    ],
-  },
-  {
-    value: "aqua",
-    label: "Aqua / Avalon",
-    baseUrl: "https://api.aqua.sh/v1",
-    hint: "Aqua OpenAI-compatible endpoint.",
-    keyHint: "REWRITE_API_KEY",
-    models: [
-      { value: "claude-3-5-haiku", label: "Claude 3.5 Haiku" },
-      { value: "gpt-4o-mini", label: "GPT-4o mini" },
-    ],
-  },
-] as const;
-
 function withCurrentOption(options: readonly Option[], current: string): Option[] {
   const value = current.trim();
   if (!value || options.some((option) => option.value === value)) return [...options];
   return [{ value, label: `Текущая: ${value}` }, ...options];
 }
 
-function providerFromBaseUrl(baseUrl: string) {
-  const normalized = baseUrl.trim().replace(/\/+$/, "").toLowerCase();
-  return (
-    OPENAI_COMPAT_PROVIDERS.find(
-      (provider) => provider.baseUrl.toLowerCase() === normalized,
-    ) ?? OPENAI_COMPAT_PROVIDERS[0]
-  );
-}
 
 export default function Ai({
   settings,
@@ -98,7 +50,13 @@ export default function Ai({
 
   const backend = settings.ai_backend;
   const aiOff = backend === "off";
-  const rewriteProvider = providerFromBaseUrl(settings.rewrite_base_url);
+  const savedProvider = providerFromBaseUrl(settings.rewrite_base_url);
+  // Выбор «Своё» держим в состоянии: адрес там пустой, пока пользователь не
+  // впечатал свой, и по одному только rewrite_base_url его не отличить от
+  // свежей установки (иначе селект сам прыгал бы обратно на первый пресет).
+  const [customPicked, setCustomPicked] = useState(savedProvider.value === "custom");
+  const isCustom = customPicked || savedProvider.value === "custom";
+  const rewriteProvider = isCustom ? CUSTOM_PROVIDER : savedProvider;
   const isOpenRouter = rewriteProvider.value === "openrouter";
   // Облачный ASR доступен только для Gemini — Qwen3 в Ollama чисто текстовый.
   const cloudAsrDisabled = backend !== "gemini";
@@ -117,6 +75,14 @@ export default function Ai({
     );
     setResult(null);
     setOpenRouterModels([]);
+    setCustomPicked(provider.value === "custom");
+    if (provider.value === "custom") {
+      // Свой адрес уже введён — не затираем его переключением селекта.
+      if (!isCustom) {
+        update({ rewrite_base_url: "", rewrite_model: "", rewrite_auth_header: "" });
+      }
+      return;
+    }
     update({
       rewrite_base_url: provider.baseUrl,
       rewrite_model: providerIsOpenRouter
@@ -124,6 +90,9 @@ export default function Ai({
         : keepModel
         ? settings.rewrite_model
         : provider.models[0]?.value ?? "",
+      // У пресетов ключ всегда уходит как Authorization: Bearer. Оставшийся
+      // от «Своего» заголовок ломал бы авторизацию молча.
+      rewrite_auth_header: "",
     });
   }
 
@@ -182,15 +151,18 @@ export default function Ai({
               setResult(null);
               setOpenRouterModels([]);
               if (v === "openai_compat") {
-                const provider = settings.rewrite_base_url.trim()
-                  ? rewriteProvider
-                  : OPENAI_COMPAT_PROVIDERS[0];
+                // Уже введённый адрес (в том числе свой) сохраняем как есть;
+                // пустой — первое включение, подставляем первый пресет.
+                const baseUrl =
+                  settings.rewrite_base_url.trim() ||
+                  OPENAI_COMPAT_PROVIDERS[0].baseUrl;
+                const provider = providerFromBaseUrl(baseUrl);
                 const providerIsOpenRouter = provider.value === "openrouter";
                 update({
                   ai_backend: v,
                   ai_backend_behavior_version: 1,
                   cloud_asr: false,
-                  rewrite_base_url: provider.baseUrl,
+                  rewrite_base_url: baseUrl,
                   rewrite_model: providerIsOpenRouter
                     ? ""
                     : settings.rewrite_model.trim() ||
@@ -325,6 +297,24 @@ export default function Ai({
               />
             </Field>
 
+            {isCustom && (
+              <Field
+                label="Base URL"
+                hint="Адрес OpenAI-совместимого API без /chat/completions. Только https (или localhost)"
+              >
+                <input
+                  type="text"
+                  placeholder="https://api.example.com/v1"
+                  value={settings.rewrite_base_url}
+                  onChange={(e) => {
+                    setResult(null);
+                    update({ rewrite_base_url: e.currentTarget.value });
+                  }}
+                  style={{ width: 260 }}
+                />
+              </Field>
+            )}
+
             <Field
               label="API-ключ"
               hint="Ключ хранится локально и используется только для запросов к выбранному провайдеру"
@@ -344,10 +334,64 @@ export default function Ai({
               className="field-hint"
               style={{ marginTop: -6, marginBottom: 14, maxWidth: "none" }}
             >
-              Или переменная окружения <code>REWRITE_API_KEY</code> /{" "}
-              <code>{rewriteProvider.keyHint}</code> / <code>OPENAI_API_KEY</code>;
-              в коде/логах не хранится.
+              {rewriteProvider.keyUrl && (
+                <>
+                  Где взять ключ:{" "}
+                  <button
+                    type="button"
+                    className="link-btn"
+                    onClick={() => void openExternalUrl(rewriteProvider.keyUrl)}
+                  >
+                    {rewriteProvider.keyUrl.replace(/^https:\/\//, "")}
+                  </button>
+                  {". "}
+                </>
+              )}
+              {isCustom ? (
+                <>
+                  Для своего адреса ключ берётся только из этого поля: из
+                  переменных окружения он подхватывается лишь у известных
+                  провайдеров и localhost. В коде/логах не хранится.
+                </>
+              ) : (
+                <>
+                  Или переменная окружения{" "}
+                  {[
+                    ...new Set([
+                      "REWRITE_API_KEY",
+                      rewriteProvider.keyHint,
+                      "OPENAI_API_KEY",
+                    ]),
+                  ]
+                    .filter((name) => /^[A-Z_]+$/.test(name))
+                    .map((name, index) => (
+                      <span key={name}>
+                        {index > 0 && " / "}
+                        <code>{name}</code>
+                      </span>
+                    ))}
+                  ; в коде/логах не хранится.
+                </>
+              )}
             </div>
+
+            {isCustom && (
+              <Field
+                label="Заголовок ключа"
+                hint="Пусто = Authorization: Bearer <ключ>. Для сервисов вне OpenAI-конвенции впишите своё имя заголовка, например x-api-key"
+              >
+                <input
+                  type="text"
+                  placeholder="Authorization"
+                  value={settings.rewrite_auth_header}
+                  onChange={(e) => {
+                    setResult(null);
+                    update({ rewrite_auth_header: e.currentTarget.value });
+                  }}
+                  style={{ width: 260 }}
+                />
+              </Field>
+            )}
 
             {isOpenRouter ? (
               openRouterModels.length > 0 ? (
@@ -380,16 +424,32 @@ export default function Ai({
             ) : (
               <Field
                 label="Модель"
-                hint={`Base URL: ${rewriteProvider.baseUrl}`}
+                hint={
+                  isCustom
+                    ? "Идентификатор модели как его ждёт ваш сервис"
+                    : `Base URL: ${rewriteProvider.baseUrl}. Можно вписать любую модель провайдера`
+                }
               >
-                <Select
+                {/* Не Select: список моделей у провайдеров меняется чаще релизов
+                    VoxFlow. datalist даёт подсказки, но не запирает ввод. */}
+                <input
+                  type="text"
+                  list="rewrite-model-options"
+                  placeholder={rewriteProvider.models[0]?.value ?? "model-id"}
                   value={settings.rewrite_model}
-                  onChange={(v) => update({ rewrite_model: v })}
-                  options={withCurrentOption(
-                    rewriteProvider.models,
-                    settings.rewrite_model,
-                  )}
+                  onChange={(e) => {
+                    setResult(null);
+                    update({ rewrite_model: e.currentTarget.value });
+                  }}
+                  style={{ width: 260 }}
                 />
+                <datalist id="rewrite-model-options">
+                  {rewriteProvider.models.map((model) => (
+                    <option key={model.value} value={model.value}>
+                      {model.label}
+                    </option>
+                  ))}
+                </datalist>
               </Field>
             )}
           </>

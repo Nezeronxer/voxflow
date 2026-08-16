@@ -1,5 +1,13 @@
 import { useEffect, useRef, useState } from "react";
-import { listModels, downloadModel, deleteModel, subscribe } from "../api";
+import {
+  listModels,
+  downloadModel,
+  deleteModel,
+  subscribe,
+  modelsDir,
+  revealPath,
+  openExternalUrl,
+} from "../api";
 import { PageHead, Field, Select, Icon } from "../ui";
 import type {
   Settings,
@@ -152,11 +160,16 @@ export default function Models({
 }) {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [progress, setProgress] = useState<Record<string, Progress>>({});
+  const [dir, setDir] = useState("");
   const speedRef = useRef<Record<string, SpeedSample>>({});
 
   async function refresh() {
     setModels(await listModels());
   }
+
+  useEffect(() => {
+    void modelsDir().then(setDir);
+  }, []);
 
   useEffect(() => {
     refresh();
@@ -253,6 +266,29 @@ export default function Models({
         title="Модель"
         desc="Модели распознавания речи хранятся локально и работают офлайн."
       />
+
+      {/* Где лежат файлы: без этого путь к моделям выясняется только из логов. */}
+      <div className="field-hint" style={{ marginTop: -8, marginBottom: 16, maxWidth: "none" }}>
+        Папка моделей: <code>{dir || "…"}</code>
+        {dir && (
+          <>
+            {" · "}
+            <button type="button" className="link-btn" onClick={() => void revealPath(dir)}>
+              открыть
+            </button>
+          </>
+        )}
+        {". "}
+        Файлы качаются с{" "}
+        <button
+          type="button"
+          className="link-btn"
+          onClick={() => void openExternalUrl("https://huggingface.co")}
+        >
+          huggingface.co
+        </button>{" "}
+        по закреплённым ревизиям и проверяются по SHA-256.
+      </div>
 
       {settings.stt_provider !== "local" && (
         <div className="toast" role="status">

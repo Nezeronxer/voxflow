@@ -8,8 +8,9 @@
 //! Groq (`https://api.groq.com/openai/v1`), OpenRouter
 //! (`https://openrouter.ai/api/v1`), OpenAI, локальные/прокси-эндпоинты,
 //! compat-обёртки над Claude/прочими. Различие только в `rewrite_base_url`,
-//! `rewrite_model` и Bearer-ключе; для OpenRouter добавляем безопасный
-//! attribution-заголовок `X-OpenRouter-Title`.
+//! `rewrite_model` и ключе; для OpenRouter добавляем безопасный
+//! attribution-заголовок `X-OpenRouter-Title`. Сервисам вне OpenAI-конвенции
+//! имя заголовка с ключом задаётся в `rewrite_auth_header` (`x-api-key` и др.).
 //!
 //! Используется СИСТЕМНЫЙ `curl` (без reqwest — на машине нет cmake). Прокси —
 //! через [`crate::net::curl_secret_with_proxy`] с `s.proxy_url`, чтобы облако
@@ -59,6 +60,19 @@ fn host_from_url(url: &str) -> Option<String> {
 
 pub(crate) fn is_openrouter_base(url: &str) -> bool {
     matches!(host_from_url(url).as_deref(), Some("openrouter.ai"))
+}
+
+/// Строка заголовка с ключом. По умолчанию — OpenAI-конвенция
+/// `Authorization: Bearer {key}`; своё имя заголовка (`x-api-key`, `api-key`)
+/// шлёт ключ как есть — так подключается провайдер вне конвенции.
+/// Имя уже отфильтровано `Settings::normalize_user_values`.
+fn auth_header_line(header_name: &str, key: &str) -> String {
+    let name = header_name.trim();
+    if name.is_empty() || name.eq_ignore_ascii_case("authorization") {
+        format!("Authorization: Bearer {key}")
+    } else {
+        format!("{name}: {key}")
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -194,7 +208,7 @@ fn openrouter_get_json(
         .arg(endpoint);
 
     let secret_headers = vec![
-        format!("Authorization: Bearer {key}"),
+        auth_header_line(&s.rewrite_auth_header, key),
         "X-OpenRouter-Title: VoxFlow".to_string(),
     ];
     let out = net::curl_secret_with_proxy(cmd, &secret_headers, &s.proxy_url)
@@ -301,7 +315,7 @@ fn chat_completion(
     let payload = serde_json::to_vec(&body).map_err(|e| anyhow!("сериализация тела: {e}"))?;
     let req = net::TempPayload::write_json("rewrite_req", &payload)?;
     let data_arg = req.curl_data_arg();
-    let mut secret_headers = vec![format!("Authorization: Bearer {key}")];
+    let mut secret_headers = vec![auth_header_line(&s.rewrite_auth_header, &key)];
     if is_openrouter_base(&base_url) {
         secret_headers.push("X-OpenRouter-Title: VoxFlow".to_string());
     }
@@ -466,6 +480,17 @@ mod tests {
             "https://openrouter.ai.evil.test/api/v1"
         ));
         assert!(!is_openrouter_base("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn custom_header_name_replaces_bearer_convention() {
+        assert_eq!(auth_header_line("", "k"), "Authorization: Bearer k");
+        assert_eq!(auth_header_line(" ", "k"), "Authorization: Bearer k");
+        assert_eq!(
+            auth_header_line("Authorization", "k"),
+            "Authorization: Bearer k"
+        );
+        assert_eq!(auth_header_line("x-api-key", "k"), "x-api-key: k");
     }
 
     #[test]

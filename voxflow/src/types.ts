@@ -42,6 +42,8 @@ export interface Settings {
   rewrite_base_url: string;
   rewrite_model: string;
   rewrite_key: string;
+  /** Имя HTTP-заголовка с ключом; пусто = `Authorization: Bearer`. */
+  rewrite_auth_header: string;
   // Верхняя граница токенов ответа рерайта (фактический лимит считается от входа).
   rewrite_max_output_tokens: number;
   // Доля слов диктовки, обязанных остаться в ответе модели (0..1).
@@ -258,6 +260,7 @@ export const DEFAULT_SETTINGS: Settings = {
   rewrite_base_url: "",
   rewrite_model: "",
   rewrite_key: "",
+  rewrite_auth_header: "",
   rewrite_max_output_tokens: 4096,
   rewrite_min_recall: 0.9,
   ai_timeout_s: 20,
