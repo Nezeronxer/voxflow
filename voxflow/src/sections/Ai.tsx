@@ -141,7 +141,11 @@ export default function Ai({
 
         <Field
           label="Бэкенд ИИ"
-          hint="Какую нейросеть использовать для умных функций"
+          hint={
+            aiOff
+              ? "Выключен: в поле уходит то, что расслышал распознаватель. Чтобы текст вставлялся по смыслу, выберите «Свой ключ» и вставьте ключ ниже"
+              : "Какую нейросеть использовать для умных функций"
+          }
         >
           <Select
             value={settings.ai_backend}
@@ -186,9 +190,11 @@ export default function Ai({
               { value: "ollama", label: "Локальный (Ollama / Qwen3)" },
               { value: "gemini", label: "Google Gemini" },
               {
+                // Название — то, что человек ищет глазами: «куда вставить свой
+                // ключ». «OpenAI-compatible» этого не говорит, и поле ключа не
+                // находили, хотя оно было на месте с 2.0.17.
                 value: "openai_compat",
-                label:
-                  "Облачный (OpenRouter / OpenAI-compatible)",
+                label: "Свой ключ — OpenAI, OpenRouter, любой сервис",
               },
             ]}
           />
