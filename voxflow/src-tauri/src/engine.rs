@@ -3874,15 +3874,10 @@ fn process_utterance(
         visible_previous_context_tail(&actx, &field_before_context, live_inserted);
     let previous_context_tail = previous_context_with_memory_boundary(ctx, &actx, visible_previous);
 
-    // ── «Умный» рерайт под стиль активного приложения (Gemini/Ollama/OpenAI-compatible) ──
-    // verbatim/neutral и встроенный AI-профиль LLM не зовут: вставка должна быть
-    // мгновенной. Явный smart prompt / правило для конкретной нейросети остаётся
-    // opt-in и может синхронно отрефайнить текст.
-    // Включённая пересборка промпта — такой же явный opt-in, как своё правило:
-    // пользователь сам попросил ждать LLM ради структурного промпта.
-    let explicit_smart_instruction = ai_prompt_rule_for_app(&s, &actx).is_some()
-        || prompt_rebuild_rules_for_app(&s, &actx).is_some()
-        || effective_smart_instruction(&s).is_some();
+    // ── Рерайт по смыслу под активное приложение (Gemini/Ollama/OpenAI-compatible) ──
+    // Зовём модель везде, где настроен бэкенд, кроме кода/дословного режима:
+    // именно она исправляет ослышки распознавания («Open I» → «OpenAI»), а
+    // локальные правила этого не умеют. Стиль задаёт профиль приложения.
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
     let context_hint = rewrite_context_hint(ctx, &actx, None, &field_before_context, live_inserted);
@@ -3891,9 +3886,7 @@ fn process_utterance(
     } else {
         tone.as_str()
     };
-    let smart_active = smart_instruction.is_some();
-    let llm_eligible = !snippet_expanded
-        && final_rewrite_eligible(&s, rewrite_tone, smart_active, explicit_smart_instruction);
+    let llm_eligible = !snippet_expanded && final_rewrite_eligible(&s, rewrite_tone);
     let t_llm = Instant::now();
     if llm_eligible {
         text = refine_text_with_fallback(
@@ -4627,23 +4620,16 @@ fn emit_final_preview(app: &AppHandle, text: &str, seq: u64, lang: Option<&'stat
     let _ = app.emit("partial", final_preview_payload(text, seq, lang));
 }
 
-fn final_rewrite_eligible(
-    s: &Settings,
-    rewrite_tone: &str,
-    smart_active: bool,
-    explicit_smart_instruction: bool,
-) -> bool {
+/// Настроенный бэкенд — и есть согласие ждать модель: она исправляет ослышки
+/// распознавания по смыслу, а без неё в поле уходит то, что услышал ASR.
+/// До 2.0.18 нейтральные окна и поля нейросети LLM не звали ради мгновенной
+/// вставки — ровно там (терминал, Claude) пользователь и видел «вставляет не то».
+/// Код и дословный режим модель не трогает никогда.
+fn final_rewrite_eligible(s: &Settings, rewrite_tone: &str) -> bool {
     if s.verbatim || configured_rewrite_backend(s).is_none() {
         return false;
     }
-    match rewrite_tone {
-        "verbatim" | "code" => false,
-        // Built-in AI context shapes prompts without blocking insertion on LLM.
-        // User rules/global smart prompts are the explicit opt-in for sync rewrite.
-        "ai" => smart_active && explicit_smart_instruction,
-        "" | "neutral" => smart_active && explicit_smart_instruction,
-        _ => true,
-    }
+    !matches!(rewrite_tone, "verbatim" | "code")
 }
 
 #[cfg(test)]
@@ -7303,7 +7289,7 @@ pub(crate) fn ask_configured_llm(s: &Settings, system: &str, user: &str) -> anyh
 }
 
 /// Основа слова для сравнения содержания: нижний регистр, ё→е и обрезка до
-/// первых четырёх символов, чтобы «модуль»/«модуля», «файл»/«файла» и
+/// первых четырёх символов (шести для латиницы), чтобы «модуль»/«модуля», «файл»/«файла» и
 /// «Алиса»/«Алису» считались одним словом — иначе гард отклонял бы штатное
 /// исправление окончаний. Числа сравниваем целиком: «1200» и «12» — разные
 /// факты, и склеивать их нельзя.
@@ -7316,7 +7302,15 @@ fn rewrite_stem(token: &str) -> String {
     if normalized.chars().all(char::is_numeric) {
         return normalized;
     }
-    normalized.chars().take(4).collect()
+    // Латинские термины почти не склоняются, зато часто делят префикс:
+    // «open» / «openai» / «openrouter» при четырёх символах слипались бы в одну
+    // основу, и склейка термина из ослышки выглядела бы как потеря слова.
+    let keep = if normalized.chars().all(|c| c.is_ascii_alphabetic()) {
+        6
+    } else {
+        4
+    };
+    normalized.chars().take(keep).collect()
 }
 
 fn rewrite_content_stems(value: &str) -> Vec<String> {
@@ -7329,10 +7323,14 @@ fn rewrite_content_stems(value: &str) -> Vec<String> {
         .collect()
 }
 
-/// Слова, которым разрешено появляться и исчезать: вежливые вставки, артикли и
-/// речевой мусор, который модель обязана убирать по системному промпту.
+/// Слова, которым разрешено появляться и исчезать: вежливые вставки, артикли,
+/// речевой мусор, который модель обязана убирать по системному промпту, и
+/// однобуквенные слова («и», «в», «я», латинская «I» из разорванного «Open I») —
+/// их пропажа или замена не меняет смысла, а гард на них спотыкался на каждой
+/// склейке термина. Однозначные числа остаются содержанием.
 fn rewrite_structural_token(token: &str) -> bool {
     matches!(token, "пожалуйста" | "please" | "a" | "an" | "the")
+        || (token.chars().count() == 1 && !token.chars().all(char::is_numeric))
         || postprocess::is_disposable_word(token)
 }
 
@@ -7395,7 +7393,34 @@ fn rewrite_grounding(
         .filter(|stem| !present.contains(*stem))
         .cloned()
         .collect();
-    let recall = 1.0 - lost.len() as f64 / unique_input.len() as f64;
+    // Замена ≠ потеря. Исправленная ослышка («север» → «сервер», «Open I» →
+    // «OpenAI», «гости» → «Ghostty») даёт одновременно пропавшую и новую основу;
+    // считать её потерей значило бы запретить модели понимать смысл — ровно
+    // за этим её и зовут. Потеря — это чистое удаление: пропавших основ больше,
+    // чем появившихся. Числа — факты, замена числа потерей остаётся.
+    // Кредит за замену даётся, только пока хотя бы половина слов диктовки
+    // осталась на месте и ответ сопоставим с диктовкой по длине: ответ, где
+    // переписано всё, — это модель, которая начала отвечать, а не исправлять,
+    // а в пересборке в структурный промпт новые слова — теги и заголовки,
+    // и прятать за ними выпавшее слово нельзя.
+    let comparable_length = output_chars
+        <= input_chars
+            .saturating_mul(REWRITE_MAX_EXPANSION)
+            .saturating_add(32);
+    let novel = if comparable_length && lost.len() * 2 <= unique_input.len() {
+        present
+            .iter()
+            .filter(|stem| !unique_input.contains(*stem))
+            .count()
+    } else {
+        0
+    };
+    let numeric_lost = lost
+        .iter()
+        .filter(|stem| stem.chars().all(char::is_numeric))
+        .count();
+    let net_lost = numeric_lost + (lost.len() - numeric_lost).saturating_sub(novel);
+    let recall = 1.0 - net_lost as f64 / unique_input.len() as f64;
     RewriteGrounding {
         grounded: recall + 1e-9 >= min_recall,
         recall,
@@ -7456,9 +7481,8 @@ fn refine_text_with_fallback(
         } else {
             tone
         };
-    if !force && !has_smart_instruction && (target_tone.is_empty() || target_tone == "neutral") {
-        return (text.to_string(), false, None);
-    }
+    // Нейтральный профиль тоже идёт в модель: стиль она не навязывает, но
+    // ослышки распознавания чинит только она.
 
     let mut attempts: Vec<Box<dyn Fn() -> anyhow::Result<String>>> = Vec::with_capacity(1);
     match configured_rewrite_backend(s) {
@@ -7554,6 +7578,9 @@ fn build_tone_instruction(
     let mut s = format!(
         "Ты — редактор надиктованного голосом текста. Перепиши его в стиле: {style}. \
          Сохрани смысл и язык оригинала. Исправь ошибки распознавания, опечатки и пунктуацию. \
+         Ослышки распознавания чини по смыслу: похожее по звучанию слово, которое не вписывается во фразу, замени на то, что имелось в виду; \
+         названия продуктов, компаний, моделей и аббревиатуры пиши в общепринятом виде («Open I» → «OpenAI», «ВПН» → «VPN»). \
+         Исправление ослышки — замена слова, а не удаление: число смысловых слов сохраняй. \
          ГЛАВНОЕ ПРАВИЛО: сохрани ВСЕ факты, числа, имена и смысловые слова диктовки. \
          Удалять можно только однозначный речевой мусор: звуки-хезитации («э-э», «ммм»), \
          дословные повторы одного слова и оборванные начала фраз, которые тут же переформулированы. \
@@ -7798,24 +7825,69 @@ mod smart_prompt_tests {
             "Конечно, вот подробный ответ с фактами, которых пользователь не произносил",
             RECALL
         ));
-        // Подмена и потеря предлога/союза — тоже потеря содержания.
-        for (input, output) in [
-            ("скопируй файл в архив", "скопируй файл из архива"),
-            ("удали файл и папку", "удали файл или папку"),
-            ("удали файл", "удари файл"),
-            ("открой порт", "открой торт"),
-        ] {
-            assert!(
-                !rewrite_is_grounded(input, output, RECALL),
-                "потеря содержания прошла гард: {input:?} -> {output:?}"
-            );
-        }
-        // Числа сравниваем целиком: обрезка суммы — не морфология.
+        // Удаление, замаскированное под правку: пропало два слова, появилось одно.
+        assert!(!rewrite_is_grounded(
+            "отправь отчёт клиенту завтра утром",
+            "отправь документ утром",
+            RECALL
+        ));
+        // Числа сравниваем целиком и замену числа потерей считаем всегда:
+        // обрезка суммы — не морфология и не ослышка.
         assert!(!rewrite_is_grounded(
             "переведи 1200 рублей",
             "переведи 12 рублей",
             RECALL
         ));
+        assert!(!rewrite_is_grounded(
+            "встретимся в 5",
+            "встретимся в 6",
+            RECALL
+        ));
+    }
+
+    /// Замена ≠ потеря (D-031). Модель зовут ради исправления ослышек
+    /// распознавания по смыслу; такое исправление — замена слова, и гард обязан
+    /// его пропускать, даже когда замена не похожа на оригинал по буквам
+    /// (кириллическая запись термина → латиница). Реальные фразы из истории
+    /// диктовок пользователя.
+    #[test]
+    fn rewrite_grounding_accepts_semantic_corrections_of_misheard_words() {
+        for (input, output) in [
+            (
+                "Любого провайдера, и основной провайдер Open I, там open roater и такие",
+                "Любого провайдера, и основной провайдер OpenAI, там OpenRouter и такие",
+            ),
+            (
+                "испанский север удали из памяти вообще",
+                "испанский сервер удали из памяти вообще",
+            ),
+            (
+                "Посмотри, если в поте, в котором лежит ВПН, есть новые ключи",
+                "Посмотри, если в папке, в которой лежит VPN, есть новые ключи",
+            ),
+            (
+                "Меня при закрытии сессии в терминале выкидывает из код кода",
+                "Меня при закрытии сессии в терминале выкидывает из Claude Code",
+            ),
+            (
+                "Мне нужно, чтобы гости распределяли автоматически окна",
+                "Мне нужно, чтобы Ghostty распределял автоматически окна",
+            ),
+            (
+                "как это сделано в АкваVoice",
+                "как это сделано в Aqua Voice",
+            ),
+            // Замена предлога/союза и созвучного слова — тоже замена, а не
+            // потеря: цена политики — ошибку модели гард не поймает, зато
+            // исправления ослышек больше не выбрасываются целиком.
+            ("скопируй файл в архив", "скопируй файл из архива"),
+            ("удали файл и папку", "удали файл или папку"),
+        ] {
+            assert!(
+                rewrite_is_grounded(input, output, RECALL),
+                "исправление ослышки отклонено гардом: {input:?} -> {output:?}"
+            );
+        }
     }
 
     #[test]
@@ -7941,7 +8013,7 @@ mod smart_prompt_tests {
         let instruction = instruction.expect("instruction");
         assert!(is_ai);
         assert!(instruction.contains(sonnet.split(' ').next().expect("первое слово правил")));
-        assert!(final_rewrite_eligible(&on, "ai", true, true));
+        assert!(final_rewrite_eligible(&on, "ai"));
 
         // Не-AI окно пересборку не получает вовсе.
         assert!(prompt_rebuild_rules_for_app(&on, &app_exe("telegram.exe", "Чат")).is_none());
@@ -7997,26 +8069,47 @@ mod smart_prompt_tests {
         );
     }
 
+    /// Настроенный бэкенд — согласие ждать модель во всех окнах, кроме кода:
+    /// без неё ослышки распознавания в терминале и поле нейросети уходили в
+    /// текст как есть. Выключенный бэкенд по-прежнему ничего не блокирует.
     #[test]
-    fn builtin_ai_context_does_not_block_final_insert_on_rewrite() {
-        let s = Settings {
+    fn configured_backend_rewrites_neutral_and_builtin_ai_windows() {
+        let off = Settings {
             smart_prompt_enabled: false,
             ai_prompt_rules: Vec::new(),
             ..Settings::default()
         };
         let actx = app("Claude");
-
-        let (instruction, is_ai) = effective_smart_instruction_for_app(&s, &actx, "ai");
-
+        let (instruction, is_ai) = effective_smart_instruction_for_app(&off, &actx, "ai");
         assert!(is_ai);
         assert!(
             instruction.is_some(),
             "ASR/context still gets prompt shaping"
         );
-        assert!(
-            !final_rewrite_eligible(&s, "ai", instruction.is_some(), false),
-            "built-in AI profile must keep insertion fast"
-        );
+        assert!(!final_rewrite_eligible(&off, "ai"));
+        assert!(!final_rewrite_eligible(&off, "neutral"));
+
+        let on = Settings {
+            ai_backend: "ollama".into(),
+            ..off
+        };
+        for tone in ["ai", "neutral", "", "casual", "formal", "work", "doc"] {
+            assert!(
+                final_rewrite_eligible(&on, tone),
+                "с настроенным бэкендом модель зовётся для {tone:?}"
+            );
+        }
+        for tone in ["code", "verbatim"] {
+            assert!(
+                !final_rewrite_eligible(&on, tone),
+                "код и дословный режим модель не трогает: {tone:?}"
+            );
+        }
+        let verbatim = Settings {
+            verbatim: true,
+            ..on
+        };
+        assert!(!final_rewrite_eligible(&verbatim, "casual"));
     }
 
     #[test]
@@ -8025,9 +8118,17 @@ mod smart_prompt_tests {
 
         assert_eq!(s.ai_backend, "off");
         assert_eq!(configured_rewrite_backend(&s), None);
-        for tone in ["ai", "casual", "very_casual", "work", "formal", "doc"] {
+        for tone in [
+            "ai",
+            "neutral",
+            "casual",
+            "very_casual",
+            "work",
+            "formal",
+            "doc",
+        ] {
             assert!(
-                !final_rewrite_eligible(&s, tone, true, true),
+                !final_rewrite_eligible(&s, tone),
                 "clean install must not schedule a blocking LLM for {tone}"
             );
         }
@@ -8080,12 +8181,7 @@ mod smart_prompt_tests {
 
         assert!(is_ai);
         assert!(instruction.is_some());
-        assert!(final_rewrite_eligible(
-            &s,
-            "ai",
-            instruction.is_some(),
-            true
-        ));
+        assert!(final_rewrite_eligible(&s, "ai"));
     }
 
     #[test]
