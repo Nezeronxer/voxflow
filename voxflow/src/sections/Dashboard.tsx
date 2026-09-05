@@ -255,7 +255,7 @@ export default function Dashboard({
           <section className="today-section">
             <div className="section-line-head">
               <h2>Сегодня</h2>
-              <button type="button" className="text-action" onClick={() => onOpenSettings("personalization")}>Исправления</button>
+              <button type="button" className="text-action" onClick={() => onOpenSettings("text")}>Исправления</button>
             </div>
             <div className="transcript-list">
               {history.length === 0 ? (
@@ -280,16 +280,17 @@ export default function Dashboard({
 
         <aside className="quick-rail" aria-label="Быстрые настройки">
           <h2>Быстрые настройки</h2>
-          <button type="button" onClick={() => onOpenSettings("models")}>
+          <button type="button" onClick={() => onOpenSettings("dictation")}>
             <Icon.Cube className="ico" /><span>Модель<small>{modelLabel(settings)}</small></span><b>›</b>
           </button>
-          <button type="button" onClick={() => onOpenSettings("general")}>
+          <button type="button" onClick={() => onOpenSettings("dictation")}>
             <Icon.Mic className="ico" /><span>Микрофон<small>{settings.input_device || "Системный"}</small></span><b>›</b>
           </button>
-          <button type="button" onClick={() => onOpenSettings("dictation")}>
+          {/* Очистка речи — это Recognition, он живёт на странице обработки текста. */}
+          <button type="button" onClick={() => onOpenSettings("text")}>
             <Icon.Sparkles className="ico" /><span>Очистка<small>{settings.verbatim ? "Дословно" : "Умная"}</small></span><b>›</b>
           </button>
-          <button type="button" onClick={() => onOpenSettings("models")}>
+          <button type="button" onClick={() => onOpenSettings("dictation")}>
             <Icon.Clock className="ico" /><span>Задержка<small>{latencyMs == null ? "После первой фразы" : `≈ ${latencyMs} мс`}</small></span><b>›</b>
           </button>
           <div className="privacy-note">

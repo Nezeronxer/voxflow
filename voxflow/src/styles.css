@@ -2646,14 +2646,8 @@ body.overlay-body #root {
   border-right: 1px solid var(--shell-line);
 }
 
-.settings-rail-title {
-  margin: 0 10px 16px;
-  color: var(--shell-faint);
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: 0.13em;
-  text-transform: uppercase;
-}
+/* Заголовок «НАСТРОЙКИ» над списком разделов удалён вместе со стилем:
+   пользователь уже нажал «Настройки» в главной навигации, чтобы сюда попасть. */
 
 .settings-rail-nav {
   display: grid;
@@ -2682,8 +2676,9 @@ body.overlay-body #root {
   color: var(--shell-ink);
 }
 
+/* Цветной левый край убран: активный пункт уже отмечен фоном и цветом
+   иконки, третий индикатор того же состояния — украшение. */
 .settings-rail-item.active {
-  border-left-color: var(--voice-accent);
   color: var(--shell-ink);
   font-weight: 650;
 }
@@ -2719,10 +2714,50 @@ body.overlay-body #root {
   letter-spacing: -0.035em;
 }
 
+/* Группы настроек разделены линией, а не вложенными коробками.
+   Коробка-карточка давала два уровня границ — рамку группы плюс линии полей
+   внутри неё, — и на длинной странице настройки превращались в лоскутное
+   одеяло. Свою рамку сохраняют только карточки с собственной вёрсткой:
+   выбор STT-провайдера и шапка «Приложений». */
 .settings-stage .card {
-  border-color: var(--shell-line);
+  background: none;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  padding: 0;
+}
+
+.settings-stage .card + .card {
+  margin-top: 34px;
+  padding-top: 26px;
+  border-top: 1px solid var(--shell-line);
+}
+
+/* Над заголовком группы воздуха больше, чем под ним. */
+.settings-stage .card-head {
+  margin-bottom: 10px;
+}
+
+.settings-stage .card-title {
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  color: var(--shell-ink);
+}
+
+.settings-stage .cloud-card,
+.settings-stage .app-hero {
+  border: 1px solid var(--shell-line);
   border-radius: 12px;
   background: var(--shell-panel);
+  padding: 22px;
+}
+
+/* Своя рамка уже отделяет карточку от соседа — вторая линия сверху лишняя. */
+.settings-stage .card + .cloud-card,
+.settings-stage .card + .app-hero {
+  border-top: 1px solid var(--shell-line);
+  padding-top: 22px;
 }
 
 .settings-statusbar {
@@ -2748,6 +2783,15 @@ body.overlay-body #root {
   width: 13px;
   height: 13px;
   color: var(--voice-good);
+}
+
+/* Данные уходят наружу — это не ошибка, а факт: тон внимательный, не тревожный. */
+.settings-private.cloud {
+  color: var(--shell-ink);
+}
+
+.settings-private.cloud .ico {
+  color: var(--amber);
 }
 
 .route-fallback {
@@ -2796,10 +2840,6 @@ body.overlay-body #root {
     padding: 18px 20px 10px;
     border-right: 0;
     border-bottom: 1px solid var(--shell-line);
-  }
-
-  .settings-rail-title {
-    display: none;
   }
 
   .settings-rail-nav {
@@ -3123,11 +3163,14 @@ body.overlay-body #root {
 .toast + .toast {
   margin-top: var(--sp-2);
 }
+/* Серьёзность несёт цвет всей рамки, а не полоса по левому краю: цветная
+   полоса в 3px с одной стороны — украшение, которое ничего не добавляло к
+   цвету и тексту тоста. Рамка у .toast уже есть, меняется только её цвет. */
 .toast-warning {
-  border-left: 3px solid var(--amber);
+  border-color: var(--amber);
 }
 .toast-error {
-  border-left: 3px solid var(--red);
+  border-color: var(--red);
 }
 .toast-msg {
   flex: 1;
@@ -3275,10 +3318,10 @@ body.overlay-body #root {
    warning/error — только вручную (пользователь должен успеть прочитать).
    ============================================================ */
 .toast-info {
-  border-left: 3px solid var(--border-strong);
+  border-color: var(--border-strong);
 }
 .toast-success {
-  border-left: 3px solid var(--green);
+  border-color: var(--green);
 }
 .toast-life {
   position: absolute;

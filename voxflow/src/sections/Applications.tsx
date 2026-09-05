@@ -201,9 +201,11 @@ function AppGlyph({ glyph }: { glyph: string }) {
 type Props = {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
+  /** Внутри страницы хаба заголовок даёт хаб. */
+  embedded?: boolean;
 };
 
-export default function Applications({ settings, update }: Props) {
+export default function Applications({ settings, update, embedded }: Props) {
   const [context, setContext] = useState<ActiveAppContext | null>(null);
   const [presets, setPresets] = useState<ProfileOverride[]>([]);
   const [match, setMatch] = useState("");
@@ -331,10 +333,12 @@ export default function Applications({ settings, update }: Props) {
 
   return (
     <>
-      <PageHead
-        title="Приложения"
-        desc="Выберите приложение и стиль диктовки. VoxFlow применит профиль к активному окну без ручного копания в правилах."
-      />
+      {!embedded && (
+        <PageHead
+          title="Приложения"
+          desc="Выберите приложение и стиль диктовки. VoxFlow применит профиль к активному окну без ручного копания в правилах."
+        />
+      )}
 
       <section className="app-hero card">
         <div className="app-hero-main">

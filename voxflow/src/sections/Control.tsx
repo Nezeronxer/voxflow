@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { checkForUpdate, installUpdate, listAudioDevices, openReleaseUrl } from "../api";
 import {
   PageHead,
+  SectionShell,
   Field,
   Select,
   Switch,
@@ -27,14 +28,24 @@ const THEME_OPTIONS = [
   { value: "dark", label: "Тёмная" },
 ] as const;
 
+/**
+ * `scope` делит раздел между двумя страницами хаба: «Диктовка» берёт то, что
+ * происходит во время записи, «Программа» — оформление и поведение самого
+ * приложения. Раньше это лежало одной кучей в «Основных», и человек искал
+ * микрофон там же, где автозапуск.
+ */
 export default function Control({
   settings,
   update,
   persist,
+  scope = "all",
+  embedded,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
   persist: (settings: Settings) => Promise<boolean>;
+  scope?: "all" | "dictation" | "app";
+  embedded?: boolean;
 }) {
   const [devices, setDevices] = useState<string[]>([]);
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null);
@@ -53,12 +64,15 @@ export default function Control({
   }
 
   useEffect(() => {
+    // Список устройств нужен только полю микрофона: на странице «Программа»
+    // его нет, и опрашивать аудиоподсистему незачем.
+    if (scope === "app") return;
     let alive = true;
     listAudioDevices().then((d) => alive && setDevices(d));
     return () => {
       alive = false;
     };
-  }, []);
+  }, [scope]);
 
   const deviceOptions = [
     { value: "", label: "По умолчанию" },
@@ -100,16 +114,22 @@ export default function Control({
     setUpdateStatus(result?.launched ? result.message : "Не удалось установить обновление");
   }
 
-  return (
-    <div className="content-inner">
-      <PageHead
-        title="Основные настройки"
-        desc="Горячие клавиши, микрофон и поведение приложения."
-      />
+  const showDictation = scope !== "app";
+  const showApp = scope !== "dictation";
 
+  return (
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="Основные настройки"
+          desc="Горячие клавиши, микрофон и поведение приложения."
+        />
+      )}
+
+      {showDictation && (
       <div className="card">
         <div className="card-head">
-          <div className="card-title">Диктовка</div>
+          <div className="card-title">Запись</div>
         </div>
 
         <Field label="Микрофон" hint="Устройство для записи речи">
@@ -180,31 +200,14 @@ export default function Control({
           />
         </Field>
 
-        <Field label="Языки" hint="Авто определяет русский и английский по фразе">
-          <div className="seg" role="radiogroup" aria-label="Язык распознавания">
-            {[
-              { value: "auto", label: "Авто" },
-              { value: "ru", label: "Русский" },
-              { value: "en", label: "English" },
-            ].map((option) => {
-              const active = settings.language === option.value;
-              return (
-                <button
-                  key={option.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  className={`seg-btn${active ? " active" : ""}`}
-                  onClick={() => update({ language: option.value })}
-                >
-                  {option.label}
-                </button>
-              );
-            })}
-          </div>
-        </Field>
+        {/* Языка здесь нет намеренно: он редактировался и тут, и в «Моделях»,
+            причём там полным списком из 16 языков, а тут урезанной тройкой.
+            Осталось одно поле — то, что рядом с движком, который язык и выбирает. */}
       </div>
+      )}
 
+      {showApp && (
+      <>
       <div className="card">
         <div className="card-head">
           <div className="card-title">Вид</div>
@@ -238,22 +241,9 @@ export default function Control({
           label="Размер плашки"
           hint="Масштаб Flow Bar сохраняется автоматически и применяется без перезапуска."
         >
+          {/* Кнопки −/+ убраны: ползунок сам шагает стрелками с клавиатуры,
+              так что они дублировали его, а не добавляли доступности. */}
           <div className="overlay-scale-control">
-            <button
-              type="button"
-              className="scale-step"
-              aria-label="Уменьшить плашку"
-              disabled={overlayScale <= OVERLAY_SCALE_MIN}
-              onClick={() =>
-                update({
-                  overlay_scale: normalizeOverlayScale(
-                    overlayScale - OVERLAY_SCALE_STEP,
-                  ),
-                })
-              }
-            >
-              −
-            </button>
             <input
               type="range"
               min={OVERLAY_SCALE_MIN * 100}
@@ -267,21 +257,6 @@ export default function Control({
               aria-valuetext={`${overlayPercent}%`}
             />
             <output>{overlayPercent}%</output>
-            <button
-              type="button"
-              className="scale-step"
-              aria-label="Увеличить плашку"
-              disabled={overlayScale >= OVERLAY_SCALE_MAX}
-              onClick={() =>
-                update({
-                  overlay_scale: normalizeOverlayScale(
-                    overlayScale + OVERLAY_SCALE_STEP,
-                  ),
-                })
-              }
-            >
-              +
-            </button>
             <button
               type="button"
               className="btn btn-sm"
@@ -360,6 +335,8 @@ export default function Control({
           </div>
         </Field>
       </div>
-    </div>
+      </>
+      )}
+    </SectionShell>
   );
 }

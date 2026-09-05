@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { aiTest, openExternalUrl, saveSettings, type AiModelOption } from "../api";
-import { PageHead, Field, Select, Switch, Icon } from "../ui";
+import { PageHead, SectionShell, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
 import {
   CUSTOM_PROVIDER,
@@ -37,10 +37,12 @@ export default function Ai({
   settings,
   update,
   persist,
+  embedded,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
   persist?: (settings: Settings) => Promise<boolean>;
+  embedded?: boolean;
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(
@@ -122,11 +124,13 @@ export default function Ai({
   }
 
   return (
-    <div className="content-inner">
-      <PageHead
-        title="ИИ"
-        desc="Подключите нейросеть для умной обработки текста и облачного распознавания."
-      />
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="ИИ"
+          desc="Подключите нейросеть для умной обработки текста и облачного распознавания."
+        />
+      )}
 
       <LocalAiCard settings={settings} update={update} />
 
@@ -598,6 +602,6 @@ export default function Ai({
           />
         </Field>
       </div>
-    </div>
+    </SectionShell>
   );
 }

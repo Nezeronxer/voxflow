@@ -8,7 +8,7 @@ import {
   revealPath,
   openExternalUrl,
 } from "../api";
-import { PageHead, Field, Select, Icon } from "../ui";
+import { PageHead, SectionShell, Field, Select, Icon } from "../ui";
 import type {
   Settings,
   ModelInfo,
@@ -154,9 +154,11 @@ function HeroModelCard({
 export default function Models({
   settings,
   update,
+  embedded,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
+  embedded?: boolean;
 }) {
   const [models, setModels] = useState<ModelInfo[]>([]);
   const [progress, setProgress] = useState<Record<string, Progress>>({});
@@ -261,11 +263,13 @@ export default function Models({
       : PRIMARY_ENGINE_OPTIONS;
 
   return (
-    <div className="content-inner">
-      <PageHead
-        title="Модель"
-        desc="Модели распознавания речи хранятся локально и работают офлайн."
-      />
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="Модель"
+          desc="Модели распознавания речи хранятся локально и работают офлайн."
+        />
+      )}
 
       {/* Где лежат файлы: без этого путь к моделям выясняется только из логов. */}
       <div className="field-hint" style={{ marginTop: -8, marginBottom: 16, maxWidth: "none" }}>
@@ -492,6 +496,6 @@ export default function Models({
           />
         </Field>
       </div>
-    </div>
+    </SectionShell>
   );
 }

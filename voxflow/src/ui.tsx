@@ -485,12 +485,35 @@ export function PageHead({ title, desc }: { title: string; desc?: string }) {
   );
 }
 
+/**
+ * Раздел настроек живёт либо отдельной страницей, либо внутри страницы хаба.
+ *
+ * Встроенный раздел не рисует ни свою колонку, ни свой заголовок: страницу и
+ * заголовок даёт `SettingsHub`. Иначе на одной странице оказались бы три
+ * заголовка первого уровня и три вложенные друг в друга колонки.
+ */
+export function SectionShell({
+  embedded,
+  children,
+}: {
+  embedded?: boolean;
+  children: ReactNode;
+}) {
+  if (embedded) return <>{children}</>;
+  return <div className="content-inner">{children}</div>;
+}
+
 /* ---------- Icons ---------- */
 type IconProps = { className?: string };
 
 export const Icon = {
   Home: (p: IconProps) => (
     <svg className={p.className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9.5 12 3l9 6.5" /><path d="M5 10v10h14V10" /></svg>
+  ),
+  // Уход данных с устройства: облако со стрелкой наружу. Тот же каркас 24×24,
+  // обводка 2, скруглённые концы — как у остальных иконок набора.
+  CloudUp: (p: IconProps) => (
+    <svg className={p.className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 13v8" /><path d="M4 14.9A7 7 0 1 1 15.7 8h1.8a4.5 4.5 0 0 1 2.5 8.2" /><path d="m8 17 4-4 4 4" /></svg>
   ),
   Cube: (p: IconProps) => (
     <svg className={p.className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 2 21 7v10l-9 5-9-5V7l9-5Z" /><path d="m3 7 9 5 9-5" /><path d="M12 12v10" /></svg>

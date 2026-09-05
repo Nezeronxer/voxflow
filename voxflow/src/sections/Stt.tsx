@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { saveSettings, sttTest } from "../api";
-import { PageHead, Field, Select, Switch, Icon } from "../ui";
+import { PageHead, SectionShell, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
 import SecretControl from "../components/SecretControl";
 
@@ -89,10 +89,12 @@ export default function Stt({
   settings,
   update,
   persist,
+  embedded,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
   persist?: (settings: Settings) => Promise<boolean>;
+  embedded?: boolean;
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<string | null>(null);
@@ -139,11 +141,13 @@ export default function Stt({
   }
 
   return (
-    <div className="content-inner">
-      <PageHead
-        title="Облако"
-        desc="Облачный движок распознавания речи. Локальный GigaAM/Parakeet/Whisper остаётся по умолчанию и приватен — аудио не покидает устройство."
-      />
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="Облако"
+          desc="Облачный движок распознавания речи. Локальный GigaAM/Parakeet/Whisper остаётся по умолчанию и приватен — аудио не покидает устройство."
+        />
+      )}
 
       <div className="card cloud-card">
         <div className="cloud-provider-head">
@@ -396,6 +400,6 @@ export default function Stt({
           </Field>
         )}
       </div>
-    </div>
+    </SectionShell>
   );
 }

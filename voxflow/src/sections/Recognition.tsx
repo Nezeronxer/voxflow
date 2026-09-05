@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { rewritePromptWithInstruction, subscribe, toggleDictation } from "../api";
-import { PageHead, Field, Icon, Select, Switch } from "../ui";
+import { PageHead, SectionShell, Field, Icon, Select, Switch } from "../ui";
 import type {
   ErrorEvent as VoxErrorEvent,
   NoRecogEvent,
@@ -107,9 +107,11 @@ function speechLanguage(settingsLanguage: string): string {
 export default function Recognition({
   settings,
   update,
+  embedded,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
+  embedded?: boolean;
 }) {
   const promptText = settings.smart_prompt_source;
   const promptReady =
@@ -376,11 +378,13 @@ export default function Recognition({
   }
 
   return (
-    <div className="content-inner">
-      <PageHead
-        title="Распознавание"
-        desc="Как обрабатывать распознанный текст перед вставкой."
-      />
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="Распознавание"
+          desc="Как обрабатывать распознанный текст перед вставкой."
+        />
+      )}
 
       <div className="card">
         <div className="card-head">
@@ -648,6 +652,6 @@ export default function Recognition({
           />
         </Field>
       </div>
-    </div>
+    </SectionShell>
   );
 }

@@ -81,7 +81,7 @@ function RouteFallback() {
 
 export default function App() {
   const [tab, setTab] = useState<TabId>("dashboard");
-  const [settingsPage, setSettingsPage] = useState<SettingsPageId>("general");
+  const [settingsPage, setSettingsPage] = useState<SettingsPageId>("dictation");
   const [settings, setSettings] = useState<Settings>({ ...DEFAULT_SETTINGS });
   const [loaded, setLoaded] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
@@ -238,7 +238,7 @@ export default function App() {
           message: event.payload?.message || "Выберите локальную модель распознавания.",
           variant: "warning",
           actionLabel: "Открыть модели",
-          route: { tab: "settings", settingsPage: "models" },
+          route: { tab: "settings", settingsPage: "dictation" },
         });
       }),
       subscribe<VoxErrorEvent>("error", (event) => {

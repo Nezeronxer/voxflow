@@ -4,15 +4,17 @@ import {
   correctionsUpsert,
   correctionsDelete,
 } from "../api";
-import { PageHead, Icon, Field, Switch } from "../ui";
+import { PageHead, SectionShell, Icon, Field, Switch } from "../ui";
 import type { CorrectionEntry, Settings } from "../types";
 
 export default function Corrections({
   settings,
   update,
+  embedded,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
+  embedded?: boolean;
 }) {
   const [entries, setEntries] = useState<CorrectionEntry[]>([]);
   const [wrong, setWrong] = useState("");
@@ -41,11 +43,13 @@ export default function Corrections({
   }
 
   return (
-    <div className="content-inner">
-      <PageHead
-        title="Исправления"
-        desc="Пары распознано → правильно. Применяются автоматически к каждой диктовке."
-      />
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="Исправления"
+          desc="Пары распознано → правильно. Применяются автоматически к каждой диктовке."
+        />
+      )}
 
       <div className="card">
         <Field
@@ -127,6 +131,6 @@ export default function Corrections({
           </button>
         </div>
       </div>
-    </div>
+    </SectionShell>
   );
 }
