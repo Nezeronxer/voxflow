@@ -621,3 +621,12 @@
   2 оставшиеся намеренные. ✅
 - **Не сделано:** автоматический визуальный прогон — нет браузерного драйвера, Mobbin-MCP платный,
   окно Tauri без драйвера не снять. Смотреть на собранном DMG.
+
+## 2026-09-06 (продолжение 2) — постобработка перестала удалять сказанное (2.0.20)
+
+- Воспроизведение на реальной записи `dataset/20260906_222318_644.wav` через
+  `VOXFLOW_TEST_DATA_DIR=%LOCALAPPDATA%\VoxFlow VOXFLOW_EVAL_WAV=… cargo test --lib eval_wav_pipeline -- --ignored --nocapture`:
+  GigaAM (один сегмент 21,8 с) → полный текст; `process_dictation_text` → «Смотри, у меня появляется текст. Он». ✅ причина найдена
+- После правки якоря тот же прогон → полный текст без потерь. ✅
+- `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --lib` — 359 passed, 7 ignored. ✅
+- `npm test`, `npm run build`, `python script/check_versions.py --tag v2.0.20`. ✅

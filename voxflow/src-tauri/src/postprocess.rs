@@ -355,13 +355,19 @@ fn normalize_filler_word(word: &str) -> String {
         .to_lowercase()
 }
 
+/// Сколько соседних одинаковых копий доказывают петлю декодера, а не речь.
+/// Человек повторяет слово или фразу два-три раза («нет, нет, нет», «давай,
+/// давай, давай»); зациклившийся декодер не останавливается на трёх. Порог
+/// общий для n-грамм и одиночных слов, чтобы плашка и вставка резали одинаково.
+pub const LOOP_MIN_COPIES: usize = 4;
+
 /// Срезать только явно зациклившиеся ПОЛНЫЕ повторы n-грамм из 2..=6 слов
 /// (редкие RNNT-петли gigaam/parakeet и повторы облачного декодера), оставив
-/// одно вхождение. Две копии сохраняем: пользователь вправе намеренно повторить
-/// предложение, а одна пауза не доказывает ошибку декодера. Петлёй считаем лишь
-/// три и более соседних копии. Сравнение регистронезависимое и без краевой
-/// пунктуации («Фраза.» == «фраза»); одиночные слова тоже не трогаем.
-/// Переводы строк сохраняются — режем построчно.
+/// одно вхождение. До трёх копий сохраняем: пользователь вправе намеренно
+/// повторить фразу, а одна пауза не доказывает ошибку декодера. Петлёй считаем
+/// лишь [`LOOP_MIN_COPIES`] и более соседних копий. Сравнение
+/// регистронезависимое и без краевой пунктуации («Фраза.» == «фраза»);
+/// одиночные слова тоже не трогаем. Переводы строк сохраняются — режем построчно.
 pub fn dedup_repeated_ngrams(text: &str) -> String {
     text.split('\n')
         .map(dedup_ngrams_line)
@@ -405,15 +411,15 @@ fn dedup_ngrams_pass(line: &str) -> String {
                     .eq(toks[j..j + n].iter().map(|t| norm(t)))
             };
             if block_eq(i + n) {
-                // Дошагать до конца цепочки. Две копии могут быть намеренной
-                // речью; схлопываем только доказанную цепочку из 3+ копий.
+                // Дошагать до конца цепочки. Две-три копии могут быть
+                // намеренной речью; схлопываем только доказанную петлю.
                 let mut j = i + 2 * n;
                 let mut copies = 2usize;
                 while j + n <= toks.len() && block_eq(j) {
                     j += n;
                     copies += 1;
                 }
-                if copies < 3 {
+                if copies < LOOP_MIN_COPIES {
                     continue;
                 }
                 let span = j - i;
@@ -511,7 +517,9 @@ fn collapse_stuttered_words_line(line: &str) -> String {
         while j < toks.len() && norm(toks[j]) == cur {
             j += 1;
         }
-        if j - i >= 3 || (j - i == 2 && collapse_double_starter_repeat(&cur)) {
+        // Служебное слово-«стартер» («я я я думаю») — заикание уже с двух
+        // копий. Любое другое слово человек вправе повторить трижды.
+        if j - i >= LOOP_MIN_COPIES || (j - i >= 2 && collapse_double_starter_repeat(&cur)) {
             out.push(toks[i]);
         } else {
             out.extend_from_slice(&toks[i..j]);
@@ -677,6 +685,16 @@ fn find_last_self_correction_marker(
             if i == 0 || i + len >= toks.len() {
                 continue;
             }
+            // Повтор самого маркера («нет, нет, нет», «ой-ой-ой») — речь, а не
+            // исправление: соседнее слово совпадает с краем маркера.
+            let repeats_marker = toks[i - 1].bare == marker[len - 1]
+                || toks
+                    .get(i + len)
+                    .map(|t| t.bare == marker[0])
+                    .unwrap_or(false);
+            if repeats_marker {
+                continue;
+            }
             // Явная опция возвращает старое поведение 2.0.x: любой маркер режет.
             let kind = if aggressive {
                 CorrectionKind::Cancel
@@ -697,12 +715,32 @@ fn find_last_self_correction_marker(
     found
 }
 
-/// Якорь: правая часть начинается тем же словом, что уже было слева
+/// Сколько слов слева от маркера может занимать переигранный кусок. Устное
+/// исправление переигрывает короткую позицию («в пять» → «в шесть»), а не
+/// половину абзаца: длинные переделки — работа LLM-рерайта, не этого правила.
+const CORRECTION_ANCHOR_MAX_SPAN: usize = 4;
+
+/// Якорь: правая часть начинается тем же словом, что стоит в ХВОСТЕ левой
 /// («в пять, то есть в шесть» → якорь «в»). Это и есть доказательство, что
-/// говорящий переигрывает ту же синтаксическую позицию.
-fn correction_anchor(left: &[WordTok<'_>], right: &[WordTok<'_>]) -> Option<usize> {
+/// говорящий переигрывает ту же синтаксическую позицию — поэтому переигранный
+/// кусок короткий и не длиннее замены. Совпадение с далёким словом якорем не
+/// считается: «…у голосового ввода такая проблема … то есть у меня появляется
+/// текст» резало фразу от первого «у» до маркера, и человек терял всё сказанное.
+/// Для переформулировок («то есть», «в смысле») местоимения и союзы якорем не
+/// служат: «то есть я…» — обычная связка, а не отказ от «…которые я говорил».
+fn correction_anchor(
+    kind: CorrectionKind,
+    left: &[WordTok<'_>],
+    right: &[WordTok<'_>],
+) -> Option<usize> {
     let first = right.iter().find(|t| !t.bare.is_empty())?.bare.as_str();
-    left.iter().rposition(|t| t.bare == first)
+    if kind == CorrectionKind::Reformulation && collapse_double_starter_repeat(first) {
+        return None;
+    }
+    let anchor = left.iter().rposition(|t| t.bare == first)?;
+    let replayed = left.len() - anchor;
+    let replacement = right.iter().filter(|t| !t.bare.is_empty()).count();
+    (replayed <= CORRECTION_ANCHOR_MAX_SPAN && replayed <= replacement + 1).then_some(anchor)
 }
 
 fn correction_fires(kind: CorrectionKind, left: &[WordTok<'_>], right: &[WordTok<'_>]) -> bool {
@@ -710,7 +748,7 @@ fn correction_fires(kind: CorrectionKind, left: &[WordTok<'_>], right: &[WordTok
         return false;
     }
     // Явный дубль позиции — режем даже начало фразы.
-    if correction_anchor(left, right).is_some() {
+    if correction_anchor(kind, left, right).is_some() {
         return true;
     }
     match kind {
@@ -727,7 +765,7 @@ fn correction_cut_point(
     left: &[WordTok<'_>],
     right: &[WordTok<'_>],
 ) -> usize {
-    if let Some(i) = correction_anchor(left, right) {
+    if let Some(i) = correction_anchor(kind, left, right) {
         return i;
     }
     match kind {
@@ -1774,6 +1812,40 @@ mod filler_tests {
         assert_eq!(process("Да, точнее нет", &s, &[], &[]), "Да, точнее нет");
     }
 
+    /// Регрессия 2.0.19 на реальной записи: «то есть у меня…» находило «у» в
+    /// начале фразы и вырезало 30 слов между ними. Далёкое совпадение — не якорь.
+    #[test]
+    fn reformulation_anchor_must_be_in_the_tail_of_the_phrase() {
+        let s = st(true, true);
+        let phrase = "Смотри, у голосового ввода такая проблема. Он иногда удаляет просто слова, которые я говорил. То есть я говорю, допустим, какие-то слова, он просто их удаляет, и всё. Повторяю их, он опять их удаляет. Как я нажимаю контрол ещё раз, то есть у меня появляется текст. Он";
+        assert_eq!(process(phrase, &s, &[], &[]), phrase);
+
+        // Местоимение после «то есть» — связка, а не переигровка «…которые я говорил».
+        assert_eq!(
+            process("слова, которые я говорил, то есть я повторяю", &s, &[], &[]),
+            "Слова, которые я говорил, то есть я повторяю"
+        );
+        // Переигранный кусок длиннее замены — тоже не исправление.
+        assert_eq!(
+            process(
+                "встреча в пять часов утра у метро, то есть в шесть",
+                &s,
+                &[],
+                &[]
+            ),
+            "Встреча в пять часов утра у метро, то есть в шесть"
+        );
+        // Короткая переигровка той же позиции по-прежнему режется.
+        assert_eq!(
+            process("в понедельник, то есть в среду", &s, &[], &[]),
+            "В среду"
+        );
+        assert_eq!(
+            process("встреча во вторник, нет, стоп, в среду", &s, &[], &[]),
+            "Встреча в среду"
+        );
+    }
+
     #[test]
     fn aggressive_mode_restores_old_cutting_behavior() {
         let s = Settings {
@@ -1834,6 +1906,22 @@ mod filler_tests {
         );
         assert_eq!(process("это это важно", &s, &[], &[]), "Это важно");
         assert_eq!(process("очень очень рад", &s, &[], &[]), "Очень очень рад");
+    }
+
+    #[test]
+    fn a_word_repeated_three_times_is_speech_not_a_loop() {
+        let s = st(true, true);
+        assert_eq!(
+            process("нет нет нет я не хочу", &s, &[], &[]),
+            "Нет нет нет я не хочу"
+        );
+        assert_eq!(process("тест тест тест", &s, &[], &[]), "Тест тест тест");
+        assert_eq!(
+            process("он шёл шёл шёл и пришёл", &s, &[], &[]),
+            "Он шёл шёл шёл и пришёл"
+        );
+        // Четыре и больше подряд — уже петля декодера.
+        assert_eq!(process("тест тест тест тест тест", &s, &[], &[]), "Тест");
     }
 
     #[test]
@@ -2259,13 +2347,22 @@ mod dedup_tests {
     #[test]
     fn stutter_phrase_collapsed() {
         assert_eq!(
-            dedup_repeated_ngrams("please send please send please send the report"),
+            dedup_repeated_ngrams("please send please send please send please send the report"),
             "please send the report"
         );
         assert_eq!(
-            dedup_repeated_ngrams("отправь отчёт отправь отчёт отправь отчёт пожалуйста"),
+            dedup_repeated_ngrams(
+                "отправь отчёт отправь отчёт отправь отчёт отправь отчёт пожалуйста"
+            ),
             "отправь отчёт пожалуйста"
         );
+    }
+
+    #[test]
+    fn three_deliberate_repeats_of_a_phrase_are_kept() {
+        // Человек повторил просьбу трижды — это речь, а не петля декодера.
+        let raw = "настрой синхронизацию настрой синхронизацию настрой синхронизацию пожалуйста";
+        assert_eq!(dedup_repeated_ngrams(raw), raw);
     }
 
     #[test]

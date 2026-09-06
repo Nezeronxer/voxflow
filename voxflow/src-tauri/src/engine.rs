@@ -892,16 +892,24 @@ fn gigaam_auto_final_trusted(text: &str) -> bool {
     !t.is_empty() && crate::parakeet::is_mostly_cyrillic(t)
 }
 
-/// Пускать ли кусок живого preview в плашку.
+/// Бейдж языка живого preview.
 ///
-/// Неспекулятивный маршрут (preview и финал — один движок) отдаёт всё: что
-/// показано, то и вставится. Спекулятивный (быстрый GigaAM ради каденса, а финал
-/// делает LID) обязан применять то же правило доверия, что и финал
-/// ([`gigaam_auto_final_trusted`]): текст, который финал отправил бы на
-/// whisper-уточнение, в плашке показывать нельзя — иначе пользователь видит
-/// русский мусор на английской речи, а в поле приезжает верный текст.
-fn preview_text_trusted(speculative: bool, text: &str) -> bool {
-    !speculative || gigaam_auto_final_trusted(text)
+/// Неспекулятивный маршрут (preview и финал — один движок) держит фиксированный
+/// бейдж движка. Спекулятивный (быстрый GigaAM при language=auto, финал делает
+/// LID) показывает в плашке и латиницу — GigaAM v3 отдаёт английскую речь
+/// латиницей, и до 2.0.20 такой кусок прятался целиком: человек говорил
+/// по-английски в пустую плашку. Раз текст виден, бейдж считается по его скрипту,
+/// а не по фиксированному «ru» маршрута.
+fn preview_lang_badge(
+    speculative: bool,
+    fixed_lang: Option<&'static str>,
+    text: &str,
+) -> Option<&'static str> {
+    if speculative {
+        detect_lang_label(text)
+    } else {
+        fixed_lang.or_else(|| detect_lang_label(text))
+    }
 }
 
 fn should_probe_gigaam_for_auto(whisper_text: &str) -> bool {
@@ -2269,7 +2277,7 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                     if a.stream_mode == "never" {
                         *a.committed_field.lock() = full.clone();
                     }
-                    let lang = a.tuning.fixed_lang.or_else(|| detect_lang_label(&full));
+                    let lang = preview_lang_badge(a.tuning.speculative, a.tuning.fixed_lang, &full);
                     let _ = a.app.emit(
                         "partial",
                         settled_partial_payload(&full, &committed, a.seq, lang),
@@ -2297,11 +2305,11 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             let txt = gm.transcribe(&mono16[seg_start..bound]).unwrap_or_default();
             drop(g);
             let t = txt.trim().to_string();
-            // Спекулятивный маршрут: сегмент, которому финал не поверил бы,
-            // в плашку не попадает вовсе — его покажет финальный preview.
+            // Спекулятивный маршрут показывает всё, что распознал, включая
+            // латиницу английской речи: финал сам решит, чем её уточнить.
             // Ledger при этом не рвётся: спекулятивный preview всегда
             // stream_mode == "never", в поле он ничего не печатает.
-            if !t.is_empty() && preview_text_trusted(a.tuning.speculative, &t) {
+            if !t.is_empty() {
                 // Длинная пауза перед сегментом -> абзац. Пауза сама по себе
                 // никогда не удаляет предыдущий сегмент.
                 let gap = cur_seg_first_speech
@@ -2328,11 +2336,7 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             let volatile = txt.trim();
             (
                 render_segments_for_postprocess(&committed_segs),
-                if preview_text_trusted(a.tuning.speculative, volatile) {
-                    volatile.to_string()
-                } else {
-                    String::new()
-                },
+                volatile.to_string(),
             )
         };
 
@@ -2360,8 +2364,9 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             *a.committed_field.lock() = full.clone();
         }
         // Бейдж языка (контракт overlay): фиксированный "ru" у GigaAM-маршрута,
-        // по скрипту текста у Parakeet (en/auto); null → бейдж скрыт.
-        let lang = a.tuning.fixed_lang.or_else(|| detect_lang_label(&full));
+        // по скрипту текста у Parakeet (en/auto) и у спекулятивного auto-preview;
+        // null → бейдж скрыт.
+        let lang = preview_lang_badge(a.tuning.speculative, a.tuning.fixed_lang, &full);
         let _ = a.app.emit(
             "partial",
             live_partial_payload(&full, &committed, &volatile, a.seq, lang),
@@ -5406,6 +5411,45 @@ mod seg_tests {
         );
     }
 
+    /// Прогон одной записи через финальный локальный путь (GigaAM +
+    /// сегментация по паузам + постобработка). Путь к WAV — в VOXFLOW_EVAL_WAV.
+    ///
+    /// `VOXFLOW_EVAL_WAV=... cargo test --lib eval_wav_pipeline -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local GigaAM models and a private WAV"]
+    fn eval_wav_pipeline() {
+        let wav = std::env::var("VOXFLOW_EVAL_WAV").expect("VOXFLOW_EVAL_WAV");
+        let dir = crate::paths::gigaam_dir();
+        assert!(
+            crate::gigaam::dir_ready(&dir),
+            "модели GigaAM не найдены в {dir:?}"
+        );
+        let threads = Settings::default().effective_threads() as usize;
+        let mut g = crate::gigaam::GigaAm::load(&dir, threads).expect("gigaam");
+        let vad = crate::vad::SileroVad::load(&crate::paths::vad_model_path(None)).expect("vad");
+        let vad = Arc::new(Mutex::new(Some(vad)));
+        let _ = g.transcribe(&vec![0.0f32; 8000]);
+
+        let samples = read_wav_16k(std::path::Path::new(&wav));
+        println!("audio: {:.1}c", samples.len() as f32 / 16000.0);
+        let single = g.transcribe(&samples).unwrap_or_default();
+        println!("single-shot: {single:?}");
+        let long = local_transcribe_long(&vad, &samples, &mut |seg| {
+            let t = g.transcribe(seg);
+            println!("  seg {:.1}c -> {:?}", seg.len() as f32 / 16000.0, t);
+            t
+        })
+        .expect("long");
+        println!(
+            "segmented raw: {:?}",
+            long.replace(SEMANTIC_PARAGRAPH_MARKER, " ¶ ")
+        );
+        let deduped = postprocess::dedup_repeated_ngrams(&long);
+        let s = Settings::default();
+        let processed = process_dictation_text(&deduped, &s, &[], &[], &[]);
+        println!("processed: {:?}", processed.text);
+    }
+
     #[test]
     fn final_local_asr_reuses_the_compacted_audio_written_to_wav() {
         let trimmed = vec![1.0_f32; 32];
@@ -6014,7 +6058,7 @@ mod seg_tests {
     #[test]
     fn live_and_final_collapse_a_proven_decoder_loop_identically() {
         let s = Settings::default();
-        let raw = "Отправь отчёт отправь отчёт отправь отчёт пожалуйста";
+        let raw = "Отправь отчёт отправь отчёт отправь отчёт отправь отчёт пожалуйста";
         let live_text = clean_live_text(raw, &s, &[], &[], &[]);
         let final_raw = postprocess::dedup_repeated_ngrams(raw);
         let final_text = process_dictation_text(&final_raw, &s, &[], &[], &[]).text;
@@ -6197,20 +6241,33 @@ mod seg_tests {
         assert!(!gigaam_auto_final_trusted("123 456."));
     }
 
-    /// Плашка не имеет права показать текст, который финал бы не вставил.
     /// Спекулятивный preview (быстрый GigaAM при language=auto, финал делает LID)
-    /// на английской речи отдаёт латиницу/мусор — такой кусок в плашку не идёт.
-    /// Неспекулятивный маршрут (движок preview == движок финала) отдаёт всё.
+    /// показывает и латиницу английской речи, поэтому бейдж языка считается по
+    /// скрипту текста. Неспекулятивный маршрут держит фиксированный бейдж движка.
     #[test]
-    fn speculative_preview_shows_only_what_the_final_would_accept() {
-        assert!(preview_text_trusted(true, "привет как дела"));
-        assert!(!preview_text_trusted(true, "hello how are you"));
-        assert!(!preview_text_trusted(true, ""));
+    fn speculative_preview_badge_follows_the_script_of_the_shown_text() {
+        assert_eq!(
+            preview_lang_badge(true, Some("ru"), "привет как дела"),
+            Some("ru")
+        );
+        assert_eq!(
+            preview_lang_badge(true, Some("ru"), "hello how are you"),
+            Some("en")
+        );
+        assert_eq!(preview_lang_badge(true, Some("ru"), ""), None);
 
-        // Тот же движок в preview и финале — доверяем без проверки скрипта,
-        // иначе английский Parakeet-маршрут остался бы с пустой плашкой.
-        assert!(preview_text_trusted(false, "hello how are you"));
-        assert!(preview_text_trusted(false, "привет как дела"));
+        assert_eq!(
+            preview_lang_badge(false, Some("ru"), "hello how are you"),
+            Some("ru")
+        );
+        assert_eq!(
+            preview_lang_badge(false, None, "hello how are you"),
+            Some("en")
+        );
+        assert_eq!(
+            preview_lang_badge(false, None, "привет как дела"),
+            Some("ru")
+        );
     }
 
     #[test]
