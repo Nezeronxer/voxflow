@@ -122,6 +122,71 @@ pub fn refine(
     call(api_key, model, &body, timeout_s)
 }
 
+/// Каталог моделей по ключу: `GET /v1beta/models`. Оставляем только те, что
+/// умеют `generateContent` (эмбеддинги и TTS в списке постобработки ни к чему).
+pub fn list_models(api_key: &str, proxy_url: &str) -> Result<Vec<crate::rewrite::ModelOption>> {
+    let mut cmd = net::curl();
+    cmd.arg("-s")
+        .arg("-m")
+        .arg("15")
+        .arg("-H")
+        .arg("Accept: application/json")
+        .arg(format!("{BASE_URL}?pageSize=200"));
+    let auth_header = format!("x-goog-api-key: {api_key}");
+    let out = net::curl_secret_with_proxy(cmd, &[auth_header], proxy_url)
+        .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
+    if !out.status.success() && out.stdout.is_empty() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(anyhow!("curl завершился с ошибкой: {}", err.trim()));
+    }
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("ответ Gemini — не JSON: {e}"))?;
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("неизвестная ошибка Gemini");
+        return Err(anyhow!("Gemini: {msg}"));
+    }
+    let models = generate_content_models(&v);
+    if models.is_empty() {
+        return Err(anyhow!("Gemini вернул пустой список моделей"));
+    }
+    Ok(models
+        .into_iter()
+        .map(|id| crate::rewrite::ModelOption {
+            label: id.clone(),
+            value: id,
+        })
+        .collect())
+}
+
+fn generate_content_models(v: &serde_json::Value) -> Vec<String> {
+    let mut ids: Vec<String> = v
+        .get("models")
+        .and_then(|m| m.as_array())
+        .map(|list| {
+            list.iter()
+                .filter(|m| {
+                    m.get("supportedGenerationMethods")
+                        .and_then(|methods| methods.as_array())
+                        .map(|methods| {
+                            methods
+                                .iter()
+                                .any(|x| x.as_str() == Some("generateContent"))
+                        })
+                        .unwrap_or(false)
+                })
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                .map(|n| n.trim_start_matches("models/").to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort_by_key(|a| a.to_lowercase());
+    ids.dedup();
+    ids
+}
+
 /// Общий вызов generateContent: пишет тело в temp-файл, дёргает curl,
 /// парсит ответ и достаёт текст. Ключ передаётся ТОЛЬКО заголовком.
 fn call(api_key: &str, model: &str, body: &serde_json::Value, timeout_s: u64) -> Result<String> {
@@ -230,6 +295,19 @@ fn parse_generate_content(v: &serde_json::Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_catalog_keeps_only_text_generation_models() {
+        let v = serde_json::json!({ "models": [
+            { "name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"] },
+            { "name": "models/embedding-001", "supportedGenerationMethods": ["embedContent"] },
+            { "name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"] }
+        ] });
+        assert_eq!(
+            super::generate_content_models(&v),
+            vec!["gemini-2.5-flash", "gemini-2.5-pro"]
+        );
+    }
 
     #[test]
     fn truncated_answer_is_rejected_instead_of_inserted() {

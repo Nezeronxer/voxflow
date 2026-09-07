@@ -757,3 +757,51 @@ BYOK exists»). Новый модуль `src/privacyState.ts` считает `eg
 **Проверка.** Регрессионный тест `reformulation_anchor_must_be_in_the_tail_of_the_phrase` —
 запись из отчёта слово в слово; `a_word_repeated_three_times_is_speech_not_a_loop`;
 `three_deliberate_repeats_of_a_phrase_are_kept`.
+
+## D-034 — Обновление с прогрессом и маркером «установка идёт»; каталог моделей по ключу; Ollama без следов (2026-09-07)
+
+**Контекст.** Три жалобы: «нажимаю установить — программа закрывается» (без прогресса), «в
+обработке текста написано скачать Ollama — не должно быть следов», «при добавлении ключа
+должен считываться каталог моделей».
+
+**Причина (обновление).** `install_update` был синхронным: curl через `output()`, событий
+нет, фронт показывал один тост «Скачиваю…» и через минуту тишины получал ответ, после
+которого приложение закрывалось. Вторая кнопка «Установить» в `Control.tsx` вообще шла мимо
+тоста App.
+
+**Решение.**
+- `updater::download_and_launch` получает колбэк `progress(phase, received, total)`; curl
+  спаунится, размер файла опрашивается раз в 300 мс (приём из `models.rs`). Фазы
+  `download / verify / launch` — enum `UpdatePhase`.
+- `commands::install_update` возвращается сразу, работа в потоке; события `update:progress`
+  / `update:done` / `update:error` (все с `version`). Повторный запуск блокируется
+  `UPDATE_INSTALL_RUNNING`. Выход из приложения — только после `update:done`.
+- Фронт: `components/UpdateOverlay.tsx` — модальный экран поверх всего; `App.tsx` поднимает
+  его от событий бэкенда (`blankUpdateRun`), поэтому источник клика не важен. Ошибка
+  оставляет экран с кнопкой «Закрыть».
+- Windows-установщик запускается `/SILENT /SP- /NOCANCEL /NORESTART /CLOSEAPPLICATIONS
+  /RELAUNCH=1`; в `VoxFlow.iss` [Run] вместо `skipifsilent` — `Check: ShouldRelaunch`
+  (в тихом режиме только при `/RELAUNCH=1`).
+- Маркер `%LOCALAPPDATA%\VoxFlow\update-in-progress.json` {installer_pid, target_version,
+  started_at} пишется после проверки живости установщика. `updater::refuse_start_if_updating`
+  на старте (до Builder и single-instance): версия ≥ целевой → маркер стёрт, обычный запуск;
+  версия старая, установщик жив (`OpenProcess`/`GetExitCodeProcess`), маркер моложе часа →
+  MessageBox «VoxFlow сейчас обновляется…» и выход. Чистая логика — `update_marker_decision`,
+  покрыта тестом.
+
+**Каталог моделей.** Команда `ai_list_models`: gemini → `gemini::list_models`
+(`/v1beta/models`, фильтр `generateContent`); ollama → `/api/tags`; openai_compat →
+OpenRouter-бесплатные (как было) либо `rewrite::list_models` (`GET {base}/models`, формат
+`data[].id` или `models[].name`, `models/` срезается). `openrouter_get_json` обобщён в
+`get_json_authed` (пустой ключ — без Authorization, для LM Studio). Фронт (`Ai.tsx`):
+эффект с дебаунсом 700 мс по полям подключения → persist → `aiListModels` → единый стейт
+`catalog` (заменил `openRouterModels`); при непустом каталоге поле модели — Select.
+
+**Ollama.** `LocalAiCard` возвращает `null`, если движок не найден и предложения нет
+(призыв ставить Ollama/LM Studio удалён). В `Ai.tsx` бэкенд «Локальный ИИ на этом
+компьютере», блок `ollama pull` удалён, поля/подсказки/сообщения `ai_test` говорят о
+«локальном сервере ИИ». Идентификаторы настроек (`ollama_url`, `ai_backend="ollama"`) не
+переименованы — это хранилище, не UI.
+
+**Границы.** macOS-ветка обновления не тронута (маркер только на Windows). Живой прогон
+2.0.20 → 2.0.21 возможен только после публикации релиза.

@@ -19,7 +19,7 @@
 ; ============================================================================
 
 #define AppName    "VoxFlow"
-#define AppVersion "2.0.20"
+#define AppVersion "2.0.21"
 #define Publisher  "Крылов Анатолий Евгеньевич"
 #define AppExe     "voxflow.exe"
 #define SrcDir     "..\voxflow\src-tauri\target\release"
@@ -30,7 +30,7 @@ AppId={{B2F1A9E0-7C4D-4E8A-9F3B-1A2C5D6E7F80}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
-VersionInfoVersion=2.0.20.0
+VersionInfoVersion=2.0.21.0
 
 ; --- Per-user install: no elevation, current user only. ---
 PrivilegesRequired=lowest
@@ -108,7 +108,11 @@ Root: HKCU; Subkey: "Software\VoxFlow"; ValueType: string; ValueName: "Version";
 Root: HKCU; Subkey: "Software\VoxFlow"; ValueType: string; ValueName: "Publisher"; ValueData: "{#Publisher}"
 
 [Run]
-Filename: "{app}\voxflow.exe"; Description: "{cm:LaunchProgram,VoxFlow}"; Flags: nowait postinstall skipifsilent
+; Мастер: галочка «Запустить VoxFlow» на последней странице. Тихая установка из
+; самого приложения (updater.rs передаёт /SILENT /RELAUNCH=1): приложение
+; перезапускается само. Тихая установка без /RELAUNCH — как раньше, ничего не
+; запускаем (см. ShouldRelaunch).
+Filename: "{app}\voxflow.exe"; Description: "{cm:LaunchProgram,VoxFlow}"; Flags: nowait postinstall; Check: ShouldRelaunch
 
 [CustomMessages]
 english.CreateDesktopIcon=Create a desktop shortcut
@@ -150,6 +154,16 @@ var
   "installed but not visible". We detect that case and warn (interactive only;
   silent installs are unaffected). IsAdminInstallMode is True only when actually
   running with admin rights — a normal double-click leaves it False (no warning). }
+{ [Run]: в мастере — по галочке пользователя; в тихом режиме — только когда
+  установку запустил сам VoxFlow с /RELAUNCH=1 (автообновление). }
+function ShouldRelaunch(): Boolean;
+begin
+  if WizardSilent then
+    Result := ExpandConstant('{param:RELAUNCH|0}') = '1'
+  else
+    Result := True;
+end;
+
 function InitializeSetup(): Boolean;
 begin
   Result := True;

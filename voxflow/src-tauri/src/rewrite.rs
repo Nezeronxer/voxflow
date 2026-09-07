@@ -190,13 +190,80 @@ pub fn openrouter_free_models(s: &crate::settings::Settings) -> Result<Vec<Model
     Ok(out)
 }
 
+/// Каталог моделей провайдера: `GET {base}/models` по ключу. Ответ ждём в
+/// формате OpenAI (`data[].id`); Gemini в OpenAI-режиме и большинство
+/// совместимых сервисов отдают его же. Список отсортирован по имени.
+pub fn list_models(s: &crate::settings::Settings) -> Result<Vec<ModelOption>> {
+    let base_url = s.rewrite_base_url.trim();
+    if base_url.is_empty() {
+        return Err(anyhow!("не задан Base URL"));
+    }
+    let key = s.resolve_rewrite_key();
+    let api_base = base(base_url);
+    let v = get_json_authed(
+        s,
+        &format!("{api_base}/models"),
+        &key,
+        15,
+        "каталог моделей",
+    )?;
+    let ids = model_ids_from_catalog(&v);
+    if ids.is_empty() {
+        return Err(anyhow!("сервис вернул пустой список моделей"));
+    }
+    Ok(ids
+        .into_iter()
+        .map(|id| ModelOption {
+            label: id.clone(),
+            value: id,
+        })
+        .collect())
+}
+
+/// Идентификаторы моделей из `/models`: OpenAI-формат `data[].id`, у части
+/// сервисов — `models[].id` или `models[].name`. Дубликаты убраны, порядок —
+/// по имени, префикс `models/` (Gemini) срезан.
+fn model_ids_from_catalog(v: &serde_json::Value) -> Vec<String> {
+    let list = v
+        .get("data")
+        .or_else(|| v.get("models"))
+        .and_then(|d| d.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut ids: Vec<String> = list
+        .iter()
+        .filter_map(|m| {
+            m.get("id")
+                .or_else(|| m.get("name"))
+                .and_then(|id| id.as_str())
+                .map(|id| id.trim_start_matches("models/").to_string())
+        })
+        .filter(|id| !id.is_empty())
+        .collect();
+    ids.sort_by_key(|a| a.to_lowercase());
+    ids.dedup();
+    ids
+}
+
 fn openrouter_get_json(
     s: &crate::settings::Settings,
     endpoint: &str,
     key: &str,
     timeout_s: u64,
 ) -> Result<serde_json::Value> {
-    net::ensure_https_or_loopback_base(endpoint, "OpenRouter endpoint")?;
+    get_json_authed(s, endpoint, key, timeout_s, "OpenRouter")
+}
+
+/// GET JSON с ключом в заголовке (через stdin-конфиг curl, не argv). Пустой
+/// ключ — запрос без авторизации: локальные серверы вроде LM Studio его не ждут.
+fn get_json_authed(
+    s: &crate::settings::Settings,
+    endpoint: &str,
+    key: &str,
+    timeout_s: u64,
+    label: &str,
+) -> Result<serde_json::Value> {
+    net::ensure_https_or_loopback_base(endpoint, &format!("{label} endpoint"))?;
     let mut cmd = net::curl();
     cmd.arg("-s")
         .arg("-m")
@@ -207,10 +274,10 @@ fn openrouter_get_json(
         .arg("GET")
         .arg(endpoint);
 
-    let secret_headers = vec![
-        auth_header_line(&s.rewrite_auth_header, key),
-        "X-OpenRouter-Title: VoxFlow".to_string(),
-    ];
+    let mut secret_headers = vec!["X-OpenRouter-Title: VoxFlow".to_string()];
+    if !key.trim().is_empty() {
+        secret_headers.push(auth_header_line(&s.rewrite_auth_header, key));
+    }
     let out = net::curl_secret_with_proxy(cmd, &secret_headers, &s.proxy_url)
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
     if !out.status.success() && out.stdout.is_empty() {
@@ -218,15 +285,15 @@ fn openrouter_get_json(
         return Err(anyhow!("curl завершился с ошибкой: {}", err.trim()));
     }
 
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout)
-        .map_err(|e| anyhow!("OpenRouter ответил не JSON: {e}"))?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| anyhow!("{label}: ответ не JSON: {e}"))?;
     if let Some(err) = v.get("error") {
         let msg = err
             .get("message")
             .and_then(|m| m.as_str())
             .or_else(|| err.as_str())
-            .unwrap_or("неизвестная ошибка OpenRouter");
-        return Err(anyhow!("OpenRouter API error: {msg}"));
+            .unwrap_or("неизвестная ошибка");
+        return Err(anyhow!("{label}: {msg}"));
     }
     Ok(v)
 }
@@ -469,6 +536,23 @@ fn looks_like_reasoning(out: &str, input: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_catalog_accepts_openai_and_gemini_shapes() {
+        let openai = serde_json::json!({ "data": [ { "id": "gpt-4o-mini" }, { "id": "gpt-4o" } ] });
+        assert_eq!(
+            super::model_ids_from_catalog(&openai),
+            vec!["gpt-4o", "gpt-4o-mini"]
+        );
+        let gemini = serde_json::json!({ "models": [ { "name": "models/gemini-2.5-flash" } ] });
+        assert_eq!(
+            super::model_ids_from_catalog(&gemini),
+            vec!["gemini-2.5-flash"]
+        );
+        let dup = serde_json::json!({ "data": [ { "id": "a" }, { "id": "a" }, { "id": "" } ] });
+        assert_eq!(super::model_ids_from_catalog(&dup), vec!["a"]);
+        assert!(super::model_ids_from_catalog(&serde_json::json!({})).is_empty());
+    }
 
     #[test]
     fn openrouter_base_detection_is_lenient() {

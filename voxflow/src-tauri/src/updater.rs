@@ -126,17 +126,57 @@ pub fn check(proxy_url: &str) -> Result<UpdateInfo> {
     update_info_from_release_for(&release, current_update_target())
 }
 
+/// Этап установки обновления — фронт показывает его словами над полосой
+/// прогресса. `received`/`total` осмысленны только на `Download`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdatePhase {
+    Download,
+    Verify,
+    Launch,
+}
+
+/// Скачать пакет, проверить и применить. `progress(phase, received, total)`
+/// зовётся из этого же потока: перед каждым этапом и по ходу скачивания
+/// (раз в ~300 мс). Раньше curl работал молча через `output()`, и пользователь
+/// нажимал «Установить» в тишину: ни процентов, ни признака жизни — а спустя
+/// минуту приложение просто закрывалось.
 pub fn download_and_launch(
     asset_url: &str,
     asset_name: &str,
     expected_size: u64,
     expected_digest: &str,
+    latest_version: &str,
     proxy_url: &str,
+    progress: &mut dyn FnMut(UpdatePhase, u64, u64),
 ) -> Result<UpdateInstallResult> {
     validate_asset_url(asset_url)?;
     validate_asset_name_for(asset_name, current_update_target())?;
 
     let dest = installer_download_path(asset_name);
+    progress(UpdatePhase::Download, 0, expected_size);
+    download_with_progress(asset_url, &dest, expected_size, proxy_url, progress)?;
+
+    progress(UpdatePhase::Verify, expected_size, expected_size);
+    verify_downloaded_asset(&dest, expected_size, expected_digest).inspect_err(|_| {
+        let _ = std::fs::remove_file(&dest);
+    })?;
+
+    progress(UpdatePhase::Launch, expected_size, expected_size);
+    apply_downloaded_update(&dest, latest_version).inspect_err(|_| {
+        let _ = std::fs::remove_file(&dest);
+    })
+}
+
+/// curl пишет в `dest`, а мы раз в 300 мс читаем размер файла и отдаём его
+/// наружу — тот же приём, что у загрузки моделей в `models.rs`.
+fn download_with_progress(
+    asset_url: &str,
+    dest: &Path,
+    expected_size: u64,
+    proxy_url: &str,
+    progress: &mut dyn FnMut(UpdatePhase, u64, u64),
+) -> Result<()> {
     let mut cmd = crate::net::curl();
     cmd.arg("-L")
         .arg("--fail")
@@ -147,29 +187,183 @@ pub fn download_and_launch(
         .arg("-A")
         .arg(USER_AGENT)
         .arg("-o")
-        .arg(&dest);
+        .arg(dest);
     crate::net::apply_proxy(&mut cmd, proxy_url);
     cmd.arg(asset_url);
+    cmd.stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
 
-    let out = cmd
-        .output()
+    let mut child = cmd
+        .spawn()
         .map_err(|e| anyhow!("не удалось скачать установщик обновления: {e}"))?;
-    if !out.status.success() {
-        let _ = std::fs::remove_file(&dest);
-        let stderr = String::from_utf8_lossy(&out.stderr);
+
+    let status = loop {
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let received = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+        progress(
+            UpdatePhase::Download,
+            received.min(expected_size),
+            expected_size,
+        );
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+    };
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+        let _ = std::fs::remove_file(dest);
         return Err(anyhow!(
             "скачивание обновления не удалось: {} {}",
-            out.status,
+            status,
             stderr.trim()
         ));
     }
-    verify_downloaded_asset(&dest, expected_size, expected_digest).inspect_err(|_| {
-        let _ = std::fs::remove_file(&dest);
-    })?;
+    progress(UpdatePhase::Download, expected_size, expected_size);
+    Ok(())
+}
 
-    apply_downloaded_update(&dest).inspect_err(|_| {
-        let _ = std::fs::remove_file(&dest);
-    })
+// ─────────────── Маркер «установка идёт» ───────────────
+//
+// Пока установщик работает, VoxFlow закрыт. Если человек в это время запустит
+// приложение снова, старый exe либо откроется поверх наполовину переписанных
+// файлов, либо заблокирует их — и установка сорвётся. Поэтому перед выходом
+// пишем маркер с PID установщика и целевой версией, а на старте сверяемся:
+// версия уже новая — установка завершилась, маркер стираем; версия старая и
+// установщик ещё жив — запуск отменяем с понятным сообщением.
+
+const UPDATE_MARKER_NAME: &str = "update-in-progress.json";
+
+/// Маркер живёт не дольше часа: зависший или убитый установщик не должен
+/// запирать приложение навсегда (PID за это время может достаться другому
+/// процессу).
+const UPDATE_MARKER_MAX_AGE_S: u64 = 60 * 60;
+
+fn update_marker_path() -> PathBuf {
+    crate::paths::data_dir().join(UPDATE_MARKER_NAME)
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(windows)]
+fn write_update_marker(installer_pid: u32, target_version: &str) {
+    let payload = serde_json::json!({
+        "installer_pid": installer_pid,
+        "target_version": target_version,
+        "started_at": unix_now(),
+    });
+    if let Err(e) = std::fs::write(update_marker_path(), payload.to_string()) {
+        log::warn!("не удалось записать маркер обновления: {e}");
+    }
+}
+
+/// Проверка на старте. `Some(text)` — запуск надо отменить и показать текст.
+pub fn refuse_start_if_updating(current_version: &str) -> Option<String> {
+    let path = update_marker_path();
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let marker: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = std::fs::remove_file(&path);
+            return None;
+        }
+    };
+    let target = marker
+        .get("target_version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let pid = marker
+        .get("installer_pid")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    let started_at = marker
+        .get("started_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let decision = update_marker_decision(
+        current_version,
+        target,
+        started_at,
+        unix_now(),
+        process_alive(pid),
+    );
+    match decision {
+        MarkerDecision::Stale => {
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+        MarkerDecision::Updating => Some(format!(
+            "VoxFlow сейчас обновляется до версии {target}.\n\n\
+             Дождитесь, пока установщик закончит работу, — \
+             приложение запустится само."
+        )),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum MarkerDecision {
+    /// Установка закончилась (версия уже новая), маркер протух или установщик
+    /// умер — стираем и запускаемся как обычно.
+    Stale,
+    /// Установщик ещё работает поверх старой версии — запускаться нельзя.
+    Updating,
+}
+
+fn update_marker_decision(
+    current_version: &str,
+    target_version: &str,
+    started_at: u64,
+    now: u64,
+    installer_alive: bool,
+) -> MarkerDecision {
+    let already_updated = version_cmp(current_version, target_version)
+        .map(|o| o != std::cmp::Ordering::Less)
+        .unwrap_or(true);
+    let expired = now.saturating_sub(started_at) > UPDATE_MARKER_MAX_AGE_S;
+    if already_updated || expired || !installer_alive {
+        MarkerDecision::Stale
+    } else {
+        MarkerDecision::Updating
+    }
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit: i32, pid: u32) -> isize;
+        fn GetExitCodeProcess(handle: isize, code: *mut u32) -> i32;
+        fn CloseHandle(handle: isize) -> i32;
+    }
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+    if pid == 0 {
+        return false;
+    }
+    // SAFETY: обычные вызовы Win32 с валидными аргументами; дескриптор
+    // закрывается на всех путях.
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle == 0 {
+            return false;
+        }
+        let mut code: u32 = 0;
+        let ok = GetExitCodeProcess(handle, &mut code) != 0;
+        CloseHandle(handle);
+        ok && code == STILL_ACTIVE
+    }
+}
+
+#[cfg(not(windows))]
+fn process_alive(_pid: u32) -> bool {
+    false
 }
 
 /// Windows: hand the verified Inno Setup package over to a *detached* process.
@@ -189,7 +383,7 @@ pub fn download_and_launch(
 /// out of any inherited job, and we only report success once it has survived a
 /// short observation window. If it died, VoxFlow stays open and shows why.
 #[cfg(windows)]
-fn apply_downloaded_update(dest: &Path) -> Result<UpdateInstallResult> {
+fn apply_downloaded_update(dest: &Path, latest_version: &str) -> Result<UpdateInstallResult> {
     const DETACHED_PROCESS: u32 = 0x0000_0008;
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
@@ -198,6 +392,13 @@ fn apply_downloaded_update(dest: &Path) -> Result<UpdateInstallResult> {
 
     let spawn_with = |flags: u32| {
         let mut cmd = Command::new(dest);
+        // Прогресс и проверку пользователь уже видел в приложении, поэтому
+        // мастер установки не нужен: /SILENT оставляет только окно с полосой
+        // копирования. /CLOSEAPPLICATIONS — если наш процесс ещё не успел
+        // выйти, установщик закроет его через Restart Manager, а не упрётся в
+        // занятый exe. /RELAUNCH=1 читает [Run] в VoxFlow.iss: после тихой
+        // установки приложение запускается само.
+        cmd.args(WINDOWS_INSTALLER_ARGS);
         cmd.creation_flags(flags);
         // Never inherit the install directory as the working directory: a
         // process CWD pins that directory and the installer writes into it.
@@ -223,12 +424,25 @@ fn apply_downloaded_update(dest: &Path) -> Result<UpdateInstallResult> {
         ));
     }
 
+    write_update_marker(child.id(), latest_version);
+
     Ok(UpdateInstallResult {
         launched: true,
         path: dest.display().to_string(),
-        message: "Установщик обновления запущен. VoxFlow сейчас закроется.".into(),
+        message: "Установщик запущен. VoxFlow закроется и откроется уже обновлённым.".into(),
     })
 }
+
+/// Ключи Inno Setup для тихой установки из приложения (см. [Run] в VoxFlow.iss).
+#[cfg(any(windows, test))]
+const WINDOWS_INSTALLER_ARGS: [&str; 6] = [
+    "/SILENT",
+    "/SP-",
+    "/NOCANCEL",
+    "/NORESTART",
+    "/CLOSEAPPLICATIONS",
+    "/RELAUNCH=1",
+];
 
 /// macOS: install the DMG in place instead of dumping the user on a web page.
 ///
@@ -237,7 +451,7 @@ fn apply_downloaded_update(dest: &Path) -> Result<UpdateInstallResult> {
 /// the installed app is left untouched. Only the throwaway cleanup/relaunch step
 /// runs after we exit.
 #[cfg(target_os = "macos")]
-fn apply_downloaded_update(dest: &Path) -> Result<UpdateInstallResult> {
+fn apply_downloaded_update(dest: &Path, _latest_version: &str) -> Result<UpdateInstallResult> {
     let exe = std::env::current_exe().map_err(|e| anyhow!("current executable: {e}"))?;
     let current = enclosing_macos_app_bundle(&exe)
         .ok_or_else(|| anyhow!("автообновление доступно только для установленного VoxFlow.app"))?;
@@ -269,7 +483,7 @@ fn apply_downloaded_update(dest: &Path) -> Result<UpdateInstallResult> {
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn apply_downloaded_update(_dest: &Path) -> Result<UpdateInstallResult> {
+fn apply_downloaded_update(_dest: &Path, _latest_version: &str) -> Result<UpdateInstallResult> {
     Err(anyhow!(
         "автоустановка обновлений для {} не поддерживается: откройте релиз вручную",
         current_update_target().label()
@@ -911,6 +1125,48 @@ mod tests {
         assert_eq!(
             version_cmp("1.2.0-beta", "1.1.9").unwrap(),
             std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn update_marker_blocks_start_only_while_installer_rewrites_old_version() {
+        use super::{update_marker_decision, MarkerDecision};
+        // Установщик жив, версия ещё старая, маркер свежий — запуск отменяем.
+        assert_eq!(
+            update_marker_decision("2.0.20", "2.0.21", 1_000, 1_100, true),
+            MarkerDecision::Updating
+        );
+        // Exe уже новый — установка закончилась, [Run] перезапустил нас.
+        assert_eq!(
+            update_marker_decision("2.0.21", "2.0.21", 1_000, 1_100, true),
+            MarkerDecision::Stale
+        );
+        // Установщик умер — не запирать приложение навсегда.
+        assert_eq!(
+            update_marker_decision("2.0.20", "2.0.21", 1_000, 1_100, false),
+            MarkerDecision::Stale
+        );
+        // Маркер старше часа — PID мог достаться чужому процессу.
+        assert_eq!(
+            update_marker_decision("2.0.20", "2.0.21", 1_000, 1_000 + 3_601, true),
+            MarkerDecision::Stale
+        );
+        // Кривая версия в маркере не должна блокировать запуск.
+        assert_eq!(
+            update_marker_decision("2.0.20", "garbage", 1_000, 1_100, true),
+            MarkerDecision::Stale
+        );
+    }
+
+    #[test]
+    fn silent_installer_asks_inno_to_relaunch_and_close_us() {
+        let args = super::WINDOWS_INSTALLER_ARGS;
+        assert!(args.contains(&"/SILENT"));
+        assert!(args.contains(&"/CLOSEAPPLICATIONS"));
+        assert!(args.contains(&"/RELAUNCH=1"));
+        assert!(
+            !args.contains(&"/VERYSILENT"),
+            "полоса установщика должна быть видна"
         );
     }
 

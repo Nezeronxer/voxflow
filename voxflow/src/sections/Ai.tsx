@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { aiTest, openExternalUrl, saveSettings, type AiModelOption } from "../api";
+import {
+  aiListModels,
+  aiTest,
+  openExternalUrl,
+  saveSettings,
+  type AiModelOption,
+} from "../api";
 import { PageHead, SectionShell, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
 import {
@@ -18,13 +24,16 @@ const GEMINI_MODELS: Option[] = [
   { value: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
 ];
 
-const OLLAMA_MODELS: Option[] = [
+const LOCAL_MODELS: Option[] = [
   { value: "qwen3:4b", label: "Qwen3 4B" },
   { value: "qwen3:8b", label: "Qwen3 8B" },
-  { value: "llama3.1:8b", label: "Llama 3.1 8B" },
   { value: "gemma3:4b", label: "Gemma 3 4B" },
-  { value: "voiceflow", label: "VoiceFlow profile" },
 ];
+
+/// Сколько ждать после последнего изменения ключа/адреса, прежде чем идти за
+/// каталогом моделей. Ключ обычно вставляют целиком, так что задержка почти
+/// не заметна, а при ручном наборе не дёргаем сервис на каждую букву.
+const CATALOG_DEBOUNCE_MS = 700;
 
 function withCurrentOption(options: readonly Option[], current: string): Option[] {
   const value = current.trim();
@@ -48,7 +57,11 @@ export default function Ai({
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(
     null,
   );
-  const [openRouterModels, setOpenRouterModels] = useState<Option[]>([]);
+  // Каталог моделей, прочитанный у провайдера по ключу. Пустой — каталога
+  // нет (ключ не введён, сервис молчит), и поле модели живёт на встроенных
+  // подсказках.
+  const [catalog, setCatalog] = useState<Option[]>([]);
+  const [catalogNote, setCatalogNote] = useState<string | null>(null);
 
   const backend = settings.ai_backend;
   const aiOff = backend === "off";
@@ -60,12 +73,46 @@ export default function Ai({
   const isCustom = customPicked || savedProvider.value === "custom";
   const rewriteProvider = isCustom ? CUSTOM_PROVIDER : savedProvider;
   const isOpenRouter = rewriteProvider.value === "openrouter";
-  // Облачный ASR доступен только для Gemini — Qwen3 в Ollama чисто текстовый.
+  // Облачный ASR доступен только для Gemini — локальный ИИ работает с текстом.
   const cloudAsrDisabled = backend !== "gemini";
 
+  // Ключ или адрес поменялись — сохраняем и читаем каталог моделей провайдера.
+  // Бэкенд берёт ключ из сохранённых настроек (а на пустом поле — из уже
+  // сохранённого ключа), поэтому список появляется и при открытии раздела.
   useEffect(() => {
-    setOpenRouterModels([]);
-  }, [backend, settings.rewrite_base_url, settings.rewrite_key]);
+    setCatalog([]);
+    setCatalogNote(null);
+    if (aiOff) return;
+    let alive = true;
+    const timer = window.setTimeout(async () => {
+      setCatalogNote("Читаю список моделей…");
+      const saved = await (persist ? persist(settings) : saveSettings(settings));
+      if (!alive) return;
+      if (!saved) {
+        setCatalogNote(null);
+        return;
+      }
+      const models = await aiListModels();
+      if (!alive) return;
+      setCatalog(models);
+      setCatalogNote(models.length > 0 ? `Найдено моделей: ${models.length}` : null);
+    }, CATALOG_DEBOUNCE_MS);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+    };
+    // Перечитываем только по полям подключения: смена модели или таймаута
+    // каталог не меняет.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    aiOff,
+    backend,
+    settings.rewrite_base_url,
+    settings.rewrite_key,
+    settings.rewrite_auth_header,
+    settings.ai_api_key,
+    settings.ollama_url,
+  ]);
 
   function applyOpenAiCompatProvider(providerValue: string) {
     const provider =
@@ -76,7 +123,6 @@ export default function Ai({
       (model) => model.value === settings.rewrite_model,
     );
     setResult(null);
-    setOpenRouterModels([]);
     setCustomPicked(provider.value === "custom");
     if (provider.value === "custom") {
       // Свой адрес уже введён — не затираем его переключением селекта.
@@ -110,13 +156,12 @@ export default function Ai({
       const r = await aiTest();
       setResult(r);
       if (isOpenRouter && r.ok && r.models?.length) {
-        setOpenRouterModels(r.models);
+        setCatalog(r.models);
+        setCatalogNote(`Найдено моделей: ${r.models.length}`);
         const current = settings.rewrite_model.trim();
         if (!r.models.some((model) => model.value === current)) {
           update({ rewrite_model: r.models[0].value });
         }
-      } else if (isOpenRouter) {
-        setOpenRouterModels([]);
       }
     } finally {
       setTesting(false);
@@ -157,7 +202,6 @@ export default function Ai({
               // Сбрасываем прошлый результат проверки и стейл-флаг cloud_asr
               // (он только для Gemini) — UI и хранилище не должны расходиться.
               setResult(null);
-              setOpenRouterModels([]);
               if (v === "openai_compat") {
                 // Уже введённый адрес (в том числе свой) сохраняем как есть;
                 // пустой — первое включение, подставляем первый пресет.
@@ -191,7 +235,7 @@ export default function Ai({
             }}
             options={[
               { value: "off", label: "Выключен" },
-              { value: "ollama", label: "Локальный (Ollama / Qwen3)" },
+              { value: "ollama", label: "Локальный ИИ на этом компьютере" },
               { value: "gemini", label: "Google Gemini" },
               {
                 // Название — то, что человек ищет глазами: «куда вставить свой
@@ -234,12 +278,15 @@ export default function Ai({
 
             <Field
               label="Модель"
-              hint="Выберите модель Gemini для обработки текста"
+              hint={catalogNote ?? "Список моделей читается по ключу"}
             >
               <Select
                 value={settings.ai_model}
                 onChange={(v) => update({ ai_model: v })}
-                options={withCurrentOption(GEMINI_MODELS, settings.ai_model)}
+                options={withCurrentOption(
+                  catalog.length > 0 ? catalog : GEMINI_MODELS,
+                  settings.ai_model,
+                )}
               />
             </Field>
           </>
@@ -248,8 +295,8 @@ export default function Ai({
         {backend === "ollama" && (
           <>
             <Field
-              label="Адрес Ollama"
-              hint="Локальный сервер Ollama. По умолчанию работает на этом адресе"
+              label="Адрес локального сервера"
+              hint="Сервер моделей, запущенный на этом компьютере"
             >
               <input
                 type="text"
@@ -260,34 +307,19 @@ export default function Ai({
               />
             </Field>
 
-            <Field label="Модель" hint="Выберите локальную модель Ollama">
+            <Field
+              label="Модель"
+              hint={catalogNote ?? "Список установленных моделей читается с сервера"}
+            >
               <Select
                 value={settings.ollama_model}
                 onChange={(v) => update({ ollama_model: v })}
                 options={withCurrentOption(
-                  OLLAMA_MODELS,
+                  catalog.length > 0 ? catalog : LOCAL_MODELS,
                   settings.ollama_model,
                 )}
               />
             </Field>
-
-            <div
-              className="field-hint"
-              style={{ marginTop: -6, marginBottom: 14, maxWidth: "none" }}
-            >
-              Установите Ollama (
-              <a
-                href="https://ollama.com/download"
-                target="_blank"
-                rel="noreferrer"
-                style={{ color: "var(--accent-hover)" }}
-              >
-                ollama.com/download
-              </a>
-              ), затем: <code>ollama pull qwen3:4b</code>. Опционально — соберите
-              профиль: <code>ollama create voiceflow -f voxflow/ollama/Modelfile</code>.
-              Всё работает офлайн.
-            </div>
           </>
         )}
 
@@ -334,7 +366,6 @@ export default function Ai({
                 value={settings.rewrite_key}
                 onChange={(value) => {
                   setResult(null);
-                  setOpenRouterModels([]);
                   update({ rewrite_key: value });
                 }}
               />
@@ -404,40 +435,55 @@ export default function Ai({
             )}
 
             {isOpenRouter ? (
-              openRouterModels.length > 0 ? (
+              catalog.length > 0 ? (
                 <Field
                   label="Бесплатная модель"
-                  hint={`Base URL: ${rewriteProvider.baseUrl}`}
+                  hint={catalogNote ?? `Base URL: ${rewriteProvider.baseUrl}`}
                 >
                   <Select
                     value={
-                      openRouterModels.some(
+                      catalog.some(
                         (model) => model.value === settings.rewrite_model,
                       )
                         ? settings.rewrite_model
-                        : openRouterModels[0]?.value ?? ""
+                        : catalog[0]?.value ?? ""
                     }
                     onChange={(v) => update({ rewrite_model: v })}
-                    options={openRouterModels}
+                    options={catalog}
                   />
                 </Field>
               ) : (
                 <Field
                   label="Бесплатная модель"
-                  hint="Список появится только после успешной проверки OpenRouter-ключа"
+                  hint={catalogNote ?? "Список читается по ключу OpenRouter"}
                 >
                   <span className="field-hint" style={{ maxWidth: 280 }}>
-                    Вставьте ключ и нажмите «Проверить».
+                    {catalogNote ?? "Вставьте ключ — список появится сам."}
                   </span>
                 </Field>
               )
+            ) : catalog.length > 0 ? (
+              <Field
+                label="Модель"
+                hint={catalogNote ?? `Base URL: ${rewriteProvider.baseUrl}`}
+              >
+                <Select
+                  value={settings.rewrite_model}
+                  onChange={(v) => {
+                    setResult(null);
+                    update({ rewrite_model: v });
+                  }}
+                  options={withCurrentOption(catalog, settings.rewrite_model)}
+                />
+              </Field>
             ) : (
               <Field
                 label="Модель"
                 hint={
-                  isCustom
-                    ? "Идентификатор модели как его ждёт ваш сервис"
-                    : `Base URL: ${rewriteProvider.baseUrl}. Можно вписать любую модель провайдера`
+                  catalogNote ??
+                  (isCustom
+                    ? "Идентификатор модели как его ждёт ваш сервис. После ввода ключа список читается с сервиса"
+                    : `Base URL: ${rewriteProvider.baseUrl}. После ввода ключа список читается у провайдера`)
                 }
               >
                 {/* Не Select: список моделей у провайдеров меняется чаще релизов
@@ -506,7 +552,7 @@ export default function Ai({
           label="Облачное распознавание"
           hint={
             backend === "ollama"
-              ? "Только для облачного Gemini (Qwen3 — текстовый). Локальное распознавание остаётся по умолчанию."
+              ? "Только для облачного Gemini: локальный ИИ работает с текстом. Локальное распознавание остаётся по умолчанию."
               : "Gemini вместо локального распознавания. Локальный GigaAM/Parakeet/Whisper остаётся приватным запасным вариантом — аудио не покидает устройство."
           }
         >
@@ -542,7 +588,7 @@ export default function Ai({
 
         <Field
           label="Таймаут ответа, с"
-          hint="Сколько ждать ответа модели. Локальная Ollama получает минимум 60 с — на CPU меньше не хватает"
+          hint="Сколько ждать ответа модели. Локальный ИИ получает минимум 60 с — на CPU меньше не хватает"
         >
           <input
             type="number"

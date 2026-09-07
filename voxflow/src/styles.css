@@ -3134,6 +3134,63 @@ body.overlay-body #root {
 /* ============================================================
    Toast / banner notice (B3: «выберите модель», ошибки движка)
    ============================================================ */
+/* Экран установки обновления: поверх всего, пока идёт скачивание/проверка/
+   запуск установщика. Закрыть нельзя, пока не ошибка — иначе человек уйдёт в
+   диктовку, а приложение через секунду закроется само. */
+.update-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(10, 10, 10, 0.55);
+  backdrop-filter: blur(6px);
+}
+.update-card {
+  width: min(440px, calc(100% - 48px));
+  background: var(--bg-card);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-pop);
+  padding: 28px 28px 24px;
+}
+.update-card h2 {
+  font-family: var(--font-display);
+  font-size: 18px;
+  margin: 0 0 6px;
+}
+.update-card .update-phase {
+  color: var(--text-dim);
+  font-size: 13.5px;
+  margin: 0 0 18px;
+}
+.update-card .progress {
+  width: 100%;
+  height: 8px;
+}
+.update-card .update-meta {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.update-card .update-error {
+  color: var(--red);
+  font-size: 13.5px;
+  line-height: 1.45;
+  margin: 0 0 16px;
+  word-break: break-word;
+}
+.update-card .update-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .toast-stack {
   position: fixed;
   top: var(--sp-4);

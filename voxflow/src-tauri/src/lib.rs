@@ -63,6 +63,14 @@ pub fn run() {
             return;
         }
     }
+    // Установщик обновления ещё переписывает файлы старой версии — запуск
+    // поверх него сорвал бы установку. Сообщаем и выходим; после установки
+    // [Run] в VoxFlow.iss откроет уже новую версию, и маркер сотрётся сам.
+    if let Some(text) = updater::refuse_start_if_updating(env!("CARGO_PKG_VERSION")) {
+        fatal_startup_notice(&text);
+        return;
+    }
+
     tauri::Builder::default()
         // ПЕРВЫМ: единственный экземпляр процесса. Иначе старый и новый voxflow.exe
         // открывают ОДИН voxflow.db и затирают настройки друг друга (B4). Колбэк
@@ -229,6 +237,7 @@ pub fn run() {
             commands::show_main_window,
             commands::active_app_context,
             commands::ai_test,
+            commands::ai_list_models,
             commands::rewrite_prompt_with_instruction,
             commands::transform_text,
             commands::default_app_profile_presets,
@@ -365,6 +374,32 @@ fn spawn_autostart_reconcile(handle: tauri::AppHandle, want_autostart: bool) {
 /// Показать фатальную ошибку старта понятным окном (GUI ещё не поднят, поэтому
 /// нативный MessageBoxW) и продублировать в лог/стдерр. Используется до
 /// инициализации Tauri — P2-7 (молчаливый краш db::open().expect).
+/// Информационное окно на старте (не ошибка): обновление ещё идёт.
+fn fatal_startup_notice(text: &str) {
+    log::info!("{text}");
+    eprintln!("{text}");
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, utype: u32) -> i32;
+        }
+        let wide = |s: &str| -> Vec<u16> {
+            std::ffi::OsStr::new(s)
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        };
+        let t = wide(text);
+        let c = wide("VoxFlow обновляется");
+        // 0x40 = MB_ICONINFORMATION.
+        unsafe {
+            MessageBoxW(0, t.as_ptr(), c.as_ptr(), 0x40);
+        }
+    }
+}
+
 fn fatal_startup_error(text: &str) {
     log::error!("{text}");
     eprintln!("{text}");
