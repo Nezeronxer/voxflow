@@ -18,6 +18,7 @@ import type {
   PromptModelView,
   PromptRulesRefresh,
   LocalAiState,
+  LocalLlmState,
   TransformResult,
   UpdateInfo,
   UpdateInstallResult,
@@ -385,6 +386,53 @@ export function localAiDetect(): Promise<LocalAiState> {
 // почему она не сработала.
 export function localAiPull(tag: string): Promise<void> {
   return invoke<void>("local_ai_pull", { tag });
+}
+
+const EMPTY_LLM_STATE: LocalLlmState = {
+  runtime_tag: "",
+  runtime_installed: false,
+  gpu: false,
+  downloading: false,
+  machine: { ram_gb: 0, cpu_cores: 0, accel: { kind: "cpu_only" } },
+  models: [],
+  server: { running: false, model_id: null, gpu: false },
+};
+
+const MOCK_LLM_STATE: LocalLlmState = {
+  runtime_tag: "b10809",
+  runtime_installed: true,
+  gpu: true,
+  downloading: false,
+  machine: { ram_gb: 32, cpu_cores: 12, accel: { kind: "nvidia", vram_gb: 12 } },
+  models: [
+    { id: "qwen3-1.7b", label: "Qwen3 1.7B", size_gb: 1.8, min_ram_gb: 8, blurb: "Самая лёгкая: чистит паразиты и пунктуацию даже на слабом ноутбуке.", installed: false, fits: true, recommended: false },
+    { id: "qwen2.5-3b-instruct", label: "Qwen2.5 3B Instruct", size_gb: 2.0, min_ram_gb: 8, blurb: "Рекомендуемая: хороший русский, быстрая на процессоре.", installed: true, fits: true, recommended: false },
+    { id: "qwen3-4b", label: "Qwen3 4B", size_gb: 2.5, min_ram_gb: 16, blurb: "Точнее понимает смысл и исправляет ослышки; хочет 16 ГБ памяти.", installed: false, fits: true, recommended: false },
+    { id: "gemma-3-4b-it", label: "Gemma 3 4B", size_gb: 2.5, min_ram_gb: 16, blurb: "Альтернатива от Google, ровный стиль в документах и письмах.", installed: false, fits: true, recommended: false },
+    { id: "qwen3-8b", label: "Qwen3 8B", size_gb: 5.0, min_ram_gb: 24, blurb: "Лучшее качество; нужна видеокарта или 24 ГБ памяти.", installed: false, fits: true, recommended: true },
+  ],
+  server: { running: true, model_id: "qwen2.5-3b-instruct", gpu: true },
+};
+
+export function localLlmState(): Promise<LocalLlmState> {
+  if (!IS_TAURI_RUNTIME) return Promise.resolve(MOCK_LLM_STATE);
+  return safe<LocalLlmState>(async () => await invoke<LocalLlmState>("local_llm_state"), EMPTY_LLM_STATE);
+}
+
+// Ошибки загрузки/удаления не глушим: человек нажал кнопку и должен видеть причину.
+export function localLlmDownload(id: string): Promise<void> {
+  if (!IS_TAURI_RUNTIME) return Promise.resolve();
+  return invoke<void>("local_llm_download", { id });
+}
+
+export function localLlmDelete(id: string): Promise<void> {
+  if (!IS_TAURI_RUNTIME) return Promise.resolve();
+  return invoke<void>("local_llm_delete", { id });
+}
+
+export function localLlmStop(): Promise<void> {
+  if (!IS_TAURI_RUNTIME) return Promise.resolve();
+  return safe<void>(async () => await invoke<void>("local_llm_stop"), undefined);
 }
 
 export function promptModels(): Promise<PromptModelView[]> {

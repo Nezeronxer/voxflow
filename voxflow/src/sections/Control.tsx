@@ -191,6 +191,33 @@ export default function Control({
         </Field>
 
         <Field
+          label="Графическое ускорение"
+          hint="Видеокарта ускоряет Whisper (NVIDIA) и встроенный локальный ИИ (NVIDIA/AMD/Intel, Apple Silicon). «Авто» включает её, когда карта есть. GigaAM и Parakeet всегда считают на процессоре."
+        >
+          <div className="seg" role="radiogroup" aria-label="Графическое ускорение">
+            {[
+              { value: "auto", label: "Авто" },
+              { value: "on", label: "Вкл" },
+              { value: "off", label: "Выкл" },
+            ].map((option) => {
+              const active = (settings.gpu_mode || "auto") === option.value;
+              return (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={active}
+                  className={`seg-btn${active ? " active" : ""}`}
+                  onClick={() => update({ gpu_mode: option.value })}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        </Field>
+
+        <Field
           label="Защёлка двойным тапом"
           hint="В hold-режиме второй быстрый тап запускает запись без удержания. Любое физическое отпускание обрабатывается сразу, без скрытой задержки."
         >

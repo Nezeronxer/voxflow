@@ -48,6 +48,10 @@ pub struct Settings {
     pub engine: String,
     /// Тема интерфейса: "system" | "light" | "dark".
     pub theme: String,
+    /// Графическое ускорение: "auto" (есть NVIDIA — используем) | "on" | "off".
+    /// Управляет выбором CUDA-сборки whisper и выгрузкой слоёв встроенной
+    /// локальной модели ИИ на GPU. GigaAM/Parakeet считают на CPU всегда.
+    pub gpu_mode: String,
     /// Масштаб плавающей плашки (0.75..1.50).
     pub overlay_scale: f64,
     /// Точная расшифровка без улучшений.
@@ -87,8 +91,10 @@ pub struct Settings {
     /// Сохранять локальный датасет аудио↔текст для будущего обучения.
     /// Ручные same-field исправления слов запоминаются отдельно и всегда.
     pub personalize: bool,
-    /// ИИ-движок рефайна: "off" | "gemini" | "ollama" | "openai_compat".
+    /// ИИ-движок рефайна: "off" | "builtin" | "gemini" | "ollama" | "openai_compat".
     pub ai_backend: String,
+    /// Модель встроенного локального ИИ (id из каталога `local_llm::CATALOG`).
+    pub builtin_llm_model: String,
     /// Версия семантики дефолтного ИИ-бэкенда. В 2.0.0 Ollama была включена
     /// без opt-in и могла синхронно занять CPU до 10 секунд перед вставкой.
     #[serde(default = "legacy_ai_backend_behavior_version")]
@@ -243,6 +249,7 @@ impl Default for Settings {
             // локальными спец-маршрутами, если пользователь выберет их в UI.
             engine: "whisper_server".into(),
             theme: "system".into(),
+            gpu_mode: "auto".into(),
             overlay_scale: OVERLAY_SCALE_DEFAULT,
             verbatim: false,
             remove_fillers: true,
@@ -298,12 +305,19 @@ impl Default for Settings {
             prompt_rebuild: false,
             prompt_models: Vec::new(),
             local_ai_dismissed: false,
+            builtin_llm_model: crate::local_llm::DEFAULT_MODEL.into(),
         }
     }
 }
 
 impl Settings {
     pub fn normalize_user_values(&mut self) {
+        if !matches!(self.gpu_mode.as_str(), "auto" | "on" | "off") {
+            self.gpu_mode = "auto".into();
+        }
+        if crate::local_llm::catalog_model(&self.builtin_llm_model).is_none() {
+            self.builtin_llm_model = crate::local_llm::DEFAULT_MODEL.into();
+        }
         // 2.0.0 записывал новый флаг как false даже без явного выбора. Один раз
         // переводим такой снимок на новый безопасный дефолт. После сохранения
         // version=1 явное отключение в UI снова становится устойчивым.

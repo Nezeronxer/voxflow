@@ -39,7 +39,7 @@ const SETTINGS_NAV: {
     label: "Обработка текста",
     title: "Обработка текста",
     desc: "Что происходит с текстом после распознавания: нейросеть и ключ, чистка речи, исправления.",
-    icon: Icon.Sparkles,
+    icon: Icon.Wand,
   },
   {
     id: "applications",
@@ -148,7 +148,7 @@ export default function SettingsHub({
           )}
           {egress.summary}
         </span>
-        <span>VoxFlow 2.0.20</span>
+        <span>VoxFlow 2.1.0</span>
       </footer>
     </div>
   );

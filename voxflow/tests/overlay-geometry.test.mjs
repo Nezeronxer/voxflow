@@ -55,7 +55,7 @@ test("final v2 cascade preserves the 13px dictation orb contract", () => {
   const orbPaint = finalRule(".aq-orb");
   assert.equal(
     declaration(orbPaint, "filter"),
-    "drop-shadow(0 0 2px rgba(111, 131, 255, 0.42))",
+    "drop-shadow(0 0 2px rgba(58, 210, 155, 0.42))",
   );
 });
 

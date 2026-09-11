@@ -34,14 +34,16 @@ import Dashboard from "./sections/Dashboard";
 import type { SettingsPageId } from "./sections/SettingsHub";
 import { ErrorBoundary } from "./ErrorBoundary";
 
+const LocalLlm = lazy(() => import("./sections/LocalLlm"));
 const History = lazy(() => import("./sections/History"));
 const Dictionary = lazy(() => import("./sections/Dictionary"));
 const Snippets = lazy(() => import("./sections/Snippets"));
 const Prompts = lazy(() => import("./sections/Prompts"));
 const SettingsHub = lazy(() => import("./sections/SettingsHub"));
 
-type TabId =
+export type TabId =
   | "dashboard"
+  | "ai"
   | "history"
   | "dictionary"
   | "snippets"
@@ -53,11 +55,12 @@ const NAV: {
   label: string;
   icon: (props: { className?: string }) => ReactNode;
 }[] = [
-  { id: "dashboard", label: "Главная", icon: Icon.Home },
+  { id: "dashboard", label: "Диктовка", icon: Icon.Mic },
+  { id: "ai", label: "Локальный ИИ", icon: Icon.Cube },
   { id: "history", label: "История", icon: Icon.Clock },
   { id: "dictionary", label: "Словарь", icon: Icon.Book },
   { id: "snippets", label: "Сниппеты", icon: Icon.Code },
-  { id: "prompts", label: "Промпты", icon: Icon.Sparkles },
+  { id: "prompts", label: "Промпты", icon: Icon.Wand },
 ];
 
 type Route = { tab: TabId; settingsPage?: SettingsPageId };
@@ -332,8 +335,8 @@ export default function App() {
             ))}
           </div>
           <div>
-            <div className="brand-name">VoxFlow <span>2.0</span></div>
-            <div className="brand-sub">Локальная диктовка</div>
+            <div className="brand-name">VoxFlow <span>2.1</span></div>
+            <div className="brand-sub">Диктовка на устройстве</div>
           </div>
         </div>
 
@@ -368,7 +371,7 @@ export default function App() {
           </button>
           <div className="sidebar-foot">
             <span className="dot-ok" />
-            <span>{loaded ? "Готово к диктовке" : "Загрузка…"}</span>
+            <span>{loaded ? "Готов" : "Загрузка…"}</span>
             <span className="sidebar-hotkey">{loaded ? settings.hotkey.replace("Meta", "⌘ ").replace("Control", "Ctrl ") : ""}</span>
           </div>
         </div>
@@ -379,8 +382,9 @@ export default function App() {
           <Suspense fallback={<RouteFallback />}>
             <div className="tab-fade">
               {tab === "dashboard" && (
-                <Dashboard settings={settings} onOpenSettings={openSettings} />
+                <Dashboard settings={settings} onOpenSettings={openSettings} onOpenTab={setTab} />
               )}
+              {tab === "ai" && <LocalLlm settings={settings} update={update} />}
               {tab === "history" && <History />}
               {tab === "dictionary" && <Dictionary />}
               {tab === "snippets" && <Snippets />}

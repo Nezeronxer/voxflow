@@ -325,7 +325,7 @@ fn parse_chat_response(v: &serde_json::Value) -> Result<&str> {
 /// КОНСЕРВАТИВНА, чтобы НЕ срезать легитимный короткий результат (напр. «Хорошо,
 /// договорились»): срабатывает только при структурных маркерах промпта ЛИБО когда
 /// ответ заметно длиннее входа И содержит явные «процессные» фразы.
-fn looks_like_reasoning(out: &str, input: &str) -> bool {
+pub(crate) fn looks_like_reasoning(out: &str, input: &str) -> bool {
     let low = out.to_lowercase();
     // Структурные маркеры нашего payload — модель спарротила промпт вместо ответа.
     const STRUCT: &[&str] = &["[приложение]", "[диктовка]", "[окружение]", "/no_think"];
@@ -358,7 +358,7 @@ fn looks_like_reasoning(out: &str, input: &str) -> bool {
 /// `"рассуждение</think>\n\nтекст"`). Такой бесхозный закрывающий тег тоже
 /// обрабатываем — иначе литерал `</think>` (вместе с возможным рассуждением до
 /// него) протёк бы в инжектируемый текст.
-fn strip_think(text: &str) -> String {
+pub(crate) fn strip_think(text: &str) -> String {
     let mut s = text.to_string();
     // 1) Парные блоки <think>…</think> — вырезаем все по очереди.
     while let Some(start) = s.find("<think>") {
