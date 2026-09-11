@@ -631,6 +631,18 @@
 - `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --lib` — 359 passed, 7 ignored. ✅
 - `npm test`, `npm run build`, `python script/check_versions.py --tag v2.0.20`. ✅
 
+## 2026-09-07 — обновление с прогрессом, каталог моделей по ключу, Ollama без следов (2.0.21)
+
+- `install_update` → поток + события `update:progress/done/error`; `UpdateOverlay.tsx` поверх окна;
+  тихий Inno (`/SILENT … /RELAUNCH=1`, `Check: ShouldRelaunch`); маркер `update-in-progress.json` +
+  `refuse_start_if_updating` на старте (D-034). ✅
+- `ai_list_models` (gemini / ollama / openai_compat) + автозапрос каталога в `Ai.tsx` через 700 мс
+  после ввода ключа; поле модели становится Select. ✅
+- `LocalAiCard` скрыта без найденного движка; из раздела «ИИ» убраны инструкции по Ollama. ✅
+- `cargo fmt`, `cargo clippy --all-targets -D warnings`, `cargo test --lib` — 363 passed, 7 ignored;
+  `npm run check` 33/33; `check_versions.py --tag v2.0.21` чист. ✅
+- **Не проверено:** живой прогон автообновления — нужен опубликованный релиз 2.0.21.
+
 ## 2026-09-11 — 2.1.0: слова не стираются, перевод не подставляется, встроенный локальный ИИ, новый интерфейс
 
 - **Запрос:** «он опять пишет перевод на слово… начинает стирать слова», «добавь скачивание

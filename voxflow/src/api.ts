@@ -21,7 +21,6 @@ import type {
   LocalLlmState,
   TransformResult,
   UpdateInfo,
-  UpdateInstallResult,
   SecretStatus,
   SecretKind,
 } from "./types";
@@ -517,6 +516,16 @@ export type AiTestResult = {
   models?: AiModelOption[];
 };
 
+/**
+ * Каталог моделей выбранного бэкенда по сохранённому ключу. Пустой список —
+ * каталог недоступен (нет ключа, сервис не отвечает); UI остаётся на
+ * встроенных подсказках.
+ */
+export function aiListModels(): Promise<AiModelOption[]> {
+  if (!IS_TAURI_RUNTIME) return Promise.resolve([]);
+  return safe<AiModelOption[]>(() => invoke<AiModelOption[]>("ai_list_models"), []);
+}
+
 export function aiTest(): Promise<AiTestResult> {
   if (!IS_TAURI_RUNTIME) {
     return Promise.resolve({ ok: true, message: "Demo-проверка пройдена" });
@@ -544,23 +553,31 @@ export function checkForUpdate(): Promise<UpdateInfo | null> {
   );
 }
 
-export function installUpdate(
+/**
+ * Запустить установку обновления. Команда возвращается сразу; ход работы —
+ * события `update:progress` / `update:done` / `update:error`. Ошибка запуска
+ * (уже идёт другая установка) — текстом.
+ */
+export async function installUpdate(
   assetUrl: string,
   assetName: string,
   assetSize: number,
   assetDigest: string,
-): Promise<UpdateInstallResult | null> {
-  if (!IS_TAURI_RUNTIME) return Promise.resolve(null);
-  return safe<UpdateInstallResult | null>(
-    () =>
-      invoke<UpdateInstallResult>("install_update", {
-        assetUrl,
-        assetName,
-        assetSize,
-        assetDigest,
-      }),
-    null,
-  );
+  latestVersion: string,
+): Promise<string | null> {
+  if (!IS_TAURI_RUNTIME) return "Установка обновления доступна только в приложении.";
+  try {
+    await invoke<void>("install_update", {
+      assetUrl,
+      assetName,
+      assetSize,
+      assetDigest,
+      latestVersion,
+    });
+    return null;
+  } catch (e) {
+    return e instanceof Error ? e.message : String(e);
+  }
 }
 
 /**

@@ -103,15 +103,18 @@ export default function Control({
       setUpdateStatus(opened ? "Страница релиза открыта" : "Не удалось открыть релиз");
       return;
     }
+    // Ход установки показывает экран прогресса в App.tsx (по событиям
+    // бэкенда); здесь только запуск и текст на случай отказа стартовать.
     setUpdateStatus("Скачиваю обновление…");
-    const result = await installUpdate(
+    const failure = await installUpdate(
       updateInfo.asset_url,
       updateInfo.asset_name,
       updateInfo.asset_size,
       updateInfo.asset_digest,
+      updateInfo.latest_version,
     );
     setInstallingUpdate(false);
-    setUpdateStatus(result?.launched ? result.message : "Не удалось установить обновление");
+    setUpdateStatus(failure ?? "Идёт установка обновления");
   }
 
   const showDictation = scope !== "app";

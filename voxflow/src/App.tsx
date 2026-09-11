@@ -23,7 +23,11 @@ import type {
   ErrorEvent as VoxErrorEvent,
   NoRecogEvent,
   UpdateInfo,
+  UpdateDoneEvent,
+  UpdateErrorEvent,
+  UpdateProgressEvent,
 } from "./types";
+import UpdateOverlay, { type UpdateRun } from "./components/UpdateOverlay";
 import { DEFAULT_SETTINGS } from "./types";
 import {
   SECRET_FIELDS,
@@ -72,6 +76,10 @@ type Notice = {
   onAction?: () => void;
 };
 
+function blankUpdateRun(version: string, total: number): UpdateRun {
+  return { version, phase: "download", received: 0, total, done: null, error: null };
+}
+
 function RouteFallback() {
   return (
     <div className="route-fallback" role="status" aria-label="Загрузка раздела">
@@ -88,6 +96,10 @@ export default function App() {
   const [settings, setSettings] = useState<Settings>({ ...DEFAULT_SETTINGS });
   const [loaded, setLoaded] = useState(false);
   const [notice, setNotice] = useState<Notice | null>(null);
+  // Идущая установка обновления: пока она есть, поверх окна — экран с
+  // прогрессом. Раньше клик «Установить» молчал всё скачивание, а потом
+  // приложение просто закрывалось.
+  const [updateRun, setUpdateRun] = useState<UpdateRun | null>(null);
 
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const loadedRef = useRef(false);
@@ -152,20 +164,51 @@ export default function App() {
       });
       return;
     }
-    setNotice({ message: `Скачиваю VoxFlow ${info.latest_version}…`, variant: "warning" });
-    const result = await installUpdate(
+    setNotice(null);
+    setUpdateRun(blankUpdateRun(info.latest_version, info.asset_size));
+    const failure = await installUpdate(
       info.asset_url,
       info.asset_name,
       info.asset_size,
       info.asset_digest,
+      info.latest_version,
     );
-    setNotice({
-      message: result?.launched
-        ? result.message
-        : "Не удалось скачать или установить обновление.",
-      variant: result?.launched ? "warning" : "error",
-    });
+    if (failure) {
+      setUpdateRun((run) => (run ? { ...run, error: failure } : run));
+    }
   }
+
+  useEffect(() => {
+    const offs = [
+      // Установку могут запустить и из «Основных настроек» — экран прогресса
+      // поднимается от событий бэкенда, а не от того, кто нажал кнопку.
+      subscribe<UpdateProgressEvent>("update:progress", (event) => {
+        const p = event.payload;
+        if (!p) return;
+        setUpdateRun((run) => ({
+          ...(run ?? blankUpdateRun(p.version, p.total)),
+          phase: p.phase,
+          received: p.received,
+          total: p.total,
+        }));
+      }),
+      subscribe<UpdateDoneEvent>("update:done", (event) => {
+        const p = event.payload;
+        setUpdateRun((run) => ({
+          ...(run ?? blankUpdateRun(p?.version ?? "", 0)),
+          done: p?.message || "Готово.",
+        }));
+      }),
+      subscribe<UpdateErrorEvent>("update:error", (event) => {
+        const p = event.payload;
+        setUpdateRun((run) => ({
+          ...(run ?? blankUpdateRun(p?.version ?? "", 0)),
+          error: p?.error || "Не удалось установить обновление.",
+        }));
+      }),
+    ];
+    return () => offs.forEach((off) => off());
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -306,6 +349,9 @@ export default function App() {
   return (
     <div className={`app app-v2${loaded ? " is-ready" : " is-loading"}`}>
       <FpsMeter />
+      {updateRun && (
+        <UpdateOverlay run={updateRun} onDismiss={() => setUpdateRun(null)} />
+      )}
       {notice && (
         <div className="toast-stack">
           <Toast

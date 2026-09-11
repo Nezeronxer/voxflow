@@ -8,7 +8,6 @@ import type {
   ModelProgressEvent,
   Settings,
 } from "../types";
-import { Icon } from "../ui";
 
 type Props = {
   settings: Settings;
@@ -152,6 +151,10 @@ export default function LocalAiCard({ settings, update }: Props) {
   }
 
   const found = state.engines.length > 0;
+  // Ничего не найдено — карточки нет вовсе. Приложение не просит ставить
+  // стороннее ПО: если человек хочет локальный ИИ, он уже знает, чем его
+  // запустить, и карточка появится сама.
+  if (!found && !state.suggestion) return null;
 
   return (
     <div className="card">
@@ -160,7 +163,7 @@ export default function LocalAiCard({ settings, update }: Props) {
         <div className="sub">
           {found
             ? `Найден на этом компьютере: ${state.engines.map((e) => e.label).join(", ")}.`
-            : "Внешние движки не найдены. Встроенный локальный ИИ живёт в главном меню и ничего ставить не требует."}
+            : "Предложение по найденному движку."}
           {machineSummary(state.machine) &&
             ` Ваш компьютер: ${machineSummary(state.machine)}. Ряд моделей подобран под него.`}
         </div>
@@ -185,17 +188,6 @@ export default function LocalAiCard({ settings, update }: Props) {
             </button>
           </div>
         </div>
-      )}
-
-      {!found && (
-        <p className="hint">
-          <Icon.Sparkles className="ico" /> Поставьте{" "}
-          <a href="https://ollama.com/download" target="_blank" rel="noreferrer">
-            Ollama
-          </a>{" "}
-          или LM Studio — после запуска приложение найдёт их само. Чужое ПО за вас
-          я не устанавливаю.
-        </p>
       )}
 
       {state.shortlist.length > 0 && (

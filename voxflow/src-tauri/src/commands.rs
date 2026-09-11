@@ -564,7 +564,10 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
             // затем делаем «ОК»-пробу. Имена моделей бывают с тегом ("qwen3:4b"),
             // поэтому принимаем и точное совпадение, и префикс с двоеточием.
             match crate::ollama::list_models(&ollama_url) {
-                Err(e) => ai_test_plain(false, format!("Ollama не запущена ({ollama_url}). {e}")),
+                Err(e) => ai_test_plain(
+                    false,
+                    format!("Локальный сервер ИИ не отвечает ({ollama_url}). {e}"),
+                ),
                 Ok(models)
                     if !models.iter().any(|m| {
                         m == &ollama_model || m.starts_with(&format!("{ollama_model}:"))
@@ -572,9 +575,7 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
                 {
                     ai_test_plain(
                         false,
-                        format!(
-                            "Модель '{ollama_model}' не найдена. Скачайте: ollama pull {ollama_model}"
-                        ),
+                        format!("Модель '{ollama_model}' не установлена на локальном сервере ИИ"),
                     )
                 }
                 Ok(_) => match crate::ollama::refine(
@@ -584,7 +585,7 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
                     "Напиши: ОК",
                     settings.backend_timeout_s(crate::net::is_loopback_base_url(&ollama_url)),
                 ) {
-                    Ok(t) => ai_test_plain(true, format!("Ollama отвечает: {}", t.trim())),
+                    Ok(t) => ai_test_plain(true, format!("Локальный ИИ отвечает: {}", t.trim())),
                     Err(e) => ai_test_plain(false, format!("Ошибка: {e}")),
                 },
             }
@@ -616,6 +617,42 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
             }
         }
         _ => ai_test_plain(false, "Движок ИИ выключен"),
+    }
+}
+
+/// Каталог моделей выбранного бэкенда по сохранённому ключу. Зовётся с фронта
+/// сразу после ввода ключа: человек должен выбирать модель из того, что ему
+/// реально доступно, а не вписывать идентификатор по памяти. Ошибка — это
+/// не отказ, а «каталога нет»: фронт остаётся на встроенном списке.
+#[tauri::command]
+pub fn ai_list_models(state: State<AppState>) -> R<Vec<crate::rewrite::ModelOption>> {
+    let settings = state.settings.lock().clone();
+    match settings.ai_backend.as_str() {
+        "gemini" => {
+            let key = settings.ai_api_key.trim().to_string();
+            if key.is_empty() {
+                return Err("Введите API-ключ".into());
+            }
+            crate::gemini::list_models(&key, &settings.proxy_url).map_err(err)
+        }
+        "ollama" => crate::ollama::list_models(&settings.ollama_url)
+            .map(|names| {
+                names
+                    .into_iter()
+                    .map(|name| crate::rewrite::ModelOption {
+                        label: name.clone(),
+                        value: name,
+                    })
+                    .collect()
+            })
+            .map_err(err),
+        "openai_compat" => {
+            if crate::rewrite::is_openrouter_base(&settings.rewrite_base_url) {
+                return crate::rewrite::openrouter_free_models(&settings).map_err(err);
+            }
+            crate::rewrite::list_models(&settings).map_err(err)
+        }
+        _ => Err("Движок ИИ выключен".into()),
     }
 }
 
@@ -1099,6 +1136,15 @@ pub fn check_for_update(state: State<AppState>) -> R<crate::updater::UpdateInfo>
     crate::updater::check(&proxy).map_err(err)
 }
 
+/// Одновременно идёт не больше одной установки: второй клик по «Установить»,
+/// пока первая качает пакет, запустил бы второй curl в тот же файл.
+static UPDATE_INSTALL_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Запуск установки. Возвращается сразу; ход работы уходит событиями
+/// `update:progress` {phase, received, total}, финал — `update:done` {message}
+/// либо `update:error` {error}. Раньше команда была синхронной и молчала всё
+/// скачивание: фронт не мог показать ни процентов, ни этапа.
 #[tauri::command]
 pub fn install_update(
     app: AppHandle,
@@ -1107,39 +1153,79 @@ pub fn install_update(
     asset_name: String,
     asset_size: u64,
     asset_digest: String,
-) -> R<crate::updater::UpdateInstallResult> {
+    latest_version: String,
+) -> R<()> {
+    if UPDATE_INSTALL_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("Обновление уже устанавливается".into());
+    }
     let proxy = state.settings.lock().proxy_url.clone();
-    let result = crate::updater::download_and_launch(
-        &asset_url,
-        &asset_name,
-        asset_size,
-        &asset_digest,
-        &proxy,
-    )
-    .map_err(err)?;
+    let engine = state.engine.clone();
+    let engine_tx = state.engine_tx.lock().clone();
 
-    state.engine.restore_auto_mute();
-    let _ = state.engine_tx.lock().send(EngineCmd::Shutdown);
-
-    // Сюда попадаем ТОЛЬКО когда обновление реально применено: на Windows
-    // установщик запущен отдельным процессом и пережил проверку живости, на
-    // macOS бандл уже заменён и перезапуск запланирован. Раньше выход был
-    // безусловным — приложение закрывалось даже если установщик умер сразу
-    // после старта, и пользователь видел ровно то, на что жаловался
-    // («программа закрылась полностью, и ничего не установилось»).
-    //
-    // Даём IPC-ответу уйти во фронт и закрываемся, чтобы установщик мог
-    // заменить работающие файлы. Форс-выход обязателен: если graceful `app.exit`
-    // зависнет на застрявшем потоке/обработчике, процесс не умрёт и установка
-    // встанет на залоченном exe.
     std::thread::spawn(move || {
+        let progress_app = app.clone();
+        let progress_version = latest_version.clone();
+        let mut progress = |phase: crate::updater::UpdatePhase, received: u64, total: u64| {
+            let _ = progress_app.emit(
+                "update:progress",
+                serde_json::json!({
+                    "version": progress_version,
+                    "phase": phase,
+                    "received": received,
+                    "total": total,
+                }),
+            );
+        };
+        let result = crate::updater::download_and_launch(
+            &asset_url,
+            &asset_name,
+            asset_size,
+            &asset_digest,
+            &latest_version,
+            &proxy,
+            &mut progress,
+        );
+        let result = match result {
+            Ok(r) => r,
+            Err(e) => {
+                UPDATE_INSTALL_RUNNING.store(false, Ordering::SeqCst);
+                log::error!("install_update: {e:#}");
+                let _ = app.emit(
+                    "update:error",
+                    serde_json::json!({ "version": latest_version, "error": e.to_string() }),
+                );
+                return;
+            }
+        };
+
+        let _ = app.emit(
+            "update:done",
+            serde_json::json!({ "version": latest_version, "message": result.message }),
+        );
+        engine.restore_auto_mute();
+        let _ = engine_tx.send(EngineCmd::Shutdown);
+
+        // Сюда попадаем ТОЛЬКО когда обновление реально применено: на Windows
+        // установщик запущен отдельным процессом и пережил проверку живости, на
+        // macOS бандл уже заменён и перезапуск запланирован. Раньше выход был
+        // безусловным — приложение закрывалось даже если установщик умер сразу
+        // после старта, и пользователь видел ровно то, на что жаловался
+        // («программа закрылась полностью, и ничего не установилось»).
+        //
+        // Даём событию дойти до фронта и закрываемся, чтобы установщик мог
+        // заменить работающие файлы. Форс-выход обязателен: если graceful `app.exit`
+        // зависнет на застрявшем потоке/обработчике, процесс не умрёт и установка
+        // встанет на залоченном exe.
         std::thread::sleep(std::time::Duration::from_millis(1200));
         app.exit(0);
         std::thread::sleep(std::time::Duration::from_millis(1500));
         std::process::exit(0);
     });
 
-    Ok(result)
+    Ok(())
 }
 
 #[cfg(test)]

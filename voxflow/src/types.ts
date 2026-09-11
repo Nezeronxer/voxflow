@@ -199,6 +199,24 @@ export interface UpdateInstallResult {
   message: string;
 }
 
+/** Ход установки обновления: событие `update:progress` с бэкенда. */
+export interface UpdateProgressEvent {
+  version: string;
+  phase: "download" | "verify" | "launch";
+  received: number;
+  total: number;
+}
+
+export interface UpdateDoneEvent {
+  version: string;
+  message: string;
+}
+
+export interface UpdateErrorEvent {
+  version: string;
+  error: string;
+}
+
 export interface SecretStatus {
   ai_api_key: boolean;
   oai_stt_key: boolean;
