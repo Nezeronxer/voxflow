@@ -12,6 +12,7 @@ mod gigaam;
 mod hotkey;
 mod inject;
 mod local_ai;
+mod local_llm;
 mod macos_permissions;
 mod models;
 mod net;
@@ -113,6 +114,7 @@ pub fn run() {
                 }
             };
             let mut loaded = settings::load(&conn);
+            paths::set_gpu_mode(&loaded.gpu_mode);
             if hotkey::repair_bindings(&mut loaded) {
                 if let Err(error) = settings::save(&conn, &loaded) {
                     log::warn!("не удалось сохранить исправленные горячие клавиши: {error}");
@@ -184,6 +186,7 @@ pub fn run() {
             spawn_prompt_rules_refresh(startup_settings.clone());
 
             spawn_local_ai_detect(handle.clone(), startup_settings.clone());
+            local_llm::warmup(&startup_settings);
 
             // Показать окно настроек при запуске, НО не при автозапуске (тогда — в трей).
             if !autostarted {
@@ -235,6 +238,10 @@ pub fn run() {
             commands::stt_test,
             commands::local_ai_detect,
             commands::local_ai_pull,
+            commands::local_llm_state,
+            commands::local_llm_download,
+            commands::local_llm_delete,
+            commands::local_llm_stop,
             commands::prompt_models,
             commands::refresh_prompt_rules,
             commands::check_for_update,
@@ -1138,6 +1145,7 @@ fn request_shutdown(app: &tauri::AppHandle) {
     if SHUTDOWN_SENT.swap(true, Ordering::SeqCst) {
         return;
     }
+    local_llm::stop();
     if let Some(state) = app.try_state::<AppState>() {
         state.engine.restore_auto_mute();
         let _ = state.engine_tx.lock().send(EngineCmd::Shutdown);

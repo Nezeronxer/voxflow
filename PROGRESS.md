@@ -630,3 +630,24 @@
 - После правки якоря тот же прогон → полный текст без потерь. ✅
 - `cargo fmt --check`, `cargo clippy --all-targets -D warnings`, `cargo test --lib` — 359 passed, 7 ignored. ✅
 - `npm test`, `npm run build`, `python script/check_versions.py --tag v2.0.20`. ✅
+
+## 2026-09-11 — 2.1.0: слова не стираются, перевод не подставляется, встроенный локальный ИИ, новый интерфейс
+
+- **Запрос:** «он опять пишет перевод на слово… начинает стирать слова», «добавь скачивание
+  локальных моделей (Qwen и др.) как главную функцию», «включи GPU-ускорение», «переработай дизайн».
+- **Стирание:** маркеры «нет/ой/погоди/подожди» без пауз с обеих сторон больше не режут;
+  «точнее/вернее/отмена/забудь» — только после паузы; «короче» стало контекстным филлером.
+  Регрессионный тест `everyday_words_that_double_as_markers_never_cut_without_a_pause`. ✅
+- **Перевод:** `prefer_gigaam_for_auto` — кириллический GigaAM побеждает чисто латинский whisper;
+  `looks_like_russian_speech` принимает смешанную речь с терминами; auto-промпт whisper двуязычный. ✅
+- **Локальный ИИ:** новый модуль `local_llm.rs` (runtime llama.cpp b10809 + GGUF с HF, sha256 из
+  манифестов, llama-server :8772, OpenAI-совместимый чат), маршрут `builtin` в engine/commands,
+  раздел `LocalLlm.tsx` в главном меню. ✅
+- **GPU:** `gpu_mode` в настройках, `paths::gpu_active()` вместо прямого `has_nvidia()`. ✅
+- **Дизайн:** `styles.css` переписан (пульт, LED-метр по событию `level`, teal-акцент), `Dashboard.tsx`
+  заново, остальные разделы на общих классах. Скриншоты сняты через vite-мок + Playwright. ✅
+- **Зелёные прогоны:** `cargo test --lib` 364 ok, clippy по новому коду чист, fmt, `npm test` 33/33,
+  tsc, vite build, `check_versions.py --tag v2.1.0`. Linux-сборка требовала GTK/ALSA и локальный
+  onnxruntime (`ORT_LIB_LOCATION`) — в CI это не нужно.
+- **Не проверено здесь:** реальная загрузка runtime/моделей (нет доступа к GitHub Releases и
+  HuggingFace из песочницы) и запуск llama-server — проверять на машине пользователя.

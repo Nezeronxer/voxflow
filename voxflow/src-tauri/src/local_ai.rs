@@ -218,7 +218,7 @@ fn probe_accel() -> Accel {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        if crate::paths::has_nvidia() {
+        if crate::paths::gpu_active() {
             return Accel::Nvidia {
                 vram_gb: nvidia_vram_gb(),
             };
@@ -255,6 +255,20 @@ fn nvidia_vram_gb() -> u32 {
 
 /// Потянет ли эта машина эту модель.
 pub fn fits_machine(model: &CatalogModel, machine: &Machine) -> bool {
+    fits_spec(model.size_gb, model.min_ram_gb, machine)
+}
+
+/// То же правило для любой модели по её весу и порогу памяти — им пользуется
+/// и встроенный локальный ИИ ([`crate::local_llm`]), чтобы ряд GGUF-моделей
+/// подбирался по тем же ярусам, что и модели Ollama.
+pub fn fits_spec(size_gb: f32, min_ram_gb: u32, machine: &Machine) -> bool {
+    let model = CatalogModel {
+        tag: "",
+        label: "",
+        size_gb,
+        min_ram_gb,
+    };
+    let model = &model;
     match machine.accel {
         // Дискретная карта: модель живёт в VRAM, системная память ей не предел.
         // Именно поэтому нельзя судить по одному ОЗУ — 16 ГБ VRAM тянут то, чего

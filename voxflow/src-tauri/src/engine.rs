@@ -860,9 +860,33 @@ fn has_cyrillic(text: &str) -> bool {
         .any(|c| ('а'..='я').contains(&c.to_ascii_lowercase()) || c == 'ё' || c == 'Ё')
 }
 
+/// Сколько слов текста написано кириллицей.
+fn cyrillic_word_count(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|w| w.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c)))
+        .count()
+}
+
+/// Текст похож на русскую речь: либо кириллицы больше латиницы, либо в нём
+/// хотя бы два кириллических слова и они составляют не меньше трети слов.
+/// Второе правило покрывает смешанную диктовку с английскими терминами
+/// («открой Settings в VS Code и нажми Save»): GigaAM v3 пишет такие термины
+/// латиницей, и по одному только числу букв фраза выглядела «нерусской».
+fn looks_like_russian_speech(text: &str) -> bool {
+    let t = text.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if crate::parakeet::is_mostly_cyrillic(t) {
+        return true;
+    }
+    let cyr = cyrillic_word_count(t);
+    cyr >= 2 && cyr * 3 >= word_count(t)
+}
+
 fn prefer_gigaam_for_auto(whisper_text: &str, gigaam_text: &str) -> bool {
     let g = gigaam_text.trim();
-    if g.is_empty() || !crate::parakeet::is_mostly_cyrillic(g) {
+    if !looks_like_russian_speech(g) {
         return false;
     }
     let w = whisper_text.trim();
@@ -877,9 +901,13 @@ fn prefer_gigaam_for_auto(whisper_text: &str, gigaam_text: &str) -> bool {
         // only when Whisper is clearly truncated.
         return ww <= 2 && gw >= 4 && gw >= ww.saturating_mul(2);
     }
-    // Типичный сбой whisper auto на русской речи: короткая латинская фраза
-    // вроде "After" / "Państwo, unze" вместо полноценной русской диктовки.
-    !has_cyrillic(w) && gw >= 3 && (ww <= 2 || gw >= ww.saturating_mul(2))
+    // Whisper с language=auto на русской речи ошибается двумя способами:
+    // короткий латинский обрывок («After», «Państwo, unze») — или ПЕРЕВОД:
+    // модель решила, что это английский, и выдала английский текст вместо
+    // сказанного. GigaAM v3 английскую речь пишет латиницей, поэтому русский
+    // результат GigaAM против чисто латинского whisper — всегда голос, а не
+    // перевод. Кириллицы в whisper нет → берём GigaAM.
+    !has_cyrillic(w) && gw >= 2
 }
 
 /// Финал auto-маршрута принимает результат GigaAM БЕЗ whisper-прохода, когда
@@ -888,8 +916,7 @@ fn prefer_gigaam_for_auto(whisper_text: &str, gigaam_text: &str) -> bool {
 /// результат уходит на медленное whisper-уточнение. Так горячий путь русской
 /// диктовки стоит ~0.1с вместо ~2.7с whisper large на каждом финале.
 fn gigaam_auto_final_trusted(text: &str) -> bool {
-    let t = text.trim();
-    !t.is_empty() && crate::parakeet::is_mostly_cyrillic(t)
+    looks_like_russian_speech(text)
 }
 
 /// Бейдж языка живого preview.
@@ -929,7 +956,11 @@ fn should_probe_gigaam_for_auto(whisper_text: &str) -> bool {
     !has_cyrillic(whisper)
 }
 
-const DEFAULT_MULTILINGUAL_PROMPT: &str = "Multilingual speech recognition. Preserve Russian, English and other language switches. Use punctuation, but do not add a final period merely because recording stopped when the sentence is grammatically unfinished. Keep technical terms such as VoxFlow, Tauri, whisper.cpp and Codex.";
+/// Промпт whisper для auto: двуязычный и начинается с русского. Чисто
+/// английская подсказка склоняла декодер к английскому тексту — русская
+/// речь выходила переводом. Смысл подсказки для модели тот же: запись
+/// речи как есть, без перевода, с сохранением переключений языка.
+const DEFAULT_MULTILINGUAL_PROMPT: &str = "Расшифровка речи как есть, без перевода: русский и английский текст остаются на языке говорящего. Transcribe verbatim, never translate, preserve Russian and English language switches. Use punctuation, but do not add a final period merely because recording stopped when the sentence is unfinished. Технические термины: VoxFlow, Tauri, whisper.cpp, Codex.";
 
 fn whisper_base_prompt(language: &str) -> Option<&'static str> {
     match language.trim().to_ascii_lowercase().as_str() {
@@ -1454,7 +1485,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
     // Живой whisper-стрим на Windows оставляем только для NVIDIA-сборки: CPU
     // сервер там слишком медленный для тиков. На macOS используем native sidecar
     // (Metal/CPU whisper.cpp), поэтому отсутствие NVIDIA не должно гасить overlay.
-    let whisper_live_supported = cfg!(target_os = "macos") || paths::has_nvidia();
+    let whisper_live_supported = cfg!(target_os = "macos") || paths::gpu_active();
     if !whisper_live_supported {
         dbg_log("partial: нет GPU whisper-server — без живого стрима (пилюля статична)");
         return;
@@ -6170,9 +6201,20 @@ mod seg_tests {
             "Пользователь говорит обычный русский текст"
         ));
         assert!(prefer_gigaam_for_auto("After", "Исправь это пожалуйста"));
-        assert!(!prefer_gigaam_for_auto(
+        // Перевод вместо распознавания: whisper решил, что речь английская,
+        // и вернул английский текст. Русский GigaAM того же аудио — голос.
+        assert!(prefer_gigaam_for_auto(
             "please update the prompt",
             "Пожалуйста обнови промпт"
+        ));
+        assert!(prefer_gigaam_for_auto(
+            "I have a problem with voice input, it deletes words",
+            "У меня проблема с голосовым вводом, он удаляет слова"
+        ));
+        // Настоящая английская речь: GigaAM пишет её латиницей, whisper остаётся.
+        assert!(!prefer_gigaam_for_auto(
+            "please update the prompt",
+            "please update the prompt"
         ));
         assert!(!prefer_gigaam_for_auto(
             "Подвяжи к боту ИИ и обучи его на шаблонах",
@@ -6233,6 +6275,11 @@ mod seg_tests {
         assert!(gigaam_auto_final_trusted(
             "открой файл main.rs и запусти cargo build"
         ));
+        // Смешанная речь с английскими терминами — по-прежнему русская.
+        assert!(gigaam_auto_final_trusted(
+            "открой Settings в VS Code и нажми Save All"
+        ));
+        assert!(!gigaam_auto_final_trusted("open the settings и"));
         assert!(!gigaam_auto_final_trusted(
             "hello this is an english phrase"
         ));
@@ -7289,6 +7336,7 @@ struct RewriteRequest<'a> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RewriteBackendRoute {
+    Builtin,
     Gemini,
     OpenAiCompat,
     Ollama,
@@ -7300,6 +7348,7 @@ enum RewriteBackendRoute {
 /// запускало Qwen3 на CPU без отдельного opt-in.
 fn configured_rewrite_backend(s: &Settings) -> Option<RewriteBackendRoute> {
     match s.ai_backend.as_str() {
+        "builtin" if crate::local_llm::configured(s) => Some(RewriteBackendRoute::Builtin),
         "gemini" if crate::gemini::available(&s.ai_api_key) => Some(RewriteBackendRoute::Gemini),
         "openai_compat" if crate::rewrite::configured(s) => Some(RewriteBackendRoute::OpenAiCompat),
         "ollama" if crate::ollama::configured(&s.ollama_url) => Some(RewriteBackendRoute::Ollama),
@@ -7326,6 +7375,7 @@ pub(crate) fn ask_configured_llm(s: &Settings, system: &str, user: &str) -> anyh
         return Err(anyhow::anyhow!("бэкенд ИИ не настроен"));
     };
     match route {
+        RewriteBackendRoute::Builtin => crate::local_llm::refine(s, system, user),
         RewriteBackendRoute::Gemini => crate::gemini::refine(
             &s.ai_api_key,
             &s.ai_model,
@@ -7543,6 +7593,14 @@ fn refine_text_with_fallback(
 
     let mut attempts: Vec<Box<dyn Fn() -> anyhow::Result<String>>> = Vec::with_capacity(1);
     match configured_rewrite_backend(s) {
+        Some(RewriteBackendRoute::Builtin) => {
+            let settings = s.clone();
+            let user =
+                build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
+            attempts.push(Box::new(move || {
+                crate::local_llm::refine(&settings, crate::ollama::SYSTEM_PROMPT, &user)
+            }));
+        }
         Some(RewriteBackendRoute::Gemini) => {
             let key = s.ai_api_key.clone();
             let model = s.ai_model.clone();

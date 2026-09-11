@@ -11,6 +11,7 @@ export interface Settings {
   model: string;
   engine: string; // "gigaam" | "whisper_server" | "whisper_cli"
   theme: string; // "system" | "light" | "dark"
+  gpu_mode: string; // "auto" | "on" | "off"
   // Масштаб плавающей плашки: 0.75..1.5 (75..150%).
   overlay_scale: number;
   verbatim: boolean;
@@ -32,7 +33,8 @@ export interface Settings {
   auto_update_check: boolean;
   personalize: boolean;
   threads: number;
-  ai_backend: string; // "off" | "ollama" | "gemini" | "openai_compat"
+  ai_backend: string; // "off" | "builtin" | "ollama" | "gemini" | "openai_compat"
+  builtin_llm_model: string;
   ai_backend_behavior_version: number;
   ai_api_key: string;
   ai_model: string;
@@ -233,6 +235,7 @@ export const DEFAULT_SETTINGS: Settings = {
   model: "ggml-large-v3-turbo-q5_0.bin",
   engine: "whisper_server",
   theme: "system",
+  gpu_mode: "auto",
   overlay_scale: 1,
   verbatim: false,
   remove_fillers: true,
@@ -282,7 +285,29 @@ export const DEFAULT_SETTINGS: Settings = {
   prompt_rebuild: false,
   prompt_models: [],
   local_ai_dismissed: false,
+  builtin_llm_model: "qwen2.5-3b-instruct",
 };
+
+export interface LocalLlmModelView {
+  id: string;
+  label: string;
+  size_gb: number;
+  min_ram_gb: number;
+  blurb: string;
+  installed: boolean;
+  fits: boolean;
+  recommended: boolean;
+}
+
+export interface LocalLlmState {
+  runtime_tag: string;
+  runtime_installed: boolean;
+  gpu: boolean;
+  downloading: boolean;
+  machine: LocalAiState["machine"];
+  models: LocalLlmModelView[];
+  server: { running: boolean; starting?: boolean; model_id: string | null; gpu: boolean };
+}
 
 export interface ModelInfo {
   name: string;

@@ -156,11 +156,11 @@ export default function LocalAiCard({ settings, update }: Props) {
   return (
     <div className="card">
       <div className="card-head">
-        <div className="card-title">Локальный ИИ</div>
+        <div className="card-title">Ollama и LM Studio</div>
         <div className="sub">
           {found
             ? `Найден на этом компьютере: ${state.engines.map((e) => e.label).join(", ")}.`
-            : "На этом компьютере локальный ИИ не найден."}
+            : "Внешние движки не найдены. Встроенный локальный ИИ живёт в главном меню и ничего ставить не требует."}
           {machineSummary(state.machine) &&
             ` Ваш компьютер: ${machineSummary(state.machine)}. Ряд моделей подобран под него.`}
         </div>

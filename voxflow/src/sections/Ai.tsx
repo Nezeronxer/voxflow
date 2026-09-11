@@ -147,7 +147,7 @@ export default function Ai({
           label="Бэкенд ИИ"
           hint={
             aiOff
-              ? "Выключен: в поле уходит то, что расслышал распознаватель. Чтобы текст вставлялся по смыслу, выберите «Свой ключ» и вставьте ключ ниже"
+              ? "Выключен: в поле уходит то, что расслышал распознаватель. Чтобы текст вставлялся по смыслу, включите встроенный локальный ИИ или подключите свой ключ"
               : "Какую нейросеть использовать для умных функций"
           }
         >
@@ -191,7 +191,8 @@ export default function Ai({
             }}
             options={[
               { value: "off", label: "Выключен" },
-              { value: "ollama", label: "Локальный (Ollama / Qwen3)" },
+              { value: "builtin", label: "Встроенный локальный ИИ (без установки)" },
+              { value: "ollama", label: "Ollama на этом компьютере" },
               { value: "gemini", label: "Google Gemini" },
               {
                 // Название — то, что человек ищет глазами: «куда вставить свой
@@ -203,6 +204,15 @@ export default function Ai({
             ]}
           />
         </Field>
+
+        {backend === "builtin" && (
+          <Field
+            label="Модель"
+            hint="Скачивание и выбор — в разделе «Локальный ИИ» в главном меню. Здесь только проверка."
+          >
+            <span className="badge accent">{settings.builtin_llm_model}</span>
+          </Field>
+        )}
 
         {backend === "gemini" && (
           <>

@@ -126,6 +126,7 @@ pub fn clear_secret(app: AppHandle, state: State<AppState>, secret: String) -> R
 pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Settings) -> R<()> {
     settings.normalize_user_values();
     crate::hotkey::validate_bindings(&settings)?;
+    crate::paths::set_gpu_mode(&settings.gpu_mode);
     let previous = state.settings.lock().clone();
     settings.preserve_empty_secrets_from(&previous);
     apply_autostart(&app, settings.autostart);
@@ -156,6 +157,19 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
     }
     if let Err(e) = app.emit("secret_status", SecretStatus::from_settings(&settings)) {
         log::warn!("secret_status не разослался: {e}");
+    }
+    // Встроенный ИИ: смена модели, режима GPU или выключение бэкенда —
+    // сервер перезапустится под новые настройки при следующем запросе, а
+    // выключенный или сменённый — выгружаем сразу, чтобы не держать память.
+    if previous.ai_backend == "builtin"
+        && (settings.ai_backend != "builtin"
+            || settings.builtin_llm_model != previous.builtin_llm_model
+            || settings.gpu_mode != previous.gpu_mode)
+    {
+        crate::local_llm::stop();
+    }
+    if settings.ai_backend == "builtin" && previous.ai_backend != "builtin" {
+        crate::local_llm::warmup(&settings);
     }
     // Язык сменился → фоновый прогрев движка под новые настройки: без него первый
     // Start после переключения на en/auto синхронно грузит ~650 МБ Parakeet и
@@ -517,6 +531,18 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
         )
     };
     match backend.as_str() {
+        "builtin" => {
+            if !crate::local_llm::model_installed(&settings.builtin_llm_model) {
+                return ai_test_plain(
+                    false,
+                    "Модель не скачана — нажмите «Скачать» в разделе «Локальный ИИ»",
+                );
+            }
+            match crate::local_llm::ping(&settings) {
+                Ok(t) => ai_test_plain(true, format!("Локальная модель отвечает: {t}")),
+                Err(e) => ai_test_plain(false, format!("Ошибка: {e}")),
+            }
+        }
         "gemini" => {
             if key.trim().is_empty() {
                 return ai_test_plain(false, "Введите API-ключ");
@@ -657,7 +683,9 @@ pub fn rewrite_prompt_with_instruction(
         };
     }
 
-    let result = if s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key) {
+    let result = if s.ai_backend == "builtin" && crate::local_llm::configured(&s) {
+        crate::local_llm::refine(&s, system, &user)
+    } else if s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key) {
         crate::gemini::refine(
             &s.ai_api_key,
             &s.ai_model,
@@ -750,7 +778,9 @@ pub fn transform_text(state: State<AppState>, text: String, transform: String) -
     let user =
         format!("[ПРИЛОЖЕНИЕ]: VoxFlow Scratchpad\n[ЗАДАЧА]: {transform_label}\n[ТЕКСТ]: {input}");
 
-    let result = if s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key) {
+    let result = if s.ai_backend == "builtin" && crate::local_llm::configured(&s) {
+        crate::local_llm::refine(&s, crate::ollama::SYSTEM_PROMPT, &user)
+    } else if s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key) {
         crate::gemini::refine(
             &s.ai_api_key,
             &s.ai_model,
@@ -977,6 +1007,35 @@ pub fn local_ai_pull(app: AppHandle, state: State<AppState>, tag: String) -> R<(
         }
     });
     Ok(())
+}
+
+// ─────────────────────────── Встроенный локальный ИИ ───────────────────────────
+
+/// Каталог, установленные модели, состояние сервера и машина — для экрана
+/// «Локальный ИИ».
+#[tauri::command]
+pub fn local_llm_state() -> crate::local_llm::LocalLlmState {
+    crate::local_llm::state()
+}
+
+/// Скачать runtime llama.cpp (если нужно) и модель. Прогресс — событиями
+/// `model:*` с именем модели (runtime идёт под именем `llama-runtime`).
+#[tauri::command]
+pub fn local_llm_download(app: AppHandle, state: State<AppState>, id: String) -> R<()> {
+    let proxy = state.settings.lock().proxy_url.clone();
+    crate::local_llm::download(app, id, proxy).map_err(err)
+}
+
+#[tauri::command]
+pub fn local_llm_delete(id: String) -> R<()> {
+    crate::local_llm::delete(&id).map_err(err)
+}
+
+/// Выгрузить модель из памяти (сервер остановится; поднимется при следующей
+/// диктовке).
+#[tauri::command]
+pub fn local_llm_stop() {
+    crate::local_llm::stop();
 }
 
 // ─────────────────────────── Промпты под модель ───────────────────────────

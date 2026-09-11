@@ -275,6 +275,21 @@ const DEV_WHISPER_CUDA: &str = concat!(
     "/resources/whisper-cuda/Release"
 );
 
+/// Пользователь выключил графическое ускорение (настройка `gpu_mode = "off"`).
+static GPU_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Применить настройку ускорения: зовётся при загрузке настроек и при каждом
+/// сохранении. "off" прячет NVIDIA от всех потребителей (whisper-сборка,
+/// живой стрим, ярусы локального ИИ); "auto"/"on" — по факту наличия карты.
+pub fn set_gpu_mode(mode: &str) {
+    GPU_DISABLED.store(mode.trim() == "off", std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Можно ли считать на NVIDIA: карта есть И ускорение не выключено.
+pub fn gpu_active() -> bool {
+    !GPU_DISABLED.load(std::sync::atomic::Ordering::SeqCst) && has_nvidia()
+}
+
 /// Есть ли NVIDIA-GPU с драйвером (наличие nvcuda.dll в System32).
 pub fn has_nvidia() -> bool {
     #[cfg(not(windows))]
@@ -300,7 +315,7 @@ pub fn whisper_dir(app: &AppHandle) -> PathBuf {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     // GPU-сборки имеют приоритет (и resource, и dev) над CPU.
-    if has_nvidia() {
+    if gpu_active() {
         if let Some(r) = &res {
             candidates.push(r.join("resources").join("whisper-cuda").join("Release"));
             candidates.push(r.join("whisper-cuda"));
@@ -361,7 +376,7 @@ pub fn whisper_dir_standalone() -> PathBuf {
             return p;
         }
     }
-    if has_nvidia() {
+    if gpu_active() {
         let p = PathBuf::from(DEV_WHISPER_CUDA);
         if p.join(whisper_cli_name()).exists() {
             return p;
