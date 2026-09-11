@@ -45,8 +45,8 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: #000;
-  border: 0.5px solid rgba(156, 163, 175, 0.8);
+  background: linear-gradient(180deg, #1c2124 0%, #111416 100%);
+  border: 0.5px solid rgba(255, 255, 255, 0.16);
   border-radius: 30px;
   /* Лёгкая посадочная тень, чтобы чёрная пилюля не «прилипала» к светлым окнам. */
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
@@ -177,8 +177,8 @@
   position: absolute;
   inset: 0;
   border-radius: 50%;
-  background: radial-gradient(circle at 35% 30%, #76b6ff 0%, #4c7df9 70%);
-  filter: drop-shadow(0 0 2px rgba(23, 129, 255, 0.3));
+  background: radial-gradient(circle at 35% 30%, #6ee7b7 0%, #0f8b7c 70%);
+  filter: drop-shadow(0 0 2px rgba(58, 210, 155, 0.35));
 }
 
 /* Динамический glow: круг 26 px (градиент гаснет к 70% ≈ радиус 9.1 px); JS
@@ -194,9 +194,9 @@
   border-radius: 50%;
   background: radial-gradient(
     circle,
-    rgba(118, 182, 255, 0.85) 0%,
-    rgba(76, 125, 249, 0.4) 40%,
-    rgba(76, 125, 249, 0) 70%
+    rgba(110, 231, 183, 0.85) 0%,
+    rgba(15, 139, 124, 0.4) 40%,
+    rgba(15, 139, 124, 0) 70%
   );
   transform: scale(0.769);
   opacity: 0;
@@ -244,8 +244,8 @@
   border-radius: 4px;
   background: linear-gradient(
     180deg,
-    rgba(180, 180, 180, 0.9) 0%,
-    rgba(140, 140, 140, 0.75) 100%
+    rgba(110, 231, 183, 0.95) 0%,
+    rgba(58, 210, 155, 0.7) 100%
   );
   transform: scaleY(0.0909);
   transform-origin: center;
@@ -348,8 +348,8 @@
   right: 12px;
   padding: 1px 5px;
   border-radius: 999px;
-  background: #000;
-  border: 0.5px solid rgba(156, 163, 175, 0.8);
+  background: #111416;
+  border: 0.5px solid rgba(255, 255, 255, 0.16);
   font-size: 9px;
   font-weight: 600;
   letter-spacing: 0.08em;
@@ -504,8 +504,8 @@
 }
 
 .aq-pill {
-  background: rgba(22, 25, 32, 0.985);
-  border: 1px solid rgba(118, 126, 143, 0.46);
+  background: rgba(20, 24, 26, 0.985);
+  border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 14px;
   box-shadow:
     0 8px 24px rgba(0, 0, 0, 0.34),
@@ -546,8 +546,8 @@
   padding: 0 8px;
   opacity: 1;
   overflow: hidden;
-  background: rgba(22, 25, 32, 0.985);
-  border-color: rgba(111, 131, 255, 0.68);
+  background: rgba(20, 24, 26, 0.985);
+  border-color: rgba(229, 67, 43, 0.75);
   border-radius: 12px;
   box-shadow:
     0 8px 24px rgba(0, 0, 0, 0.34),
@@ -590,14 +590,14 @@
   align-items: center;
   justify-content: center;
   gap: 1.5px;
-  color: #6f83ff;
+  color: #3ad29b;
 }
 
 .aq-logo-wave i {
   width: 2px;
   border-radius: 999px;
   background: currentColor;
-  box-shadow: 0 0 8px rgba(111, 131, 255, 0.42);
+  box-shadow: 0 0 8px rgba(58, 210, 155, 0.42);
 }
 
 .aq-logo-wave i:nth-child(1),
@@ -627,7 +627,7 @@
   padding: 0 10px;
   justify-content: flex-start;
   gap: 7px;
-  border-color: rgba(111, 131, 255, 0.72);
+  border-color: rgba(229, 67, 43, 0.75);
 }
 
 .aq-trans {
@@ -647,7 +647,7 @@
   max-height: 66px;
   padding: 7px 10px;
   gap: 7px;
-  border-color: rgba(111, 131, 255, 0.58);
+  border-color: rgba(58, 210, 155, 0.6);
 }
 
 .aq-latch {
@@ -674,8 +674,8 @@
 }
 
 .aq-orb {
-  background: radial-gradient(circle at 35% 28%, #9cacff 0%, #6f83ff 54%, #5369f2 100%);
-  filter: drop-shadow(0 0 2px rgba(111, 131, 255, 0.42));
+  background: radial-gradient(circle at 35% 28%, #a7f3d0 0%, #3ad29b 54%, #0f8b7c 100%);
+  filter: drop-shadow(0 0 2px rgba(58, 210, 155, 0.42));
 }
 
 .aq-orb-glow {
@@ -710,7 +710,7 @@
 .aq-bar {
   width: 2px;
   height: 18px;
-  background: linear-gradient(180deg, #91a0ff, #5e74f7);
+  background: linear-gradient(180deg, #a7f3d0, #3ad29b);
   will-change: transform, opacity;
 }
 
@@ -738,7 +738,7 @@
 .aq-caret {
   width: 5px;
   height: 5px;
-  background: #7f91ff;
+  background: #3ad29b;
 }
 
 .aq-trans-copy {
@@ -750,9 +750,9 @@
 .aq-lang {
   top: -5px;
   right: 12px;
-  background: #202530;
-  border-color: rgba(111, 131, 255, 0.52);
-  color: #aeb9ff;
+  background: #14181a;
+  border-color: rgba(58, 210, 155, 0.5);
+  color: #a7f3d0;
 }
 
 .aq-msg {
