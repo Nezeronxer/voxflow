@@ -123,7 +123,8 @@ pub fn refine(
 }
 
 /// Каталог моделей по ключу: `GET /v1beta/models`. Оставляем только те, что
-/// умеют `generateContent` (эмбеддинги и TTS в списке постобработки ни к чему).
+/// умеют `generateContent` и отвечают текстом: эмбеддинги, TTS, генераторы
+/// картинок и native-audio в списке постобработки ни к чему.
 pub fn list_models(api_key: &str, proxy_url: &str) -> Result<Vec<crate::rewrite::ModelOption>> {
     let mut cmd = net::curl();
     cmd.arg("-s")
@@ -179,6 +180,12 @@ fn generate_content_models(v: &serde_json::Value) -> Vec<String> {
                 })
                 .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
                 .map(|n| n.trim_start_matches("models/").to_string())
+                // TTS, генераторы картинок и native-audio тоже объявляют
+                // generateContent, но на текстовый запрос отвечают ошибкой.
+                .filter(|id| {
+                    let id = id.to_ascii_lowercase();
+                    !id.contains("-tts") && !id.contains("image") && !id.contains("native-audio")
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -301,7 +308,10 @@ mod tests {
         let v = serde_json::json!({ "models": [
             { "name": "models/gemini-2.5-flash", "supportedGenerationMethods": ["generateContent"] },
             { "name": "models/embedding-001", "supportedGenerationMethods": ["embedContent"] },
-            { "name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"] }
+            { "name": "models/gemini-2.5-pro", "supportedGenerationMethods": ["generateContent"] },
+            { "name": "models/gemini-2.5-flash-preview-tts", "supportedGenerationMethods": ["countTokens", "generateContent"] },
+            { "name": "models/gemini-2.5-flash-image-preview", "supportedGenerationMethods": ["generateContent"] },
+            { "name": "models/gemini-2.5-flash-native-audio-latest", "supportedGenerationMethods": ["generateContent"] }
         ] });
         assert_eq!(
             super::generate_content_models(&v),

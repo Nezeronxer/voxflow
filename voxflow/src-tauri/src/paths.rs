@@ -290,6 +290,16 @@ pub fn gpu_active() -> bool {
     !GPU_DISABLED.load(std::sync::atomic::Ordering::SeqCst) && has_nvidia()
 }
 
+/// Можно ли встроенному ИИ (llama.cpp) отдавать слои на видеокарту. На
+/// Windows — NVIDIA, как и раньше; на Apple Silicon — всегда Metal, если
+/// ускорение не выключено. `gpu_active` для этого не годится: он про
+/// CUDA-сборку whisper и на macOS всегда ложь, из-за чего модель на Mac
+/// считалась только процессором.
+pub fn llm_gpu_active() -> bool {
+    !GPU_DISABLED.load(std::sync::atomic::Ordering::SeqCst)
+        && (cfg!(all(target_os = "macos", target_arch = "aarch64")) || has_nvidia())
+}
+
 /// Есть ли NVIDIA-GPU с драйвером (наличие nvcuda.dll в System32).
 pub fn has_nvidia() -> bool {
     #[cfg(not(windows))]

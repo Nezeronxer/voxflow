@@ -624,9 +624,19 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
 /// сразу после ввода ключа: человек должен выбирать модель из того, что ему
 /// реально доступно, а не вписывать идентификатор по памяти. Ошибка — это
 /// не отказ, а «каталога нет»: фронт остаётся на встроенном списке.
+///
+/// Асинхронная и с `spawn_blocking`: синхронные команды Tauri выполняются на
+/// UI-потоке, а фронт зовёт эту сам после каждой паузы в наборе ключа —
+/// медленный провайдер (curl до 15–25 с) замораживал бы всё окно.
 #[tauri::command]
-pub fn ai_list_models(state: State<AppState>) -> R<Vec<crate::rewrite::ModelOption>> {
+pub async fn ai_list_models(state: State<'_, AppState>) -> R<Vec<crate::rewrite::ModelOption>> {
     let settings = state.settings.lock().clone();
+    tauri::async_runtime::spawn_blocking(move || list_models_for(&settings))
+        .await
+        .map_err(err)?
+}
+
+fn list_models_for(settings: &crate::settings::Settings) -> R<Vec<crate::rewrite::ModelOption>> {
     match settings.ai_backend.as_str() {
         "gemini" => {
             let key = settings.ai_api_key.trim().to_string();
@@ -648,9 +658,9 @@ pub fn ai_list_models(state: State<AppState>) -> R<Vec<crate::rewrite::ModelOpti
             .map_err(err),
         "openai_compat" => {
             if crate::rewrite::is_openrouter_base(&settings.rewrite_base_url) {
-                return crate::rewrite::openrouter_free_models(&settings).map_err(err);
+                return crate::rewrite::openrouter_free_models(settings).map_err(err);
             }
-            crate::rewrite::list_models(&settings).map_err(err)
+            crate::rewrite::list_models(settings).map_err(err)
         }
         _ => Err("Движок ИИ выключен".into()),
     }
@@ -1207,6 +1217,9 @@ pub fn install_update(
         );
         engine.restore_auto_mute();
         let _ = engine_tx.send(EngineCmd::Shutdown);
+        // Встроенный ИИ гасим сразу, не дожидаясь обработчика выхода: форс-выход
+        // ниже наступает раньше, чем тот успел бы дождаться загрузки модели.
+        crate::local_llm::stop();
 
         // Сюда попадаем ТОЛЬКО когда обновление реально применено: на Windows
         // установщик запущен отдельным процессом и пережил проверку живости, на

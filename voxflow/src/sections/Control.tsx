@@ -1,5 +1,11 @@
 import { useEffect, useState } from "react";
-import { checkForUpdate, installUpdate, listAudioDevices, openReleaseUrl } from "../api";
+import {
+  checkForUpdate,
+  installUpdate,
+  listAudioDevices,
+  openReleaseUrl,
+  subscribe,
+} from "../api";
 import {
   PageHead,
   SectionShell,
@@ -11,7 +17,7 @@ import {
   HOTKEY_FIELD_HINT,
 } from "../ui";
 import type { Settings } from "../types";
-import type { UpdateInfo } from "../types";
+import type { UpdateErrorEvent, UpdateInfo } from "../types";
 import {
   normalizeOverlayScale,
   OVERLAY_SCALE_MAX,
@@ -74,6 +80,16 @@ export default function Control({
     };
   }, [scope]);
 
+  useEffect(
+    () =>
+      // Исход установки приходит только событием: без подписки подсказка у
+      // «Версии» так и говорила бы «идёт установка» после ошибки.
+      subscribe<UpdateErrorEvent>("update:error", (event) => {
+        setUpdateStatus(event.payload?.error || "Обновление не установлено");
+      }),
+    [],
+  );
+
   const deviceOptions = [
     { value: "", label: "По умолчанию" },
     ...devices.map((d) => ({ value: d, label: d })),
@@ -114,7 +130,7 @@ export default function Control({
       updateInfo.latest_version,
     );
     setInstallingUpdate(false);
-    setUpdateStatus(failure ?? "Идёт установка обновления");
+    setUpdateStatus(failure ?? "Установка запущена — ход показан поверх окна");
   }
 
   const showDictation = scope !== "app";

@@ -135,7 +135,7 @@ export default function Snippets() {
           </table>
         )}
 
-        <div className="add-row" style={{ flexDirection: "column" }}>
+        <div className="add-row" style={{ display: "flex", flexDirection: "column" }}>
           <div className="row-flex" style={{ width: "100%", gap: 10 }}>
             <input
               type="text"

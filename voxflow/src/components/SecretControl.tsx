@@ -64,7 +64,12 @@ export default function SecretControl({
         }}
       />
       {status[kind] && !value && (
-        <button type="button" onClick={onClear} disabled={clearing}>
+        <button
+          type="button"
+          className="btn btn-sm btn-ghost"
+          onClick={onClear}
+          disabled={clearing}
+        >
           {clearing ? "Удаляю…" : "Удалить"}
         </button>
       )}

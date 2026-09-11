@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   aiListModels,
   aiTest,
@@ -13,6 +13,7 @@ import {
   OPENAI_COMPAT_PROVIDERS,
   providerFromBaseUrl,
 } from "../aiProviders";
+import { isLoopbackUrl } from "../privacyState";
 import SecretControl from "../components/SecretControl";
 import LocalAiCard from "../components/LocalAiCard";
 
@@ -37,7 +38,11 @@ const CATALOG_DEBOUNCE_MS = 700;
 
 function withCurrentOption(options: readonly Option[], current: string): Option[] {
   const value = current.trim();
-  if (!value || options.some((option) => option.value === value)) return [...options];
+  // Пустое значение показываем честно: иначе нативный select рисует первый
+  // вариант выбранным, хотя в настройках модели нет, а повторный выбор того же
+  // пункта не присылает onChange.
+  if (!value) return [{ value: "", label: "— выберите модель —" }, ...options];
+  if (options.some((option) => option.value === value)) return [...options];
   return [{ value, label: `Текущая: ${value}` }, ...options];
 }
 
@@ -80,6 +85,18 @@ export default function Ai({
   const hasCatalog =
     backend === "gemini" || backend === "ollama" || backend === "openai_compat";
 
+  // Таймер каталога срабатывает позже рендера, который его завёл: сохранять
+  // нужно свежие настройки, а не снимок 700-мс давности, иначе он откатит
+  // правки, которые автосохранение App уже записало.
+  const latestSettings = useRef(settings);
+  latestSettings.current = settings;
+  // Адрес, к которому относится сохранённый ключ OpenAI-совместимого
+  // провайдера. Все пресеты делят одно поле ключа, поэтому после смены адреса
+  // сохранённый ключ сам на новый хост не уходит — только введённый заново
+  // или по кнопке «Проверить».
+  const keyBaseUrl = useRef(settings.rewrite_base_url.trim());
+  if (settings.rewrite_key.trim()) keyBaseUrl.current = settings.rewrite_base_url.trim();
+
   // Ключ или адрес поменялись — сохраняем и читаем каталог моделей провайдера.
   // Бэкенд берёт ключ из сохранённых настроек (а на пустом поле — из уже
   // сохранённого ключа), поэтому список появляется и при открытии раздела.
@@ -87,10 +104,21 @@ export default function Ai({
     setCatalog([]);
     setCatalogNote(null);
     if (!hasCatalog) return;
+    if (
+      backend === "openai_compat" &&
+      !settings.rewrite_key.trim() &&
+      settings.rewrite_base_url.trim() !== keyBaseUrl.current &&
+      // Локальный сервер (LM Studio) ключа не требует и живёт на этой машине.
+      !isLoopbackUrl(settings.rewrite_base_url)
+    ) {
+      setCatalogNote("Вставьте ключ этого провайдера — список моделей появится сам.");
+      return;
+    }
     let alive = true;
     const timer = window.setTimeout(async () => {
       setCatalogNote("Читаю список моделей…");
-      const saved = await (persist ? persist(settings) : saveSettings(settings));
+      const snapshot = latestSettings.current;
+      const saved = await (persist ? persist(snapshot) : saveSettings(snapshot));
       if (!alive) return;
       if (!saved) {
         setCatalogNote(null);
@@ -100,6 +128,16 @@ export default function Ai({
       if (!alive) return;
       setCatalog(models);
       setCatalogNote(models.length > 0 ? `Найдено моделей: ${models.length}` : null);
+      // Модель ещё не выбрана (свежий пресет OpenRouter, LM Studio, «Своё») —
+      // берём первую из каталога, как это делает «Проверить». Без модели
+      // обработка текста молча не включается.
+      if (
+        backend === "openai_compat" &&
+        models.length > 0 &&
+        !latestSettings.current.rewrite_model.trim()
+      ) {
+        update({ rewrite_model: models[0].value });
+      }
     }, CATALOG_DEBOUNCE_MS);
     return () => {
       alive = false;
@@ -455,15 +493,9 @@ export default function Ai({
                   hint={catalogNote ?? `Base URL: ${rewriteProvider.baseUrl}`}
                 >
                   <Select
-                    value={
-                      catalog.some(
-                        (model) => model.value === settings.rewrite_model,
-                      )
-                        ? settings.rewrite_model
-                        : catalog[0]?.value ?? ""
-                    }
+                    value={settings.rewrite_model}
                     onChange={(v) => update({ rewrite_model: v })}
-                    options={catalog}
+                    options={withCurrentOption(catalog, settings.rewrite_model)}
                   />
                 </Field>
               ) : (
@@ -525,7 +557,7 @@ export default function Ai({
           </>
         )}
 
-        <div className="add-row" style={{ alignItems: "center" }}>
+        <div className="add-row" style={{ display: "flex", alignItems: "center" }}>
           <button
             className="btn btn-primary"
             onClick={onTest}

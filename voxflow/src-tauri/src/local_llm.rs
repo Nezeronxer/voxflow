@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -39,10 +39,18 @@ use crate::net;
 /// Закреплённая сборка llama.cpp. Меняется вместе с проверкой совместимости
 /// (флаги `llama-server`, формат ответа `/v1/chat/completions`).
 pub const RUNTIME_TAG: &str = "b10809";
-/// Порт локального сервера. 8771 занят whisper-server.
-pub const SERVER_PORT: u16 = 8772;
-/// Окно контекста: системный промпт VoxFlow ~6k токенов + диктовка + ответ.
-const CONTEXT_TOKENS: u32 = 8192;
+/// Порт работающего сервера: свободный loopback-порт, выбранный при запуске
+/// (0 — сервера нет). Постоянный порт отдавал запросы чужому или
+/// осиротевшему llama-server от прошлого запуска: тот отвечал на `/health`
+/// вместо нашего, и смена модели молча ничего не меняла.
+static ACTIVE_PORT: AtomicU16 = AtomicU16::new(0);
+/// PID сервера, который как раз грузит модель. Замок [`SERVER`] на это время
+/// занят, поэтому [`stop`] убивает такой процесс по PID, не дожидаясь замка.
+static STARTING_PID: AtomicU32 = AtomicU32::new(0);
+/// Окно контекста: системный промпт VoxFlow — 5,9 тыс. токенов токенизатора
+/// Qwen, дальше диктовка и ответ примерно той же длины. При 8192 длинная
+/// диктовка упиралась в лимит и возвращалась «оборванной».
+const CONTEXT_TOKENS: u32 = 16384;
 /// Сколько ждём, пока сервер загрузит модель и ответит на `/health`.
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -198,8 +206,24 @@ fn find_server_binary(root: &Path) -> Option<PathBuf> {
     walk(root, 4, server_binary_name())
 }
 
+/// Установленный runtime под режим ускорения. Если нужной сборки нет (режим
+/// GPU переключили уже после загрузки), берём другую: Vulkan-сборка считает
+/// и на процессоре с `-ngl 0`, а CPU-сборке слои на видеокарту не отдать.
+/// Второе значение — можно ли в найденной сборке отдавать слои на GPU.
+fn installed_runtime(gpu: bool) -> Option<(PathBuf, bool)> {
+    let preferred = runtime_flavor(gpu);
+    if let Some(bin) = find_server_binary(&runtime_dir(preferred)) {
+        return Some((bin, gpu));
+    }
+    let other = runtime_flavor(!gpu);
+    if other == preferred {
+        return None;
+    }
+    find_server_binary(&runtime_dir(other)).map(|bin| (bin, gpu && other == runtime_flavor(true)))
+}
+
 pub fn runtime_installed(gpu: bool) -> bool {
-    find_server_binary(&runtime_dir(runtime_flavor(gpu))).is_some()
+    installed_runtime(gpu).is_some()
 }
 
 fn model_path(model: &LlmModel) -> PathBuf {
@@ -222,7 +246,7 @@ pub fn model_installed(id: &str) -> bool {
 
 /// Готов ли встроенный ИИ к работе с выбранной моделью.
 pub fn configured(s: &crate::settings::Settings) -> bool {
-    model_installed(&s.builtin_llm_model) && runtime_installed(crate::paths::gpu_active())
+    model_installed(&s.builtin_llm_model) && runtime_installed(crate::paths::llm_gpu_active())
 }
 
 // ───────────────────────────── Загрузка ─────────────────────────────
@@ -504,7 +528,7 @@ pub fn download(app: AppHandle, id: String, proxy: String) -> Result<()> {
         .name("voxflow-llm-download".into())
         .spawn(move || {
             let result = (|| -> Result<()> {
-                ensure_runtime(&app, crate::paths::gpu_active(), &proxy)?;
+                ensure_runtime(&app, crate::paths::llm_gpu_active(), &proxy)?;
                 let dest = model_path(model);
                 if !model_installed(model.id) {
                     let remote = resolve_model(model, &proxy)?;
@@ -541,10 +565,12 @@ pub fn delete(id: &str) -> Result<()> {
         stop();
     }
     let path = model_path(model);
-    let _ = std::fs::remove_file(marker_path(&path));
+    // Сначала сам файл: если его держит процесс, модель честно остаётся
+    // установленной, а не превращается в «не скачана» с файлом на диске.
     if path.exists() {
         std::fs::remove_file(&path)?;
     }
+    let _ = std::fs::remove_file(marker_path(&path));
     Ok(())
 }
 
@@ -554,6 +580,7 @@ struct Running {
     child: Child,
     model_id: String,
     gpu: bool,
+    port: u16,
 }
 
 static SERVER: Mutex<Option<Running>> = Mutex::new(None);
@@ -581,6 +608,7 @@ pub fn server_status() -> ServerStatus {
         // Процесс мог умереть (нехватка памяти) — не врём, что он работает.
         if run.child.try_wait().ok().flatten().is_some() {
             *guard = None;
+            ACTIVE_PORT.store(0, Ordering::SeqCst);
             return ServerStatus::default();
         }
         return ServerStatus {
@@ -593,7 +621,7 @@ pub fn server_status() -> ServerStatus {
     ServerStatus::default()
 }
 
-fn health_ok() -> bool {
+fn health_ok(port: u16) -> bool {
     let mut cmd = net::curl();
     let out = cmd
         .arg("--noproxy")
@@ -601,7 +629,7 @@ fn health_ok() -> bool {
         .arg("-s")
         .arg("-m")
         .arg("2")
-        .arg(format!("http://127.0.0.1:{SERVER_PORT}/health"))
+        .arg(format!("http://127.0.0.1:{port}/health"))
         .output();
     match out {
         Ok(o) if o.status.success() => serde_json::from_slice::<serde_json::Value>(&o.stdout)
@@ -617,23 +645,31 @@ fn server_log_path() -> PathBuf {
 }
 
 /// Аргументы запуска сервера — вынесены ради теста и читаемости.
-pub fn server_args(model: &Path, gpu: bool, threads: u32) -> Vec<String> {
-    vec![
+///
+/// С ускорением `-ngl` не передаём: без него llama.cpp сам подбирает, сколько
+/// слоёв влезет в видеопамять. Явный `-ngl 99` отключал этот подбор, и на
+/// карте с 2–4 ГБ модель не загружалась вовсе. Без ускорения — `-ngl 0`.
+pub fn server_args(model: &Path, gpu: bool, threads: u32, port: u16) -> Vec<String> {
+    let mut args: Vec<String> = vec![
         "-m".into(),
         model.display().to_string(),
         "--host".into(),
         "127.0.0.1".into(),
         "--port".into(),
-        SERVER_PORT.to_string(),
+        port.to_string(),
         "-c".into(),
         CONTEXT_TOKENS.to_string(),
-        "-ngl".into(),
-        if gpu { "99".into() } else { "0".into() },
+    ];
+    if !gpu {
+        args.extend(["-ngl".into(), "0".into()]);
+    }
+    args.extend([
         "-t".into(),
         threads.to_string(),
         "--no-webui".into(),
         "--jinja".into(),
-    ]
+    ]);
+    args
 }
 
 /// Поднять сервер с нужной моделью (или убедиться, что он уже поднят).
@@ -646,32 +682,41 @@ pub fn ensure_server(model_id: &str, gpu: bool, threads: u32) -> Result<()> {
             model.label
         ));
     }
-    let bin = find_server_binary(&runtime_dir(runtime_flavor(gpu))).ok_or_else(|| {
+    let (bin, gpu) = installed_runtime(gpu).ok_or_else(|| {
         anyhow!("движок llama.cpp не установлен — скачайте модель заново в «Локальном ИИ»")
     })?;
 
     let mut guard = SERVER.lock();
     if let Some(run) = guard.as_mut() {
         let alive = run.child.try_wait().ok().flatten().is_none();
-        if alive && run.model_id == model.id && run.gpu == gpu && health_ok() {
+        if alive && run.model_id == model.id && run.gpu == gpu && health_ok(run.port) {
+            ACTIVE_PORT.store(run.port, Ordering::SeqCst);
             return Ok(());
         }
         let _ = run.child.kill();
         let _ = run.child.wait();
         *guard = None;
+        ACTIVE_PORT.store(0, Ordering::SeqCst);
     }
 
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(server_log_path())
-        .ok();
+    #[cfg(windows)]
+    if let Some(dir) = bin.parent() {
+        provide_app_local_crt(dir)?;
+    }
+
+    // Лог перезаписывается на каждом запуске: в нём ошибки именно этого
+    // старта. llama.cpp пишет всё (INFO/WARN/ERROR) в stderr.
+    let log = std::fs::File::create(server_log_path()).ok();
     let (out, err) = match log {
-        Some(f) => (Stdio::from(f.try_clone().unwrap_or(f)), Stdio::null()),
+        Some(f) => match f.try_clone() {
+            Ok(copy) => (Stdio::from(copy), Stdio::from(f)),
+            Err(_) => (Stdio::null(), Stdio::from(f)),
+        },
         None => (Stdio::null(), Stdio::null()),
     };
+    let port = crate::asr::reserve_loopback_port()?;
     let mut cmd = Command::new(&bin);
-    cmd.args(server_args(&path, gpu, threads))
+    cmd.args(server_args(&path, gpu, threads, port))
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
@@ -683,17 +728,20 @@ pub fn ensure_server(model_id: &str, gpu: bool, threads: u32) -> Result<()> {
     let mut child = cmd
         .spawn()
         .map_err(|e| anyhow!("не удалось запустить llama-server: {e}"))?;
+    let _starting = StartingPid::set(child.id());
 
     let started = Instant::now();
     loop {
-        if health_ok() {
-            break;
-        }
+        // Сначала — жив ли наш процесс: ответ на /health от кого-то другого
+        // не делает запуск успешным.
         if let Some(status) = child.try_wait()? {
             return Err(anyhow!(
                 "llama-server завершился при запуске ({status}); подробности в {}",
                 server_log_path().display()
             ));
+        }
+        if health_ok(port) {
+            break;
         }
         if started.elapsed() > STARTUP_TIMEOUT {
             let _ = child.kill();
@@ -706,7 +754,7 @@ pub fn ensure_server(model_id: &str, gpu: bool, threads: u32) -> Result<()> {
         std::thread::sleep(Duration::from_millis(300));
     }
     log::info!(
-        "llama-server поднят: модель {} gpu={gpu} за {} мс",
+        "llama-server поднят: модель {} gpu={gpu} порт {port} за {} мс",
         model.id,
         started.elapsed().as_millis()
     );
@@ -714,18 +762,122 @@ pub fn ensure_server(model_id: &str, gpu: bool, threads: u32) -> Result<()> {
         child,
         model_id: model.id.to_string(),
         gpu,
+        port,
     });
+    ACTIVE_PORT.store(port, Ordering::SeqCst);
     Ok(())
+}
+
+/// Публикует PID запускаемого сервера на время загрузки модели и снимает его
+/// на любом выходе из [`ensure_server`].
+struct StartingPid;
+
+impl StartingPid {
+    fn set(pid: u32) -> Self {
+        STARTING_PID.store(pid, Ordering::SeqCst);
+        StartingPid
+    }
+}
+
+impl Drop for StartingPid {
+    fn drop(&mut self) {
+        STARTING_PID.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Windows: сборки llama.cpp не несут MSVC-runtime (msvcp140, vcruntime140),
+/// а VoxFlow ставит свою копию рядом с voxflow.exe, чтобы не требовать
+/// VC_redist. Загрузчик DLL ищет сначала в папке самого llama-server.exe и
+/// только потом в System32, поэтому копия кладётся туда: так сервер стартует
+/// и на чистой машине, и поверх старого System32-runtime (до 14.40 новые
+/// сборки падают на std::mutex). В dev-сборке копий рядом с exe нет — тогда
+/// остаётся системный runtime.
+#[cfg(windows)]
+fn provide_app_local_crt(bin_dir: &Path) -> Result<()> {
+    let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return Ok(());
+    };
+    let Ok(entries) = std::fs::read_dir(&exe_dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let lower = name.to_ascii_lowercase();
+        let is_crt = lower.ends_with(".dll")
+            && (lower.starts_with("msvcp140")
+                || lower.starts_with("vcruntime140")
+                || lower.starts_with("concrt140"));
+        if !is_crt {
+            continue;
+        }
+        let src = entry.path();
+        let dst = bin_dir.join(name);
+        let same = match (std::fs::metadata(&src), std::fs::metadata(&dst)) {
+            (Ok(a), Ok(b)) => a.len() == b.len(),
+            _ => false,
+        };
+        if !same {
+            std::fs::copy(&src, &dst)
+                .map_err(|e| anyhow!("не удалось положить {name} рядом с llama-server: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Убить процесс по PID без дескриптора `Child` (он у потока запуска).
+fn kill_pid(pid: u32) {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn OpenProcess(desired_access: u32, inherit: i32, pid: u32) -> isize;
+            fn TerminateProcess(handle: isize, exit_code: u32) -> i32;
+            fn CloseHandle(handle: isize) -> i32;
+        }
+        const PROCESS_TERMINATE: u32 = 0x0001;
+        // SAFETY: обычные вызовы Win32 с валидными аргументами; дескриптор
+        // закрывается сразу после TerminateProcess.
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if handle != 0 {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill")
+            .arg("-9")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 /// Остановить сервер (выход из приложения, удаление модели, выключение ИИ).
 pub fn stop() {
-    // Во время старта замок занят загрузкой модели; ждать её из синхронной
-    // команды нельзя — лучше оставить процесс, чем подвесить интерфейс.
+    // Идёт загрузка модели: замок занят потоком запуска, а при выходе ради
+    // обновления процесс умирает через ~1,5 с — ждать нельзя, иначе
+    // llama-server остаётся сиротой с моделью в памяти. Убиваем его по PID;
+    // поток запуска увидит смерть процесса и отпустит замок.
+    let starting = STARTING_PID.load(Ordering::SeqCst);
+    if starting != 0 {
+        kill_pid(starting);
+        log::info!("llama-server остановлен во время загрузки модели (pid {starting})");
+    }
     let Some(mut guard) = SERVER.try_lock_for(Duration::from_secs(2)) else {
-        log::warn!("llama-server ещё поднимается — остановка отложена");
+        log::warn!("llama-server: замок занят, остановить не удалось");
         return;
     };
+    ACTIVE_PORT.store(0, Ordering::SeqCst);
     if let Some(mut run) = guard.take() {
         let _ = run.child.kill();
         let _ = run.child.wait();
@@ -780,6 +932,10 @@ pub fn parse_chat_completion(v: &serde_json::Value) -> Result<String> {
 }
 
 fn chat(system: &str, user: &str, timeout_s: u64, max_tokens: u32) -> Result<String> {
+    let port = ACTIVE_PORT.load(Ordering::SeqCst);
+    if port == 0 {
+        return Err(anyhow!("локальный сервер ИИ не запущен"));
+    }
     let body = chat_body(system, user, max_tokens);
     let payload = serde_json::to_vec(&body).map_err(|e| anyhow!("сериализация тела: {e}"))?;
     let req = net::TempPayload::write_json("llm_req", &payload)?;
@@ -796,9 +952,7 @@ fn chat(system: &str, user: &str, timeout_s: u64, max_tokens: u32) -> Result<Str
         .arg("POST")
         .arg("--data-binary")
         .arg(&data_arg)
-        .arg(format!(
-            "http://127.0.0.1:{SERVER_PORT}/v1/chat/completions"
-        ));
+        .arg(format!("http://127.0.0.1:{port}/v1/chat/completions"));
     let out = cmd
         .output()
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
@@ -831,7 +985,7 @@ fn chat(system: &str, user: &str, timeout_s: u64, max_tokens: u32) -> Result<Str
 /// Отрефайнить текст встроенной моделью: поднять сервер при необходимости и
 /// спросить. Сигнатура повторяет [`crate::ollama::refine`] по смыслу.
 pub fn refine(s: &crate::settings::Settings, system: &str, user: &str) -> Result<String> {
-    let gpu = crate::paths::gpu_active();
+    let gpu = crate::paths::llm_gpu_active();
     ensure_server(&s.builtin_llm_model, gpu, s.effective_threads())?;
     let input = net::estimate_tokens(system) + net::estimate_tokens(user);
     let max_tokens = net::output_token_budget(input, s.rewrite_max_output_tokens.min(4096));
@@ -840,7 +994,7 @@ pub fn refine(s: &crate::settings::Settings, system: &str, user: &str) -> Result
 
 /// Короткая проба для кнопки «Проверить».
 pub fn ping(s: &crate::settings::Settings) -> Result<String> {
-    let gpu = crate::paths::gpu_active();
+    let gpu = crate::paths::llm_gpu_active();
     ensure_server(&s.builtin_llm_model, gpu, s.effective_threads())?;
     let text = chat(
         "Ответь ровно одним словом.",
@@ -862,7 +1016,7 @@ pub fn warmup(s: &crate::settings::Settings) {
     let _ = std::thread::Builder::new()
         .name("voxflow-llm-warmup".into())
         .spawn(move || {
-            if let Err(e) = ensure_server(&model, crate::paths::gpu_active(), threads) {
+            if let Err(e) = ensure_server(&model, crate::paths::llm_gpu_active(), threads) {
                 log::warn!("прогрев локального ИИ: {e:#}");
             }
         });
@@ -897,7 +1051,7 @@ pub struct LocalLlmState {
 
 pub fn state() -> LocalLlmState {
     let machine = crate::local_ai::probe_machine();
-    let gpu = crate::paths::gpu_active();
+    let gpu = crate::paths::llm_gpu_active();
     let fits: Vec<bool> = CATALOG
         .iter()
         .map(|m| crate::local_ai::fits_spec(m.size_gb, m.min_ram_gb, &machine))
@@ -1013,15 +1167,18 @@ mod tests {
 
     #[test]
     fn server_args_switch_gpu_layers() {
-        let cpu = server_args(Path::new("m.gguf"), false, 4);
-        let gpu = server_args(Path::new("m.gguf"), true, 4);
-        let ngl = |args: &[String]| {
+        let cpu = server_args(Path::new("m.gguf"), false, 4, 50123);
+        let gpu = server_args(Path::new("m.gguf"), true, 4, 50123);
+        let value = |args: &[String], flag: &str| {
             args.iter()
-                .position(|a| a == "-ngl")
+                .position(|a| a == flag)
                 .map(|i| args[i + 1].clone())
         };
-        assert_eq!(ngl(&cpu).as_deref(), Some("0"));
-        assert_eq!(ngl(&gpu).as_deref(), Some("99"));
+        assert_eq!(value(&cpu, "-ngl").as_deref(), Some("0"));
+        // С ускорением слои подбирает сам llama.cpp под объём видеопамяти.
+        assert_eq!(value(&gpu, "-ngl"), None);
+        assert_eq!(value(&cpu, "--port").as_deref(), Some("50123"));
+        assert_eq!(value(&cpu, "--host").as_deref(), Some("127.0.0.1"));
         assert!(cpu.contains(&"--no-webui".to_string()));
         assert!(chat_body("s", "u", 10)["chat_template_kwargs"]["enable_thinking"] == false);
     }

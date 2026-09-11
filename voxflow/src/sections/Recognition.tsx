@@ -505,7 +505,7 @@ export default function Recognition({
               }
               disabled={isRewritingPrompt}
             >
-              <Icon.Mic className="btn-icon" />
+              <Icon.Mic className="ico" />
               {isRecordingInstruction ? "Остановить" : "Голосовая правка"}
             </button>
             <button
@@ -520,7 +520,7 @@ export default function Recognition({
               }
               disabled={!promptText.trim()}
             >
-              <Icon.Sparkles className="btn-icon" />
+              <Icon.Sparkles className="ico" />
               Обновить prompt
             </button>
           </div>
@@ -533,7 +533,7 @@ export default function Recognition({
                 onClick={() => void rewritePromptFromInstruction(voiceInstruction)}
                 disabled={isRecordingInstruction || isRewritingPrompt}
               >
-                <Icon.Sparkles className="btn-icon" />
+                <Icon.Sparkles className="ico" />
                 {isRewritingPrompt ? "Работаю..." : "Переработать"}
               </button>
             </div>
@@ -568,7 +568,7 @@ export default function Recognition({
                     className="btn btn-primary"
                     onClick={applyRewritePreview}
                   >
-                    <Icon.Check className="btn-icon" />
+                    <Icon.Check className="ico" />
                     Применить
                   </button>
                   <button
