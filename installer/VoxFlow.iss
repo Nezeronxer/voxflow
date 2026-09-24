@@ -164,6 +164,15 @@ begin
     Result := True;
 end;
 
+{ Маркер «установка идёт» (updater.rs) снимает сам установщик: файлы уже
+  на месте, а [Run] ещё не перезапустил приложение. По версии exe этого не
+  понять — voxflow.exe копируется первым. }
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    DeleteFile(ExpandConstant('{localappdata}\VoxFlow\update-in-progress.json'));
+end;
+
 function InitializeSetup(): Boolean;
 begin
   Result := True;

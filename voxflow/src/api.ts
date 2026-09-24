@@ -252,6 +252,17 @@ export function downloadModel(name: string): Promise<void> {
   }, undefined);
 }
 
+// Отмена оставляет .part на диске: следующий downloadModel продолжит с места.
+export function cancelModelDownload(name: string): Promise<void> {
+  if (!IS_TAURI_RUNTIME) {
+    queueMicrotask(() => emitMock("model:cancelled", { name }));
+    return Promise.resolve();
+  }
+  return safe<void>(async () => {
+    await invoke("cancel_model_download", { name });
+  }, undefined);
+}
+
 export function deleteModel(name: string): Promise<void> {
   if (!IS_TAURI_RUNTIME) {
     mockInstalledModels.delete(name);

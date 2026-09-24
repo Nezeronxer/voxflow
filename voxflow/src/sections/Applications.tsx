@@ -142,60 +142,11 @@ function platformPreset(rule: ProfileOverride): ProfileOverride {
   return app ? { ...rule, match: preferredMatch(app) } : rule;
 }
 
-function matchHint(app: AppPreset): string {
-  if (!app.macMatch || sameMatch(app.macMatch, app.match)) {
-    return `Match: ${app.match}`;
-  }
-  return IS_APPLE_PLATFORM
-    ? `Match: ${app.macMatch} (macOS; Windows: ${app.match})`
-    : `Match: ${app.match} (Windows; macOS: ${app.macMatch})`;
-}
-
 function promptPlaceholder(appName: string): string {
   if (appName === "Codex") return "Например: превращай диктовку в задачу для Codex: контекст, файлы, что проверить, что не трогать.";
   if (appName === "Claude") return "Например: структурируй как длинный промпт с требованиями, ограничениями и форматом ответа.";
   if (appName === "Perplexity") return "Например: делай исследовательский вопрос с контекстом и критериями источников.";
   return "Например: перепиши диктовку как ясный промпт для этой нейросети.";
-}
-
-function AppGlyph({ glyph }: { glyph: string }) {
-  if (glyph === "telegram") {
-    return <svg viewBox="0 0 24 24"><path d="M4 11.8 20 4.8 17.4 19l-5-3.8-2.7 2.6.5-4.2 6.9-6.1-8.6 5.2L4 11.8Z" /></svg>;
-  }
-  if (glyph === "whatsapp") {
-    return <svg viewBox="0 0 24 24"><path d="M7 19.2 4.8 20l.8-2.2a7.5 7.5 0 1 1 1.4 1.4Z" /><path d="M9 8.6c.4 2 2 4 4 4.9l1.5-1c.3-.2.7-.1.9.2l1 1.4c.2.3.2.7-.1.9-.8.7-1.8 1-2.8.7-2.8-.8-5.3-3.3-6.1-6.1-.3-1 .1-2 .7-2.8.2-.3.7-.3 1-.1l1.3 1c.3.2.4.6.2.9L9 8.6Z" /></svg>;
-  }
-  if (glyph === "discord") {
-    return <svg viewBox="0 0 24 24"><path d="M7.5 8.2c3-1.1 6-1.1 9 0l1.5 6.3c-1.8 1.4-3.6 2.1-5.4 2.2l-.6-1.2c-.8.1-1.6.1-2.4 0L9 16.7c-1.8-.1-3.6-.8-5.4-2.2l1.5-6.3Z" /><path d="M9.2 12.2h.1M14.7 12.2h.1" /></svg>;
-  }
-  if (glyph === "gmail") {
-    return <svg viewBox="0 0 24 24"><path d="M4 7h16v10H4V7Z" /><path d="m4 7 8 6 8-6" /><path d="M4 17v-7l6 4.5M20 17v-7l-6 4.5" /></svg>;
-  }
-  if (glyph === "outlook") {
-    return <svg viewBox="0 0 24 24"><path d="M4 7h9v10H4V7Z" /><path d="M13 9h7v7h-7" /><path d="m13 9 3.5 3 3.5-3" /><path d="M7 12a2 2 0 1 0 4 0 2 2 0 0 0-4 0Z" /></svg>;
-  }
-  if (glyph === "terminal") {
-    return <svg viewBox="0 0 24 24"><path d="M4 6h16v12H4V6Z" /><path d="m7 10 2.4 2L7 14M12 15h4" /></svg>;
-  }
-  if (glyph === "spark") {
-    return <svg viewBox="0 0 24 24"><path d="M12 3 14 9l6 2-6 2-2 6-2-6-6-2 6-2 2-6Z" /><path d="M19 16.5 20 19l2 1-2 1-1 2-1-2-2-1 2-1 1-2.5Z" /></svg>;
-  }
-  if (glyph === "claude") {
-    return <svg viewBox="0 0 24 24"><path d="M12 4c4 0 7 3 7 8s-3 8-7 8-7-3-7-8 3-8 7-8Z" /><path d="M8 12h8M12 8v8" /></svg>;
-  }
-  if (glyph === "code") {
-    return <svg viewBox="0 0 24 24"><path d="m9 8-4 4 4 4M15 8l4 4-4 4" /><path d="m13 5-2 14" /></svg>;
-  }
-  if (glyph === "cursor") {
-    return <svg viewBox="0 0 24 24"><path d="M6 4 19 12l-6 1.2L10 20 6 4Z" /></svg>;
-  }
-  if (glyph === "wave") {
-    return <svg viewBox="0 0 24 24"><path d="M3 14c3-5 6-5 9 0s6 5 9 0" /><path d="M3 9c3-4 6-4 9 0s6 4 9 0" /></svg>;
-  }
-  if (glyph === "word") {
-    return <svg viewBox="0 0 24 24"><path d="M5 5h14v14H5V5Z" /><path d="m8 9 1.2 6L12 9l2.8 6L16 9" /></svg>;
-  }
-  return <svg viewBox="0 0 24 24"><path d="M7 3h7l4 4v14H7V3Z" /><path d="M14 3v5h5M9 12h6M9 16h6" /></svg>;
 }
 
 type Props = {
@@ -207,6 +158,7 @@ type Props = {
 
 export default function Applications({ settings, update, embedded }: Props) {
   const [context, setContext] = useState<ActiveAppContext | null>(null);
+  const [openPrompts, setOpenPrompts] = useState<Record<string, boolean>>({});
   const [presets, setPresets] = useState<ProfileOverride[]>([]);
   const [match, setMatch] = useState("");
   const [profile, setProfile] = useState("casual");
@@ -342,9 +294,9 @@ export default function Applications({ settings, update, embedded }: Props) {
 
       <section className="app-hero card">
         <div className="app-hero-main">
-          <div className="app-current-icon">
-            <AppGlyph glyph="terminal" />
-          </div>
+          <span className="app-avatar" aria-hidden>
+            {(context?.exe || "?").slice(0, 1)}
+          </span>
           <div>
             <h2>{context?.exe || "Активное окно"}</h2>
             <p>{context?.title || "Обновите детектор, чтобы увидеть текущее приложение."}</p>
@@ -365,8 +317,8 @@ export default function Applications({ settings, update, embedded }: Props) {
         <div className="app-picker-main">
           <div className="app-picker-top">
             <div>
-              <h2>Выбор приложения</h2>
-              <p>У каждого приложения свой стиль. Изменение сохраняется сразу для выбранной плитки.</p>
+              <h2>Программы</h2>
+              <p>Выбор сохраняется сразу.</p>
             </div>
             <button className="btn" type="button" onClick={addPresets} disabled={hasPresets}>
               <Icon.Plus className="ico" /> {hasPresets ? "Все базовые добавлены" : "Добавить базовые"}
@@ -376,8 +328,10 @@ export default function Applications({ settings, update, embedded }: Props) {
 
           {APP_GROUPS.map((group) => (
             <div className="app-group" key={group.title}>
-              <div className="app-group-title">{group.title}</div>
-              <div className="app-tile-grid">
+              <div className="app-group-title">
+                {group.title === "Промты" ? "Нейросети" : group.title}
+              </div>
+              <div className="app-list">
                 {group.apps.map((app) => {
                   const configured = ruleForApp(rules, app);
                   const promptConfigured = promptRuleForApp(promptRules, app);
@@ -386,21 +340,31 @@ export default function Applications({ settings, update, embedded }: Props) {
                   const promptTargetMatch =
                     promptConfigured?.match || preferredMatch(app);
                   const isPromptApp = group.title === "Промты";
+                  // Поле промпта раскрыто, если его открыли или промпт уже задан.
+                  const promptOpen =
+                    openPrompts[app.name] ?? Boolean(promptConfigured?.prompt);
                   return (
-                    <div
-                      className={`app-tile ${configured || promptConfigured ? "is-configured" : ""}`}
-                      key={app.name}
-                    >
-                      <span className={`app-icon app-icon-${app.glyph}`}>
-                        <AppGlyph glyph={app.glyph} />
+                    <div className="app-row" key={app.name}>
+                      <span className="app-avatar" aria-hidden>
+                        {app.name.slice(0, 1)}
                       </span>
-                      <span className="app-tile-copy">
+                      <span className="app-row-copy">
                         <strong>{app.name}</strong>
                         <small>{app.hint}</small>
-                        <small>{matchHint(app)}</small>
                       </span>
-                      <label className="app-tile-style">
-                        <span>Стиль</span>
+                      <span className="app-row-controls">
+                        {isPromptApp && (
+                          <button
+                            type="button"
+                            className={`btn btn-sm btn-ghost${promptOpen ? " active" : ""}`}
+                            aria-expanded={promptOpen}
+                            onClick={() =>
+                              setOpenPrompts((prev) => ({ ...prev, [app.name]: !promptOpen }))
+                            }
+                          >
+                            Промпт{promptConfigured?.prompt ? " •" : ""}
+                          </button>
+                        )}
                         <Select
                           value={currentProfile}
                           onChange={(value) =>
@@ -411,23 +375,22 @@ export default function Applications({ settings, update, embedded }: Props) {
                           }
                           options={profileOptionsWithCurrent(currentProfile)}
                         />
-                      </label>
-                      {isPromptApp && (
-                        <label className="app-tile-prompt">
-                          <span>Промт</span>
-                          <textarea
-                            value={promptConfigured?.prompt ?? ""}
-                            onChange={(event) => upsertPromptRule(
-                              {
-                                match: promptTargetMatch,
-                                prompt: event.currentTarget.value,
-                              },
-                              `${app.name}: промт обновлён.`,
-                            )}
-                            placeholder={promptPlaceholder(app.name)}
-                            rows={3}
-                          />
-                        </label>
+                      </span>
+                      {isPromptApp && promptOpen && (
+                        <textarea
+                          className="app-row-prompt"
+                          aria-label={`Промпт для ${app.name}`}
+                          value={promptConfigured?.prompt ?? ""}
+                          onChange={(event) => upsertPromptRule(
+                            {
+                              match: promptTargetMatch,
+                              prompt: event.currentTarget.value,
+                            },
+                            `${app.name}: промт обновлён.`,
+                          )}
+                          placeholder={promptPlaceholder(app.name)}
+                          rows={3}
+                        />
                       )}
                     </div>
                   );
@@ -439,7 +402,7 @@ export default function Applications({ settings, update, embedded }: Props) {
       </section>
 
       <details className="advanced-rules">
-        <summary>Дополнительные match-правила</summary>
+        <summary>Свои правила для окон и промпты</summary>
         <section className="card">
           <div className="add-row">
             <input

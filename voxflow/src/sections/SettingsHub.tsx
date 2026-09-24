@@ -2,12 +2,12 @@ import type { ReactNode } from "react";
 import { Icon, PageHead } from "../ui";
 import type { Settings } from "../types";
 import { egressState } from "../privacyState";
-import Models from "./Models";
 import Recognition from "./Recognition";
 import Control from "./Control";
 import Ai from "./Ai";
 import Stt from "./Stt";
 import Corrections from "./Corrections";
+import LocalLlm from "./LocalLlm";
 import Applications from "./Applications";
 
 /**
@@ -31,31 +31,42 @@ const SETTINGS_NAV: {
     id: "dictation",
     label: "Диктовка",
     title: "Диктовка",
-    desc: "Что происходит, пока вы говорите: устройство, клавиша, язык и движок распознавания.",
+    desc: "Микрофон, клавиша, язык и где распознавать речь.",
     icon: Icon.Mic,
   },
   {
     id: "text",
     label: "Обработка текста",
     title: "Обработка текста",
-    desc: "Что происходит с текстом после распознавания: нейросеть и ключ, чистка речи, исправления.",
+    desc: "Что делать с текстом перед вставкой: чистка, нейросеть и её модели, исправления.",
     icon: Icon.Wand,
   },
   {
     id: "applications",
     label: "Приложения",
     title: "Приложения",
-    desc: "Правила стиля и промпты для конкретных программ.",
+    desc: "Стиль текста для каждой программы.",
     icon: Icon.Code,
   },
   {
     id: "app",
     label: "Программа",
     title: "Программа",
-    desc: "Оформление, звуки, автозапуск и обновления самого VoxFlow.",
+    desc: "Оформление, звуки, автозапуск и обновления.",
     icon: Icon.Sliders,
   },
 ];
+
+// Редко нужные настройки страницы — одним свёрнутым блоком внизу, чтобы первый
+// экран показывал только то, что меняют чаще всего.
+function Advanced({ children }: { children: ReactNode }) {
+  return (
+    <details className="card settings-advanced">
+      <summary>Дополнительно</summary>
+      {children}
+    </details>
+  );
+}
 
 export default function SettingsHub({
   page,
@@ -98,7 +109,7 @@ export default function SettingsHub({
       </aside>
 
       <section className="settings-stage">
-        <div className="content-inner">
+        <div className="content-inner settings-flat">
           <PageHead title={current.title} desc={current.desc} />
 
           {page === "dictation" && (
@@ -110,16 +121,30 @@ export default function SettingsHub({
                 scope="dictation"
                 embedded
               />
-              <Models settings={settings} update={update} embedded />
-              <Stt settings={settings} update={update} persist={persist} embedded />
+              <Stt settings={settings} update={update} persist={persist} part="main" />
+              <Advanced>
+                <Control
+                  settings={settings}
+                  update={update}
+                  persist={persist}
+                  scope="dictation-advanced"
+                  embedded
+                />
+                <Stt settings={settings} update={update} persist={persist} part="advanced" />
+              </Advanced>
             </>
           )}
 
           {page === "text" && (
             <>
-              <Ai settings={settings} update={update} persist={persist} embedded />
-              <Recognition settings={settings} update={update} embedded />
+              <Recognition settings={settings} update={update} part="main" />
+              <Ai settings={settings} update={update} persist={persist} part="main" />
+              <LocalLlm settings={settings} update={update} />
               <Corrections settings={settings} update={update} embedded />
+              <Advanced>
+                <Recognition settings={settings} update={update} part="advanced" />
+                <Ai settings={settings} update={update} persist={persist} part="advanced" />
+              </Advanced>
             </>
           )}
 

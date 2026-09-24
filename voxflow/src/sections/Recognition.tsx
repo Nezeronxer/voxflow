@@ -104,14 +104,20 @@ function speechLanguage(settingsLanguage: string): string {
   return "ru-RU";
 }
 
+/**
+ * `part`: main — очистка речи и инструкция для нейросети; advanced — способ
+ * вставки, потоковая вставка, обучающие записи (свёрнутое «Дополнительно»).
+ */
 export default function Recognition({
   settings,
   update,
   embedded,
+  part,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
   embedded?: boolean;
+  part?: "main" | "advanced";
 }) {
   const promptText = settings.smart_prompt_source;
   const promptReady =
@@ -377,23 +383,16 @@ export default function Recognition({
     setVoiceError("");
   }
 
-  return (
-    <SectionShell embedded={embedded}>
-      {!embedded && (
-        <PageHead
-          title="Распознавание"
-          desc="Как обрабатывать распознанный текст перед вставкой."
-        />
-      )}
-
+  const main = (
+    <>
       <div className="card">
         <div className="card-head">
-          <div className="card-title">Обработка текста</div>
+          <div className="card-title">Очистка речи</div>
         </div>
 
         <Field
-          label="Дословно (verbatim)"
-          hint="Вставлять текст как есть, без редактирования и переформулирования"
+          label="Дословно"
+          hint="Вставлять как сказано, без правок"
         >
           <Switch
             checked={settings.verbatim}
@@ -403,7 +402,7 @@ export default function Recognition({
 
         <Field
           label="Убирать слова-паразиты"
-          hint="Удалять «эээ», «ну», «как бы» и подобные заполнители"
+          hint="«Эээ», «ну», «как бы»"
         >
           <Switch
             checked={settings.remove_fillers}
@@ -413,7 +412,7 @@ export default function Recognition({
 
         <Field
           label="Автопунктуация"
-          hint="Автоматически расставлять знаки препинания и заглавные буквы"
+          hint="Точки, запятые и заглавные буквы"
         >
           <Switch
             checked={settings.auto_punct}
@@ -422,8 +421,8 @@ export default function Recognition({
         </Field>
 
         <Field
-          label="Агрессивные самоисправления"
-          hint="Вырезать левую часть фразы по словам «то есть», «в смысле», «нет», «точнее». Это обычные связки речи — включайте, только если диктуете исправления голосом и готовы терять текст"
+          label="Исправления голосом"
+          hint="Удалять сказанное до «то есть», «нет», «точнее». Может срезать нужный текст"
         >
           <Switch
             checked={settings.aggressive_self_correction}
@@ -431,31 +430,15 @@ export default function Recognition({
           />
         </Field>
       </div>
-
+      {aiReady && (
       <div className="card">
         <div className="card-head">
-          <div className="card-title">Стиль</div>
+          <div className="card-title">Инструкция для нейросети</div>
         </div>
 
-        <Field label="Тон" hint="Тональность итогового текста">
-          <Select
-            value={settings.tone}
-            onChange={(v) => update({ tone: v })}
-            options={[
-              { value: "very_casual", label: "Очень неформальный" },
-              { value: "casual", label: "Неформальный" },
-              { value: "neutral", label: "Нейтральный" },
-              { value: "work", label: "Рабочий" },
-              { value: "formal", label: "Формальный" },
-              { value: "doc", label: "Документ" },
-              { value: "ai", label: "Промпт для ИИ" },
-            ]}
-          />
-        </Field>
-
         <Field
-          label="Инструкция диктовки"
-          hint="Сохранённый prompt применяется к каждой диктовке поверх обычной очистки"
+          label="Своя инструкция"
+          hint="Применяется к каждой диктовке, например «пиши коротко и без воды»"
         >
           <Switch
             checked={settings.smart_prompt_enabled}
@@ -595,63 +578,64 @@ export default function Recognition({
             rows={5}
           />
         </div>
+      </div>
+      )}
+    </>
+  );
 
+  const advanced = (
+    <>
         <Field
           label="Способ вставки"
-          hint="«Вставка» — через буфер обмена, «Печать» — эмуляция нажатий клавиш"
+          hint="Через буфер обмена или имитацией набора"
         >
           <Select
             value={settings.paste_method}
             onChange={(v) => update({ paste_method: v })}
             options={[
-              { value: "clipboard", label: "Вставка" },
-              { value: "type", label: "Печать" },
+              { value: "clipboard", label: "Буфер обмена" },
+              { value: "type", label: "Набор клавишами" },
             ]}
           />
         </Field>
-      </div>
-
-      <div className="card">
-        <div className="card-head">
-          <div className="card-title">Живой ввод</div>
-          <div className="sub">
-            Текст в пилюле всегда обновляется по мере речи (когда доступен
-            GPU-движок whisper-server). Настройка ниже управляет вставкой текста
-            в активное поле во время речи.
-          </div>
-        </div>
-
         <Field
-          label="Потоковая вставка"
-          hint="Никогда (рекомендуется) — во время речи текст живёт только в пилюле, в поле ничего не печатается; готовый текст вставляется после отпускания клавиши. Авто — вставлять живьём устоявшуюся часть фразы, «хвост» остаётся серым в пилюле. Всегда — печатать каждую частичную версию прямо в поле с дотипыванием/забоем (может выглядеть дёргано)."
+          label="Печатать в поле во время речи"
+          hint="«Нет» — текст вставится, когда отпустите клавишу"
         >
           <Select
             value={settings.stream_mode}
             onChange={(v) => update({ stream_mode: v })}
             options={[
-              { value: "never", label: "Никогда" },
-              { value: "auto", label: "Авто" },
-              { value: "always", label: "Всегда" },
+              { value: "never", label: "Нет" },
+              { value: "auto", label: "Готовую часть фразы" },
+              { value: "always", label: "Всё сразу (дёргано)" },
             ]}
           />
         </Field>
-      </div>
-
-      <div className="card">
-        <div className="card-head">
-          <div className="card-title">Персонализация</div>
-        </div>
-
         <Field
-          label="Сохранять обучающие записи"
-          hint="Ручные исправления слов VoxFlow запоминает локально автоматически. Эта отдельная настройка дополнительно сохраняет пары аудио ↔ текст для будущего обучения; по умолчанию она выключена."
+          label="Сохранять записи для обучения"
+          hint="Пары звук ↔ текст, только на этом компьютере"
         >
           <Switch
             checked={settings.personalize}
             onChange={(v) => update({ personalize: v })}
           />
         </Field>
-      </div>
+    </>
+  );
+
+  if (part === "main") return main;
+  if (part === "advanced") return advanced;
+  return (
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="Распознавание"
+          desc="Как обрабатывать распознанный текст перед вставкой."
+        />
+      )}
+      {main}
+      <div className="card">{advanced}</div>
     </SectionShell>
   );
 }

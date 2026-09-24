@@ -1390,7 +1390,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                 Arc::clone(&ctx.gigaam),
                 LocalLoopTuning {
                     tick_ms: 220,
-                    max_seg_samples: 8 * 16000,
+                    max_seg_samples: PREVIEW_MAX_SEG_SAMPLES,
                     fixed_lang: Some("ru"),
                     speculative: true,
                 },
@@ -1420,7 +1420,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
             Arc::clone(&ctx.gigaam),
             LocalLoopTuning {
                 tick_ms: 260,
-                max_seg_samples: 8 * 16000,
+                max_seg_samples: PREVIEW_MAX_SEG_SAMPLES,
                 fixed_lang: Some("ru"),
                 speculative: true,
             },
@@ -1445,7 +1445,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                 Arc::clone(&ctx.gigaam),
                 LocalLoopTuning {
                     tick_ms: 220,
-                    max_seg_samples: 8 * 16000,
+                    max_seg_samples: PREVIEW_MAX_SEG_SAMPLES,
                     fixed_lang: Some("ru"),
                     speculative: false,
                 },
@@ -2104,7 +2104,7 @@ fn spawn_level_loop(capture: &Capture, ctx: &EngineCtx) {
 }
 
 /// Каденс/лимиты петли локальных партиалов: GigaAM — быстрый первый тик 220 мс
-/// и кап сегмента 8 c, Parakeet — тик 500 мс и кап 20 c.
+/// и кап сегмента 25 c (как у финала), Parakeet — тик 500 мс и кап 20 c.
 struct LocalLoopTuning {
     tick_ms: u64,
     max_seg_samples: usize,
@@ -5005,7 +5005,7 @@ pub(crate) fn local_transcribe_long<F>(
 where
     F: FnMut(&[f32]) -> anyhow::Result<String>,
 {
-    const MAX_SEG: usize = 25 * 16000;
+    const MAX_SEG: usize = LOCAL_ASR_MAX_SEG_SAMPLES;
     const PAD: usize = 4800; // 300 мс запас вокруг речи
 
     let chunk = crate::vad::CHUNK;
@@ -5149,8 +5149,18 @@ const SEG_GAP_MIN_SAMPLES: usize = 160 * 16;
 /// короткий сегмент ASR распознаёт хуже длинного — выгоднее дождаться следующей.
 const SEG_MIN_FILL_NUM: usize = 3;
 const SEG_MIN_FILL_DEN: usize = 4;
-/// Пауза, закрывающая сегмент живого превью.
-const SEG_SILENCE_SAMPLES: usize = 600 * 16;
+/// Пауза, закрывающая сегмент живого превью. Каждый сегмент GigaAM распознаёт
+/// без контекста соседей, поэтому ложные резы на коротких паузах дают ошибки на
+/// стыках. Порог выше 1200 мс на dataset уже ничего не меняет (D-035).
+const SEG_SILENCE_SAMPLES: usize = 1200 * 16;
+/// Лимит куска финального локального ASR (`local_transcribe_long`).
+const LOCAL_ASR_MAX_SEG_SAMPLES: usize = 25 * 16000;
+/// Лимит сегмента живого превью GigaAM = лимит финала: финал сжимает паузы и
+/// режет речь кусками по 25 с, и плашка с тем же лимитом режет примерно там же —
+/// у стыка тот же контекст, что у финала. Против настоящего финала на длинных
+/// записях: 15 с — 5,0% расхождения, 25 с — 2,1%. Перекрытие соседних кусков
+/// со склейкой по совпавшим словам проверено и хуже (6,6%, дубли на стыке).
+const PREVIEW_MAX_SEG_SAMPLES: usize = LOCAL_ASR_MAX_SEG_SAMPLES;
 /// Насколько сегменту позволено перерасти лимит, пока ждём микропаузу.
 const SEG_CAP_OVERRUN_SAMPLES: usize = 4000 * 16;
 
@@ -5263,7 +5273,7 @@ mod seg_tests {
         speech: &[bool],
         wait_for_gap: bool,
     ) -> String {
-        const MAX_SEG: usize = 8 * 16000;
+        const MAX_SEG: usize = PREVIEW_MAX_SEG_SAMPLES;
         let mut segs: Vec<String> = Vec::new();
         let mut seg_start = 0usize;
         let mut last_speech_end = 0usize;
@@ -5367,7 +5377,7 @@ mod seg_tests {
     #[test]
     #[ignore = "requires local GigaAM models and the private dataset"]
     fn preview_pill_diverges_less_from_the_final_after_the_micro_pause_cut() {
-        const FILES: usize = 60;
+        const FILES: usize = 150;
         let dir = crate::paths::gigaam_dir();
         assert!(
             crate::gigaam::dir_ready(&dir),
@@ -5375,8 +5385,11 @@ mod seg_tests {
         );
         let threads = Settings::default().effective_threads() as usize;
         let mut g = crate::gigaam::GigaAm::load(&dir, threads).expect("gigaam");
-        let mut vad =
-            crate::vad::SileroVad::load(&crate::paths::vad_model_path(None)).expect("vad");
+        let vad_path = crate::paths::vad_model_path(None);
+        let mut vad = crate::vad::SileroVad::load(&vad_path).expect("vad");
+        let vad_final = Arc::new(Mutex::new(Some(
+            crate::vad::SileroVad::load(&vad_path).expect("vad"),
+        )));
         let _ = g.transcribe(&vec![0.0f32; 8000]);
 
         let mut wavs: Vec<std::path::PathBuf> = std::fs::read_dir(crate::paths::dataset_dir())
@@ -5392,10 +5405,16 @@ mod seg_tests {
         for wav in &wavs {
             let samples = read_wav_16k(wav);
             // Короче лимита сегмента — резать нечего, разницы не будет.
-            if samples.len() < 9 * 16000 {
+            if samples.len() < PREVIEW_MAX_SEG_SAMPLES + 16000 {
                 continue;
             }
-            let final_text = g.transcribe(&samples).unwrap_or_default();
+            // Эталон — то, что реально вставляется: компакт тишины + нарезка финала.
+            let compact = compact_speech_for_final_asr(&vad_final, &samples);
+            let final_text = local_transcribe_long(&vad_final, &compact, &mut |seg| {
+                g.transcribe(seg)
+            })
+            .unwrap_or_default()
+            .replace(SEMANTIC_PARAGRAPH_MARKER, " ");
             if final_text.trim().is_empty() {
                 continue;
             }

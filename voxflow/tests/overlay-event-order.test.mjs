@@ -81,3 +81,16 @@ test("stale final and idle settled previews remain rejected", () => {
   assert.equal(idleSettled.preview, null);
   assert.equal(previewState.shouldResetFinalPreviewAfterHold("recording"), false);
 });
+
+test("word stream keeps the stable prefix and re-animates only the rewritten tail", () => {
+  const before = previewState.wordTokens("добавь авто");
+  const after = previewState.wordTokens("добавь автоматические тесты");
+  assert.deepEqual(after, ["добавь ", "автоматические ", "тесты"]);
+  // «авто» переписано в «автоматические» — анимируется с него, «добавь» стоит.
+  assert.equal(previewState.sharedWordPrefix(before, after), 1);
+  // Появившийся хвостовой пробел не считается правкой слова.
+  const grown = previewState.wordTokens("добавь автоматические тесты для");
+  assert.equal(previewState.sharedWordPrefix(after, grown), 3);
+  assert.equal(previewState.sharedWordPrefix(grown, []), 0);
+  assert.deepEqual(previewState.wordTokens("  "), []);
+});

@@ -6,9 +6,8 @@
 // Состояния пилюли (классы aq-* в overlay.css):
 //   idle   — компактная полоска с горячей клавишей и языком;
 //   rec    — орб с градиентом и glow от громкости + 12 баров ("level");
-//   stream — пришёл partial с текстом: до 360×82, посимвольная печать (rAF);
+//   stream — пришёл partial с текстом: до 360×82, новые слова всплывают по одному;
 //   trans  — компактная пилюля с кольцом-спиннером поверх орба;
-//   final  — короткая вспышка финального preview во время transcribing, без зависания после вставки;
 //   latch  — подтверждение двойного тапа: запись зафиксирована без удержания;
 //   notice — краткое предупреждение (no_model / error) поверх любого состояния.
 //
@@ -26,7 +25,8 @@ import "./overlay.css";
 import {
   previewPillMode,
   resolveOverlayPreviewEvent,
-  shouldResetFinalPreviewAfterHold,
+  sharedWordPrefix,
+  wordTokens,
 } from "./overlayPreviewState";
 import { DEFAULT_HOTKEY, normalizeOverlayScale } from "./types";
 import { prettyHotkey } from "./ui";
@@ -91,11 +91,6 @@ const BOX: Record<PillMode, { w: number; h: number }> = {
   latch: { w: 264, h: 66 },
   notice: { w: 356, h: 70 },
 };
-// Финальный (уже вставленный) текст держим в пилюле достаточно долго, чтобы
-// пользователь СРАВНИЛ его со сказанным и увидел ровно то, что попало в поле.
-// Раньше было 360 мс — финал лишь мелькал, и казалось, что «в кружке одно, а на
-// выходе другое». 1500 мс = отчётливо видно, но пилюля не залипает.
-const FINAL_PREVIEW_HOLD_MS = 1500;
 const DRAG_HIT_PADDING = 6;
 
 // Раскладка громкости по 12 барам: центр громче краёв (сглаженный «холм» Aqua).
@@ -140,24 +135,18 @@ export default function Overlay() {
   // Язык текущей диктовки от бэкенда (lang в "partial"/"status"). null =
   // не определён / старый бэкенд без поля → бейдж скрыт. Сброс на новой записи.
   const [lang, setLang] = useState<DetectedLang>(null);
-  const [finalHold, setFinalHold] = useState(false);
-  const finalHoldRef = useRef(false);
-  const finalHoldTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Плавный поток ПОСИМВОЛЬНО (как у Aqua Voice). partial-тики приходят рывками раз
-  // в ~700 мс целыми кусками; чтобы текст «втекал» непрерывно, а бегущий кружок-каретка
-  // будто «печатал» его, проявляем не слова, а СИМВОЛЫ по одному через rAF.
-  // targetText — полный текст последнего partial; committedLen — граница «стабильно/
-  // изменчиво» (в символах): slice(0,committedLen) — committed (белый), остаток —
-  // volatile (серый хвост). shown — сколько символов уже проявлено.
-  const targetTextRef = useRef<string>("");
-  const targetCharsRef = useRef<string[]>([]);
+  // Поток ПО СЛОВАМ: partial-тики приходят раз в 220–420 мс целыми кусками, и
+  // распознавание переписывает хвост. Общий префикс слов остаётся на месте,
+  // изменившиеся и новые слова вставляются span'ами и всплывают CSS-анимацией
+  // (.aq-w). textRef/committedLenRef — последний partial; committedLen — граница
+  // «стабильно/изменчиво» в символах (белое/серое).
+  const textRef = useRef("");
   const committedLenRef = useRef(0);
-  const shownRef = useRef(0);
+  const tokensRef = useRef<string[]>([]);
+  const wordsHostRef = useRef<HTMLSpanElement | null>(null);
   const hasPreviewRef = useRef(false);
   const [hasPreview, setHasPreview] = useState(false);
-  const [previewVersion, setPreviewVersion] = useState(0);
-  const [typing, setTyping] = useState(false);
   // Дедуп по seq: МОНОТОННЫЙ счётчик (НЕ сбрасывается между диктовками). partial старее
   // currentSeq — это эхо прошлой записи (StrictMode/async-гонки), игнорируем. seq константен
   // внутри диктовки (= её поколение) и строго растёт между ними, поэтому монотонность и
@@ -166,19 +155,8 @@ export default function Overlay() {
   // После принятого final обычный partial того же seq уже не имеет права менять
   // кружок: это может быть только запоздавший результат детачнутого live-worker.
   const finalSeqRef = useRef(-1);
-  // PERF (60fps): зеркало React-стейта typing, чтобы выставлять его РОВНО один раз
-  // на старте печати и один раз в конце — а не setState каждый кадр rAF.
-  const typingRef = useRef(false);
-  const rafRef = useRef<number | null>(null);
-  // shownFloat — ДРОБНЫЙ аккумулятор показанных символов (время × скорость), shown —
-  // его floor. lastFrame — метка прошлого кадра rAF для расчёта dt, чтобы темп печати
-  // НЕ зависел от частоты кадров и шёл плавно (ровно в 60 fps).
-  const shownFloatRef = useRef(0);
-  const lastFrameRef = useRef(0);
   // Скролл-контейнер: держим показанным «хвост» (последнее надиктованное).
   const scrollRef = useRef<HTMLDivElement>(null);
-  const committedTextRef = useRef<HTMLSpanElement>(null);
-  const volatileTextRef = useRef<HTMLSpanElement>(null);
   // Корневой узел пилюли — для замеров hit-rect (см. sendHit ниже).
   const pillRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -198,9 +176,56 @@ export default function Overlay() {
   const glowPosRef = useRef(0);
   const barEls = useRef<(HTMLSpanElement | null)[]>(new Array(BAR_COUNT).fill(null));
   const glowEl = useRef<HTMLSpanElement | null>(null);
+  const orbEl = useRef<HTMLSpanElement | null>(null);
   const levelRafRef = useRef<number | null>(null);
   const levelLastRef = useRef(0);
   const reducedMotionRef = useRef(false);
+
+  // Перерисовать поток слов в DOM напрямую (без React-рендера на каждый partial).
+  // Совпавшие слова остаются теми же узлами — не мигают; с первого отличия
+  // хвост пересоздаётся, и новые span'ы всплывают CSS-анимацией.
+  const paintWords = () => {
+    const tokens = wordTokens(textRef.current);
+    const host = wordsHostRef.current;
+    if (host) {
+      const same = Math.min(
+        sharedWordPrefix(tokensRef.current, tokens),
+        host.childNodes.length,
+      );
+      while (host.childNodes.length > same) host.lastChild?.remove();
+      let offset = 0;
+      tokens.forEach((token, idx) => {
+        const cls =
+          "aq-w " + (offset < committedLenRef.current ? "committed" : "volatile");
+        offset += Array.from(token).length;
+        if (idx < same) {
+          const el = host.childNodes[idx] as HTMLSpanElement;
+          if (el.textContent !== token) el.textContent = token;
+          if (el.className !== cls) el.className = cls;
+          return;
+        }
+        const el = document.createElement("span");
+        el.className = cls;
+        el.textContent = token;
+        host.appendChild(el);
+      });
+      tokensRef.current = tokens;
+    }
+    const nextHasPreview = tokens.length > 0;
+    if (hasPreviewRef.current !== nextHasPreview) {
+      hasPreviewRef.current = nextHasPreview;
+      setHasPreview(nextHasPreview);
+    }
+  };
+
+  // Стабильный ref-колбэк: inline-функция менялась бы каждый рендер, React
+  // переподключал бы узел, и все слова заново всплывали бы на любой setState.
+  // Узел монтируется при входе в stream — рисуем в него уже пришедший текст.
+  const attachWordsHost = useRef((el: HTMLSpanElement | null) => {
+    wordsHostRef.current = el;
+    tokensRef.current = [];
+    if (el) paintWords();
+  }).current;
 
   useEffect(() => {
     if (IS_TAURI_RUNTIME) return;
@@ -223,15 +248,9 @@ export default function Overlay() {
         setNotice("Не удалось вставить текст");
       }
       if (demo === "stream" || demo === "stream-processing") {
-        const text = "Добавь автоматические тесты для Windows";
-        const chars = Array.from(text);
-        targetTextRef.current = text;
-        targetCharsRef.current = chars;
+        textRef.current = "Добавь автоматические тесты для Windows";
         committedLenRef.current = Array.from("Добавь автоматические тесты").length;
-        shownFloatRef.current = chars.length;
-        shownRef.current = chars.length;
-        hasPreviewRef.current = true;
-        setHasPreview(true);
+        paintWords();
         setLang("ru");
       }
     }, 60);
@@ -283,102 +302,14 @@ export default function Overlay() {
       needScrollRef.current = false;
     };
 
-    // PERF: посимвольный preview не должен перерисовывать весь Overlay. React
-    // получает только булев переход «текст появился/исчез», а сами две текстовые
-    // ноды и data-shown обновляются напрямую максимум один раз за rAF.
-    const setShownDirect = (n: number) => {
-      shownRef.current = n;
-      const chars = targetCharsRef.current;
-      const visible = Math.min(n, chars.length);
-      const cut = Math.min(committedLenRef.current, visible);
-      if (committedTextRef.current) {
-        committedTextRef.current.textContent = chars.slice(0, cut).join("");
-      }
-      if (volatileTextRef.current) {
-        volatileTextRef.current.textContent = chars.slice(cut, visible).join("");
-      }
-      if (pillRef.current) pillRef.current.dataset.shown = String(visible);
-      const nextHasPreview = visible > 0;
-      if (hasPreviewRef.current !== nextHasPreview) {
-        hasPreviewRef.current = nextHasPreview;
-        setHasPreview(nextHasPreview);
-      }
+    const showText = (text: string, committedLen: number) => {
+      textRef.current = text;
+      committedLenRef.current = committedLen;
+      paintWords();
       requestScroll();
     };
-    // PERF: typing-стейт пишем в React ТОЛЬКО при реальной смене значения. Иначе
-    // tick/kick дёргали бы setTyping каждый кадр → лишняя перерисовка React в 60 fps.
-    const setTypingOnce = (v: boolean) => {
-      if (typingRef.current === v) return;
-      typingRef.current = v;
-      setTyping(v);
-    };
-    const stopRaf = () => {
-      if (rafRef.current != null) {
-        cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
-      }
-    };
-    const clearFinalHold = () => {
-      if (finalHoldTimer.current) {
-        clearTimeout(finalHoldTimer.current);
-        finalHoldTimer.current = null;
-      }
-      finalHoldRef.current = false;
-      setFinalHold(false);
-    };
-    // Полный сброс потока печати (новая диктовка / уход в покой).
-    const resetTextEngine = () => {
-      stopRaf();
-      targetTextRef.current = "";
-      targetCharsRef.current = [];
-      committedLenRef.current = 0;
-      shownFloatRef.current = 0;
-      lastFrameRef.current = 0;
-      setShownDirect(0);
-      setTypingOnce(false);
-      clearFinalHold();
-    };
-
-    // Кадр потока: проявляем цель ПОСИМВОЛЬНО, ПОКАДРОВО (каждый кадр rAF ≈ 16.7 мс).
-    // Скорость в символах/сек × dt = сколько символов добавить за этот кадр (дробно
-    // копится в shownFloat). dt берём из реального времени → темп ровный и не зависит
-    // от FPS. Каждый новый символ мягко проявляется через CSS (.aq-ch) → текст «течёт».
-    const tick = (now: number) => {
-      const total = targetCharsRef.current.length;
-      if (shownFloatRef.current > total) shownFloatRef.current = total;
-      const last = lastFrameRef.current || now;
-      const dt = Math.min(64, now - last); // клампим скачок после простоя/таб-аут
-      lastFrameRef.current = now;
-
-      const pending = total - shownFloatRef.current;
-      if (pending <= 0.001) {
-        rafRef.current = null; // догнали — ждём следующий partial
-        lastFrameRef.current = 0;
-        setTypingOnce(false); // печать закончилась — один setState на смену
-        return;
-      }
-      // Символов/сек: live-кружок должен поспевать за речью. Небольшой хвост
-      // всё ещё проявляется плавно, но при большом отставании резко догоняем.
-      const cps = Math.max(180, Math.min(900, pending * 18));
-      shownFloatRef.current = Math.min(total, shownFloatRef.current + (cps * dt) / 1000);
-      const next = Math.floor(shownFloatRef.current);
-      if (next !== shownRef.current) setShownDirect(next);
-      rafRef.current = requestAnimationFrame(tick);
-    };
-    const kick = () => {
-      if (reducedMotionRef.current) {
-        stopRaf();
-        shownFloatRef.current = targetCharsRef.current.length;
-        setShownDirect(targetCharsRef.current.length);
-        setTypingOnce(false);
-        return;
-      }
-      setTypingOnce(true); // печать началась — один setState на смену
-      if (rafRef.current == null) {
-        lastFrameRef.current = 0; // первый кадр после простоя не делает скачок dt
-        rafRef.current = requestAnimationFrame(tick);
-      }
-    };
+    // Полный сброс потока (новая диктовка / уход в покой).
+    const resetTextEngine = () => showText("", 0);
 
     // --- rAF-цикл громкости: устойчивое экспоненциальное сглаживание баров/glow.
     // Работает,
@@ -426,6 +357,12 @@ export default function Overlay() {
         gl.style.transform = `scale(${(6.5 + g) / 9.1})`;
         gl.style.opacity = String(clamp01((g - 0.5) / 3.3) * 0.85);
       }
+      // Сам орб дышит голосом (как у Aqua): тишина — 1×, громко — до 1.45×.
+      const orb = orbEl.current;
+      if (orb) {
+        const v = reducedMotion ? 0 : clamp01(glowPosRef.current);
+        orb.style.transform = `scale(${1 + 0.45 * Math.sqrt(v)})`;
+      }
       if (!reducedMotion && (busy || fresh)) {
         levelRafRef.current = requestAnimationFrame(levelTick);
       } else {
@@ -465,18 +402,6 @@ export default function Overlay() {
         setLatchNotice(null);
       }, 1150);
     };
-    const holdFinalPreview = () => {
-      if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
-      finalHoldRef.current = true;
-      setFinalHold(true);
-      finalHoldTimer.current = setTimeout(() => {
-        finalHoldTimer.current = null;
-        finalHoldRef.current = false;
-        setFinalHold(false);
-        if (shouldResetFinalPreviewAfterHold(statusRef.current)) resetTextEngine();
-      }, FINAL_PREVIEW_HOLD_MS);
-    };
-
     // Применить lang из события: поля нет (undefined) — старый бэкенд, ничего
     // не меняем; null/незнакомое значение — язык не определён, бейдж прячем.
     const applyLang = (l: DetectedLang | undefined) => {
@@ -517,21 +442,11 @@ export default function Overlay() {
       } else if (v === "transcribing") {
         // Не стираем live-preview во время финального распознавания: пользователь
         // продолжает видеть сказанное, а кольцо на орбе показывает обработку.
-        stopRaf();
-        shownFloatRef.current = targetCharsRef.current.length;
-        setShownDirect(targetCharsRef.current.length);
-        setTypingOnce(false);
         kickLevel();
       } else {
-        // Короткий final-preview остаётся видимым до своего таймера; обычный текст
-        // сворачивается сразу после успешной вставки.
+        // Готовый текст в плашке не показываем: после вставки она сворачивается.
         clearLatch();
-        if (finalHoldRef.current) {
-          stopRaf();
-          setTypingOnce(false);
-        } else {
-          resetTextEngine();
-        }
+        resetTextEngine();
         kickLevel(); // дать уровням опасть, цикл сам заснёт
       }
       // lang из самого события (если бэкенд прислал) — ПОСЛЕ сброса на recording,
@@ -549,47 +464,15 @@ export default function Overlay() {
       currentSeqRef.current = resolved.currentSeq;
       finalSeqRef.current = resolved.finalSeq;
       const preview = resolved.preview;
-      if (preview == null) return;
-      const { text, committedLen: nextCommittedLen } = preview;
-      const isFinalPreview = preview.isFinal;
-      const isSettledPreview = preview.isSettled;
-      if (!isFinalPreview && !isSettledPreview && finalHoldRef.current) {
-        clearFinalHold();
-      }
+      // Финал (вставленный текст) в плашке не показываем — только то, что слышно.
+      if (preview == null || preview.isFinal) return;
       // Язык от STT (опционален): обновляем после дедупа — эхо прошлой записи
       // не перетирает бейдж текущей. setState с тем же значением React гасит сам.
       applyLang(e.payload?.lang);
-      const chars = Array.from(text);
-      const previewChanged =
-        targetTextRef.current !== text ||
-        committedLenRef.current !== nextCommittedLen;
-      targetTextRef.current = text;
-      targetCharsRef.current = chars;
-      // committed — префикс text; его длина в символах = граница «белое/серое».
-      committedLenRef.current = nextCommittedLen;
-      if (previewChanged) setPreviewVersion((v) => v + 1);
-      // Хвост укоротился (whisper переписал короче) — подрезаем показанное, без скачка.
-      if (shownFloatRef.current > chars.length) shownFloatRef.current = chars.length;
-      if (shownRef.current > chars.length) setShownDirect(chars.length);
-      // Если ASR прислал большой новый кусок, не заставляем пользователя ждать
-      // посимвольную анимацию всей фразы: держим максимум небольшой live-lag.
-      if (previewChanged) {
-        const maxLiveLag = isFinalPreview || isSettledPreview ? 0 : 28;
-        const lag = chars.length - shownFloatRef.current;
-        if (lag > maxLiveLag) {
-          shownFloatRef.current = Math.max(0, chars.length - maxLiveLag);
-          setShownDirect(Math.floor(shownFloatRef.current));
-        } else if (chars.length > 0 && shownFloatRef.current < 1) {
-          // Первая буква появляется в тот же event-turn, без пустого кадра.
-          shownFloatRef.current = 1;
-          setShownDirect(1);
-        } else {
-          // committed/volatile мог измениться при той же длине строки.
-          setShownDirect(shownRef.current);
-        }
+      if (textRef.current === preview.text && committedLenRef.current === preview.committedLen) {
+        return;
       }
-      if (preview.holdFinal) holdFinalPreview();
-      kick();
+      showText(preview.text, preview.committedLen);
     });
 
     // Громкость микрофона (~33 мс при записи). Дедуп отдельным счётчиком: level
@@ -646,12 +529,10 @@ export default function Overlay() {
 
     return () => {
       alive = false;
-      stopRaf();
       stopScrollRaf();
       stopLevelRaf();
       if (noticeTimer.current) clearTimeout(noticeTimer.current);
       if (latchTimer.current) clearTimeout(latchTimer.current);
-      if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
       for (const fn of unlisteners) fn();
       motionQuery.removeEventListener("change", syncMotionPreference);
     };
@@ -665,7 +546,7 @@ export default function Overlay() {
       ? "notice"
       : latchNotice != null
         ? "latch"
-        : previewPillMode(status, hasPreview, finalHold);
+        : previewPillMode(status, hasPreview, false);
   const compactHotkeyTip = compactHotkeyLabel(hotkeyTip);
 
   const pillHitRect = () => {
@@ -887,7 +768,6 @@ export default function Overlay() {
           ref={pillRef}
           data-mode={mode}
           data-status={status}
-          data-shown={shownRef.current}
           title={
             offline && isProcessing
               ? "Облако недоступно — локальное распознавание"
@@ -930,47 +810,22 @@ export default function Overlay() {
                 transform/opacity пишет rAF-цикл громкости напрямую (без setState). */}
             <span className="aq-orbwrap" aria-hidden>
               <span className="aq-orb-glow" ref={glowEl} />
-              <span className="aq-orb" />
+              <span className="aq-orb" ref={orbEl} />
               {isProcessing && <span className="aq-ring" />}
             </span>
             {mode === "stream" ? (
-              (() => {
-                const chars = targetCharsRef.current;
-                const vis = Math.min(shownRef.current, chars.length);
-                // Граница committed — не дальше показанного.
-                const cut = Math.min(committedLenRef.current, vis);
-                const committedText = chars.slice(0, cut).join("");
-                const volatileText = chars.slice(cut, vis).join("");
-                return (
-                  <div
-                    className="aq-text"
-                    ref={scrollRef}
-                    data-preview-version={previewVersion}
+              <div className="aq-text" ref={scrollRef}>
+                {/* Слова пишет paintWords напрямую; React детей не рендерит. */}
+                <span ref={attachWordsHost} />
+                {offline && (
+                  <span
+                    className="aq-offline"
+                    title="Облако недоступно — локальное распознавание"
                   >
-                    <span className="aq-chunk committed" ref={committedTextRef}>
-                      {committedText}
-                    </span>
-                    <span className="aq-chunk volatile" ref={volatileTextRef}>
-                      {volatileText}
-                    </span>
-                    {/* Каретка-кружок — последний inline-элемент: всегда вплотную за
-                        текстом и переносится вместе с ним. Пульс при печати, мигание в покое. */}
-                    <span
-                      className={"aq-caret " + (typing ? "is-typing" : "is-idle")}
-                      aria-hidden
-                    />
-                    {offline && (
-                      <span
-                        className="aq-offline"
-                        title="Облако недоступно — локальное распознавание"
-                      >
-                        офлайн
-                      </span>
-                    )}
-                    {finalHold && <span className="aq-final-badge">готово</span>}
-                  </div>
-                );
-              })()
+                    офлайн
+                  </span>
+                )}
+              </div>
             ) : (
               // 12 баров визуализатора; высоту/прозрачность пишет rAF-цикл громкости.
               // Пока событий "level" нет (бэкенд не готов) — стоят на CSS-минимуме.

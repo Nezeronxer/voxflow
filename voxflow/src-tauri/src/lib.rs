@@ -225,6 +225,7 @@ pub fn run() {
             commands::list_models,
             commands::models_dir,
             commands::download_model,
+            commands::cancel_model_download,
             commands::delete_model,
             commands::toggle_dictation,
             commands::overlay_click,

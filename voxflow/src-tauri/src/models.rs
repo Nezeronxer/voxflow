@@ -14,11 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-#[cfg(windows)]
-const NO_WINDOW: u32 = 0x08000000;
-
 #[derive(Serialize, Clone)]
 pub struct ModelInfo {
     pub name: String,
@@ -43,11 +38,10 @@ const WEAK_LEGACY_WHISPER_NAMES: &[&str] = &["ggml-tiny.bin", "ggml-base.bin", "
 
 /// Защита от двойного запуска загрузки каталожной модели: автозагрузка при первом
 /// старте (ensure_default_models) и клик «Скачать» в UI могут прилететь
-/// одновременно — два параллельных curl в один .part порвали бы файл. У
-/// whisper-моделей такой гонки нет (качаются только по клику).
+/// одновременно — два параллельных curl в один .part порвали бы файл.
+/// Whisper-модели сторожит WHISPER_ACTIVE ниже.
 static GIGAAM_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 static PARAKEET_DOWNLOADING: AtomicBool = AtomicBool::new(false);
-static WHISPER_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
 struct Artifact {
@@ -469,6 +463,7 @@ pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Setting
         return;
     };
 
+    let proxy = settings.proxy_url.clone();
     // Проверка legacy-файла может включать однократный SHA больших весов, поэтому
     // не блокируем setup/UI. Успешная проверка пишет marker и следующие старты быстры.
     std::thread::spawn(move || {
@@ -478,15 +473,72 @@ pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Setting
             verify_whisper_model_path(&crate::paths::model_path(&name)).is_ok()
         };
         if !ready {
-            if let Err(e) = start_download(app, name) {
+            if let Err(e) = start_download(app, name, proxy) {
                 log::error!("ensure_default_models: {e:#}");
             }
         }
     });
 }
 
-/// Запустить загрузку в фоновом потоке. События: `model:progress` / `model:done` / `model:error`.
-pub fn start_download(app: AppHandle, name: String) -> Result<()> {
+/// Имена моделей, чью загрузку попросили отменить. Цикл curl проверяет флаг
+/// раз в 400 мс, убивает curl и оставляет .part — следующий «Скачать» докачает.
+static CANCEL_REQUESTS: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+/// Какая whisper-модель сейчас качается: повторный клик по ней же — не ошибка.
+static WHISPER_ACTIVE: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
+
+pub fn cancel_download(name: &str) {
+    let mut requests = CANCEL_REQUESTS.lock();
+    if !requests.iter().any(|n| n == name) {
+        requests.push(name.to_string());
+    }
+}
+
+fn cancel_requested(name: &str) -> bool {
+    CANCEL_REQUESTS.lock().iter().any(|n| n == name)
+}
+
+fn clear_cancel(name: &str) -> bool {
+    let mut requests = CANCEL_REQUESTS.lock();
+    let before = requests.len();
+    requests.retain(|n| n != name);
+    requests.len() != before
+}
+
+/// Итог фонового потока загрузки → событие для UI. Отмена — не ошибка:
+/// `model:cancelled`, частичный файл остаётся для докачки.
+fn report(app: &AppHandle, name: &str, result: Result<()>) {
+    let cancelled = clear_cancel(name);
+    match result {
+        Ok(()) => {}
+        Err(_) if cancelled => {
+            let _ = app.emit("model:cancelled", serde_json::json!({ "name": name }));
+        }
+        Err(e) => {
+            log::error!("download {name}: {e:#}");
+            let _ = app.emit(
+                "model:error",
+                // "error" читает фронт (types.ts), "message" — для обратной совместимости.
+                serde_json::json!({ "name": name, "error": e.to_string(), "message": e.to_string() }),
+            );
+        }
+    }
+}
+
+/// Запустить загрузку в фоновом потоке. События: `model:progress` / `model:done` /
+/// `model:error` / `model:cancelled`. Любой отказ тоже уходит `model:error`,
+/// иначе UI, уже нарисовавший прогресс, висел бы на «скачивание…».
+pub fn start_download(app: AppHandle, name: String, proxy: String) -> Result<()> {
+    let result = spawn_download(app.clone(), name.clone(), proxy);
+    if let Err(e) = &result {
+        let _ = app.emit(
+            "model:error",
+            serde_json::json!({ "name": name, "error": e.to_string(), "message": e.to_string() }),
+        );
+    }
+    result
+}
+
+fn spawn_download(app: AppHandle, name: String, proxy: String) -> Result<()> {
     if let Some(m) = find_dir_model(&name) {
         // Уже качается → молча выходим: события прогресса и так летят от первого
         // потока, второй curl поверх того же .part устроил бы кашу.
@@ -496,17 +548,11 @@ pub fn start_download(app: AppHandle, name: String) -> Result<()> {
         {
             return Ok(());
         }
+        clear_cancel(m.name);
         std::thread::spawn(move || {
-            let r = run_download_dir(&app, m);
+            let r = run_download_dir(&app, m, &proxy);
             m.downloading.store(false, Ordering::SeqCst);
-            if let Err(e) = r {
-                log::error!("download {}: {e:#}", m.name);
-                let _ = app.emit(
-                    "model:error",
-                    // "error" читает фронт (types.ts), "message" — для обратной совместимости.
-                    serde_json::json!({ "name": m.name, "error": e.to_string(), "message": e.to_string() }),
-                );
-            }
+            report(&app, m.name, r);
         });
         return Ok(());
     }
@@ -520,35 +566,131 @@ pub fn start_download(app: AppHandle, name: String) -> Result<()> {
             "Эта legacy-модель больше не предлагается; выберите Large v3 Turbo Q5"
         ));
     }
-    if WHISPER_DOWNLOADING
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
     {
-        let message = "Уже загружается другая Whisper-модель";
-        let _ = app.emit(
-            "model:error",
-            serde_json::json!({ "name": name, "error": message, "message": message }),
-        );
-        return Err(anyhow!(message));
-    }
-    std::thread::spawn(move || {
-        if let Err(e) = run_download(&app, &name) {
-            log::error!("download {name}: {e:#}");
-            let _ = app.emit(
-                "model:error",
-                serde_json::json!({ "name": name, "error": e.to_string(), "message": e.to_string() }),
-            );
+        let mut active = WHISPER_ACTIVE.lock();
+        match active.as_deref() {
+            Some(current) if current == name => return Ok(()),
+            Some(_) => return Err(anyhow!("Уже загружается другая Whisper-модель")),
+            None => *active = Some(name.clone()),
         }
-        WHISPER_DOWNLOADING.store(false, Ordering::SeqCst);
+    }
+    clear_cancel(&name);
+    std::thread::spawn(move || {
+        let r = run_download(&app, &name, &proxy);
+        *WHISPER_ACTIVE.lock() = None;
+        report(&app, &name, r);
     });
     Ok(())
+}
+
+/// Понятная причина вместо «exit status: 6»: чаще всего из РФ это недоступный
+/// huggingface.co, и лечится прокси в настройках.
+fn curl_failure(artifact: &str, code: Option<i32>, stderr: &str) -> anyhow::Error {
+    let hint = match code {
+        Some(5) => "не удалось подключиться к прокси — проверьте адрес прокси в настройках",
+        Some(6) | Some(7) | Some(35) | Some(52) | Some(56) => {
+            "нет связи с huggingface.co — проверьте интернет или укажите прокси в настройках «Облако»"
+        }
+        Some(28) => "сеть слишком медленная или соединение зависло — повторите, загрузка продолжится",
+        Some(22) => "сервер отказал в выдаче файла (HTTP-ошибка) — повторите позже",
+        Some(23) => "не удалось записать файл — проверьте свободное место на диске",
+        _ => "загрузка прервалась — повторите, она продолжится с места обрыва",
+    };
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        anyhow!("{artifact}: {hint}")
+    } else {
+        anyhow!("{artifact}: {hint} ({detail})")
+    }
+}
+
+/// Скачать один файл в `<dest>.part` с докачкой и прогрессом, проверить SHA и
+/// атомарно переименовать в `dest`. `(base, total)` — для суммарного прогресса
+/// многофайловой модели (`received = base + размер .part`).
+fn download_artifact<R: tauri::Runtime>(
+    app: &AppHandle<R>,
+    event_name: &str,
+    url: &str,
+    dest: &std::path::Path,
+    artifact: Artifact,
+    (base, total): (u64, u64),
+    proxy: &str,
+) -> Result<()> {
+    // .part уникален: расширения файлов различны, with_extension не конфликтует.
+    let part = dest.with_extension("part");
+    let part_len = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
+    if part_len > artifact.size_bytes {
+        let _ = std::fs::remove_file(&part);
+    } else if part_len == artifact.size_bytes && finalize_part(&part, dest, artifact).is_ok() {
+        return Ok(());
+    }
+
+    let mut reset_after_unsupported_resume = false;
+    loop {
+        let resume = std::fs::metadata(&part)
+            .map(|meta| meta.len() > 0)
+            .unwrap_or(false);
+        let mut cmd = crate::net::curl();
+        crate::net::apply_proxy(&mut cmd, proxy);
+        cmd.arg("-L")
+            .arg("--fail")
+            .arg("--silent")
+            .arg("--show-error")
+            .arg("-o")
+            .arg(&part)
+            .arg(url)
+            .stderr(std::process::Stdio::piped());
+        configure_resumable_curl(&mut cmd, resume);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
+
+        let status = loop {
+            std::thread::sleep(Duration::from_millis(400));
+            let received = base + std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
+            let _ = app.emit(
+                "model:progress",
+                serde_json::json!({ "name": event_name, "received": received, "total": total }),
+            );
+            if cancel_requested(event_name) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("загрузка отменена"));
+            }
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+        };
+        // --silent --show-error: в stderr одна строка, pipe не переполнится.
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            let _ = pipe.read_to_string(&mut stderr);
+        }
+
+        if status.success() {
+            return finalize_part(&part, dest, artifact);
+        }
+        // Crash мог случиться после последнего байта, но до rename; не теряем
+        // уже валидный файл из-за HTTP 416/ошибки возобновления.
+        if finalize_part(&part, dest, artifact).is_ok() {
+            return Ok(());
+        }
+        // 33 = сервер не умеет докачку — начинаем заново один раз.
+        if status.code() == Some(33) && resume && !reset_after_unsupported_resume {
+            let _ = std::fs::remove_file(&part);
+            reset_after_unsupported_resume = true;
+            continue;
+        }
+        return Err(curl_failure(artifact.name, status.code(), &stderr));
+    }
 }
 
 /// Скачать файлы каталожной ONNX-модели последовательно в её каталог. Прогресс —
 /// СУММАРНЫЙ (готовые байты всех файлов / общий размер) под единым именем модели.
 /// Файл с уже правильным размером — скип: докачка после обрыва сети/закрытия
 /// приложения продолжает с первого недокачанного файла.
-fn run_download_dir(app: &AppHandle, m: &DirModel) -> Result<()> {
+fn run_download_dir(app: &AppHandle, m: &DirModel, proxy: &str) -> Result<()> {
     let dir = (m.dir)();
     std::fs::create_dir_all(&dir)?;
     let total: u64 = m.files.iter().map(|artifact| artifact.size_bytes).sum();
@@ -556,75 +698,10 @@ fn run_download_dir(app: &AppHandle, m: &DirModel) -> Result<()> {
 
     for artifact in m.files {
         let dest = dir.join(artifact.name);
-        if verify_artifact(&dest, *artifact).is_ok() {
-            base += artifact.size_bytes;
-            continue;
-        }
-        remove_artifact(&dest);
-
-        // .part уникален: расширения файлов различны, with_extension не конфликтует.
-        let part = dest.with_extension("part");
-        let part_len = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
-        if part_len > artifact.size_bytes {
-            let _ = std::fs::remove_file(&part);
-        } else if part_len == artifact.size_bytes && finalize_part(&part, &dest, *artifact).is_ok()
-        {
-            base += artifact.size_bytes;
-            continue;
-        }
-
-        let url = format!("{}{}", m.base_url, artifact.name);
-        let mut reset_after_unsupported_resume = false;
-        loop {
-            let resume = std::fs::metadata(&part)
-                .map(|meta| meta.len() > 0)
-                .unwrap_or(false);
-            let mut cmd = Command::new("curl");
-            cmd.arg("-L")
-                .arg("--fail")
-                .arg("--silent")
-                .arg("--show-error")
-                .arg("-o")
-                .arg(&part)
-                .arg(&url);
-            configure_resumable_curl(&mut cmd, resume);
-            #[cfg(windows)]
-            cmd.creation_flags(NO_WINDOW);
-
-            let mut child = cmd
-                .spawn()
-                .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
-
-            let status = loop {
-                std::thread::sleep(Duration::from_millis(400));
-                let received = base + std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
-                let _ = app.emit(
-                    "model:progress",
-                    serde_json::json!({ "name": m.name, "received": received, "total": total }),
-                );
-                if let Some(status) = child.try_wait()? {
-                    break status;
-                }
-            };
-
-            if status.success() {
-                finalize_part(&part, &dest, *artifact)?;
-                break;
-            }
-            // Crash мог случиться после последнего байта, но до rename; не теряем
-            // уже валидный файл из-за HTTP 416/ошибки возобновления.
-            if finalize_part(&part, &dest, *artifact).is_ok() {
-                break;
-            }
-            if status.code() == Some(33) && resume && !reset_after_unsupported_resume {
-                let _ = std::fs::remove_file(&part);
-                reset_after_unsupported_resume = true;
-                continue;
-            }
-            return Err(anyhow!(
-                "curl ({}) завершился с ошибкой: {status}; частичная загрузка сохранена",
-                artifact.name
-            ));
+        if verify_artifact(&dest, *artifact).is_err() {
+            remove_artifact(&dest);
+            let url = format!("{}{}", m.base_url, artifact.name);
+            download_artifact(app, m.name, &url, &dest, *artifact, (base, total), proxy)?;
         }
         base += artifact.size_bytes;
     }
@@ -637,82 +714,21 @@ fn run_download_dir(app: &AppHandle, m: &DirModel) -> Result<()> {
     Ok(())
 }
 
-fn run_download(app: &AppHandle, name: &str) -> Result<()> {
+fn run_download(app: &AppHandle, name: &str, proxy: &str) -> Result<()> {
     let entry = catalog_entry(name).ok_or_else(|| anyhow!("Неизвестная модель: {name}"))?;
     let artifact = whisper_artifact(entry);
     let dest = crate::paths::model_path(name);
-    if verify_artifact(&dest, artifact).is_ok() {
-        let _ = app.emit("model:done", serde_json::json!({ "name": name }));
-        return Ok(());
-    }
-    remove_artifact(&dest);
-    let part = dest.with_extension("part");
-    let url = url_for(name);
-    let total = entry.size_bytes;
-    let part_len = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
-    if part_len > total {
-        let _ = std::fs::remove_file(&part);
-    } else if part_len == total && finalize_part(&part, &dest, artifact).is_ok() {
+    if verify_artifact(&dest, artifact).is_err() {
+        remove_artifact(&dest);
+        let total = entry.size_bytes;
+        download_artifact(app, name, &url_for(name), &dest, artifact, (0, total), proxy)?;
         let _ = app.emit(
             "model:progress",
             serde_json::json!({ "name": name, "received": total, "total": total }),
         );
-        let _ = app.emit("model:done", serde_json::json!({ "name": name }));
-        return Ok(());
     }
-
-    let mut reset_after_unsupported_resume = false;
-    loop {
-        let resume = std::fs::metadata(&part)
-            .map(|meta| meta.len() > 0)
-            .unwrap_or(false);
-        let mut cmd = Command::new("curl");
-        cmd.arg("-L")
-            .arg("--fail")
-            .arg("--silent")
-            .arg("--show-error")
-            .arg("-o")
-            .arg(&part)
-            .arg(&url);
-        configure_resumable_curl(&mut cmd, resume);
-        #[cfg(windows)]
-        cmd.creation_flags(NO_WINDOW);
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
-
-        let status = loop {
-            std::thread::sleep(Duration::from_millis(400));
-            let received = std::fs::metadata(&part).map(|meta| meta.len()).unwrap_or(0);
-            let _ = app.emit(
-                "model:progress",
-                serde_json::json!({ "name": name, "received": received, "total": total }),
-            );
-            if let Some(status) = child.try_wait()? {
-                break status;
-            }
-        };
-        if status.success() || finalize_part(&part, &dest, artifact).is_ok() {
-            if !dest.exists() {
-                finalize_part(&part, &dest, artifact)?;
-            }
-            let _ = app.emit(
-                "model:progress",
-                serde_json::json!({ "name": name, "received": total, "total": total }),
-            );
-            let _ = app.emit("model:done", serde_json::json!({ "name": name }));
-            return Ok(());
-        }
-        if status.code() == Some(33) && resume && !reset_after_unsupported_resume {
-            let _ = std::fs::remove_file(&part);
-            reset_after_unsupported_resume = true;
-            continue;
-        }
-        return Err(anyhow!(
-            "curl завершился с ошибкой: {status}; частичная загрузка сохранена"
-        ));
-    }
+    let _ = app.emit("model:done", serde_json::json!({ "name": name }));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -902,6 +918,53 @@ mod tests {
                 m.name
             );
         }
+    }
+
+    /// Живая загрузка маленького файла GigaAM с HF: докачка с середины .part,
+    /// отмена и внятная ошибка при мёртвом прокси.
+    #[test]
+    #[ignore = "requires network access to huggingface.co"]
+    fn download_artifact_resumes_cancels_and_explains_proxy_failure() {
+        let app = tauri::test::mock_app();
+        let handle = app.handle();
+        let artifact = GIGAAM_ARTIFACTS[3]; // vocab.txt, 13 КБ
+        let url = format!("{}{}", DIR_MODELS[0].base_url, artifact.name);
+        let dir = std::env::temp_dir().join(format!("voxflow-dl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join(artifact.name);
+        let span = (0, artifact.size_bytes);
+
+        download_artifact(handle, "t-fresh", &url, &dest, artifact, span, "").expect("fresh");
+        let full = std::fs::read(&dest).unwrap();
+
+        // Докачка: .part с первой половиной файла → curl продолжает, SHA сходится.
+        let resumed = dir.join("resumed.txt");
+        std::fs::write(resumed.with_extension("part"), &full[..full.len() / 2]).unwrap();
+        download_artifact(handle, "t-resume", &url, &resumed, artifact, span, "").expect("resume");
+        assert_eq!(std::fs::read(&resumed).unwrap(), full);
+
+        let cancelled = dir.join("cancelled.txt");
+        cancel_download("t-cancel");
+        let err = download_artifact(handle, "t-cancel", &url, &cancelled, artifact, span, "")
+            .unwrap_err();
+        assert!(err.to_string().contains("отменена"), "{err}");
+        assert!(clear_cancel("t-cancel"));
+        assert!(!cancelled.exists());
+
+        let proxied = dir.join("proxied.txt");
+        let err = download_artifact(
+            handle,
+            "t-proxy",
+            &url,
+            &proxied,
+            artifact,
+            span,
+            "http://127.0.0.1:9",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("прокси"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
