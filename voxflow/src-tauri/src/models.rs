@@ -930,6 +930,7 @@ mod tests {
 
     /// Живая загрузка маленького файла GigaAM с HF: докачка с середины .part,
     /// отмена и внятная ошибка при мёртвом прокси.
+    #[cfg(not(windows))]
     #[test]
     #[ignore = "requires network access to huggingface.co"]
     fn download_artifact_resumes_cancels_and_explains_proxy_failure() {
