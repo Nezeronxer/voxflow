@@ -5410,11 +5410,10 @@ mod seg_tests {
             }
             // Эталон — то, что реально вставляется: компакт тишины + нарезка финала.
             let compact = compact_speech_for_final_asr(&vad_final, &samples);
-            let final_text = local_transcribe_long(&vad_final, &compact, &mut |seg| {
-                g.transcribe(seg)
-            })
-            .unwrap_or_default()
-            .replace(SEMANTIC_PARAGRAPH_MARKER, " ");
+            let final_text =
+                local_transcribe_long(&vad_final, &compact, &mut |seg| g.transcribe(seg))
+                    .unwrap_or_default()
+                    .replace(SEMANTIC_PARAGRAPH_MARKER, " ");
             if final_text.trim().is_empty() {
                 continue;
             }

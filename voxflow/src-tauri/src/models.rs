@@ -721,7 +721,15 @@ fn run_download(app: &AppHandle, name: &str, proxy: &str) -> Result<()> {
     if verify_artifact(&dest, artifact).is_err() {
         remove_artifact(&dest);
         let total = entry.size_bytes;
-        download_artifact(app, name, &url_for(name), &dest, artifact, (0, total), proxy)?;
+        download_artifact(
+            app,
+            name,
+            &url_for(name),
+            &dest,
+            artifact,
+            (0, total),
+            proxy,
+        )?;
         let _ = app.emit(
             "model:progress",
             serde_json::json!({ "name": name, "received": total, "total": total }),
