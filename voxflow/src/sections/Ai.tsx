@@ -47,16 +47,22 @@ function withCurrentOption(options: readonly Option[], current: string): Option[
 }
 
 
+/**
+ * `part`: main — выбор нейросети, ключ и проверка; advanced — облачное
+ * распознавание Gemini и надёжность обработки (свёрнутое «Дополнительно»).
+ */
 export default function Ai({
   settings,
   update,
   persist,
   embedded,
+  part,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
   persist?: (settings: Settings) => Promise<boolean>;
   embedded?: boolean;
+  part?: "main" | "advanced";
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(
@@ -210,32 +216,24 @@ export default function Ai({
     }
   }
 
-  return (
-    <SectionShell embedded={embedded}>
-      {!embedded && (
-        <PageHead
-          title="ИИ"
-          desc="Подключите нейросеть для умной обработки текста и облачного распознавания."
-        />
-      )}
-
+  const main = (
+    <>
       <LocalAiCard settings={settings} update={update} />
 
       <div className="card">
         <div className="card-head">
-          <div className="card-title">Бэкенд</div>
+          <div className="card-title">Нейросеть</div>
           <div className="sub">
-            Локальное распознавание остаётся по умолчанию и работает офлайн. ИИ
-            подключается отдельно.
+            Переписывает распознанный текст по смыслу: пунктуация, абзацы, стиль.
           </div>
         </div>
 
         <Field
-          label="Бэкенд ИИ"
+          label="Нейросеть для текста"
           hint={
             aiOff
-              ? "Выключен: в поле уходит то, что расслышал распознаватель. Чтобы текст вставлялся по смыслу, включите встроенный локальный ИИ или подключите свой ключ"
-              : "Какую нейросеть использовать для умных функций"
+              ? "Выключена — вставляется ровно то, что распознано"
+              : "Какая нейросеть обрабатывает текст"
           }
         >
           <Select
@@ -276,7 +274,7 @@ export default function Ai({
               }
             }}
             options={[
-              { value: "off", label: "Выключен" },
+              { value: "off", label: "Выключена" },
               { value: "builtin", label: "Встроенный локальный ИИ (без установки)" },
               { value: "ollama", label: "Ollama на этом компьютере" },
               { value: "gemini", label: "Google Gemini" },
@@ -294,7 +292,7 @@ export default function Ai({
         {backend === "builtin" && (
           <Field
             label="Модель"
-            hint="Скачивание и выбор — в разделе «Локальный ИИ» в главном меню. Здесь только проверка."
+            hint="Скачивание и выбор — ниже, в «Моделях обработки на устройстве»"
           >
             <span className="badge accent">{settings.builtin_llm_model}</span>
           </Field>
@@ -557,9 +555,10 @@ export default function Ai({
           </>
         )}
 
+        {!aiOff && (
         <div className="add-row" style={{ display: "flex", alignItems: "center" }}>
           <button
-            className="btn btn-primary"
+            className="btn"
             onClick={onTest}
             disabled={testing || aiOff}
           >
@@ -576,31 +575,18 @@ export default function Ai({
               {result.ok ? result.message || "Подключение работает" : result.message}
             </span>
           )}
-          {aiOff && !result && (
-            <span style={{ fontSize: 12.5, color: "var(--amber)" }}>
-              Сначала выберите бэкенд ИИ
-            </span>
-          )}
         </div>
+        )}
       </div>
+    </>
+  );
 
-      <div className="card">
-        <div className="card-head">
-          <div className="card-title">Умные функции</div>
-          {aiOff && (
-            <div className="sub" style={{ color: "var(--amber)" }}>
-              Для функций ниже нужно включить бэкенд ИИ
-            </div>
-          )}
-        </div>
-
+  const advanced = (
+    <>
+      {backend === "gemini" && (
         <Field
-          label="Облачное распознавание"
-          hint={
-            backend === "ollama" || backend === "builtin"
-              ? "Только для облачного Gemini: локальный ИИ работает с текстом. Локальное распознавание остаётся по умолчанию."
-              : "Gemini вместо локального распознавания. Локальный GigaAM/Parakeet/Whisper остаётся приватным запасным вариантом — аудио не покидает устройство."
-          }
+          label="Распознавать речь через Gemini"
+          hint="Звук уходит в Google вместо распознавания на устройстве"
         >
           <span
             style={
@@ -615,26 +601,12 @@ export default function Ai({
             />
           </span>
         </Field>
-
-        {aiOff && (
-          <div className="field-hint" style={{ marginTop: 12, maxWidth: "none" }}>
-            Эти функции работают только при включённом бэкенде ИИ.
-          </div>
-        )}
-      </div>
-
-      <div className="card">
-        <div className="card-head">
-          <div className="card-title">Надёжность рерайта</div>
-          <div className="sub">
-            Рерайт синхронный: не успел или потерял слова — в поле уходит текст
-            после локальных правил.
-          </div>
-        </div>
-
+      )}
+      {!aiOff && (
+        <>
         <Field
-          label="Таймаут ответа, с"
-          hint="Сколько ждать ответа модели. Локальный ИИ получает минимум 60 с — на CPU меньше не хватает"
+          label="Ждать ответ нейросети, с"
+          hint="Не ответила вовремя — вставится текст без обработки"
         >
           <input
             type="number"
@@ -653,8 +625,8 @@ export default function Ai({
         </Field>
 
         <Field
-          label="Сохранять слов, %"
-          hint="Какая доля слов диктовки обязана остаться в ответе модели. Ниже порога рерайт отклоняется целиком. 100% = запрет любой потери"
+          label="Защита от потери слов, %"
+          hint="Если нейросеть выбросила больше слов — её ответ не используется"
         >
           <input
             type="number"
@@ -674,8 +646,8 @@ export default function Ai({
         </Field>
 
         <Field
-          label="Максимум токенов ответа"
-          hint="Верхняя граница; фактический лимит считается от длины диктовки. Обрыв по лимиту не вставляется — отдаётся исходный текст"
+          label="Предел длины ответа, токенов"
+          hint="Верхняя граница; обрезанный ответ не вставляется"
         >
           <input
             type="number"
@@ -693,7 +665,23 @@ export default function Ai({
             }}
           />
         </Field>
-      </div>
+        </>
+      )}
+    </>
+  );
+
+  if (part === "main") return main;
+  if (part === "advanced") return advanced;
+  return (
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="ИИ"
+          desc="Подключите нейросеть для умной обработки текста и облачного распознавания."
+        />
+      )}
+      {main}
+      <div className="card">{advanced}</div>
     </SectionShell>
   );
 }

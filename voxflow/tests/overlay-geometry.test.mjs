@@ -138,15 +138,18 @@ test("idle is a tiny outlined capsule and reveals the rich controls only on hove
   assert.equal(declaration(finalRule(".aq-idle:hover .aq-idle-copy"), "opacity"), "1");
 });
 
-test("live preview survives transcribing and frame updates bypass React state", () => {
+test("live preview survives transcribing and word updates bypass React state", () => {
   const transcribingBranch = /else if \(v === "transcribing"\) \{([\s\S]*?)\n\s*\} else \{/.exec(
     overlaySource,
   );
   assert.ok(transcribingBranch, "missing transcribing status branch");
   assert.doesNotMatch(transcribingBranch[1], /resetTextEngine\(\)/);
-  assert.match(transcribingBranch[1], /setShownDirect\(targetCharsRef\.current\.length\)/);
   assert.doesNotMatch(overlaySource, /const \[shown,\s*setShown\]/);
-  assert.match(overlaySource, /committedTextRef\.current\.textContent/);
+  // Слова пишутся в DOM напрямую, совпавший префикс не пересоздаётся.
+  assert.match(overlaySource, /host\.appendChild\(el\)/);
+  assert.match(overlaySource, /sharedWordPrefix\(tokensRef\.current, tokens\)/);
+  // Вставленный финал в плашке не показывается.
+  assert.match(overlaySource, /if \(preview == null \|\| preview\.isFinal\) return;/);
   assert.match(overlaySource, /el\.style\.transform = `scaleY/);
   assert.match(overlaySource, /seq\?: number/);
   assert.match(overlaySource, /p\?\.latched === true/);
@@ -163,7 +166,8 @@ test("recording and double-tap latch share geometry without a second pop animati
 
 test("overlay honors reduced motion for both CSS and rAF-driven animation", () => {
   assert.match(overlaySource, /matchMedia\("\(prefers-reduced-motion: reduce\)"\)/);
-  assert.match(overlaySource, /if \(reducedMotionRef\.current\)/);
+  assert.match(overlaySource, /const reducedMotion = reducedMotionRef\.current/);
+  assert.match(overlaySource, /reducedMotion \? 0 : clamp01\(glowPosRef\.current\)/);
   assert.doesNotMatch(overlaySource, /SPRING_[KC]/);
   assert.match(overlaySource, /1 - Math\.exp\(-dt \/ tau\)/);
   const reducedMotion = /@media \(prefers-reduced-motion: reduce\) \{([\s\S]*)\}\s*$/.exec(css);

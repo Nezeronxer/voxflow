@@ -6,7 +6,7 @@ import {
   localLlmStop,
   subscribe,
 } from "../api";
-import { Icon, PageHead, Switch } from "../ui";
+import { Icon } from "../ui";
 import type {
   LocalLlmState,
   ModelDoneEvent,
@@ -144,157 +144,104 @@ export default function LocalLlm({
 
   const enabled = settings.ai_backend === "builtin";
   const installedCount = state.models.filter((m) => m.installed).length;
-  const active = state.models.find((m) => m.id === settings.builtin_llm_model);
 
+  const machine = [
+    state.machine.ram_gb > 0 ? `${state.machine.ram_gb} ГБ памяти` : "",
+    state.machine.cpu_cores ? `${state.machine.cpu_cores} ядер` : "",
+    state.gpu ? accelLabel(state.machine) : accelLabel({ ...state.machine, accel: { kind: "cpu_only" } }),
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  // Секция страницы «Обработка текста»: те же строки, что у моделей
+  // распознавания, — одна визуальная система для обоих видов моделей.
   return (
-    <div className="content-inner">
-      <PageHead
-        title="Локальный ИИ"
-        desc="Нейросеть на вашем компьютере убирает паразиты, расставляет знаки и исправляет ослышки. Аудио и текст никуда не уходят."
-      />
-
-      <section className="llm-hero">
-        <div>
-          <div className="kicker">
-            {enabled && active ? `работает · ${active.label}` : installedCount > 0 ? "выключен" : "не установлен"}
-          </div>
-          <h2>
-            {enabled
-              ? "Обработка текста включена"
-              : installedCount > 0
-                ? "Модель скачана, обработка выключена"
-                : "Скачайте модель — и диктовка станет чище"}
-          </h2>
-          <p>
-            Движок llama.cpp {state.runtime_tag ? `(${state.runtime_tag})` : ""} и модели
-            скачиваются один раз и проверяются по контрольной сумме. Работает без интернета и без ключей.
-          </p>
-          <div className="llm-machine">
-            <div>
-              <small>Память</small>
-              <strong>{state.machine.ram_gb > 0 ? `${state.machine.ram_gb} ГБ` : "—"}</strong>
-            </div>
-            <div>
-              <small>Ядер</small>
-              <strong>{state.machine.cpu_cores || "—"}</strong>
-            </div>
-            <div>
-              <small>Считает</small>
-              <strong>{state.gpu ? accelLabel(state.machine) : accelLabel({ ...state.machine, accel: { kind: "cpu_only" } })}</strong>
-            </div>
-            <div>
-              <small>В памяти</small>
-              <strong>
-                {state.server.running
-                  ? state.models.find((m) => m.id === state.server.model_id)?.label ?? "модель"
-                  : state.server.starting
-                    ? "загружается…"
-                    : "ничего"}
-              </strong>
-            </div>
-          </div>
+    <div className="card">
+      <div className="card-head">
+        <div className="card-title">Модели обработки на устройстве</div>
+        <div className="sub">
+          Правят текст без интернета и ключей. Этот компьютер: {machine}.
         </div>
-        <div className="llm-hero-side">
-          <label className="row-flex" style={{ gap: 10 }}>
-            <span className="hint" style={{ margin: 0 }}>Обрабатывать текст</span>
-            <Switch
-              checked={enabled}
-              onChange={(v) => {
-                if (v) {
-                  const pick = active?.installed ? active.id : state.models.find((m) => m.installed)?.id;
-                  if (!pick) {
-                    setNote({ kind: "error", text: "Сначала скачайте хотя бы одну модель." });
-                    return;
-                  }
-                  onUse(pick);
-                } else {
-                  update({ ai_backend: "off" });
-                }
-              }}
-            />
-          </label>
-          {state.server.running && (
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => void onUnload()}>
-              Выгрузить из памяти
-            </button>
-          )}
-        </div>
-      </section>
+      </div>
 
       {note && (
-        <div className={`toast ${note.kind === "ok" ? "toast-success" : "toast-error"}`} role="status" style={{ marginBottom: 14 }}>
+        <div className={`toast ${note.kind === "ok" ? "toast-success" : "toast-error"}`} role="status">
           <span className="toast-msg">{note.text}</span>
         </div>
       )}
 
-      <div className="llm-grid">
-        {state.models.map((m) => {
-          const prog = progress[m.id];
-          const pct = prog && prog.total > 0 ? Math.min(100, Math.round((prog.received / prog.total) * 100)) : 0;
-          const isActive = enabled && settings.builtin_llm_model === m.id;
-          const busy = pendingRef.current !== null;
-          return (
-            <div
-              key={m.id}
-              className={`llm-tile${isActive ? " is-active" : ""}${!m.fits ? " is-heavy" : ""}`}
-            >
-              <div className="llm-tile-top">
-                <strong>{m.label}</strong>
-                {isActive && <span className="badge ok">работает</span>}
-                {!isActive && m.installed && <span className="badge">скачана</span>}
-                {m.recommended && !m.installed && <span className="badge accent">под ваш компьютер</span>}
-                {!m.fits && <span className="badge warn">тяжёлая для этой машины</span>}
+      {state.models.map((m) => {
+        const prog = progress[m.id];
+        const pct = prog && prog.total > 0 ? Math.min(100, Math.round((prog.received / prog.total) * 100)) : 0;
+        const isActive = enabled && settings.builtin_llm_model === m.id;
+        const busy = pendingRef.current !== null;
+        return (
+          <div key={m.id} className={`model-row${isActive ? " selected" : ""}`}>
+            <div className="model-info">
+              <div className="model-name">
+                {m.label}
+                {isActive && <span className="badge accent">Активна</span>}
+                {m.recommended && !m.installed && <span className="badge">Подходит</span>}
+                {!m.fits && <span className="badge warn">Тяжёлая</span>}
               </div>
-              <div className="llm-tile-meta">{fmtGb(m.size_gb)} · от {m.min_ram_gb} ГБ памяти</div>
-              <p>{m.blurb}</p>
-              <div className="llm-tile-actions">
-                {prog ? (
-                  <>
-                    <div className="progress-wrap">
-                      <div className="progress"><div className="bar" style={{ width: `${pct}%` }} /></div>
-                      <span className="progress-pct">{pct}%</span>
-                    </div>
-                    <span className="hint" style={{ margin: 0 }}>
-                      {prog.stage === "runtime" ? "движок" : "модель"}
-                    </span>
-                  </>
-                ) : m.installed ? (
-                  <>
-                    {!isActive && (
-                      <button type="button" className="btn btn-sm btn-primary" onClick={() => onUse(m.id)}>
-                        Использовать
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="btn btn-sm btn-ghost btn-danger"
-                      onClick={() => void onDelete(m.id)}
-                      title="Удалить файл модели"
-                    >
-                      <Icon.Trash className="ico" />
-                    </button>
-                  </>
-                ) : (
-                  <button
-                    type="button"
-                    className="btn btn-sm btn-primary"
-                    disabled={busy}
-                    onClick={() => void onDownload(m.id)}
-                  >
-                    <Icon.Download className="ico" />
-                    Скачать
+              <div className="model-size">
+                {fmtGb(m.size_gb)} · от {m.min_ram_gb} ГБ памяти
+              </div>
+              {m.blurb && <div className="model-blurb">{m.blurb}</div>}
+            </div>
+            {prog ? (
+              <div className="progress-wrap">
+                <div className="progress"><div className="bar" style={{ width: `${pct}%` }} /></div>
+                <span className="progress-pct">{prog.stage === "runtime" ? "движок" : `${pct}%`}</span>
+              </div>
+            ) : m.installed ? (
+              <div className="row-flex">
+                {!isActive && (
+                  <button type="button" className="btn btn-sm" onClick={() => onUse(m.id)}>
+                    Использовать
                   </button>
                 )}
+                <button
+                  type="button"
+                  className="btn btn-sm btn-ghost"
+                  onClick={() => void onDelete(m.id)}
+                  title="Удалить с диска"
+                  aria-label={`Удалить ${m.label}`}
+                >
+                  <Icon.Trash className="ico" />
+                </button>
               </div>
-            </div>
-          );
-        })}
-      </div>
+            ) : (
+              <button
+                type="button"
+                className="btn btn-sm"
+                disabled={busy}
+                onClick={() => void onDownload(m.id)}
+              >
+                <Icon.Download className="ico" />
+                Скачать
+              </button>
+            )}
+          </div>
+        );
+      })}
 
-      <p className="hint" style={{ marginTop: 16 }}>
-        Ollama, LM Studio или облачные сервисы по-прежнему можно выбрать в
-        «Настройки → Обработка текста». Ускорение видеокартой включается в «Настройки → Диктовка».
-      </p>
+      {(installedCount > 0 || state.server.running) && (
+        <div className="model-footer">
+          <span>
+            {state.server.running
+              ? `В памяти: ${state.models.find((m) => m.id === state.server.model_id)?.label ?? "модель"}`
+              : state.server.starting
+                ? "Модель загружается…"
+                : "Модель выгружена из памяти"}
+          </span>
+          {state.server.running && (
+            <button type="button" className="link-btn" onClick={() => void onUnload()}>
+              Выгрузить
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

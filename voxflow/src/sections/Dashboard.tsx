@@ -348,7 +348,7 @@ export default function Dashboard({
           <div className="ai-card">
             <div className="ai-card-top">
               <Icon.Cube className="ico" />
-              <strong>Локальный ИИ</strong>
+              <strong>Модель обработки</strong>
               <span className={`badge${aiOn ? " ok" : ""}`}>
                 {aiOn ? "вкл" : "выкл"}
               </span>
@@ -360,14 +360,14 @@ export default function Dashboard({
                   ? "Модель скачана, но обработка выключена. Включите её, чтобы текст вставлялся по смыслу."
                   : "Скачайте модель — она уберёт паразиты, расставит знаки и исправит ослышки без облака."}
             </p>
-            <button type="button" className="btn btn-sm" onClick={() => onOpenTab("ai")}>
+            <button type="button" className="btn btn-sm" onClick={() => onOpenSettings("text")}>
               {aiOn ? "Настроить" : llmReady ? "Включить" : "Скачать модель"}
             </button>
           </div>
 
           <h2>Быстрые настройки</h2>
-          <button type="button" onClick={() => onOpenSettings("dictation")}>
-            <Icon.Cube className="ico" />
+          <button type="button" onClick={() => onOpenTab("asr")}>
+            <Icon.Wave className="ico" />
             <span>Распознавание<small>{modelLabel(settings)}</small></span>
             <b>›</b>
           </button>

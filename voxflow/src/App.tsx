@@ -38,7 +38,7 @@ import Dashboard from "./sections/Dashboard";
 import type { SettingsPageId } from "./sections/SettingsHub";
 import { ErrorBoundary } from "./ErrorBoundary";
 
-const LocalLlm = lazy(() => import("./sections/LocalLlm"));
+const Models = lazy(() => import("./sections/Models"));
 const History = lazy(() => import("./sections/History"));
 const Dictionary = lazy(() => import("./sections/Dictionary"));
 const Snippets = lazy(() => import("./sections/Snippets"));
@@ -47,24 +47,39 @@ const SettingsHub = lazy(() => import("./sections/SettingsHub"));
 
 export type TabId =
   | "dashboard"
-  | "ai"
+  | "asr"
   | "history"
   | "dictionary"
   | "snippets"
   | "prompts"
   | "settings";
 
-const NAV: {
-  id: Exclude<TabId, "settings">;
-  label: string;
-  icon: (props: { className?: string }) => ReactNode;
+// Меню по пути голоса: запись → распознавание → история, затем всё про текст.
+// Модели обработки текста живут в «Настройки → Обработка текста».
+const NAV_GROUPS: {
+  title: string;
+  items: {
+    id: Exclude<TabId, "settings">;
+    label: string;
+    icon: (props: { className?: string }) => ReactNode;
+  }[];
 }[] = [
-  { id: "dashboard", label: "Диктовка", icon: Icon.Mic },
-  { id: "ai", label: "Локальный ИИ", icon: Icon.Cube },
-  { id: "history", label: "История", icon: Icon.Clock },
-  { id: "dictionary", label: "Словарь", icon: Icon.Book },
-  { id: "snippets", label: "Сниппеты", icon: Icon.Code },
-  { id: "prompts", label: "Промпты", icon: Icon.Wand },
+  {
+    title: "Диктовка",
+    items: [
+      { id: "dashboard", label: "Главная", icon: Icon.Mic },
+      { id: "asr", label: "Модели распознавания", icon: Icon.Wave },
+      { id: "history", label: "История", icon: Icon.Clock },
+    ],
+  },
+  {
+    title: "Текст",
+    items: [
+      { id: "dictionary", label: "Словарь", icon: Icon.Book },
+      { id: "snippets", label: "Сниппеты", icon: Icon.Code },
+      { id: "prompts", label: "Промпты", icon: Icon.Wand },
+    ],
+  },
 ];
 
 type Route = { tab: TabId; settingsPage?: SettingsPageId };
@@ -284,7 +299,7 @@ export default function App() {
           message: event.payload?.message || "Выберите локальную модель распознавания.",
           variant: "warning",
           actionLabel: "Открыть модели",
-          route: { tab: "settings", settingsPage: "dictation" },
+          route: { tab: "asr" },
         });
       }),
       subscribe<VoxErrorEvent>("error", (event) => {
@@ -387,22 +402,27 @@ export default function App() {
         </div>
 
         <nav className="nav" aria-label="Основная навигация">
-          {NAV.map((item) => {
-            const NavIcon = item.icon;
-            const active = tab === item.id;
-            return (
-              <button
-                type="button"
-                key={item.id}
-                className={`nav-item${active ? " active" : ""}`}
-                aria-current={active ? "page" : undefined}
-                onClick={() => setTab(item.id)}
-              >
-                <NavIcon className="ico" />
-                <span>{item.label}</span>
-              </button>
-            );
-          })}
+          {NAV_GROUPS.map((group) => (
+            <div className="nav-group" key={group.title}>
+              <div className="nav-group-title">{group.title}</div>
+              {group.items.map((item) => {
+                const NavIcon = item.icon;
+                const active = tab === item.id;
+                return (
+                  <button
+                    type="button"
+                    key={item.id}
+                    className={`nav-item${active ? " active" : ""}`}
+                    aria-current={active ? "page" : undefined}
+                    onClick={() => setTab(item.id)}
+                  >
+                    <NavIcon className="ico" />
+                    <span>{item.label}</span>
+                  </button>
+                );
+              })}
+            </div>
+          ))}
         </nav>
 
         <div className="sidebar-bottom">
@@ -430,7 +450,7 @@ export default function App() {
               {tab === "dashboard" && (
                 <Dashboard settings={settings} onOpenSettings={openSettings} onOpenTab={setTab} />
               )}
-              {tab === "ai" && <LocalLlm settings={settings} update={update} />}
+              {tab === "asr" && <Models settings={settings} update={update} />}
               {tab === "history" && <History />}
               {tab === "dictionary" && <Dictionary />}
               {tab === "snippets" && <Snippets />}

@@ -77,24 +77,46 @@ const STT_PRESETS: SttPreset[] = [
     },
     keyHint: "Ключ: console.deepgram.com (есть free-tier)",
   },
-  {
-    id: "local",
-    label: "Локально",
-    badge: "офлайн",
-    patch: { stt_provider: "local" },
-  },
 ];
 
+// Языки распознавания. «Авто» — Whisper для всех языков; явный RU/EN включают
+// быстрые специализированные GigaAM/Parakeet (если установлены).
+const LANGUAGE_OPTIONS = [
+  { value: "auto", label: "Все языки (авто)" },
+  { value: "ru", label: "Русский" },
+  { value: "en", label: "English" },
+  { value: "uk", label: "Українська" },
+  { value: "de", label: "Deutsch" },
+  { value: "fr", label: "Français" },
+  { value: "es", label: "Español" },
+  { value: "it", label: "Italiano" },
+  { value: "pt", label: "Português" },
+  { value: "pl", label: "Polski" },
+  { value: "tr", label: "Türkçe" },
+  { value: "zh", label: "中文" },
+  { value: "ja", label: "日本語" },
+  { value: "ko", label: "한국어" },
+  { value: "ar", label: "العربية" },
+  { value: "hi", label: "हिन्दी" },
+];
+
+/**
+ * `part` делит раздел по странице «Диктовка»: main — язык и где распознавать
+ * (то, что меняют), advanced — прокси, откат и черновик через API (в свёрнутом
+ * «Дополнительно»). Без `part` рисуется всё — для отдельной страницы.
+ */
 export default function Stt({
   settings,
   update,
   persist,
   embedded,
+  part,
 }: {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
   persist?: (settings: Settings) => Promise<boolean>;
   embedded?: boolean;
+  part?: "main" | "advanced";
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<string | null>(null);
@@ -108,18 +130,6 @@ export default function Stt({
       ([k, v]) => (settings as unknown as Record<string, unknown>)[k] === v,
     ),
   );
-  const providerName =
-    provider === "deepgram"
-      ? "Deepgram"
-      : provider === "openai_compat"
-        ? "OpenAI-compatible"
-        : "Локально";
-  const providerMode = isLocal ? "Офлайн и приватно" : "Облако с фолбэком";
-  const providerHint = isLocal
-    ? "Аудио остаётся на устройстве"
-    : settings.stt_fallback_local
-      ? "При ошибке вернётся на локальное распознавание"
-      : "Нужны сеть и API-ключ";
 
   async function onTest() {
     setTesting(true);
@@ -140,45 +150,62 @@ export default function Stt({
     }
   }
 
-  return (
-    <SectionShell embedded={embedded}>
-      {!embedded && (
-        <PageHead
-          title="Облако"
-          desc="Облачный движок распознавания речи. Локальный GigaAM/Parakeet/Whisper остаётся по умолчанию и приватен — аудио не покидает устройство."
+  function chooseWhere(cloud: boolean) {
+    setResult(null);
+    if (!cloud) update({ stt_provider: "local" });
+    // Облако без выбранного провайдера — сразу рекомендуемый пресет.
+    else if (isLocal) update(STT_PRESETS[0].patch);
+  }
+
+  const main = (
+    <div className="card">
+      <div className="card-head">
+        <div className="card-title">Распознавание</div>
+      </div>
+
+      <Field
+        label="Язык"
+        hint="«Авто» понимает все языки и смешанную речь. Русский и English работают быстрее."
+      >
+        <Select
+          value={settings.language}
+          onChange={(v) => update({ language: v })}
+          options={LANGUAGE_OPTIONS}
         />
-      )}
+      </Field>
 
-      <div className="card cloud-card">
-        <div className="cloud-provider-head">
-          <div>
-            <div className="card-title">Провайдер STT</div>
-            <p className="cloud-provider-copy">
-              Какой движок распознаёт речь. Облако подключается как BYOK-режим,
-              локальное распознавание остаётся приватным запасным вариантом.
-            </p>
-          </div>
-          <div className="cloud-provider-status" aria-live="polite">
-            <span>{providerName}</span>
-            <strong>{providerMode}</strong>
-            <small>{providerHint}</small>
-          </div>
+      <Field
+        label="Где распознавать"
+        hint={
+          isLocal
+            ? "Звук не покидает компьютер. Модели — в разделе «Модели распознавания»."
+            : "Облако точнее на слабом железе, но нужен интернет и ключ."
+        }
+      >
+        <div className="seg" role="radiogroup" aria-label="Где распознавать">
+          {[
+            { cloud: false, label: "На устройстве" },
+            { cloud: true, label: "В облаке" },
+          ].map((option) => {
+            const active = option.cloud !== isLocal;
+            return (
+              <button
+                key={option.label}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                className={`seg-btn${active ? " active" : ""}`}
+                onClick={() => chooseWhere(option.cloud)}
+              >
+                {option.label}
+              </button>
+            );
+          })}
         </div>
+      </Field>
 
-        <div className="cloud-presets">
-          <div className="cloud-presets-head">
-            <div>
-              <div className="field-label">Готовые пресеты</div>
-              <div className="field-hint">
-                Один клик заполнит провайдера, адрес и модель. Groq ·
-                whisper-large-v3 — сильный бесплатный старт.
-              </div>
-            </div>
-            <div className="cloud-presets-active">
-              {activePreset ? activePreset.label : "Свой набор"}
-            </div>
-          </div>
-
+      {!isLocal && (
+        <>
           <div className="cloud-preset-grid">
             {STT_PRESETS.map((p) => {
               const active = activePreset?.id === p.id;
@@ -194,212 +221,155 @@ export default function Stt({
                   aria-pressed={active}
                 >
                   <span className="cloud-preset-main">{p.label}</span>
-                  <span className="cloud-preset-meta">
-                    {p.badge ?? (p.id === "local" ? "без ключа" : "API-ключ")}
-                  </span>
+                  <span className="cloud-preset-meta">{p.badge ?? "API-ключ"}</span>
                 </button>
               );
             })}
           </div>
-
-          <div className="cloud-preset-note">
-            {activePreset?.keyHint ??
-              (activePreset
-                ? "Локальный режим выбран: ключ и проверка соединения не нужны."
-                : "Пресет не выбран: можно вручную указать провайдера, URL и модель ниже.")}
-          </div>
-          <div className="cloud-preset-note">
-            Если диктовка распознаётся неверно, сначала смените язык или модель
-            во вкладке «Модель». Cloud STT можно включить для сложных голосов,
-            микрофонов и языков, но онлайн-провайдеры зависят от сети, лимитов
-            API и доступности сервиса.
-          </div>
-        </div>
-
-        <Field
-          label="Движок распознавания"
-          hint="Локальные GigaAM/Parakeet/Whisper работают офлайн и приватно. Облачные провайдеры — быстрее на слабом железе, но требуют сети и ключа."
-        >
-          <Select
-            value={settings.stt_provider}
-            onChange={(v) => {
-              setResult(null);
-              update({ stt_provider: v });
-            }}
-            options={[
-              { value: "local", label: "Локально" },
-              {
-                value: "openai_compat",
-                label: "OpenAI-совместимый (Avalon/OpenAI/Groq)",
-              },
-              { value: "deepgram", label: "Deepgram" },
-            ]}
-          />
-        </Field>
-
-        {!isLocal && (
-          <div
-            className="field-hint"
-            style={{ marginTop: -6, marginBottom: 14, maxWidth: "none" }}
-          >
-            Без ключа VoxFlow мгновенно работает локально (умный
-            фолбэк) — облако подключится, как только укажете ключ.
-          </div>
-        )}
-
-        {provider === "openai_compat" && (
-          <>
-            <Field
-              label="Base URL"
-              hint="Адрес OpenAI-совместимого API. Пресеты выше заполняют его сами."
-            >
-              <input
-                type="text"
-                className="input-mono"
-                placeholder="https://api.groq.com/openai/v1"
-                value={settings.oai_stt_base_url}
-                onChange={(e) =>
-                  update({ oai_stt_base_url: e.currentTarget.value })
-                }
-                style={{ width: 320 }}
-              />
-            </Field>
-
-            <Field label="Модель" hint="Идентификатор модели у провайдера">
-              <input
-                type="text"
-                placeholder="whisper-large-v3"
-                value={settings.oai_stt_model}
-                onChange={(e) =>
-                  update({ oai_stt_model: e.currentTarget.value })
-                }
-                style={{ width: 260 }}
-              />
-            </Field>
-
-            <Field
-              label="API-ключ"
-              hint="Ключ хранится локально и используется только для запросов к выбранному провайдеру"
-            >
-              <SecretControl
-                kind="oai_stt_key"
-                value={settings.oai_stt_key}
-                onChange={(value) => update({ oai_stt_key: value })}
-              />
-            </Field>
-
-            <div
-              className="field-hint"
-              style={{ marginTop: -6, marginBottom: 4, maxWidth: "none" }}
-            >
-              Рекомендуется Groq · whisper-large-v3 — флагман по точности,
-              сильный русский, OpenAI-совместимый, бесплатный ключ
-              (console.groq.com/keys). Из РФ — через прокси.
-            </div>
-          </>
-        )}
-
-        {provider === "deepgram" && (
-          <>
-            <Field label="Base URL" hint="Адрес API Deepgram">
-              <input
-                type="text"
-                className="input-mono"
-                placeholder="https://api.deepgram.com"
-                value={settings.deepgram_base}
-                onChange={(e) =>
-                  update({ deepgram_base: e.currentTarget.value })
-                }
-                style={{ width: 320 }}
-              />
-            </Field>
-
-            <Field label="Модель" hint="Идентификатор модели Deepgram">
-              <input
-                type="text"
-                placeholder="nova-3"
-                value={settings.deepgram_model}
-                onChange={(e) =>
-                  update({ deepgram_model: e.currentTarget.value })
-                }
-                style={{ width: 260 }}
-              />
-            </Field>
-
-            <Field
-              label="API-ключ"
-              hint="Ключ хранится локально и используется только для запросов к Deepgram"
-            >
-              <SecretControl
-                kind="deepgram_key"
-                value={settings.deepgram_key}
-                onChange={(value) => update({ deepgram_key: value })}
-              />
-            </Field>
-          </>
-        )}
-
-        <div className="add-row stt-test-row">
-          <button
-            className="btn btn-primary"
-            onClick={onTest}
-            disabled={testing || isLocal}
-          >
-            <Icon.Check className="ico" />
-            {testing ? "Проверка…" : "Проверить"}
-          </button>
-          {result && (
-            <span className="stt-test-result">{result}</span>
+          {activePreset?.keyHint && (
+            <div className="field-hint cloud-key-hint">{activePreset.keyHint}</div>
           )}
-          {isLocal && !result && (
-            <span className="stt-test-local">
-              Локальное распознавание не требует проверки соединения
-            </span>
-          )}
-        </div>
-      </div>
 
-      <div className="card">
-        <div className="card-head">
-          <div className="card-title">Сеть и отказоустойчивость</div>
-        </div>
-
-        <Field
-          label="Прокси"
-          hint="HTTP/HTTPS-прокси для облачных запросов. Пусто → используется системный HTTPS_PROXY из окружения."
-        >
-          <input
-            type="text"
-            className="input-mono"
-            placeholder="http://127.0.0.1:10808"
-            value={settings.proxy_url}
-            onChange={(e) => update({ proxy_url: e.currentTarget.value })}
-            style={{ width: 320 }}
-          />
-        </Field>
-
-        <Field
-          label="Откат на локальное распознавание"
-          hint="Если облако недоступно (нет сети, ошибка или таймаут) — автоматически распознать локально. В плашке появится метка «офлайн»."
-        >
-          <Switch
-            checked={settings.stt_fallback_local}
-            onChange={(v) => update({ stt_fallback_local: v })}
-          />
-        </Field>
-
-        {!isLocal && (
-          <Field
-            label="Живой черновик в плашке (через API)"
-            hint="Показывать серый текст в плашке во время речи для облачной модели — как у офлайн-моделей, но через API. Периодически отправляет растущий звук в облако (≤4 превью на диктовку). Локальная модель не нужна. Расходует квоту API: на бесплатном тире при активной диктовке лимит можно исчерпать — тогда выключите этот тоггл (распознавание останется, без серого превью)."
-          >
-            <Switch
-              checked={settings.cloud_live_draft}
-              onChange={(v) => update({ cloud_live_draft: v })}
+          <Field label="Провайдер">
+            <Select
+              value={settings.stt_provider}
+              onChange={(v) => {
+                setResult(null);
+                update({ stt_provider: v });
+              }}
+              options={[
+                { value: "openai_compat", label: "OpenAI-совместимый" },
+                { value: "deepgram", label: "Deepgram" },
+              ]}
             />
           </Field>
-        )}
-      </div>
+
+          {provider === "openai_compat" && (
+            <>
+              <Field label="Адрес API">
+                <input
+                  type="text"
+                  className="input-mono"
+                  placeholder="https://api.groq.com/openai/v1"
+                  value={settings.oai_stt_base_url}
+                  onChange={(e) => update({ oai_stt_base_url: e.currentTarget.value })}
+                  style={{ width: 320 }}
+                />
+              </Field>
+              <Field label="Модель">
+                <input
+                  type="text"
+                  placeholder="whisper-large-v3"
+                  value={settings.oai_stt_model}
+                  onChange={(e) => update({ oai_stt_model: e.currentTarget.value })}
+                  style={{ width: 260 }}
+                />
+              </Field>
+              <Field label="API-ключ" hint="Хранится только на этом компьютере">
+                <SecretControl
+                  kind="oai_stt_key"
+                  value={settings.oai_stt_key}
+                  onChange={(value) => update({ oai_stt_key: value })}
+                />
+              </Field>
+            </>
+          )}
+
+          {provider === "deepgram" && (
+            <>
+              <Field label="Адрес API">
+                <input
+                  type="text"
+                  className="input-mono"
+                  placeholder="https://api.deepgram.com"
+                  value={settings.deepgram_base}
+                  onChange={(e) => update({ deepgram_base: e.currentTarget.value })}
+                  style={{ width: 320 }}
+                />
+              </Field>
+              <Field label="Модель">
+                <input
+                  type="text"
+                  placeholder="nova-3"
+                  value={settings.deepgram_model}
+                  onChange={(e) => update({ deepgram_model: e.currentTarget.value })}
+                  style={{ width: 260 }}
+                />
+              </Field>
+              <Field label="API-ключ" hint="Хранится только на этом компьютере">
+                <SecretControl
+                  kind="deepgram_key"
+                  value={settings.deepgram_key}
+                  onChange={(value) => update({ deepgram_key: value })}
+                />
+              </Field>
+            </>
+          )}
+
+          <div className="add-row stt-test-row">
+            <button className="btn" onClick={onTest} disabled={testing}>
+              <Icon.Check className="ico" />
+              {testing ? "Проверка…" : "Проверить"}
+            </button>
+            {result && <span className="stt-test-result">{result}</span>}
+          </div>
+        </>
+      )}
+    </div>
+  );
+
+  const advanced = (
+    <>
+      <Field
+        label="Прокси"
+        hint="Для облака и загрузки моделей. Пусто — системный прокси."
+      >
+        <input
+          type="text"
+          className="input-mono"
+          placeholder="http://127.0.0.1:10808"
+          value={settings.proxy_url}
+          onChange={(e) => update({ proxy_url: e.currentTarget.value })}
+          style={{ width: 320 }}
+        />
+      </Field>
+
+      <Field
+        label="Запасное распознавание на устройстве"
+        hint="Если облако не ответило — распознать локально"
+      >
+        <Switch
+          checked={settings.stt_fallback_local}
+          onChange={(v) => update({ stt_fallback_local: v })}
+        />
+      </Field>
+
+      {!isLocal && (
+        <Field
+          label="Живой текст в плашке через облако"
+          hint="До 4 запросов на диктовку — расходует квоту API"
+        >
+          <Switch
+            checked={settings.cloud_live_draft}
+            onChange={(v) => update({ cloud_live_draft: v })}
+          />
+        </Field>
+      )}
+    </>
+  );
+
+  if (part === "main") return main;
+  if (part === "advanced") return advanced;
+  return (
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="Облако"
+          desc="Облачный движок распознавания речи. Локальный GigaAM/Parakeet/Whisper остаётся по умолчанию и приватен — аудио не покидает устройство."
+        />
+      )}
+      {main}
+      <div className="card">{advanced}</div>
     </SectionShell>
   );
 }

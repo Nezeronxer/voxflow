@@ -52,24 +52,22 @@ export default function Corrections({
       )}
 
       <div className="card">
+        <div className="card-head">
+          <div className="card-title">Исправления</div>
+          <div className="sub">
+            Слово, которое распознаётся неправильно, и чем его заменять
+          </div>
+        </div>
+
         <Field
           label="Учиться на моих правках"
-          hint="Автоматически создавать пары, когда вы правите надиктованный текст. Эвристика может добавлять неточные исправления — держите выключенным, если видите мусор в списке."
+          hint="Запоминать, когда вы правите вставленный текст. Иногда ошибается"
         >
           <Switch
             checked={settings.learn_corrections}
             onChange={(v) => update({ learn_corrections: v })}
           />
         </Field>
-      </div>
-
-      <div className="card">
-        <div className="card-head">
-          <div className="card-title">Исправления</div>
-          <div className="sub">
-            Слева — как распозналось, справа — на что исправить
-          </div>
-        </div>
 
         {entries.length === 0 ? (
           <div className="empty">Пока нет ни одного исправления</div>

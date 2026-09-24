@@ -38,7 +38,8 @@ const THEME_OPTIONS = [
  * `scope` делит раздел между двумя страницами хаба: «Диктовка» берёт то, что
  * происходит во время записи, «Программа» — оформление и поведение самого
  * приложения. Раньше это лежало одной кучей в «Основных», и человек искал
- * микрофон там же, где автозапуск.
+ * микрофон там же, где автозапуск. «dictation-advanced» — графическое ускорение
+ * для свёрнутого «Дополнительно» страницы «Диктовка».
  */
 export default function Control({
   settings,
@@ -50,7 +51,7 @@ export default function Control({
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
   persist: (settings: Settings) => Promise<boolean>;
-  scope?: "all" | "dictation" | "app";
+  scope?: "all" | "dictation" | "dictation-advanced" | "app";
   embedded?: boolean;
 }) {
   const [devices, setDevices] = useState<string[]>([]);
@@ -72,7 +73,7 @@ export default function Control({
   useEffect(() => {
     // Список устройств нужен только полю микрофона: на странице «Программа»
     // его нет, и опрашивать аудиоподсистему незачем.
-    if (scope === "app") return;
+    if (scope === "app" || scope === "dictation-advanced") return;
     let alive = true;
     listAudioDevices().then((d) => alive && setDevices(d));
     return () => {
@@ -133,8 +134,38 @@ export default function Control({
     setUpdateStatus(failure ?? "Установка запущена — ход показан поверх окна");
   }
 
-  const showDictation = scope !== "app";
-  const showApp = scope !== "dictation";
+  const showDictation = scope === "all" || scope === "dictation";
+  const showApp = scope === "all" || scope === "app";
+
+  const gpuField = (
+    <Field
+      label="Графическое ускорение"
+      hint="Для Whisper и встроенного ИИ. «Авто» — если видеокарта есть"
+    >
+      <div className="seg" role="radiogroup" aria-label="Графическое ускорение">
+        {[
+          { value: "auto", label: "Авто" },
+          { value: "on", label: "Вкл" },
+          { value: "off", label: "Выкл" },
+        ].map((option) => {
+          const active = (settings.gpu_mode || "auto") === option.value;
+          return (
+            <button
+              key={option.value}
+              type="button"
+              role="radio"
+              aria-checked={active}
+              className={`seg-btn${active ? " active" : ""}`}
+              onClick={() => update({ gpu_mode: option.value })}
+            >
+              {option.label}
+            </button>
+          );
+        })}
+      </div>
+    </Field>
+  );
+  if (scope === "dictation-advanced") return gpuField;
 
   return (
     <SectionShell embedded={embedded}>
@@ -173,7 +204,7 @@ export default function Control({
 
         <Field
           label="Улучшить выделенное"
-          hint="Одиночное нажатие берёт выделенный текст, чистит его и заменяет в активном поле. Esc отменяет незавершённую обработку."
+          hint="Нажмите — выделенный текст будет переписан начисто"
         >
           <HotkeyCapture
             value={settings.improve_hotkey}
@@ -185,7 +216,7 @@ export default function Control({
 
         <Field
           label="Режим"
-          hint="«Удержание» пишет, пока клавиша зажата. «Переключатель» — нажал/нажал."
+          hint="Удержание — пока клавиша зажата; переключатель — нажал и нажал снова"
         >
           <div className="seg" role="radiogroup" aria-label="Режим диктовки">
             {[
@@ -210,35 +241,8 @@ export default function Control({
         </Field>
 
         <Field
-          label="Графическое ускорение"
-          hint="Видеокарта ускоряет Whisper (NVIDIA) и встроенный локальный ИИ (NVIDIA/AMD/Intel, Apple Silicon). «Авто» включает её, когда карта есть. GigaAM и Parakeet всегда считают на процессоре."
-        >
-          <div className="seg" role="radiogroup" aria-label="Графическое ускорение">
-            {[
-              { value: "auto", label: "Авто" },
-              { value: "on", label: "Вкл" },
-              { value: "off", label: "Выкл" },
-            ].map((option) => {
-              const active = (settings.gpu_mode || "auto") === option.value;
-              return (
-                <button
-                  key={option.value}
-                  type="button"
-                  role="radio"
-                  aria-checked={active}
-                  className={`seg-btn${active ? " active" : ""}`}
-                  onClick={() => update({ gpu_mode: option.value })}
-                >
-                  {option.label}
-                </button>
-              );
-            })}
-          </div>
-        </Field>
-
-        <Field
-          label="Защёлка двойным тапом"
-          hint="В hold-режиме второй быстрый тап запускает запись без удержания. Любое физическое отпускание обрабатывается сразу, без скрытой задержки."
+          label="Двойное нажатие — без удержания"
+          hint="Два быстрых нажатия включают запись, держать клавишу не нужно"
         >
           <Switch
             checked={settings.double_tap_latch}
@@ -246,9 +250,8 @@ export default function Control({
           />
         </Field>
 
-        {/* Языка здесь нет намеренно: он редактировался и тут, и в «Моделях»,
-            причём там полным списком из 16 языков, а тут урезанной тройкой.
-            Осталось одно поле — то, что рядом с движком, который язык и выбирает. */}
+        {scope === "all" && gpuField}
+        {/* Языка здесь нет намеренно: он один — в карточке «Распознавание». */}
       </div>
       )}
 

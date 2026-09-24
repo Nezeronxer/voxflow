@@ -216,8 +216,14 @@ pub fn models_dir() -> String {
 }
 
 #[tauri::command]
-pub fn download_model(app: AppHandle, name: String) -> R<()> {
-    models::start_download(app, name).map_err(err)
+pub fn download_model(app: AppHandle, state: State<AppState>, name: String) -> R<()> {
+    let proxy = state.settings.lock().proxy_url.clone();
+    models::start_download(app, name, proxy).map_err(err)
+}
+
+#[tauri::command]
+pub fn cancel_model_download(name: String) {
+    models::cancel_download(&name);
 }
 
 #[tauri::command]

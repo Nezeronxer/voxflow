@@ -99,3 +99,23 @@ export function previewPillMode(
 export function shouldResetFinalPreviewAfterHold(status: OverlayStatus): boolean {
   return status === "idle";
 }
+
+// Слово вместе с хвостовыми пробелами/переносом — единица анимации потока.
+export function wordTokens(text: string): string[] {
+  return text.match(/\S+\s*/g) ?? [];
+}
+
+// Сколько слов с начала совпало: их узлы плашка оставляет как есть, остальные
+// пересоздаёт с анимацией. Хвостовой пробел не в счёт — у последнего слова он
+// появляется, когда следом приходит новое.
+export function sharedWordPrefix(prev: string[], next: string[]): number {
+  let same = 0;
+  while (
+    same < prev.length &&
+    same < next.length &&
+    prev[same].trimEnd() === next[same].trimEnd()
+  ) {
+    same++;
+  }
+  return same;
+}

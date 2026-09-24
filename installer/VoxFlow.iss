@@ -19,7 +19,7 @@
 ; ============================================================================
 
 #define AppName    "VoxFlow"
-#define AppVersion "2.1.0"
+#define AppVersion "2.1.1"
 #define Publisher  "Крылов Анатолий Евгеньевич"
 #define AppExe     "voxflow.exe"
 #define SrcDir     "..\voxflow\src-tauri\target\release"
@@ -30,7 +30,7 @@ AppId={{B2F1A9E0-7C4D-4E8A-9F3B-1A2C5D6E7F80}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
-VersionInfoVersion=2.1.0.0
+VersionInfoVersion=2.1.1.0
 
 ; --- Per-user install: no elevation, current user only. ---
 PrivilegesRequired=lowest
@@ -162,6 +162,15 @@ begin
     Result := ExpandConstant('{param:RELAUNCH|0}') = '1'
   else
     Result := True;
+end;
+
+{ Маркер «установка идёт» (updater.rs) снимает сам установщик: файлы уже
+  на месте, а [Run] ещё не перезапустил приложение. По версии exe этого не
+  понять — voxflow.exe копируется первым. }
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    DeleteFile(ExpandConstant('{localappdata}\VoxFlow\update-in-progress.json'));
 end;
 
 function InitializeSetup(): Boolean;
