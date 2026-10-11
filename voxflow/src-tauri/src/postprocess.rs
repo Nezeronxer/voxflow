@@ -734,14 +734,20 @@ fn marker_is_delimited(
     start: usize,
     len: usize,
 ) -> bool {
-    if len > 1 {
+    // «нет, стоп» / «стоп, не то» говорят сами за себя, а «не так» — обычная
+    // пара слов: «я был там, не так давно» теряло «там».
+    if len > 1 && marker[0] != "не" {
         return true;
     }
     let anchored = correction_anchor(kind, &toks[..start], &toks[start + len..]).is_some();
     let before = start > 0 && ends_with_pause(toks[start - 1].raw);
-    let after = ends_with_pause(toks[start].raw);
+    let after = ends_with_pause(toks[start + len - 1].raw);
     match marker[0] {
-        "нет" | "ой" | "погоди" | "подожди" => before && (after || anchored),
+        // «забудь», «отмена», «зачеркни» — тоже обычные слова («забудь про это»,
+        // «отмена заказа»): без паузы справа это не вставка-исправление.
+        "нет" | "ой" | "погоди" | "подожди" | "не" | "забудь" | "отмена" | "зачеркни" => {
+            before && (after || anchored)
+        }
         _ => anchored || before,
     }
 }
@@ -771,7 +777,11 @@ fn correction_anchor(
     let anchor = left.iter().rposition(|t| t.bare == first)?;
     let replayed = left.len() - anchor;
     let replacement = right.iter().filter(|t| !t.bare.is_empty()).count();
-    (replayed <= CORRECTION_ANCHOR_MAX_SPAN && replayed <= replacement + 1).then_some(anchor)
+        // Переформулировка («то есть») чаще уточняет, чем отменяет: «супер быстро работает,
+    // то есть вообще летает» повторяет «вообще» и не отменяет сказанное. Лишнее слово
+    // допускаем только для замены и отмены.
+    let slack = usize::from(kind != CorrectionKind::Reformulation);
+    (replayed <= CORRECTION_ANCHOR_MAX_SPAN && replayed <= replacement + slack).then_some(anchor)
 }
 
 fn correction_fires(kind: CorrectionKind, left: &[WordTok<'_>], right: &[WordTok<'_>]) -> bool {
@@ -1701,6 +1711,54 @@ mod filler_tests {
             "Я не знаю почему."
         );
         assert_eq!(process("м-м-м, хорошо", &s, &[], &[]), "Хорошо");
+    }
+
+    /// Регрессия: «не так» после запятой считалось маркером даже без паузы справа,
+    /// и «я был там, не так давно» превращалось в «я был давно».
+    #[test]
+    fn plain_phrase_ne_tak_is_not_a_correction_marker() {
+        let s = st(true, true);
+        assert_eq!(
+            process("Я был там, не так давно.", &s, &[], &[]),
+            "Я был там, не так давно."
+        );
+        assert_eq!(
+            process("Купи красное, не так, зелёное.", &s, &[], &[]),
+            "Купи зелёное."
+        );
+    }
+
+    /// Регрессия: «забудь про это» после запятой резало слова слева от маркера.
+    #[test]
+    fn forget_and_cancel_words_need_a_pause_on_both_sides() {
+        let s = st(true, true);
+        assert_eq!(
+            process("Я всё сделал, забудь про это.", &s, &[], &[]),
+            "Я всё сделал, забудь про это."
+        );
+        assert_eq!(
+            process("Он пришёл вечером, отмена заказа не нужна.", &s, &[], &[]),
+            "Он пришёл вечером, отмена заказа не нужна."
+        );
+        assert_eq!(
+            process("встреча в пять, забудь, в шесть", &s, &[], &[]),
+            "Встреча в шесть"
+        );
+    }
+
+    /// Регрессия: «то есть вообще летает» вырезало «супер быстро работает».
+    #[test]
+    fn to_est_elaboration_repeating_a_word_keeps_the_left_part() {
+        let s = st(true, true);
+        assert_eq!(
+            process(
+                "У меня программа вообще супер быстро работает, то есть вообще летает полностью.",
+                &s,
+                &[],
+                &[]
+            ),
+            "У меня программа вообще супер быстро работает, то есть вообще летает полностью."
+        );
     }
 
     #[test]
