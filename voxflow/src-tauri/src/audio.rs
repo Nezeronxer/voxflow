@@ -27,6 +27,16 @@ use cpal::SampleFormat;
 /// выставляется флаг overflow (UI может предупредить, см. Capture::overflowed).
 const MAX_CAPTURE_SECS: usize = 30 * 60;
 
+/// ALSA отдаёт десятки служебных PCM (hdmi, surround, null, dmix...). Оставляем
+/// те, что имеет смысл выбирать для микрофона: маршрут по умолчанию (он же
+/// PulseAudio/PipeWire через alsa-плагин) и карты целиком.
+#[cfg(any(target_os = "linux", test))]
+fn is_user_facing_alsa_input(name: &str) -> bool {
+    matches!(name, "default" | "pulse" | "pipewire")
+        || name.starts_with("sysdefault:")
+        || name.starts_with("plughw:")
+}
+
 /// Возвращает имена всех входных устройств (без дубликатов).
 ///
 /// Best-effort: любые ошибки проглатываются, возвращается то, что удалось
@@ -40,6 +50,10 @@ pub fn list_input_devices() -> Vec<String> {
     if let Ok(devices) = host.input_devices() {
         for device in devices {
             if let Ok(name) = device.name() {
+                #[cfg(target_os = "linux")]
+                if !is_user_facing_alsa_input(&name) {
+                    continue;
+                }
                 if seen.insert(name.clone()) {
                     names.push(name);
                 }
@@ -733,6 +747,26 @@ mod tests {
                 (a - b).abs() <= 1e-6,
                 "расхождение на сэмпле {i}: inc={a} batch={b}"
             );
+        }
+    }
+
+    #[test]
+    fn alsa_input_filter_keeps_only_user_facing_names() {
+        for keep in [
+            "default",
+            "pipewire",
+            "sysdefault:CARD=PCH",
+            "plughw:CARD=PCH,DEV=0",
+        ] {
+            assert!(is_user_facing_alsa_input(keep), "{keep}");
+        }
+        for drop in [
+            "null",
+            "hdmi:CARD=NVidia,DEV=0",
+            "surround51",
+            "hw:CARD=PCH,DEV=0",
+        ] {
+            assert!(!is_user_facing_alsa_input(drop), "{drop}");
         }
     }
 

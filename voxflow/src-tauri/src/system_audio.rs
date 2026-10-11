@@ -182,7 +182,50 @@ mod imp {
     }
 }
 
-#[cfg(all(not(windows), not(target_os = "macos")))]
+/// Linux: mute default sink через `pactl` (PulseAudio и PipeWire-pulse).
+/// Нет pactl — `engage` возвращает ошибку, диктовка идёт без глушения.
+#[cfg(target_os = "linux")]
+mod imp {
+    use crate::linux_env::{set_sink_mute, sink_muted};
+    use anyhow::{Context, Result};
+
+    #[derive(Debug)]
+    pub struct AutoMuteGuard {
+        was_muted: bool,
+        active: bool,
+    }
+
+    impl AutoMuteGuard {
+        pub fn engage() -> Result<Self> {
+            let was_muted = sink_muted().context("Linux audio mute: read current state")?;
+            if !was_muted {
+                set_sink_mute(true).context("Linux audio mute: set muted")?;
+            }
+            Ok(Self {
+                was_muted,
+                active: true,
+            })
+        }
+
+        pub fn restore(&mut self) {
+            if !self.active {
+                return;
+            }
+            if let Err(e) = set_sink_mute(self.was_muted) {
+                log::warn!("auto-mute restore failed: {e:#}");
+            }
+            self.active = false;
+        }
+    }
+
+    impl Drop for AutoMuteGuard {
+        fn drop(&mut self) {
+            self.restore();
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 mod imp {
     use anyhow::Result;
 
