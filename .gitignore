@@ -31,3 +31,9 @@ __pycache__/
 /_subs_data.bin
 
 # runtime data lives in %LOCALAPPDATA%\VoxFlow, never in repo
+
+# secrets
+.env
+.env.*
+!.env.example
+.autopilot/serve.pid
