@@ -305,6 +305,8 @@ struct EngineCtx {
     /// даже если два detached-потока финала как-то совпали по gen, второй НЕ дублирует
     /// текст в активном поле. Это вторая линия защиты от «дубля вставки».
     last_injected_gen: Arc<AtomicU64>,
+    /// Поколение, начиная с которого финалы ещё нужны: Esc поднимает его, Start - нет.
+    cancel_floor: Arc<AtomicU64>,
     /// Резидентный GigaAM-v3 (русский ASR, ONNX/CPU): грузится на warmup и живёт
     /// всю сессию — холодного старта на диктовке нет. Mutex сериализует
     /// партиал-тики и финал (Session::run требует &mut).
@@ -363,6 +365,7 @@ pub fn spawn(
         last_external_target: Arc::new(Mutex::new(None)),
         gen: Arc::new(AtomicU64::new(0)),
         last_injected_gen: Arc::new(AtomicU64::new(0)),
+        cancel_floor: Arc::new(AtomicU64::new(0)),
         gigaam: Arc::new(Mutex::new(None)),
         parakeet: Arc::new(Mutex::new(None)),
         vad: Arc::new(Mutex::new(None)),
@@ -2968,7 +2971,8 @@ fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         }
         {
             let _activity = ctx.cancel_activity_lock.lock();
-            ctx.gen.fetch_add(1, Ordering::SeqCst);
+            let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
+            ctx.cancel_floor.store(next, Ordering::SeqCst);
             ctx.cancel_active.store(false, Ordering::SeqCst);
         }
         set_status(ctx, "idle");
@@ -3329,8 +3333,22 @@ fn generation_is_current(current: u64, expected: u64) -> bool {
     current == expected
 }
 
+/// Нужен ли ещё финал поколения `expected`. Новое нажатие хоткея финал прошлой
+/// диктовки НЕ отменяет: в режиме «только плашка» (клавиши не печатаются) он
+/// просто вставляется следом, иначе фраза, не успевшая распознаться до
+/// следующего нажатия, пропадала целиком. Отменяет только Esc (`cancel_floor`).
+/// Живая печать (always/auto) делит поле с новой диктовкой - там поколение строгое.
+fn final_still_wanted(current: u64, expected: u64, cancel_floor: u64, preview_only: bool) -> bool {
+    generation_is_current(current, expected) || (preview_only && expected >= cancel_floor)
+}
+
 fn final_generation_is_current(ctx: &EngineCtx, expected: u64) -> bool {
-    generation_is_current(ctx.gen.load(Ordering::Acquire), expected)
+    final_still_wanted(
+        ctx.gen.load(Ordering::Acquire),
+        expected,
+        ctx.cancel_floor.load(Ordering::Acquire),
+        ctx.settings.lock().stream_mode == "never",
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3552,6 +3570,7 @@ fn advance_generation_with_live_cleanup(ctx: &EngineCtx, cancel_active: bool) ->
         }
     }
     let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
+    ctx.cancel_floor.store(next, Ordering::SeqCst);
     ctx.cancel_active.store(cancel_active, Ordering::SeqCst);
     next
 }
@@ -3917,7 +3936,7 @@ fn process_utterance(
     // send text off-device, validate the target again immediately before that
     // possible egress; the earlier cloud-ASR guard is too old by this point.
     if !snippet_expanded && potentially_remote_rewrite(&s) {
-        if ctx.gen.load(Ordering::SeqCst) != my_gen {
+        if !final_generation_is_current(ctx, my_gen) {
             dbg_log("финал: поколение устарело до remote rewrite — данные не отправляем");
             let _ = std::fs::remove_file(&wav);
             return Ok(());
@@ -3931,7 +3950,7 @@ fn process_utterance(
             let _ = std::fs::remove_file(&wav);
             return Ok(());
         };
-        if ctx.gen.load(Ordering::SeqCst) != my_gen {
+        if !final_generation_is_current(ctx, my_gen) {
             dbg_log("финал: поколение устарело во время target-check перед rewrite");
             let _ = std::fs::remove_file(&wav);
             return Ok(());
@@ -4007,7 +4026,7 @@ fn process_utterance(
     // Если за время обработки уже стартовала НОВАЯ диктовка — этот поток «осиротел».
     // Не вставляем ничего (иначе многократная вставка при быстрой диктовке подряд).
     // Чистим за собой временный WAV и выходим.
-    if ctx.gen.load(Ordering::SeqCst) != my_gen {
+    if !final_generation_is_current(ctx, my_gen) {
         dbg_log("финал: поколение устарело (началась новая диктовка) — вставку пропускаем");
         let _ = std::fs::remove_file(&wav);
         return Ok(());
@@ -4051,7 +4070,7 @@ fn process_utterance(
     // slow target query above is deliberately outside both locks.
     let inject_guard = ctx.inject_lock.lock();
     let commit_guard = ctx.cancel_activity_lock.lock();
-    if ctx.gen.load(Ordering::SeqCst) != my_gen {
+    if !final_generation_is_current(ctx, my_gen) {
         dbg_log("финал: поколение устарело после target-check — вставку пропускаем");
         drop(inject_guard);
         let _ = std::fs::remove_file(&wav);
@@ -6409,10 +6428,34 @@ mod seg_tests {
         assert!(!resident_model_ready(&model));
     }
 
+    /// Регрессия: паника в финале убивала поток, `idle` не приходил, и плашка
+    /// висела в «распознаю» до перезапуска.
+    #[test]
+    fn a_panic_in_the_final_thread_is_contained() {
+        assert_eq!(run_guarded("t", || 7), Some(7));
+        assert_eq!(run_guarded("t", || -> u8 { panic!("boom") }), None);
+    }
+
     #[test]
     fn stale_generation_is_rejected_before_expensive_fallbacks() {
         assert!(generation_is_current(9, 9));
         assert!(!generation_is_current(10, 9));
+    }
+
+    /// Регрессия: новое нажатие хоткея, пока предыдущая фраза ещё распознаётся,
+    /// выбрасывало её целиком (debug.log: «поколение устарело ... вставку
+    /// пропускаем» при asr=4026мс). Теперь отменяет только Esc.
+    #[test]
+    fn next_hotkey_press_does_not_drop_the_previous_final() {
+        // Старт поколения 10 поверх финала 9; Esc ещё не нажимали (floor 0).
+        assert!(final_still_wanted(10, 9, 0, true));
+        // Esc в поколении 9 поднял floor до 10: финал 9 отменён.
+        assert!(!final_still_wanted(10, 9, 10, true));
+        // Финал, начавшийся после Esc, нужен.
+        assert!(final_still_wanted(11, 10, 10, true));
+        // Живая печать делит поле с новой диктовкой: поколение строгое.
+        assert!(!final_still_wanted(10, 9, 0, false));
+        assert!(final_still_wanted(9, 9, 0, false));
     }
 
     #[test]
@@ -6428,14 +6471,6 @@ mod seg_tests {
         assert!(!should_emit_norecog(180));
         assert!(!should_emit_norecog(499));
         assert!(should_emit_norecog(500));
-    }
-
-    /// Регрессия: паника в финале убивала поток, `idle` не приходил, и плашка
-    /// висела в «распознаю» до перезапуска.
-    #[test]
-    fn a_panic_in_the_final_thread_is_contained() {
-        assert_eq!(run_guarded("t", || 7), Some(7));
-        assert_eq!(run_guarded("t", || -> u8 { panic!("boom") }), None);
     }
 
     #[test]
