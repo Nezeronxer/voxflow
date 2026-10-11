@@ -58,7 +58,7 @@ sets fail instead of silently publishing an untrusted artifact.
 Linux x64 ships as `.deb` (Debian, Ubuntu, Mint), `.rpm` (Fedora, RHEL,
 openSUSE) and `.AppImage` (everything else, including Arch/Manjaro). The
 packages come from the release page; `deb`/`rpm` pull in webkit2gtk-4.1, GTK 3,
-ALSA and the Ayatana AppIndicator tray library automatically.
+gtk-layer-shell, ALSA and the Ayatana AppIndicator tray library automatically.
 ONNX Runtime (GigaAM, Parakeet, Silero VAD) is linked statically by the `ort`
 crate, so nothing extra is installed for it. Whisper (`whisper-cli`) is built
 from the pinned whisper.cpp sources by `script/build_linux_runtime.sh`, CPU only
@@ -73,18 +73,18 @@ Support" extension).
 
 ```bash
 # Debian / Ubuntu / Mint
-sudo apt install build-essential cmake pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev \
+sudo apt install build-essential cmake pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libgtk-layer-shell-dev \
   libayatana-appindicator3-dev librsvg2-dev libasound2-dev libssl-dev libx11-dev \
   libxtst-dev libxi-dev libevdev-dev libwayland-dev patchelf
 # Fedora / RHEL
-sudo dnf install gcc-c++ cmake pkgconf-pkg-config webkit2gtk4.1-devel gtk3-devel \
+sudo dnf install gcc-c++ cmake pkgconf-pkg-config webkit2gtk4.1-devel gtk3-devel gtk-layer-shell-devel \
   libayatana-appindicator-gtk3-devel librsvg2-devel alsa-lib-devel openssl-devel \
   libX11-devel libXtst-devel libXi-devel libevdev-devel wayland-devel patchelf
 # Arch / Manjaro
-sudo pacman -S --needed base-devel cmake webkit2gtk-4.1 gtk3 libayatana-appindicator \
+sudo pacman -S --needed base-devel cmake webkit2gtk-4.1 gtk3 gtk-layer-shell libayatana-appindicator \
   librsvg alsa-lib openssl libx11 libxtst libxi libevdev wayland patchelf
 # openSUSE
-sudo zypper install gcc-c++ cmake pkg-config webkit2gtk3-devel gtk3-devel \
+sudo zypper install gcc-c++ cmake pkg-config webkit2gtk3-devel gtk3-devel gtk-layer-shell-devel \
   libayatana-appindicator3-devel librsvg-devel alsa-devel libopenssl-devel \
   libX11-devel libXtst-devel libXi-devel libevdev-devel wayland-devel patchelf
 ```
@@ -134,8 +134,12 @@ Wayland deliberately forbids global key capture and synthetic input, so:
   `type` insertion method there.
 - **Window context.** Wayland hides other windows, so per-app tone profiles and
   the "window changed, do not paste" guard are unavailable.
-- **Overlay.** Always-on-top and free positioning of the overlay depend on the
-  compositor; GNOME ignores them. The overlay is never click-through on Linux.
+- **Overlay.** On Hyprland, Sway and KDE (compositors with the layer-shell
+  protocol) the overlay is a layer surface: it stays above all windows, never
+  takes focus and sits at the bottom centre; dragging it is not possible there.
+  Elsewhere (GNOME, X11) it is a regular window, so always-on-top and free
+  positioning depend on the compositor and GNOME ignores them. The overlay is
+  never click-through on Linux.
 
 ### Updates
 

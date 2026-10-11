@@ -17,6 +17,8 @@ mod inject;
 mod linux_env;
 #[cfg(any(target_os = "linux", test))]
 mod linux_evdev;
+#[cfg(any(target_os = "linux", test))]
+mod linux_overlay;
 mod local_ai;
 mod local_llm;
 mod macos_permissions;
@@ -1438,6 +1440,9 @@ pub(crate) fn commit_overlay_position(app: &tauri::AppHandle) -> Result<(), Stri
     Ok(())
 }
 
+/// Отступ плашки от нижней кромки рабочей области, логические px.
+const OVERLAY_BOTTOM_MARGIN: i32 = 156;
+
 /// Overlay-индикатор (orb): маленькое плавающее окно. И на macOS, и на Windows
 /// оно СТАРТУЕТ click-through: прозрачное окно (крупнее видимой пилюли — запас
 /// под тень) иначе перехватывало бы курсор и клики над пустыми полями, показывая
@@ -1455,6 +1460,13 @@ fn setup_overlay(app: &tauri::AppHandle) {
         #[cfg(not(any(windows, target_os = "macos")))]
         let _ = ov.set_ignore_cursor_events(false);
         let _ = ov.set_always_on_top(true);
+        // Wayland с layer-shell: слой задаётся до первого show(), снизу тот же
+        // отступ, что у позиции по умолчанию ниже. Позицию тогда ведёт
+        // композитор: set_position и сохранённое место не используются.
+        #[cfg(target_os = "linux")]
+        let layered = linux_overlay::apply(&ov, OVERLAY_BOTTOM_MARGIN);
+        #[cfg(not(target_os = "linux"))]
+        let layered = false;
         let scale = ov.scale_factor().unwrap_or(1.0);
         let user_scale = app.state::<AppState>().settings.lock().overlay_scale;
         // Стартовый размер = компактный idle-запрос фронта с небольшим
@@ -1476,14 +1488,18 @@ fn setup_overlay(app: &tauri::AppHandle) {
                     .and_then(|json| serde_json::from_str::<(i32, i32)>(&json).ok()),
             )
         };
-        let mut placed = false;
+        let mut placed = layered;
         let win_w_i = win_w.round() as i32;
         let win_h_i = win_h.round() as i32;
         // Та же формула, что при смене режима, — иначе стартовая позиция и
         // позиция после первой диктовки могут разойтись на пиксель.
-        let saved_position = saved_anchor
-            .map(|anchor| commands::overlay_box_position(anchor, (win_w_i, win_h_i)))
-            .or(saved_legacy);
+        let saved_position = if layered {
+            None
+        } else {
+            saved_anchor
+                .map(|anchor| commands::overlay_box_position(anchor, (win_w_i, win_h_i)))
+                .or(saved_legacy)
+        };
         if let (Some((x, y)), Ok(monitors)) = (saved_position, ov.available_monitors()) {
             let visible = monitors.iter().any(|mon| {
                 let area = mon.work_area();
@@ -1510,7 +1526,8 @@ fn setup_overlay(app: &tauri::AppHandle) {
                 // Держим заметно выше Dock/menu-safe area: на macOS маленькая
                 // recording-пилюля иначе визуально терялась у нижней кромки.
                 let y = area.position.y
-                    + (area.size.height as f64 - win_h - 156.0 * scale).max(0.0) as i32;
+                    + (area.size.height as f64 - win_h - f64::from(OVERLAY_BOTTOM_MARGIN) * scale)
+                        .max(0.0) as i32;
                 let _ = ov.set_position(PhysicalPosition::new(x, y));
             }
         }

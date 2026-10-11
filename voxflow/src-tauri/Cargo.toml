@@ -60,6 +60,10 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 # Буфер обмена на Wayland (протокол data-control) вместо XWayland; на X11 и в
 # GNOME (нет data-control) arboard остаётся на X11-бэкенде.
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
+# Плашка поверх окон на Wayland (layer surface); обёртка над gtk 0.18 из Tauri.
+# Уже в дереве через tao/wry (та же 0.18.2); прямая зависимость нужна ради WidgetExt.
+gtk = "0.18"
+gtk-layer-shell = { version = "0.8.2", features = ["v0_6"] }
 
 # mock_app() для теста загрузки моделей без окна. Не на Windows: с фичей
 # `test` тестовый exe там падает на старте (STATUS_ENTRYPOINT_NOT_FOUND).
