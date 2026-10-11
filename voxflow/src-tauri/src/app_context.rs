@@ -311,6 +311,7 @@ fn is_sensitive_focused_field(role: &str, subrole: &str, role_description: &str)
 /// Limit value reads to editable/textual controls. Besides reducing AX work,
 /// this avoids treating button values, sliders and other UI metadata as local
 /// document context.
+#[cfg(any(windows, target_os = "macos", test))]
 fn is_textual_focused_field(role: &str, subrole: &str) -> bool {
     let role = role.to_ascii_lowercase();
     let subrole = subrole.to_ascii_lowercase();
