@@ -11,6 +11,10 @@ mod gemini;
 mod gigaam;
 mod hotkey;
 mod inject;
+#[cfg(any(target_os = "linux", test))]
+mod linux_env;
+#[cfg(any(target_os = "linux", test))]
+mod linux_evdev;
 mod local_ai;
 mod local_llm;
 mod macos_permissions;
@@ -44,6 +48,13 @@ const OVERLAY_IDLE_BOX: (i32, i32) = (266, 60);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK 2.42+ с DMA-BUF рендерером даёт пустое окно или краш на части
+    // драйверов (NVIDIA, VM). Программный путь чуть медленнее, но надёжен;
+    // пользователь может выставить переменную сам, и тогда мы её не трогаем.
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
     // CLI-селфтесты Parakeet/LID. Диспатч здесь, а не в main.rs: main.rs правится
     // другим кластером, а неизвестные ему флаги всё равно проваливаются в run().
     {
@@ -76,7 +87,11 @@ pub fn run() {
         // ПЕРВЫМ: единственный экземпляр процесса. Иначе старый и новый voxflow.exe
         // открывают ОДИН voxflow.db и затирают настройки друг друга (B4). Колбэк
         // показывает/фокусирует уже запущенное окно настроек.
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            // `voxflow --toggle` из системного шортката (Wayland): команда, не окно.
+            if hotkey::handle_remote_args(&argv) {
+                return;
+            }
             if let Some(main) = app.get_webview_window("main") {
                 let _ = main.show();
                 let _ = main.unminimize();

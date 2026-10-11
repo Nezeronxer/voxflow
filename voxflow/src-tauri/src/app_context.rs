@@ -2261,9 +2261,36 @@ pub fn detect() -> AppContext {
 // Fallback для прочих платформ (не Windows и не macOS)
 // ===========================================================================
 
+/// Linux/X11: класс и заголовок активного окна через `xprop`. На Wayland
+/// (композитор не раскрывает чужие окна) и без xprop контекст пуст.
+#[cfg(target_os = "linux")]
+pub fn detect() -> AppContext {
+    // Нет данных об окне (Wayland / нет xprop): стабильная заглушка. Пустой
+    // контекст движок считает «неизвестным» и отменяет вставку, а так диктовка
+    // работает, просто без защиты от смены окна.
+    let window =
+        crate::linux_env::x11_active_window().unwrap_or_else(|| crate::linux_env::ActiveWindow {
+            id: "linux-session".into(),
+            class: "linux-desktop".into(),
+            title: String::new(),
+        });
+    let exe = window.class.to_ascii_lowercase();
+    AppContext {
+        category: classify(&exe, &window.title.to_ascii_lowercase()),
+        exe,
+        title: window.title,
+        window_id: window.id,
+        field_role: String::new(),
+        field_subrole: String::new(),
+        field_id: String::new(),
+        field_text: String::new(),
+        selected_text: String::new(),
+    }
+}
+
 /// Заглушка для платформ, где контекст определить нечем: возвращаем пустые
 /// строки и нейтральную категорию.
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 pub fn detect() -> AppContext {
     AppContext {
         exe: String::new(),

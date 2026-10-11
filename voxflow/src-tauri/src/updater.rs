@@ -32,6 +32,7 @@ enum UpdateTarget {
     WindowsX64,
     MacosArm64,
     MacosX64,
+    LinuxX64,
     Unsupported,
 }
 
@@ -41,6 +42,7 @@ impl UpdateTarget {
             Self::WindowsX64 => Some(("VoxFlow-Setup-", ".exe")),
             Self::MacosArm64 => Some(("VoxFlow-macOS-", "-arm64.dmg")),
             Self::MacosX64 => Some(("VoxFlow-macOS-", "-x64.dmg")),
+            Self::LinuxX64 => Some(("VoxFlow-", "-linux-x64.AppImage")),
             Self::Unsupported => None,
         }
     }
@@ -50,6 +52,7 @@ impl UpdateTarget {
             Self::WindowsX64 => "Windows x64",
             Self::MacosArm64 => "macOS ARM64",
             Self::MacosX64 => "macOS x64",
+            Self::LinuxX64 => "Linux x64",
             Self::Unsupported => "этой платформы",
         }
     }
@@ -67,6 +70,10 @@ fn current_update_target() -> UpdateTarget {
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
         return UpdateTarget::MacosX64;
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        return UpdateTarget::LinuxX64;
     }
     #[allow(unreachable_code)]
     UpdateTarget::Unsupported
@@ -482,7 +489,49 @@ fn apply_downloaded_update(dest: &Path, _latest_version: &str) -> Result<UpdateI
     })
 }
 
-#[cfg(not(any(windows, target_os = "macos")))]
+/// Linux: заменить запущенный AppImage проверенным файлом и перезапустить его.
+/// Замена идёт переименованием (новый inode), поэтому работающий образ не ломается.
+#[cfg(target_os = "linux")]
+fn apply_downloaded_update(dest: &Path, _latest_version: &str) -> Result<UpdateInstallResult> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let current = std::env::var_os("APPIMAGE")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .ok_or_else(|| {
+            anyhow!("автообновление работает только для AppImage: обновите пакет через менеджер пакетов или скачайте релиз вручную")
+        })?;
+    let staged = current.with_extension(format!("update-{}", std::process::id()));
+    std::fs::copy(dest, &staged).map_err(|e| {
+        anyhow!(
+            "не удалось записать обновление рядом с {}: {e}",
+            current.display()
+        )
+    })?;
+    let installed = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755))
+        .and_then(|()| std::fs::rename(&staged, &current));
+    if let Err(e) = installed {
+        let _ = std::fs::remove_file(&staged);
+        return Err(anyhow!("не удалось заменить {}: {e}", current.display()));
+    }
+    let _ = std::fs::remove_file(dest);
+    // Старый процесс завершится сам; новый ждёт, пока освободится single-instance.
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(r#"sleep 3; exec "$0""#)
+        .arg(&current)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    Ok(UpdateInstallResult {
+        launched: true,
+        path: current.display().to_string(),
+        message: "Обновление установлено. VoxFlow перезапустится.".into(),
+    })
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 fn apply_downloaded_update(_dest: &Path, _latest_version: &str) -> Result<UpdateInstallResult> {
     Err(anyhow!(
         "автоустановка обновлений для {} не поддерживается: откройте релиз вручную",
@@ -817,6 +866,17 @@ fn cleanup_old_macos_app_bundles_in(
     Ok(removed)
 }
 
+/// Linux ставит обновление только поверх AppImage (его можно заменить файлом).
+/// Для deb/rpm пакетный менеджер сам владеет файлами, поэтому там кнопка
+/// ведёт на страницу релиза.
+fn target_auto_install(target: UpdateTarget) -> bool {
+    match target {
+        UpdateTarget::Unsupported => false,
+        UpdateTarget::LinuxX64 => std::env::var_os("APPIMAGE").is_some(),
+        _ => true,
+    }
+}
+
 fn update_info_from_release_for(
     release: &serde_json::Value,
     target: UpdateTarget,
@@ -871,7 +931,7 @@ fn update_info_from_release_for(
 
     Ok(UpdateInfo {
         available,
-        auto_install: !matches!(target, UpdateTarget::Unsupported),
+        auto_install: target_auto_install(target),
         current_version,
         latest_version,
         release_name: release
@@ -942,6 +1002,7 @@ fn asset_name_matches_version(name: &str, target: UpdateTarget, version: &str) -
         ]
         .iter()
         .any(|expected| expected == name),
+        UpdateTarget::LinuxX64 => name == format!("VoxFlow-{version}-linux-x64.AppImage"),
         UpdateTarget::Unsupported => false,
     }
 }
@@ -1217,6 +1278,28 @@ mod tests {
         assert!(validate_asset_digest(&format!("sha256:{}", "a".repeat(64))).is_ok());
         assert!(validate_asset_digest("sha512:abcd").is_err());
         assert!(validate_asset_digest("sha256:abcd").is_err());
+    }
+
+    #[test]
+    fn selects_linux_appimage_asset_and_ignores_packages() {
+        let base = "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0";
+        let release = serde_json::json!({
+            "tag_name": "v99.0.0",
+            "assets": [
+                { "name": "VoxFlow_99.0.0_amd64.deb", "size": 1,
+                  "browser_download_url": format!("{base}/VoxFlow_99.0.0_amd64.deb") },
+                { "name": "VoxFlow-99.0.0-linux-x64.AppImage", "size": 123,
+                  "browser_download_url": format!("{base}/VoxFlow-99.0.0-linux-x64.AppImage") }
+            ]
+        });
+        let info = update_info_from_release_for(&release, UpdateTarget::LinuxX64).unwrap();
+        assert_eq!(info.asset_name, "VoxFlow-99.0.0-linux-x64.AppImage");
+        assert!(info.available);
+        assert!(validate_asset_name_for(
+            "VoxFlow-99.0.0-linux-x64.AppImage",
+            UpdateTarget::WindowsX64
+        )
+        .is_err());
     }
 
     #[test]

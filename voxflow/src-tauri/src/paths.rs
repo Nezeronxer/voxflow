@@ -218,9 +218,13 @@ pub fn model_path(name: &str) -> PathBuf {
     models_dir().join(name)
 }
 
-#[cfg(target_os = "macos")]
-fn macos_whisper_resource_dir() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
+/// Каталог ресурсов с whisper-cli/whisper-server для macOS и Linux
+/// (на Windows они лежат в `whisper/Release`).
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn unix_whisper_resource_dir() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "whisper-linux-x64"
+    } else if cfg!(target_arch = "aarch64") {
         "whisper-darwin-arm64"
     } else {
         "whisper-darwin-x64"
@@ -347,9 +351,9 @@ pub fn whisper_cpu_dir(app: &AppHandle) -> PathBuf {
     let res = app.path().resource_dir().ok();
     let mut candidates: Vec<PathBuf> = Vec::new();
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        let dir = macos_whisper_resource_dir();
+        let dir = unix_whisper_resource_dir();
         if let Some(r) = &res {
             candidates.push(r.join("resources").join(dir));
             candidates.push(r.join(dir));
@@ -377,11 +381,11 @@ pub fn whisper_cpu_dir(app: &AppHandle) -> PathBuf {
 
 /// Dev-каталог whisper (для `--selftest` без Tauri-контекста): CUDA при наличии GPU.
 pub fn whisper_dir_standalone() -> PathBuf {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("resources")
-            .join(macos_whisper_resource_dir());
+            .join(unix_whisper_resource_dir());
         if p.join(whisper_cli_name()).exists() {
             return p;
         }
