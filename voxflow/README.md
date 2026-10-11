@@ -149,7 +149,7 @@ Settings button opens the release page: install the new package with `apt`,
 - Explicit Russian: GigaAM v3.
 - Explicit English: Parakeet TDT v3 when installed.
 - Auto/mixed language and universal fallback: Whisper, with Large v3 Turbo Q5
-  recommended. Medium, Turbo Q8/full, and Large v3 remain available;
-  Tiny/Base/Small are hidden legacy choices unless already installed or active.
+  recommended. Turbo Q8/full and Large v3 remain available; the weak
+  Tiny/Base/Small/Medium models were removed (saved choice migrates to Q5).
 - Cloud STT/rewrite: optional BYOK; local fallback preserves the selected local
   router.

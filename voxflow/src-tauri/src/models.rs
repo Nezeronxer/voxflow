@@ -32,9 +32,6 @@ pub const PARAKEET_NAME: &str = "parakeet-v3";
 /// Единственный рекомендованный Whisper-пресет: multilingual, пригоден для RU/EN
 /// и смешанной речи, но не требует 1.6–3.1 ГБ на диске.
 pub const RECOMMENDED_WHISPER_NAME: &str = "ggml-large-v3-turbo-q5_0.bin";
-/// Слабые legacy-пресеты не предлагаем к новой загрузке, но сохраняем в
-/// каталоге, чтобы уже установленную/активную модель можно было увидеть и удалить.
-const WEAK_LEGACY_WHISPER_NAMES: &[&str] = &["ggml-tiny.bin", "ggml-base.bin", "ggml-small.bin"];
 
 /// Защита от двойного запуска загрузки каталожной модели: автозагрузка при первом
 /// старте (ensure_default_models) и клик «Скачать» в UI могут прилететь
@@ -149,13 +146,6 @@ struct Entry {
 
 const CATALOG: &[Entry] = &[
     Entry {
-        name: "ggml-tiny.bin",
-        label: "Tiny — legacy, низкая точность (78 МБ)",
-        size_mb: 78,
-        size_bytes: 77_691_713,
-        sha256: "be07e048e1e599ad46341c8d2a135645097a538221678b7acdd1b1919c6e1b21",
-    },
-    Entry {
         name: "ggml-large-v3-turbo-q5_0.bin",
         label: "Large v3 Turbo Q5 — рекомендуется (все языки, 574 МБ)",
         size_mb: 574,
@@ -182,27 +172,6 @@ const CATALOG: &[Entry] = &[
         size_mb: 3100,
         size_bytes: 3_095_033_483,
         sha256: "64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2",
-    },
-    Entry {
-        name: "ggml-base.bin",
-        label: "Base — legacy, низкая точность (148 МБ)",
-        size_mb: 148,
-        size_bytes: 147_951_465,
-        sha256: "60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe",
-    },
-    Entry {
-        name: "ggml-small.bin",
-        label: "Small — legacy, уступает Turbo (488 МБ)",
-        size_mb: 488,
-        size_bytes: 487_601_967,
-        sha256: "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b",
-    },
-    Entry {
-        name: "ggml-medium.bin",
-        label: "Medium — повышенная точность без Large (1.53 ГБ)",
-        size_mb: 1530,
-        size_bytes: 1_533_763_059,
-        sha256: "6c14d5adee5f86394037b4e4e8b59f1673b6cee10e3cf0b11bbdbee79c156208",
     },
 ];
 
@@ -239,10 +208,6 @@ fn url_for(name: &str) -> String {
 
 fn is_whisper_catalog_name(name: &str) -> bool {
     CATALOG.iter().any(|e| e.name == name)
-}
-
-fn is_weak_legacy_whisper(name: &str) -> bool {
-    WEAK_LEGACY_WHISPER_NAMES.contains(&name)
 }
 
 fn catalog_entry(name: &str) -> Option<&'static Entry> {
@@ -450,9 +415,7 @@ pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Setting
         "auto" | "all" | "any" | "multi" | "multilingual" | "*"
     ) || settings.engine != "gigaam";
 
-    let configured_model_is_usable = is_whisper_catalog_name(&settings.model)
-        && (!is_weak_legacy_whisper(&settings.model)
-            || crate::paths::model_path(&settings.model).exists());
+    let configured_model_is_usable = is_whisper_catalog_name(&settings.model);
     let name = if wants_multilingual && configured_model_is_usable {
         settings.model.clone()
     } else if wants_multilingual {
@@ -558,13 +521,6 @@ fn spawn_download(app: AppHandle, name: String, proxy: String) -> Result<()> {
     }
     if !CATALOG.iter().any(|e| e.name == name) {
         return Err(anyhow!("Неизвестная модель: {name}"));
-    }
-    // Уже скачанные legacy-веса остаются управляемыми и удаляемыми. Новую
-    // загрузку слабого пресета не начинаем: предлагаем один понятный default.
-    if is_weak_legacy_whisper(&name) && !crate::paths::model_path(&name).exists() {
-        return Err(anyhow!(
-            "Эта legacy-модель больше не предлагается; выберите Large v3 Turbo Q5"
-        ));
     }
     {
         let mut active = WHISPER_ACTIVE.lock();
@@ -805,9 +761,8 @@ mod tests {
 
     #[test]
     fn whisper_catalog_has_fast_and_quality_v2_profiles() {
-        assert!(is_whisper_catalog_name("ggml-tiny.bin"));
         assert!(is_whisper_catalog_name("ggml-large-v3-turbo-q8_0.bin"));
-        assert!(is_whisper_catalog_name("ggml-medium.bin"));
+        assert!(!is_whisper_catalog_name("ggml-tiny.bin"));
         for entry in CATALOG {
             assert!(entry.size_bytes > 0, "{} size", entry.name);
             assert_eq!(entry.sha256.len(), 64, "{} sha256", entry.name);
@@ -817,22 +772,13 @@ mod tests {
     }
 
     #[test]
-    fn catalog_has_one_recommendation_and_marks_weak_legacy_models() {
+    fn catalog_has_one_recommendation() {
         let recommended = CATALOG
             .iter()
             .filter(|entry| entry.label.contains("рекомендуется"))
             .collect::<Vec<_>>();
         assert_eq!(recommended.len(), 1);
         assert_eq!(recommended[0].name, RECOMMENDED_WHISPER_NAME);
-
-        for name in WEAK_LEGACY_WHISPER_NAMES {
-            let entry = CATALOG
-                .iter()
-                .find(|entry| entry.name == *name)
-                .expect("legacy-модель остаётся управляемой");
-            assert!(entry.label.contains("legacy"), "{}", entry.label);
-            assert!(is_weak_legacy_whisper(name));
-        }
     }
 
     #[test]
@@ -981,6 +927,6 @@ mod tests {
         assert!(delete("..\\voxflow.db").is_err());
         assert!(delete("../voxflow.db").is_err());
         assert!(delete("C:\\Users\\Public\\victim.bin").is_err());
-        assert!(is_whisper_catalog_name("ggml-base.bin"));
+        assert!(is_whisper_catalog_name("ggml-large-v3.bin"));
     }
 }
