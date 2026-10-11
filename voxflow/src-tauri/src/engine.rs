@@ -307,6 +307,8 @@ struct EngineCtx {
     last_injected_gen: Arc<AtomicU64>,
     /// Поколение, начиная с которого финалы ещё нужны: Esc поднимает его, Start - нет.
     cancel_floor: Arc<AtomicU64>,
+    /// Очередь финалов в полёте: вставка строго по порядку поколений.
+    final_queue: Arc<FinalQueue>,
     /// Резидентный GigaAM-v3 (русский ASR, ONNX/CPU): грузится на warmup и живёт
     /// всю сессию — холодного старта на диктовке нет. Mutex сериализует
     /// партиал-тики и финал (Session::run требует &mut).
@@ -366,6 +368,7 @@ pub fn spawn(
         gen: Arc::new(AtomicU64::new(0)),
         last_injected_gen: Arc::new(AtomicU64::new(0)),
         cancel_floor: Arc::new(AtomicU64::new(0)),
+        final_queue: Arc::new(FinalQueue::default()),
         gigaam: Arc::new(Mutex::new(None)),
         parakeet: Arc::new(Mutex::new(None)),
         vad: Arc::new(Mutex::new(None)),
@@ -2814,6 +2817,52 @@ fn stop_tap_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     dbg_log("hotkey: quick tap discarded as a double-tap gesture candidate");
 }
 
+/// Финалы в полёте. Распознавание длится по-разному, и без очереди второй
+/// короткий финал вставлялся бы раньше первого длинного.
+#[derive(Default)]
+struct FinalQueue {
+    pending: Mutex<std::collections::BTreeSet<u64>>,
+    changed: parking_lot::Condvar,
+}
+
+/// Место финала в очереди; освобождается при любом выходе, включая панику.
+struct FinalTicket {
+    queue: Arc<FinalQueue>,
+    gen: u64,
+}
+
+impl Drop for FinalTicket {
+    fn drop(&mut self) {
+        self.queue.pending.lock().remove(&self.gen);
+        self.queue.changed.notify_all();
+    }
+}
+
+impl FinalQueue {
+    fn enter(queue: &Arc<Self>, gen: u64) -> FinalTicket {
+        queue.pending.lock().insert(gen);
+        FinalTicket {
+            queue: Arc::clone(queue),
+            gen,
+        }
+    }
+
+    /// Ждёт, пока все более ранние финалы вставлены, отменены или упали.
+    /// По таймауту идёт дальше: зависший финал не держит очередь вечно.
+    fn wait_turn(&self, gen: u64, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut pending = self.pending.lock();
+        while pending.range(..gen).next().is_some() {
+            if self.changed.wait_until(&mut pending, deadline).timed_out() {
+                log::warn!("очередь финалов: предыдущий финал завис, вставляем без него");
+                return;
+            }
+        }
+    }
+}
+
+const FINAL_ORDER_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
     let rate = c.sample_rate();
     // Переполнение буфера записи (audio P2-1): хвост диктовки отброшен —
@@ -2867,7 +2916,9 @@ fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
             sound::play(false);
         }
         let ctx2 = ctx.clone();
+        let ticket = FinalQueue::enter(&ctx.final_queue, my_gen);
         std::thread::spawn(move || {
+            let _ticket = ticket;
             match run_guarded("process_utterance", || {
                 process_utterance(&ctx2, samples, rate, Some(live), my_gen, target_fp)
             }) {
@@ -2902,7 +2953,9 @@ fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
         ));
         fp
     });
+    let ticket = FinalQueue::enter(&ctx.final_queue, my_gen);
     std::thread::spawn(move || {
+        let _ticket = ticket;
         match run_guarded("process_utterance", || {
             process_utterance(&ctx2, samples, rate, None, my_gen, target_fp)
         }) {
@@ -4045,6 +4098,7 @@ fn process_utterance(
     // Target detection may call platform accessibility APIs. Keep it outside
     // the keyboard lock so a new hotkey can invalidate this generation while
     // detection is running instead of waiting behind it.
+    ctx.final_queue.wait_turn(my_gen, FINAL_ORDER_TIMEOUT);
     let context_started = Instant::now();
     let final_target = current_or_restored_target(ctx, &mut target_fp, "перед вставкой");
     context_ms += context_started.elapsed().as_millis() as u64;
@@ -6426,6 +6480,37 @@ mod seg_tests {
         drop(loading);
         *model.lock() = None;
         assert!(!resident_model_ready(&model));
+    }
+
+    /// Регрессия фикса «финал не отбрасывается»: второй финал готов раньше
+    /// первого, но вставки идут строго 1, 2.
+    #[test]
+    fn finals_are_inserted_in_generation_order() {
+        let queue = Arc::new(FinalQueue::default());
+        let t1 = FinalQueue::enter(&queue, 1);
+        let t2 = FinalQueue::enter(&queue, 2);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (q2, o2) = (Arc::clone(&queue), Arc::clone(&order));
+        let second = std::thread::spawn(move || {
+            q2.wait_turn(2, Duration::from_secs(5));
+            o2.lock().push(2);
+            drop(t2);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        queue.wait_turn(1, Duration::from_secs(5));
+        order.lock().push(1);
+        drop(t1);
+        second.join().unwrap();
+        assert_eq!(*order.lock(), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_hung_earlier_final_does_not_block_forever() {
+        let queue = Arc::new(FinalQueue::default());
+        let _hung = FinalQueue::enter(&queue, 1);
+        let started = Instant::now();
+        queue.wait_turn(2, Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     /// Регрессия: паника в финале убивала поток, `idle` не приходил, и плашка
