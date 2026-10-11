@@ -9,7 +9,7 @@ window.STATE =
   "briefFile": "2026-10-11-brief.md",
   "memoryFile": "CLAUDE.md",
   "startedAt": "2026-10-11T18:46:46+03:00",
-  "updatedAt": "2026-10-11T19:22:00+03:00",
+  "updatedAt": "2026-10-11T19:28:45+03:00",
   "finishedAt": null,
   "stages": [
     { "id": "preflight", "status": "done", "startedAt": "2026-10-11T18:46:46+03:00", "finishedAt": "2026-10-11T18:52:10+03:00" },
@@ -19,7 +19,7 @@ window.STATE =
     { "id": "plan",      "status": "done", "startedAt": "2026-10-11T19:10:30+03:00", "finishedAt": "2026-10-11T18:51:25+03:00" },
     { "id": "build",     "status": "done", "finishedAt": "2026-10-11T19:22:00+03:00", "startedAt": "2026-10-11T18:51:25+03:00", "note": "3 из 3 тасков" },
     { "id": "review",    "status": "done", "finishedAt": "2026-10-11T19:22:00+03:00", "startedAt": "2026-10-11T18:58:42+03:00" },
-    { "id": "final",     "status": "active", "startedAt": "2026-10-11T19:22:00+03:00", "note": "сборка и живой запуск на Arch" }
+    { "id": "final",     "status": "active", "startedAt": "2026-10-11T19:22:00+03:00", "note": "собрано и запущено на Arch; ждёт живой диктовки и разрешения на пуш и тег v2.2.1" }
   ],
   "requirements": { "total": 9, "done": 1, "inTicket": 0, "inSpec": 0, "placeholder": 0, "deferred": 0, "dropped": 0 },
   "tickets": [
@@ -80,7 +80,7 @@ window.STATE =
 ],
   "singlePass": null,
   "tests": null,
-  "debt": { "placeholders": [], "assumptions": ["Новая зависимость gtk-layer-shell (Wayland-плашка)", "Новая фраза в живой печати ждёт вставки прошлой (задержка = время финала прошлой)", "Conflicted copies перенесены в ~/.cache, не удалены"], "emptyEnv": [] },
+  "debt": { "placeholders": [], "assumptions": ["AppImage локально на Arch не собирается (linuxdeploy, нет gdk-pixbuf-2.0); релизный AppImage соберёт CI на Ubuntu", "Новая зависимость gtk-layer-shell (Wayland-плашка)", "Новая фраза в живой печати ждёт вставки прошлой (задержка = время финала прошлой)", "Conflicted copies перенесены в ~/.cache, не удалены"], "emptyEnv": [] },
   "additions": [],
   "coverage": { "found": 15, "fixed": 11, "deferred": 4 },
   "blind": null
