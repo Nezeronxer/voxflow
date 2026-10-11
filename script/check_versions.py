@@ -42,6 +42,7 @@ def collect_versions() -> tuple[dict[str, str], str]:
     settings_hub = (ROOT / "voxflow/src/sections/SettingsHub.tsx").read_text(
         encoding="utf-8"
     )
+    app_tsx = (ROOT / "voxflow/src/App.tsx").read_text(encoding="utf-8")
     app_readme = (ROOT / "voxflow/README.md").read_text(encoding="utf-8")
     release_notes = (ROOT / "RELEASE_NOTES.md").read_text(encoding="utf-8")
 
@@ -67,6 +68,13 @@ def collect_versions() -> tuple[dict[str, str], str]:
         "SettingsHub.tsx": capture(
             r"VoxFlow\s+(\d+\.\d+\.\d+)", settings_hub, "visible UI version"
         ),
+        # The sidebar brand shows major.minor only; borrow the package patch to compare.
+        "App.tsx brand-name": capture(
+            r'brand-name">VoxFlow\s+<span>(\d+\.\d+)</span>',
+            app_tsx,
+            "sidebar brand version",
+        )
+        + "." + str(package.get("version", "")).rpartition(".")[2],
         "voxflow/README.md": capture(
             r"check_versions\.py\s+--tag\s+v(\d+\.\d+\.\d+)",
             app_readme,

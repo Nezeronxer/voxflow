@@ -396,7 +396,7 @@ export default function App() {
             ))}
           </div>
           <div>
-            <div className="brand-name">VoxFlow <span>2.1</span></div>
+            <div className="brand-name">VoxFlow <span>2.2</span></div>
             <div className="brand-sub">Диктовка на устройстве</div>
           </div>
         </div>
