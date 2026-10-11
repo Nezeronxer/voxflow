@@ -95,6 +95,7 @@ export default function History() {
           type="text"
           className="hist-search"
           placeholder="Поиск по тексту и приложению"
+          aria-label="Поиск по истории"
           value={query}
           onChange={(e) => setQuery(e.currentTarget.value)}
         />

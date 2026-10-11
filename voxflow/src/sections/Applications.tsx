@@ -42,16 +42,16 @@ const APP_GROUPS: { title: string; apps: AppPreset[] }[] = [
     ],
   },
   {
-    title: "Промты",
+    title: "Промпты",
     apps: [
-      { name: "Codex", match: "codex", profile: "ai", group: "Промты", hint: "Команды, списки и технический контекст.", glyph: "terminal" },
-      { name: "ChatGPT", match: "chatgpt", profile: "ai", group: "Промты", hint: "Промты без случайной отправки.", glyph: "spark" },
-      { name: "Claude", match: "claude", profile: "ai", group: "Промты", hint: "Чёткие инструкции и длинный контекст.", glyph: "claude" },
-      { name: "Gemini", match: "gemini", profile: "ai", group: "Промты", hint: "Структурные запросы без лишней воды.", glyph: "spark" },
-      { name: "Perplexity", match: "perplexity", profile: "ai", group: "Промты", hint: "Вопросы с контекстом и критериями поиска.", glyph: "spark" },
-      { name: "DeepSeek", match: "deepseek", profile: "ai", group: "Промты", hint: "Чёткие задачи для кода и анализа.", glyph: "spark" },
-      { name: "Grok", match: "grok", profile: "ai", group: "Промты", hint: "Короткие постановки с явным результатом.", glyph: "spark" },
-      { name: "OpenRouter", match: "openrouter", profile: "ai", group: "Промты", hint: "Единые правила для веб-чата и роутера моделей.", glyph: "spark" },
+      { name: "Codex", match: "codex", profile: "ai", group: "Промпты", hint: "Команды, списки и технический контекст.", glyph: "terminal" },
+      { name: "ChatGPT", match: "chatgpt", profile: "ai", group: "Промпты", hint: "Промпты без случайной отправки.", glyph: "spark" },
+      { name: "Claude", match: "claude", profile: "ai", group: "Промпты", hint: "Чёткие инструкции и длинный контекст.", glyph: "claude" },
+      { name: "Gemini", match: "gemini", profile: "ai", group: "Промпты", hint: "Структурные запросы без лишней воды.", glyph: "spark" },
+      { name: "Perplexity", match: "perplexity", profile: "ai", group: "Промпты", hint: "Вопросы с контекстом и критериями поиска.", glyph: "spark" },
+      { name: "DeepSeek", match: "deepseek", profile: "ai", group: "Промпты", hint: "Чёткие задачи для кода и анализа.", glyph: "spark" },
+      { name: "Grok", match: "grok", profile: "ai", group: "Промпты", hint: "Короткие постановки с явным результатом.", glyph: "spark" },
+      { name: "OpenRouter", match: "openrouter", profile: "ai", group: "Промпты", hint: "Единые правила для веб-чата и роутера моделей.", glyph: "spark" },
     ],
   },
   {
@@ -190,7 +190,7 @@ export default function Applications({ settings, update, embedded }: Props) {
     setStatus(message);
   }
 
-  function savePromptRules(nextRules: AiPromptRule[], message = "Промты обновлены.") {
+  function savePromptRules(nextRules: AiPromptRule[], message = "Промпты обновлены.") {
     const normalized = nextRules.map(normalizePromptRule).filter((item): item is AiPromptRule => item !== null);
     update({ ai_prompt_rules: normalized });
     setStatus(message);
@@ -207,7 +207,7 @@ export default function Applications({ settings, update, embedded }: Props) {
     const normalized = normalizePromptRule(nextRule);
     const withoutDuplicate = promptRules.filter((rule) => !sameMatch(rule.match, nextRule.match));
     if (!normalized) {
-      savePromptRules(withoutDuplicate, "Промт очищен.");
+      savePromptRules(withoutDuplicate, "Промпт очищен.");
       return;
     }
     savePromptRules([...withoutDuplicate, normalized], message);
@@ -247,10 +247,10 @@ export default function Applications({ settings, update, embedded }: Props) {
   function addPromptRule() {
     const next = normalizePromptRule({ match: promptMatch, prompt: promptText });
     if (!next) {
-      setStatus("Введите match и промт для нейросети.");
+      setStatus("Введите название нейросети и промпт для нейросети.");
       return;
     }
-    upsertPromptRule(next, "Промт добавлен.");
+    upsertPromptRule(next, "Промпт добавлен.");
     setPromptMatch("");
     setPromptText("");
   }
@@ -263,7 +263,7 @@ export default function Applications({ settings, update, embedded }: Props) {
   function deletePromptRule(index: number) {
     savePromptRules(
       promptRules.filter((_, ruleIndex) => ruleIndex !== index),
-      "Промт удалён.",
+      "Промпт удалён.",
     );
   }
 
@@ -329,7 +329,7 @@ export default function Applications({ settings, update, embedded }: Props) {
           {APP_GROUPS.map((group) => (
             <div className="app-group" key={group.title}>
               <div className="app-group-title">
-                {group.title === "Промты" ? "Нейросети" : group.title}
+                {group.title === "Промпты" ? "Нейросети" : group.title}
               </div>
               <div className="app-list">
                 {group.apps.map((app) => {
@@ -339,7 +339,7 @@ export default function Applications({ settings, update, embedded }: Props) {
                   const targetMatch = configured?.match || preferredMatch(app);
                   const promptTargetMatch =
                     promptConfigured?.match || preferredMatch(app);
-                  const isPromptApp = group.title === "Промты";
+                  const isPromptApp = group.title === "Промпты";
                   // Поле промпта раскрыто, если его открыли или промпт уже задан.
                   const promptOpen =
                     openPrompts[app.name] ?? Boolean(promptConfigured?.prompt);
@@ -386,7 +386,7 @@ export default function Applications({ settings, update, embedded }: Props) {
                               match: promptTargetMatch,
                               prompt: event.currentTarget.value,
                             },
-                            `${app.name}: промт обновлён.`,
+                            `${app.name}: промпт обновлён.`,
                           )}
                           placeholder={promptPlaceholder(app.name)}
                           rows={3}
@@ -461,7 +461,7 @@ export default function Applications({ settings, update, embedded }: Props) {
 
         <section className="card">
           <div className="card-head">
-            <div className="card-title">Дополнительные промты</div>
+            <div className="card-title">Дополнительные промпты</div>
             <div className="sub">Для нейросетей, которых нет в плитках выше.</div>
           </div>
           <div className="app-prompt-add">
@@ -482,13 +482,13 @@ export default function Applications({ settings, update, embedded }: Props) {
           </div>
 
           {promptRules.length === 0 ? (
-            <div className="empty compact">Промты пока не заданы.</div>
+            <div className="empty compact">Промпты пока не заданы.</div>
           ) : (
             <table className="table prompt-rules-table">
               <thead>
                 <tr>
-                  <th>Нейросеть / match</th>
-                  <th>Промт</th>
+                  <th>Нейросеть или сервис</th>
+                  <th>Промпт</th>
                   <th aria-label="Действия" />
                 </tr>
               </thead>
@@ -499,19 +499,19 @@ export default function Applications({ settings, update, embedded }: Props) {
                       <input
                         value={rule.match}
                         onChange={(event) => editPromptRule(index, { match: event.target.value })}
-                        aria-label="Нейросеть или match"
+                        aria-label="Нейросеть или сервис"
                       />
                     </td>
                     <td>
                       <textarea
                         value={rule.prompt}
                         onChange={(event) => editPromptRule(index, { prompt: event.target.value })}
-                        aria-label="Промт"
+                        aria-label="Промпт"
                         rows={2}
                       />
                     </td>
                     <td className="table-actions">
-                      <button className="btn btn-sm btn-danger btn-ghost" type="button" aria-label="Удалить промт" onClick={() => deletePromptRule(index)}>
+                      <button className="btn btn-sm btn-danger btn-ghost" type="button" aria-label="Удалить промпт" onClick={() => deletePromptRule(index)}>
                         <Icon.Trash className="ico" />
                       </button>
                     </td>
