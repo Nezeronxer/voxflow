@@ -17,7 +17,7 @@ use crate::audio::{self, Capture};
 use crate::settings::Settings;
 use crate::system_audio::AutoMuteGuard;
 use crate::{db, inject, paths, postprocess};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 
 /// Звуки старт/стоп (Windows: MessageBeep, без зависимостей; неблокирующий).
 #[cfg(windows)]
@@ -282,10 +282,12 @@ struct EngineCtx {
     inject_lock: Arc<Mutex<()>>,
     /// Состояние живого стриминга текущей диктовки (None, если петля не запущена).
     partial: Arc<Mutex<Option<PartialState>>>,
-    /// Physical live text transferred to a detached final. The slot is an
-    /// ownership token: a final commit/reject, a new Start, or Esc may claim it
-    /// exactly once while holding the keyboard + generation locks.
-    pending_live_draft: Arc<Mutex<Option<PendingLiveDraft>>>,
+    /// Physical live text transferred to detached finals, by generation. Each
+    /// entry is an ownership token: a final commit/reject, Esc, or a Start whose
+    /// final is already gone may claim it exactly once while holding the keyboard
+    /// and generation locks. Start does NOT take the token of a final still in
+    /// flight: that final diffs from the draft (several phrases can be in flight).
+    pending_live_draft: Arc<Mutex<PendingLiveDrafts>>,
     /// Целевое окно текущей записи, снятое ДО показа overlay/status.
     active_target: Arc<Mutex<Option<TargetFingerprint>>>,
     /// Последнее внешнее окно, куда можно безопасно возвращать фокус для вставки.
@@ -305,8 +307,9 @@ struct EngineCtx {
     /// даже если два detached-потока финала как-то совпали по gen, второй НЕ дублирует
     /// текст в активном поле. Это вторая линия защиты от «дубля вставки».
     last_injected_gen: Arc<AtomicU64>,
-    /// Поколение, начиная с которого финалы ещё нужны: Esc поднимает его, Start - нет.
-    cancel_floor: Arc<AtomicU64>,
+    /// Поколения, отменённые Esc: Esc отменяет только фразу, на которой нажат, а
+    /// финалы более ранних фраз в полёте вставляются. Start ничего не отменяет.
+    cancelled_gens: CancelledGens,
     /// Очередь финалов в полёте: вставка строго по порядку поколений.
     final_queue: Arc<FinalQueue>,
     /// Резидентный GigaAM-v3 (русский ASR, ONNX/CPU): грузится на warmup и живёт
@@ -362,12 +365,12 @@ pub fn spawn(
         asr_lock: Arc::new(Mutex::new(())),
         inject_lock: Arc::new(Mutex::new(())),
         partial: Arc::new(Mutex::new(None)),
-        pending_live_draft: Arc::new(Mutex::new(None)),
+        pending_live_draft: Arc::new(Mutex::new(PendingLiveDrafts::new())),
         active_target: Arc::new(Mutex::new(None)),
         last_external_target: Arc::new(Mutex::new(None)),
         gen: Arc::new(AtomicU64::new(0)),
         last_injected_gen: Arc::new(AtomicU64::new(0)),
-        cancel_floor: Arc::new(AtomicU64::new(0)),
+        cancelled_gens: CancelledGens::default(),
         final_queue: Arc::new(FinalQueue::default()),
         gigaam: Arc::new(Mutex::new(None)),
         parakeet: Arc::new(Mutex::new(None)),
@@ -1624,6 +1627,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                 language: lang,
                 asr_lock,
                 inject_lock,
+                gate: PreviewGate::new(&server_ctx, my_seq),
                 stop: t_stop,
                 abort: t_abort,
                 injected: t_injected,
@@ -2162,6 +2166,8 @@ struct LocalLoopArgs<T: LocalStt> {
     engine: Arc<Mutex<Option<T>>>,
     vad: Arc<Mutex<Option<crate::vad::SileroVad>>>,
     inject_lock: Arc<Mutex<()>>,
+    /// Ход печати в поле: ждёт финал прошлой фразы (плашку не задерживает).
+    gate: PreviewGate,
     stop: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     injected: Arc<Mutex<String>>,
@@ -2202,6 +2208,7 @@ fn start_local_partial_loop<T: LocalStt + Send + 'static>(
         engine,
         vad: Arc::clone(&ctx.vad),
         inject_lock: Arc::clone(&ctx.inject_lock),
+        gate: PreviewGate::new(ctx, my_seq),
         stop: Arc::clone(&stop),
         abort: Arc::clone(&abort),
         injected: Arc::clone(&injected),
@@ -2443,20 +2450,18 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
         }
         match a.stream_mode.as_str() {
             "always" => {
-                if !live_target_ok(&a.start_fp, &a.abort) {
-                    continue;
-                }
                 let flat = flatten_breaks(&full);
-                let _inj = a.inject_lock.lock();
-                // Гонка осиротевшего тика (P2-5): финал выставляет stop ДО взятия
-                // inject_lock — перепроверяем уже ПОД замком, чтобы детачнутый тик
-                // не печатал поверх идущей/завершённой финальной реконсиляции.
-                if a.stop.load(Ordering::Acquire) {
-                    break;
-                }
-                let prev = a.injected.lock().clone();
-                if inject::inject_incremental(&prev, &flat).is_ok() {
-                    *a.injected.lock() = flat;
+                match live_field_always(
+                    &LiveField::new(&a.gate, &a.inject_lock, &a.stop, &a.injected),
+                    &flat,
+                    &|| live_target_ok(&a.start_fp, &a.abort),
+                    &inject::inject_incremental,
+                ) {
+                    // Прошлый финал ещё не вставлен: в поле не печатаем, а
+                    // следующий тик повторит печать, даже если текст не изменился.
+                    FieldTyping::Waiting => last_emitted = None,
+                    FieldTyping::Stopped => break,
+                    FieldTyping::Done => {}
                 }
             }
             "auto" => {
@@ -2464,23 +2469,15 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                     continue;
                 }
                 let flat = flatten_breaks(&committed);
-                if !live_target_ok(&a.start_fp, &a.abort) {
-                    continue;
-                }
-                let _inj = a.inject_lock.lock();
-                // Перепроверка stop под замком — как в always (см. выше).
-                if a.stop.load(Ordering::Acquire) {
-                    break;
-                }
-                // already читаем ПОД inject_lock: пока тик ждал замок, финал или
-                // стирание черновика могли обновить committed_field — дифф от
-                // устаревшего prev поломал бы текст в поле.
-                let already = a.committed_field.lock().clone();
-                if flat == already {
-                    continue;
-                }
-                if inject::inject_incremental(&already, &flat).is_ok() {
-                    *a.committed_field.lock() = flat;
+                match live_field_auto(
+                    &LiveField::new(&a.gate, &a.inject_lock, &a.stop, &a.committed_field),
+                    &flat,
+                    &|| live_target_ok(&a.start_fp, &a.abort),
+                    &inject::inject_incremental,
+                ) {
+                    FieldTyping::Waiting => last_emitted = None,
+                    FieldTyping::Stopped => break,
+                    FieldTyping::Done => {}
                 }
             }
             _ => {}
@@ -2498,6 +2495,8 @@ struct PartialLoopArgs {
     asr_lock: Arc<Mutex<()>>,
     /// Замок эмиссии клавиш (см. EngineCtx.inject_lock) — общий на движок.
     inject_lock: Arc<Mutex<()>>,
+    /// Ход печати в поле: ждёт финал прошлой фразы (плашку не задерживает).
+    gate: PreviewGate,
     stop: Arc<AtomicBool>,
     abort: Arc<AtomicBool>,
     injected: Arc<Mutex<String>>,
@@ -2667,51 +2666,124 @@ fn live_target_ok(start_fp: &TargetFingerprint, abort: &Arc<AtomicBool>) -> bool
     true
 }
 
-/// always: на каждый тик сводим напечатанное (`injected`) → `partial` клавишами.
-fn live_insert_always(a: &PartialLoopArgs, partial: &str) {
-    if !live_target_ok(&a.start_fp, &a.abort) {
-        return;
+/// Всё, что нужно, чтобы напечатать превью в поле (общее для обеих петель).
+struct LiveField<'a> {
+    gate: &'a PreviewGate,
+    inject_lock: &'a Mutex<()>,
+    stop: &'a AtomicBool,
+    /// always: что сейчас напечатано; auto: committed-префикс в поле.
+    injected: &'a Mutex<String>,
+}
+
+impl<'a> LiveField<'a> {
+    fn new(
+        gate: &'a PreviewGate,
+        inject_lock: &'a Mutex<()>,
+        stop: &'a AtomicBool,
+        ledger: &'a Mutex<String>,
+    ) -> Self {
+        Self {
+            gate,
+            inject_lock,
+            stop,
+            injected: ledger,
+        }
+    }
+}
+
+/// Чем кончился тик печати в поле.
+#[derive(Debug, PartialEq, Eq)]
+enum FieldTyping {
+    /// Ход не наступил (финал прошлой фразы ещё не вставлен): не печатали.
+    Waiting,
+    /// Финал взял замок раньше: петле пора заканчивать.
+    Stopped,
+    Done,
+}
+
+/// Проверка, что фокус в нужном поле (`live_target_ok`), и сведение
+/// напечатанного (`inject::inject_incremental`) подставляются снаружи.
+type TargetOk<'a> = &'a dyn Fn() -> bool;
+type Reconcile<'a> = &'a dyn Fn(&str, &str) -> anyhow::Result<()>;
+
+/// always: на каждый тик сводим напечатанное (`injected`) → `text` клавишами.
+fn live_field_always(
+    f: &LiveField,
+    text: &str,
+    target_ok: TargetOk,
+    reconcile: Reconcile,
+) -> FieldTyping {
+    if !f.gate.open() {
+        return FieldTyping::Waiting;
+    }
+    if !target_ok() {
+        return FieldTyping::Done;
     }
     // Замок эмиссии клавиш: нажатия этой диктовки не чередуются с финалом предыдущей.
-    let _inj = a.inject_lock.lock();
+    let _inj = f.inject_lock.lock();
     // Гонка осиротевшего тика (P2-5): финал выставляет stop ДО взятия inject_lock —
     // перепроверяем под замком; взведён → тик ничего не печатает.
-    if a.stop.load(Ordering::Acquire) {
-        return;
+    if f.stop.load(Ordering::Acquire) {
+        return FieldTyping::Stopped;
     }
-    let prev = a.injected.lock().clone();
-    if inject::inject_incremental(&prev, partial).is_ok() {
-        *a.injected.lock() = partial.to_string();
+    let prev = f.injected.lock().clone();
+    if reconcile(&prev, text).is_ok() {
+        *f.injected.lock() = text.to_string();
     }
+    FieldTyping::Done
 }
 
 /// auto: печатаем КЛАВИШАМИ только стабилизированный committed-префикс (его считает
 /// PrefixStabilizer — тот же источник истины, что и пилюля). Волатильный хвост в поле
-/// НЕ печатаем — он может меняться. inject_incremental сам сведёт уже напечатанный
-/// committed → новый минимальным backspace (кириллица — 1 backspace на букву).
-fn live_insert_auto_committed(a: &PartialLoopArgs, committed: &str) {
+/// НЕ печатаем — он может меняться. Сведение само даёт минимальный backspace
+/// (кириллица — 1 backspace на букву).
+fn live_field_auto(
+    f: &LiveField,
+    committed: &str,
+    target_ok: TargetOk,
+    reconcile: Reconcile,
+) -> FieldTyping {
     if committed.is_empty() {
-        return;
+        return FieldTyping::Done;
     }
-    if !live_target_ok(&a.start_fp, &a.abort) {
-        return;
+    if !f.gate.open() {
+        return FieldTyping::Waiting;
+    }
+    if !target_ok() {
+        return FieldTyping::Done;
     }
     // Замок эмиссии клавиш (как в always).
-    let _inj = a.inject_lock.lock();
+    let _inj = f.inject_lock.lock();
     // Перепроверка stop под замком (P2-5) — детачнутый тик не печатает
     // поверх идущего финала (тот выставляет stop ДО взятия inject_lock).
-    if a.stop.load(Ordering::Acquire) {
-        return;
+    if f.stop.load(Ordering::Acquire) {
+        return FieldTyping::Stopped;
     }
     // already читаем ПОД замком: финал/стирание черновика могли обновить
     // committed, пока тик ждал, — дифф от устаревшего prev портил бы поле.
-    let already = a.committed.lock().clone();
-    if committed == already {
-        return; // фиксировать нечего нового
+    let already = f.injected.lock().clone();
+    if committed != already && reconcile(&already, committed).is_ok() {
+        *f.injected.lock() = committed.to_string();
     }
-    if inject::inject_incremental(&already, committed).is_ok() {
-        *a.committed.lock() = committed.to_string();
-    }
+    FieldTyping::Done
+}
+
+fn live_insert_always(a: &PartialLoopArgs, partial: &str) {
+    live_field_always(
+        &LiveField::new(&a.gate, &a.inject_lock, &a.stop, &a.injected),
+        partial,
+        &|| live_target_ok(&a.start_fp, &a.abort),
+        &inject::inject_incremental,
+    );
+}
+
+fn live_insert_auto_committed(a: &PartialLoopArgs, committed: &str) {
+    live_field_auto(
+        &LiveField::new(&a.gate, &a.inject_lock, &a.stop, &a.committed),
+        committed,
+        &|| live_target_ok(&a.start_fp, &a.abort),
+        &inject::inject_incremental,
+    );
 }
 
 /// Стабилизатор живого префикса: держит историю последних N токен-партиалов и
@@ -2821,8 +2893,11 @@ fn stop_tap_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
 /// короткий финал вставлялся бы раньше первого длинного.
 #[derive(Default)]
 struct FinalQueue {
-    pending: Mutex<std::collections::BTreeSet<u64>>,
+    pending: Mutex<BTreeSet<u64>>,
     changed: parking_lot::Condvar,
+    /// С какого момента печать превью поколения упирается в чужой финал
+    /// (для таймаута `preview_turn`).
+    blocked_since: Mutex<std::collections::BTreeMap<u64, Instant>>,
 }
 
 /// Место финала в очереди; освобождается при любом выходе, включая панику.
@@ -2847,6 +2922,42 @@ impl FinalQueue {
         }
     }
 
+    /// Идёт ли ещё финал поколения `gen` (билет не освобождён).
+    fn in_flight(&self, gen: u64) -> bool {
+        self.pending.lock().contains(&gen)
+    }
+
+    /// Неблокирующий ход печати превью поколения `gen` в поле: тик петли превью
+    /// либо печатает, либо пропускает печать (плашка при этом уже обновлена).
+    /// Ход наступает, когда все неотменённые финалы поколений ниже `gen` вставлены
+    /// или упали, либо когда ожидание дошло до `timeout`. Финалы из `cancelled`
+    /// отменены Esc и не держат очередь.
+    fn preview_turn(
+        &self,
+        gen: u64,
+        cancelled: &BTreeSet<u64>,
+        now: Instant,
+        timeout: Duration,
+    ) -> bool {
+        let blocked = self
+            .pending
+            .lock()
+            .range(..gen)
+            .any(|g| !cancelled.contains(g));
+        let mut since = self.blocked_since.lock();
+        since.retain(|g, _| *g >= gen);
+        if !blocked {
+            since.remove(&gen);
+            return true;
+        }
+        let first = *since.entry(gen).or_insert(now);
+        if now.saturating_duration_since(first) >= timeout {
+            log::warn!("очередь финалов: прошлый финал завис, печатаем превью без него");
+            return true;
+        }
+        false
+    }
+
     /// Ждёт, пока все более ранние финалы вставлены, отменены или упали.
     /// По таймауту идёт дальше: зависший финал не держит очередь вечно.
     fn wait_turn(&self, gen: u64, timeout: Duration) {
@@ -2862,6 +2973,34 @@ impl FinalQueue {
 }
 
 const FINAL_ORDER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Ход печати превью в поле для петли одной диктовки (always/auto). Плашка
+/// обновляется всегда; в поле печатаем, только когда `open()`.
+#[derive(Clone)]
+struct PreviewGate {
+    queue: Arc<FinalQueue>,
+    cancelled: CancelledGens,
+    gen: u64,
+}
+
+impl PreviewGate {
+    fn new(ctx: &EngineCtx, gen: u64) -> Self {
+        Self {
+            queue: Arc::clone(&ctx.final_queue),
+            cancelled: Arc::clone(&ctx.cancelled_gens),
+            gen,
+        }
+    }
+
+    fn open(&self) -> bool {
+        self.queue.preview_turn(
+            self.gen,
+            &self.cancelled.lock(),
+            Instant::now(),
+            FINAL_ORDER_TIMEOUT,
+        )
+    }
+}
 
 fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
     let rate = c.sample_rate();
@@ -2918,7 +3057,6 @@ fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
         let ctx2 = ctx.clone();
         let ticket = FinalQueue::enter(&ctx.final_queue, my_gen);
         std::thread::spawn(move || {
-            let _ticket = ticket;
             match run_guarded("process_utterance", || {
                 process_utterance(&ctx2, samples, rate, Some(live), my_gen, target_fp)
             }) {
@@ -2929,6 +3067,12 @@ fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
                 Some(Ok(())) => {}
                 None => emit_error(&ctx2.app, "Сбой при обработке диктовки"),
             }
+            release_final(
+                &ctx2.cancel_activity_lock,
+                &ctx2.pending_live_draft,
+                ticket,
+                my_gen,
+            );
             // Статус idle эмитим только если новая диктовка ещё не началась —
             // иначе перетёрли бы «recording» свежей диктовки (C3/C4).
             if ctx2.gen.load(Ordering::SeqCst) == my_gen {
@@ -2994,6 +3138,22 @@ fn clear_cancel_active_if_current(ctx: &EngineCtx, my_gen: u64) {
     }
 }
 
+/// Финал поколения `my_gen` закончил работу: снимаем токен его черновика и
+/// освобождаем место в очереди. Оба шага под замком коммита, которым владеет и
+/// Start, поэтому Start видит либо «финал в полёте, токен на месте» (не трогает),
+/// либо «финала и токена нет» (нечего стирать). Черновик упавшего финала при
+/// любом порядке остаётся в поле как есть, новая фраза печатается после него.
+fn release_final(
+    activity: &Mutex<()>,
+    slot: &Mutex<PendingLiveDrafts>,
+    ticket: FinalTicket,
+    my_gen: u64,
+) {
+    let _activity = activity.lock();
+    let _ = take_pending_live_draft_from_slot(&mut slot.lock(), my_gen);
+    drop(ticket);
+}
+
 fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     let my_gen = ctx.gen.load(Ordering::SeqCst);
     if let Some(c) = capture.take() {
@@ -3023,9 +3183,11 @@ fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
             erase_live_draft(ctx, Some(&live), my_gen);
         }
         {
+            // Esc отменяет только эту фразу: финалы прошлых фраз в полёте и их
+            // черновики в поле не трогаем, финалы вставятся как обычно.
             let _activity = ctx.cancel_activity_lock.lock();
-            let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
-            ctx.cancel_floor.store(next, Ordering::SeqCst);
+            ctx.cancelled_gens.lock().insert(my_gen);
+            ctx.gen.fetch_add(1, Ordering::SeqCst);
             ctx.cancel_active.store(false, Ordering::SeqCst);
         }
         set_status(ctx, "idle");
@@ -3204,9 +3366,13 @@ struct LiveState {
 }
 
 struct PendingLiveDraft {
-    generation: u64,
     live: LiveState,
 }
+
+type PendingLiveDrafts = std::collections::BTreeMap<u64, PendingLiveDraft>;
+
+/// Поколения, отменённые Esc (см. `EngineCtx::cancelled_gens`).
+type CancelledGens = Arc<Mutex<BTreeSet<u64>>>;
 
 impl LiveState {
     /// Было ли уже что-то физически напечатано в поле за эту диктовку.
@@ -3387,20 +3553,21 @@ fn generation_is_current(current: u64, expected: u64) -> bool {
 }
 
 /// Нужен ли ещё финал поколения `expected`. Новое нажатие хоткея финал прошлой
-/// диктовки НЕ отменяет: в режиме «только плашка» (клавиши не печатаются) он
-/// просто вставляется следом, иначе фраза, не успевшая распознаться до
-/// следующего нажатия, пропадала целиком. Отменяет только Esc (`cancel_floor`).
-/// Живая печать (always/auto) делит поле с новой диктовкой - там поколение строгое.
-fn final_still_wanted(current: u64, expected: u64, cancel_floor: u64, preview_only: bool) -> bool {
-    generation_is_current(current, expected) || (preview_only && expected >= cancel_floor)
+/// диктовки НЕ отменяет: он вставляется следом, иначе фраза, не успевшая
+/// распознаться до следующего нажатия, пропадала целиком. В режимах живой печати
+/// (always/auto) то же самое: черновик прошлой фразы остаётся в поле за своим
+/// финалом, а печать превью нового поколения ждёт хода в `FinalQueue`
+/// (`FinalQueue::preview_turn`), поэтому курсор стоит за черновиком.
+/// Отменяет только Esc, и только фразу, на которой он нажат (`cancelled`).
+fn final_still_wanted(current: u64, expected: u64, cancelled: &BTreeSet<u64>) -> bool {
+    generation_is_current(current, expected) || !cancelled.contains(&expected)
 }
 
 fn final_generation_is_current(ctx: &EngineCtx, expected: u64) -> bool {
     final_still_wanted(
         ctx.gen.load(Ordering::Acquire),
         expected,
-        ctx.cancel_floor.load(Ordering::Acquire),
-        ctx.settings.lock().stream_mode == "never",
+        &ctx.cancelled_gens.lock(),
     )
 }
 
@@ -3492,32 +3659,29 @@ fn erase_live_draft_locked(
     }
 }
 
+/// У каких режимов потока есть токен черновика (в never в поле ничего не печатается).
+fn draft_token_mode(stream_mode: &str) -> bool {
+    matches!(stream_mode, "always" | "auto")
+}
+
 fn register_pending_live_draft(ctx: &EngineCtx, generation: u64, live: &LiveState) {
     // Register the ownership token even when the ledger is still empty: a
     // partial worker may already be inside inject_lock and update the shared
     // Arc immediately after Stop. Start/Esc inspect the ledger only after
     // acquiring that same lock, so a genuinely empty token never triggers a
     // slow target lookup.
-    if matches!(live.stream_mode.as_str(), "always" | "auto") {
-        *ctx.pending_live_draft.lock() = Some(PendingLiveDraft {
-            generation,
-            live: live.clone(),
-        });
+    if draft_token_mode(&live.stream_mode) {
+        ctx.pending_live_draft
+            .lock()
+            .insert(generation, PendingLiveDraft { live: live.clone() });
     }
 }
 
 fn take_pending_live_draft_from_slot(
-    slot: &mut Option<PendingLiveDraft>,
+    slot: &mut PendingLiveDrafts,
     generation: u64,
 ) -> Option<PendingLiveDraft> {
-    if slot
-        .as_ref()
-        .is_some_and(|pending| pending.generation == generation)
-    {
-        slot.take()
-    } else {
-        None
-    }
+    slot.remove(&generation)
 }
 
 fn take_pending_live_draft(ctx: &EngineCtx, generation: u64) -> Option<PendingLiveDraft> {
@@ -3525,10 +3689,7 @@ fn take_pending_live_draft(ctx: &EngineCtx, generation: u64) -> Option<PendingLi
 }
 
 fn pending_live_draft_is_registered(ctx: &EngineCtx, generation: u64) -> bool {
-    ctx.pending_live_draft
-        .lock()
-        .as_ref()
-        .is_some_and(|pending| pending.generation == generation)
+    ctx.pending_live_draft.lock().contains_key(&generation)
 }
 
 /// Claim and erase a detached draft as the current generation's terminal
@@ -3546,14 +3707,34 @@ fn erase_registered_live_draft(ctx: &EngineCtx, generation: u64) {
     }
 }
 
-/// Fast phase for a new Start. Claim the old slot and bump generation while
+/// Токен черновика, который новый Start обязан убрать сам. Финал в полёте
+/// владеет черновиком и дифает от него: Start его не трогает. Токен без финала
+/// (вставка не удалась) остаётся сиротой - его Start стирает, как и раньше.
+fn claim_orphaned_draft_at_start(
+    slot: &mut PendingLiveDrafts,
+    current: u64,
+    final_in_flight: bool,
+) -> Option<PendingLiveDraft> {
+    if final_in_flight {
+        None
+    } else {
+        take_pending_live_draft_from_slot(slot, current)
+    }
+}
+
+/// Fast phase for a new Start. Claim an orphaned slot and bump generation while
 /// holding the same locks as final commit, but never query Accessibility here.
 /// The returned draft is cleaned only after CoreAudio is already capturing.
+/// The draft of a final still in flight stays in the field and in its slot.
 fn advance_generation_for_start(ctx: &EngineCtx) -> (u64, Option<PendingLiveDraft>) {
     let _inj = ctx.inject_lock.lock();
     let _activity = ctx.cancel_activity_lock.lock();
     let current = ctx.gen.load(Ordering::SeqCst);
-    let inherited = take_pending_live_draft(ctx, current);
+    let inherited = claim_orphaned_draft_at_start(
+        &mut ctx.pending_live_draft.lock(),
+        current,
+        ctx.final_queue.in_flight(current),
+    );
     let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
     ctx.cancel_active.store(true, Ordering::SeqCst);
     (next, inherited)
@@ -3600,30 +3781,48 @@ fn erase_claimed_live_draft_with_fresh_context(
     )
 }
 
-/// Invalidate an older detached final without orphaning its physical partial.
-/// Whichever side acquires the commit locks first owns the old draft: the final
-/// may commit it, or Start/Esc erases it and advances the generation.
+/// Во всех режимах потока (never тоже) Esc отменяет только своё поколение, а не
+/// все ранние: осознанное отличие от 2.2.0.
+/// Esc на поколении `generation`: отменяет только его финал и отдаёт токен его
+/// черновика на стирание. Финалы более ранних фраз и их токены не трогаем.
+fn cancel_generation(
+    slot: &mut PendingLiveDrafts,
+    cancelled: &mut BTreeSet<u64>,
+    generation: u64,
+) -> Option<PendingLiveDraft> {
+    cancelled.insert(generation);
+    take_pending_live_draft_from_slot(slot, generation)
+}
+
+fn has_physical_pending_draft(ctx: &EngineCtx, generation: u64) -> bool {
+    ctx.pending_live_draft
+        .lock()
+        .get(&generation)
+        .is_some_and(|pending| pending.live.live_inserted())
+}
+
+/// Esc: cancel the current generation's detached final without orphaning its
+/// physical partial. Whichever side acquires the commit locks first owns the
+/// draft: the final may commit it, or Esc erases it and advances the generation.
+/// Finals of earlier phrases are not cancelled.
 fn advance_generation_with_live_cleanup(ctx: &EngineCtx, cancel_active: bool) -> u64 {
     // Esc may afford a synchronous target check; keep inject_lock held so an
     // in-flight partial finishes its ledger update before we decide whether a
     // physical draft exists, and a final cannot commit during detection.
     let _inj = ctx.inject_lock.lock();
     let current = ctx.gen.load(Ordering::SeqCst);
-    let detected = ctx
-        .pending_live_draft
-        .lock()
-        .as_ref()
-        .filter(|pending| pending.generation == current)
-        .filter(|pending| pending.live.live_inserted())
-        .map(|_| detect_current_context());
+    let detected = has_physical_pending_draft(ctx, current).then(detect_current_context);
     let _activity = ctx.cancel_activity_lock.lock();
-    if let Some(pending) = take_pending_live_draft(ctx, current) {
+    if let Some(pending) = cancel_generation(
+        &mut ctx.pending_live_draft.lock(),
+        &mut ctx.cancelled_gens.lock(),
+        current,
+    ) {
         if let Some(cur) = detected.as_ref() {
             let _ = erase_live_draft_locked(ctx, &pending.live, current, cur);
         }
     }
     let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
-    ctx.cancel_floor.store(next, Ordering::SeqCst);
     ctx.cancel_active.store(cancel_active, Ordering::SeqCst);
     next
 }
@@ -4076,11 +4275,12 @@ fn process_utterance(
     }
 
     // ── Generation-guard (C4) ──
-    // Если за время обработки уже стартовала НОВАЯ диктовка — этот поток «осиротел».
-    // Не вставляем ничего (иначе многократная вставка при быстрой диктовке подряд).
+    // Финал вытесненного поколения всё равно нужен (см. `final_still_wanted`); не
+    // нужен только отменённый Esc. Вставки идут по порядку через FinalQueue, а
+    // `last_injected_gen` не даёт вставить одно поколение дважды.
     // Чистим за собой временный WAV и выходим.
     if !final_generation_is_current(ctx, my_gen) {
-        dbg_log("финал: поколение устарело (началась новая диктовка) — вставку пропускаем");
+        dbg_log("финал: отменён Esc — вставку пропускаем");
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     }
@@ -5370,7 +5570,9 @@ mod seg_tests {
     fn speech_track(vad: &mut crate::vad::SileroVad, samples: &[f32]) -> Vec<bool> {
         vad.reset();
         samples
-            .chunks_exact(crate::vad::CHUNK)
+            .as_chunks::<{ crate::vad::CHUNK }>()
+            .0
+            .iter()
             .map(|c| vad.process_chunk(c).unwrap_or(0.0) >= 0.35)
             .collect()
     }
@@ -5687,11 +5889,43 @@ mod seg_tests {
         }
     }
 
-    fn pending_slot(generation: u64, mode: &str, draft: &str) -> Option<PendingLiveDraft> {
-        Some(PendingLiveDraft {
+    fn pending_slot(generation: u64, mode: &str, draft: &str) -> PendingLiveDrafts {
+        let mut slot = PendingLiveDrafts::new();
+        slot.insert(
             generation,
-            live: live_state_with_draft(mode, draft),
-        })
+            PendingLiveDraft {
+                live: live_state_with_draft(mode, draft),
+            },
+        );
+        slot
+    }
+
+    /// Start не забирает черновик, чей финал ещё в работе: финал дифает от него.
+    #[test]
+    fn start_leaves_the_draft_of_a_final_still_in_flight() {
+        let queue = Arc::new(FinalQueue::default());
+        let mut slot = pending_slot(7, "always", "старый черновик");
+        let _ticket = FinalQueue::enter(&queue, 7);
+
+        let claimed = claim_orphaned_draft_at_start(&mut slot, 7, queue.in_flight(7));
+
+        assert!(
+            claimed.is_none(),
+            "Start must not erase a draft owned by a live final"
+        );
+        assert!(slot.contains_key(&7), "the final must still find its token");
+    }
+
+    /// Финал уже ушёл, а токен остался (вставка не удалась): Start убирает черновик, как в 2.2.0.
+    #[test]
+    fn start_still_retires_a_draft_whose_final_is_gone() {
+        let queue = Arc::new(FinalQueue::default());
+        let mut slot = pending_slot(7, "always", "осиротевший черновик");
+
+        let claimed = claim_orphaned_draft_at_start(&mut slot, 7, queue.in_flight(7));
+
+        assert!(claimed.is_some());
+        assert!(slot.is_empty());
     }
 
     #[test]
@@ -5701,7 +5935,7 @@ mod seg_tests {
         let inherited = take_pending_live_draft_from_slot(&mut slot, 7);
 
         assert!(inherited.is_some(), "new Start must own the old draft");
-        assert!(slot.is_none());
+        assert!(slot.is_empty());
         assert!(
             take_pending_live_draft_from_slot(&mut slot, 7).is_none(),
             "the stale detached final must not regain ownership"
@@ -5724,7 +5958,7 @@ mod seg_tests {
     #[test]
     fn successful_final_clears_token_before_next_start_can_erase_it() {
         let mut slot = pending_slot(13, "always", "черновик");
-        let live = slot.as_ref().expect("registered draft").live.clone();
+        let live = slot[&13].live.clone();
 
         // Final reconciliation succeeded while commit locks are held.
         *live.injected.lock() = "готовый текст".into();
@@ -5741,14 +5975,14 @@ mod seg_tests {
     #[test]
     fn multiline_paste_failure_does_not_leave_a_double_erase_ledger() {
         let mut slot = pending_slot(17, "always", "живой черновик");
-        let live = slot.as_ref().expect("registered draft").live.clone();
+        let live = slot[&17].live.clone();
 
         // The first operation (draft -> empty) succeeded, while the separate
         // multiline clipboard paste failed. Runtime keeps the terminal token,
         // but the physical ledger must already say that nothing remains.
         *live.injected.lock() = String::new();
 
-        assert!(slot.is_some());
+        assert!(!slot.is_empty());
         assert!(!live.live_inserted());
         let inherited = take_pending_live_draft_from_slot(&mut slot, 17)
             .expect("next Start may retire the empty token");
@@ -6504,6 +6738,433 @@ mod seg_tests {
         assert_eq!(*order.lock(), vec![1, 2]);
     }
 
+    /// Печать превью нового поколения в поле ждёт хода: пока финал прошлой фразы
+    /// не вставлен, курсор должен стоять за её черновиком. Проверка не блокирует
+    /// петлю превью, поэтому плашка рисует текст без задержки.
+    #[test]
+    fn preview_typing_waits_for_the_previous_final_without_blocking() {
+        let queue = Arc::new(FinalQueue::default());
+        let now = Instant::now();
+        let previous = FinalQueue::enter(&queue, 1);
+
+        let started = Instant::now();
+        assert!(!queue.preview_turn(2, &BTreeSet::new(), now, FINAL_ORDER_TIMEOUT));
+        assert!(started.elapsed() < Duration::from_millis(50));
+        // Финал прошлой фразы вставлен (или упал): ход нового поколения.
+        drop(previous);
+        assert!(queue.preview_turn(2, &BTreeSet::new(), now, FINAL_ORDER_TIMEOUT));
+        // Первой фразе ждать нечего.
+        assert!(queue.preview_turn(1, &BTreeSet::new(), now, FINAL_ORDER_TIMEOUT));
+    }
+
+    /// Финал прошлой фразы завис: через FINAL_ORDER_TIMEOUT печать идёт без него.
+    #[test]
+    fn preview_typing_goes_ahead_after_the_final_order_timeout() {
+        let queue = Arc::new(FinalQueue::default());
+        let _hung = FinalQueue::enter(&queue, 1);
+        let t0 = Instant::now();
+
+        assert!(!queue.preview_turn(2, &BTreeSet::new(), t0, FINAL_ORDER_TIMEOUT));
+        assert!(!queue.preview_turn(
+            2,
+            &BTreeSet::new(),
+            t0 + Duration::from_secs(14),
+            FINAL_ORDER_TIMEOUT
+        ));
+        assert!(queue.preview_turn(
+            2,
+            &BTreeSet::new(),
+            t0 + Duration::from_secs(15),
+            FINAL_ORDER_TIMEOUT
+        ));
+    }
+
+    /// Esc отменил финал 1: новое поколение его не ждёт.
+    #[test]
+    fn preview_typing_does_not_wait_for_a_final_cancelled_by_escape() {
+        let queue = Arc::new(FinalQueue::default());
+        let _cancelled = FinalQueue::enter(&queue, 1);
+        let _live = FinalQueue::enter(&queue, 2);
+
+        let cancelled = BTreeSet::from([1]);
+        // Финал 2 жив и держит очередь для 3; финал 1 отменён и не держит для 2.
+        assert!(!queue.preview_turn(3, &cancelled, Instant::now(), FINAL_ORDER_TIMEOUT));
+        assert!(queue.preview_turn(2, &cancelled, Instant::now(), FINAL_ORDER_TIMEOUT));
+    }
+
+    /// Модель поля ввода: текст и курсор. `reconcile` повторяет контракт
+    /// `inject::inject_incremental`: снимает Backspace несовпавший хвост `prev` и
+    /// печатает остаток `next` ПЕРЕД курсором, поэтому верен, только если курсор
+    /// стоит сразу за `prev`.
+    #[derive(Default)]
+    struct FieldModel {
+        text: Vec<char>,
+        cursor: usize,
+    }
+
+    impl FieldModel {
+        fn reconcile(&mut self, prev: &str, next: &str) {
+            let prev: Vec<char> = prev.chars().collect();
+            let next: Vec<char> = next.chars().collect();
+            assert!(
+                self.cursor >= prev.len()
+                    && self.text[self.cursor - prev.len()..self.cursor] == prev[..],
+                "курсор не стоит сразу за черновиком {prev:?}: поле {:?}",
+                self.text.iter().collect::<String>()
+            );
+            let common = prev.iter().zip(&next).take_while(|(a, b)| a == b).count();
+            let backspaces = prev.len() - common;
+            self.text.drain(self.cursor - backspaces..self.cursor);
+            self.cursor -= backspaces;
+            for ch in &next[common..] {
+                self.text.insert(self.cursor, *ch);
+                self.cursor += 1;
+            }
+        }
+
+        fn as_string(&self) -> String {
+            self.text.iter().collect()
+        }
+    }
+
+    /// Тик петли превью поколения `gen`: печатает в поле, только когда настал ход.
+    fn preview_tick(
+        field: &mut FieldModel,
+        queue: &FinalQueue,
+        gen: u64,
+        live: &LiveState,
+        text: &str,
+    ) {
+        if queue.preview_turn(gen, &BTreeSet::new(), Instant::now(), FINAL_ORDER_TIMEOUT) {
+            let prev = live.injected.lock().clone();
+            field.reconcile(&prev, text);
+            *live.injected.lock() = text.to_string();
+        }
+    }
+
+    /// Вставка финала поколения `gen`: решение «нужен ли» и владение токеном
+    /// черновика - настоящие, дифф уходит в модель поля. Возвращает, вставлен ли.
+    fn commit_final(
+        field: &mut FieldModel,
+        slot: &mut PendingLiveDrafts,
+        current: u64,
+        gen: u64,
+        cancelled: &BTreeSet<u64>,
+        text: &str,
+    ) -> bool {
+        if !final_still_wanted(current, gen, cancelled) {
+            return false;
+        }
+        let Some(pending) = take_pending_live_draft_from_slot(slot, gen) else {
+            return false;
+        };
+        let prev = pending.live.injected.lock().clone();
+        field.reconcile(&prev, text);
+        *pending.live.injected.lock() = text.to_string();
+        true
+    }
+
+    /// История 5/7/10. Это МОДЕЛЬ коммита: поле - `FieldModel`, а продакшен-швы
+    /// настоящие (`final_still_wanted`, `claim_orphaned_draft_at_start`, ход
+    /// `preview_turn`, владение токеном через `take_pending_live_draft_from_slot`).
+    /// «Ровно один раз» держит токен: забрать его можно один раз, второй финал
+    /// того же поколения не находит токена и ничего не вставляет.
+    /// История 5/7/10: хоткей нажат, пока финал первой фразы ещё считается. В поле
+    /// обе фразы, по порядку, по одному разу; новая не печатается раньше хода.
+    #[test]
+    fn a_slow_first_final_and_a_second_phrase_both_land_in_order_once() {
+        let queue = Arc::new(FinalQueue::default());
+        let mut slot = PendingLiveDrafts::new();
+        let mut field = FieldModel::default();
+
+        // Фраза 1: черновик напечатан, Stop, финал ушёл считаться.
+        let live1 = live_state_with_draft("always", "");
+        preview_tick(&mut field, &queue, 1, &live1, "привет");
+        slot.insert(
+            1,
+            PendingLiveDraft {
+                live: live1.clone(),
+            },
+        );
+        let ticket1 = FinalQueue::enter(&queue, 1);
+
+        // Хоткей новой фразы: черновик 1 не стирается.
+        let claimed = claim_orphaned_draft_at_start(&mut slot, 1, queue.in_flight(1));
+        assert!(claimed.is_none());
+        assert_eq!(field.as_string(), "привет");
+
+        // Новая фраза слышна, но в поле не печатается, пока финал 1 не вставлен.
+        let live2 = live_state_with_draft("always", "");
+        preview_tick(&mut field, &queue, 2, &live2, " как дела");
+        assert_eq!(field.as_string(), "привет");
+        assert_eq!(*live2.injected.lock(), "");
+
+        // Финал 1 вставлен дифом от черновика: курсор стоял сразу за ним.
+        assert!(commit_final(
+            &mut field,
+            &mut slot,
+            2,
+            1,
+            &BTreeSet::new(),
+            "Привет."
+        ));
+        drop(ticket1);
+        assert_eq!(field.as_string(), "Привет.");
+
+        // Ход нового поколения: превью печатается следом, потом его финал.
+        preview_tick(&mut field, &queue, 2, &live2, " как дела");
+        assert_eq!(field.as_string(), "Привет. как дела");
+        slot.insert(
+            2,
+            PendingLiveDraft {
+                live: live2.clone(),
+            },
+        );
+        let ticket2 = FinalQueue::enter(&queue, 2);
+        assert!(commit_final(
+            &mut field,
+            &mut slot,
+            2,
+            2,
+            &BTreeSet::new(),
+            " Как дела?"
+        ));
+        drop(ticket2);
+
+        assert_eq!(field.as_string(), "Привет. Как дела?");
+        assert_eq!(field.cursor, field.text.len());
+        // Повторная вставка того же поколения (второй поток финала) ничего не добавляет.
+        assert!(!commit_final(
+            &mut field,
+            &mut slot,
+            2,
+            1,
+            &BTreeSet::new(),
+            "Привет."
+        ));
+        assert!(!commit_final(
+            &mut field,
+            &mut slot,
+            2,
+            2,
+            &BTreeSet::new(),
+            " Как дела?"
+        ));
+        assert_eq!(field.as_string(), "Привет. Как дела?");
+    }
+
+    /// История 9: финал прошлой фразы упал, а новая фраза уже началась. Черновик
+    /// остаётся в поле как есть, новая фраза печатается следом.
+    #[test]
+    fn a_failed_final_keeps_its_draft_and_the_next_phrase_follows() {
+        let queue = Arc::new(FinalQueue::default());
+        let slot = Mutex::new(PendingLiveDrafts::new());
+        let activity = Mutex::new(());
+        let mut field = FieldModel::default();
+
+        let live1 = live_state_with_draft("always", "");
+        preview_tick(&mut field, &queue, 1, &live1, "привет мир");
+        slot.lock().insert(1, PendingLiveDraft { live: live1 });
+        let ticket1 = FinalQueue::enter(&queue, 1);
+        let live2 = live_state_with_draft("always", "");
+        preview_tick(&mut field, &queue, 2, &live2, " как дела");
+        assert_eq!(field.as_string(), "привет мир");
+
+        // Финал 1 упал: поток закончился, ничего не вставив.
+        release_final(&activity, &slot, ticket1, 1);
+
+        assert!(
+            slot.lock().is_empty(),
+            "no stale token may outlive the final"
+        );
+        assert_eq!(field.as_string(), "привет мир");
+        preview_tick(&mut field, &queue, 2, &live2, " как дела");
+        assert_eq!(field.as_string(), "привет мир как дела");
+    }
+
+    /// Условие ревью 2: исход «финал упал» не зависит от порядка между концом
+    /// финала и Start. Start держит замок коммита, `release_final` берёт тот же
+    /// замок, поэтому Start видит либо «финал в полёте, токен на месте», либо
+    /// «ни финала, ни токена»: в обоих случаях черновик упавшего финала цел.
+    #[test]
+    fn a_failed_final_keeps_its_draft_whichever_comes_first_final_end_or_start() {
+        // Start первым: финал ещё в полёте.
+        let queue = Arc::new(FinalQueue::default());
+        let slot = Arc::new(Mutex::new(pending_slot(1, "always", "черновик")));
+        let activity = Arc::new(Mutex::new(()));
+        let ticket = FinalQueue::enter(&queue, 1);
+        let start_first = {
+            let held = activity.lock();
+            // Поток финала уже просится освободить место, но Start держит замок.
+            let (a, sl) = (Arc::clone(&activity), Arc::clone(&slot));
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let end = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                release_final(&a, &sl, ticket, 1);
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            // Конец финала не может завершиться, пока Start держит замок.
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            // Пока Start держит замок, он видит финал в полёте и его токен.
+            assert!(
+                queue.in_flight(1),
+                "the end of the final must wait for the lock"
+            );
+            assert!(slot.lock().contains_key(&1));
+            let claimed = claim_orphaned_draft_at_start(&mut slot.lock(), 1, queue.in_flight(1));
+            drop(held);
+            end.join().unwrap();
+            claimed
+        };
+        assert!(
+            start_first.is_none(),
+            "Start must not erase a draft of a final in flight"
+        );
+        assert!(
+            slot.lock().is_empty(),
+            "the ended final retires its own token"
+        );
+
+        // Финал закончился первым: Start не находит ни билета, ни токена.
+        let queue = Arc::new(FinalQueue::default());
+        let slot = Mutex::new(pending_slot(1, "always", "черновик"));
+        let ticket = FinalQueue::enter(&queue, 1);
+        release_final(&activity, &slot, ticket, 1);
+        let claimed = claim_orphaned_draft_at_start(&mut slot.lock(), 1, queue.in_flight(1));
+        assert!(claimed.is_none(), "nothing left for Start to erase");
+    }
+
+    /// Условие ревью 1 (истории 8 и 3): Esc на фразе 3 отменяет только поколение 3.
+    /// Финалы фраз 1 и 2, уже в полёте, нужны и вставляются; токены их
+    /// черновиков остаются на местах, чтобы финал продиффил от них.
+    #[test]
+    fn escape_cancels_only_its_own_phrase_and_earlier_finals_still_insert() {
+        let queue = Arc::new(FinalQueue::default());
+        let mut slot = pending_slot(1, "always", "первый");
+        for (g, t) in [(2, "второй"), (3, "третий")] {
+            slot.insert(
+                g,
+                PendingLiveDraft {
+                    live: live_state_with_draft("always", t),
+                },
+            );
+        }
+        let _t1 = FinalQueue::enter(&queue, 1);
+        let _t2 = FinalQueue::enter(&queue, 2);
+        let _t3 = FinalQueue::enter(&queue, 3);
+        let mut cancelled = BTreeSet::new();
+
+        // Esc, когда фраза 3 - текущая.
+        let erased = cancel_generation(&mut slot, &mut cancelled, 3).expect("draft of phrase 3");
+        assert_eq!(*erased.live.injected.lock(), "третий");
+
+        assert!(slot.contains_key(&1) && slot.contains_key(&2) && !slot.contains_key(&3));
+        // Gen после Esc = 4: финал 3 отменён, финалы 1 и 2 нужны.
+        assert!(!final_still_wanted(4, 3, &cancelled));
+        assert!(final_still_wanted(4, 2, &cancelled));
+        assert!(final_still_wanted(4, 1, &cancelled));
+        // Фраза 4, начатая после Esc, и её финал не отменены; печатать она будет
+        // после финалов 1 и 2, а отменённый 3 её не держит.
+        assert!(final_still_wanted(4, 4, &cancelled));
+        assert!(!queue.preview_turn(4, &cancelled, Instant::now(), FINAL_ORDER_TIMEOUT));
+        drop(_t1);
+        drop(_t2);
+        assert!(queue.preview_turn(4, &cancelled, Instant::now(), FINAL_ORDER_TIMEOUT));
+    }
+
+    fn gate_for(queue: &Arc<FinalQueue>, gen: u64) -> PreviewGate {
+        PreviewGate {
+            queue: Arc::clone(queue),
+            cancelled: CancelledGens::default(),
+            gen,
+        }
+    }
+
+    /// Записывает, что сведение попыталось напечатать (вместо настоящих клавиш).
+    fn recording_reconcile(
+        log: &Mutex<Vec<(String, String)>>,
+    ) -> impl Fn(&str, &str) -> anyhow::Result<()> + '_ {
+        move |prev, next| {
+            log.lock().push((prev.to_string(), next.to_string()));
+            Ok(())
+        }
+    }
+
+    /// Условие ревью 3 (always): пока финал прошлой фразы в полёте, тик ничего не
+    /// печатает и не трогает журнал напечатанного; с ходом очереди печатает.
+    #[test]
+    fn live_field_always_types_nothing_until_the_previous_final_is_done() {
+        let queue = Arc::new(FinalQueue::default());
+        let previous = FinalQueue::enter(&queue, 1);
+        let gate = gate_for(&queue, 2);
+        let (inject_lock, stop) = (Mutex::new(()), AtomicBool::new(false));
+        let injected = Mutex::new(String::new());
+        let field = LiveField {
+            gate: &gate,
+            inject_lock: &inject_lock,
+            stop: &stop,
+            injected: &injected,
+        };
+        let log = Mutex::new(Vec::new());
+
+        let out = live_field_always(&field, "привет", &|| true, &recording_reconcile(&log));
+        assert_eq!(out, FieldTyping::Waiting);
+        assert!(log.lock().is_empty(), "the field must stay untouched");
+        assert_eq!(*injected.lock(), "");
+
+        drop(previous);
+        let out = live_field_always(&field, "привет", &|| true, &recording_reconcile(&log));
+        assert_eq!(out, FieldTyping::Done);
+        assert_eq!(*log.lock(), [(String::new(), "привет".to_string())]);
+        assert_eq!(*injected.lock(), "привет");
+    }
+
+    /// Условие ревью 3 (auto): то же для committed-префикса.
+    #[test]
+    fn live_field_auto_types_nothing_until_the_previous_final_is_done() {
+        let queue = Arc::new(FinalQueue::default());
+        let previous = FinalQueue::enter(&queue, 1);
+        let gate = gate_for(&queue, 2);
+        let (inject_lock, stop) = (Mutex::new(()), AtomicBool::new(false));
+        let committed = Mutex::new(String::new());
+        let field = LiveField {
+            gate: &gate,
+            inject_lock: &inject_lock,
+            stop: &stop,
+            injected: &committed,
+        };
+        let log = Mutex::new(Vec::new());
+
+        let out = live_field_auto(&field, "привет", &|| true, &recording_reconcile(&log));
+        assert_eq!(out, FieldTyping::Waiting);
+        assert!(log.lock().is_empty(), "the field must stay untouched");
+        assert_eq!(*committed.lock(), "");
+
+        drop(previous);
+        let out = live_field_auto(&field, "привет", &|| true, &recording_reconcile(&log));
+        assert_eq!(out, FieldTyping::Done);
+        assert_eq!(*log.lock(), [(String::new(), "привет".to_string())]);
+        assert_eq!(*committed.lock(), "привет");
+    }
+
+    /// Режим «never» ведёт себя как в 2.2.0: токена черновика нет (в поле ничего не
+    /// печатается), поэтому ждать нечего, а финал фразы, вытесненной новым Start,
+    /// нужен и вставляется. Esc отменяет в never тоже только свою фразу.
+    #[test]
+    fn never_mode_has_no_draft_token_and_its_superseded_final_is_inserted() {
+        assert!(!draft_token_mode("never"));
+        assert!(draft_token_mode("always") && draft_token_mode("auto"));
+        // Фраза 1 в never: Stop, финал считается; хоткей фразы 2: gen = 2.
+        assert!(final_still_wanted(2, 1, &BTreeSet::new()));
+        // Esc на фразе 2: токена нет, чужой финал 1 не отменён.
+        let mut slot = PendingLiveDrafts::new();
+        let mut cancelled = BTreeSet::new();
+        assert!(cancel_generation(&mut slot, &mut cancelled, 2).is_none());
+        assert!(final_still_wanted(3, 1, &cancelled));
+    }
+
     #[test]
     fn a_hung_earlier_final_does_not_block_forever() {
         let queue = Arc::new(FinalQueue::default());
@@ -6529,18 +7190,19 @@ mod seg_tests {
 
     /// Регрессия: новое нажатие хоткея, пока предыдущая фраза ещё распознаётся,
     /// выбрасывало её целиком (debug.log: «поколение устарело ... вставку
-    /// пропускаем» при asr=4026мс). Теперь отменяет только Esc.
+    /// пропускаем» при asr=4026мс). Теперь отменяет только Esc - в любом режиме
+    /// потока, включая живую печать always/auto.
     #[test]
     fn next_hotkey_press_does_not_drop_the_previous_final() {
-        // Старт поколения 10 поверх финала 9; Esc ещё не нажимали (floor 0).
-        assert!(final_still_wanted(10, 9, 0, true));
-        // Esc в поколении 9 поднял floor до 10: финал 9 отменён.
-        assert!(!final_still_wanted(10, 9, 10, true));
+        let none = BTreeSet::new();
+        // Старт поколения 10 поверх финала 9; Esc ещё не нажимали.
+        assert!(final_still_wanted(10, 9, &none));
+        // Esc в поколении 9 отменил его финал.
+        assert!(!final_still_wanted(10, 9, &BTreeSet::from([9])));
         // Финал, начавшийся после Esc, нужен.
-        assert!(final_still_wanted(11, 10, 10, true));
-        // Живая печать делит поле с новой диктовкой: поколение строгое.
-        assert!(!final_still_wanted(10, 9, 0, false));
-        assert!(final_still_wanted(9, 9, 0, false));
+        assert!(final_still_wanted(11, 10, &BTreeSet::from([9])));
+        // Текущее поколение нужно всегда.
+        assert!(final_still_wanted(9, 9, &none));
     }
 
     #[test]
