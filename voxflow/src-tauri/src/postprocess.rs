@@ -603,6 +603,10 @@ fn looks_like_inline_correction(left: &str, right: &str) -> bool {
     if lc < 4 || rc < 4 {
         return false;
     }
+    // «чуть-чуть», «еле-еле» — намеренное удвоение, а не оговорка.
+    if left == right {
+        return false;
+    }
     if !left.chars().all(char::is_alphabetic) || !right.chars().all(char::is_alphabetic) {
         return false;
     }
@@ -1759,6 +1763,17 @@ mod filler_tests {
             ),
             "У меня программа вообще супер быстро работает, то есть вообще летает полностью."
         );
+    }
+
+    /// Регрессия: «чуть-чуть» схлопывалось в «чуть» как «оговорка».
+    #[test]
+    fn deliberate_reduplication_survives() {
+        let s = st(true, true);
+        assert_eq!(
+            process("подредактируй его чуть-чуть в моём стиле", &s, &[], &[]),
+            "Подредактируй его чуть-чуть в моём стиле"
+        );
+        assert_eq!(process("еле-еле успел вчера", &s, &[], &[]), "Еле-еле успел вчера");
     }
 
     #[test]
