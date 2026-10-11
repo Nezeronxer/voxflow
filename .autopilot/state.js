@@ -9,7 +9,7 @@ window.STATE =
   "briefFile": "2026-10-11-brief.md",
   "memoryFile": "CLAUDE.md",
   "startedAt": "2026-10-11T18:46:46+03:00",
-  "updatedAt": "2026-10-11T19:04:07+03:00",
+  "updatedAt": "2026-10-11T19:22:00+03:00",
   "finishedAt": null,
   "stages": [
     { "id": "preflight", "status": "done", "startedAt": "2026-10-11T18:46:46+03:00", "finishedAt": "2026-10-11T18:52:10+03:00" },
@@ -17,9 +17,9 @@ window.STATE =
     { "id": "briefing",  "status": "done", "startedAt": "2026-10-11T18:55:02+03:00", "finishedAt": "2026-10-11T19:03:40+03:00", "note": "1 вопрос: релиз — 2.2.1 в конце" },
     { "id": "spec",      "status": "done", "startedAt": "2026-10-11T19:03:40+03:00", "finishedAt": "2026-10-11T19:14:05+03:00" },
     { "id": "plan",      "status": "done", "startedAt": "2026-10-11T19:10:30+03:00", "finishedAt": "2026-10-11T18:51:25+03:00" },
-    { "id": "build",     "status": "active", "startedAt": "2026-10-11T18:51:25+03:00", "note": "1 из 3 тасков · остановлено пользователем" },
-    { "id": "review",    "status": "active", "startedAt": "2026-10-11T18:58:42+03:00" },
-    { "id": "final",     "status": "pending" }
+    { "id": "build",     "status": "done", "finishedAt": "2026-10-11T19:22:00+03:00", "startedAt": "2026-10-11T18:51:25+03:00", "note": "3 из 3 тасков" },
+    { "id": "review",    "status": "done", "finishedAt": "2026-10-11T19:22:00+03:00", "startedAt": "2026-10-11T18:58:42+03:00" },
+    { "id": "final",     "status": "active", "startedAt": "2026-10-11T19:22:00+03:00", "note": "сборка и живой запуск на Arch" }
   ],
   "requirements": { "total": 9, "done": 1, "inTicket": 0, "inSpec": 0, "placeholder": 0, "deferred": 0, "dropped": 0 },
   "tickets": [
@@ -34,10 +34,10 @@ window.STATE =
     "zone": [
       "src-tauri/src/engine.rs"
     ],
-    "status": "pending", "note": "остановлено пользователем во время доработки по ревью; коммит f21dc51 в ветке autopilot/t01-live-typing, условия ревью в истории чата",
+    "status": "done", "finishedAt": "2026-10-11T19:22:00+03:00", "commit": "754c305", "tests": {"passed": 402, "failed": 0}, "concerns": ["Переход Waiting/Stopped в петле превью не покрыт юнит-тестом (нужен AppHandle)", "Esc в never больше не отменяет финалы прошлых фраз (D01)"], "note": "2 круга доработки по ревью",
     "startedAt": "2026-10-11T18:51:25+03:00",
     "retries": 0,
-    "repairs": 1
+    "repairs": 2
   },
   {
     "id": "02",
@@ -73,7 +73,7 @@ window.STATE =
       ".github/",
       "версии"
     ],
-    "status": "pending",
+    "status": "done", "finishedAt": "2026-10-11T19:11:27+03:00", "commit": "26ef7d2", "tests": {"passed": 5, "failed": 0}, "startedAt": "2026-10-11T19:09:58+03:00", "note": "в master 26ef7d2",
     "retries": 0,
     "repairs": 0
   }
