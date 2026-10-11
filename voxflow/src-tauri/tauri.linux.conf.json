@@ -1,0 +1,45 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "com.nezeronxer.voxflow",
+  "mainBinaryName": "voxflow",
+  "bundle": {
+    "targets": ["deb", "rpm", "appimage"],
+    "category": "Utility",
+    "icon": [
+      "icons/32x32.png",
+      "icons/64x64.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.png"
+    ],
+    "resources": [
+      "resources/whisper-linux-x64/*",
+      "resources/vad/*"
+    ],
+    "linux": {
+      "deb": {
+        "section": "sound",
+        "depends": [
+          "libwebkit2gtk-4.1-0",
+          "libgtk-3-0",
+          "libasound2 | libasound2t64",
+          "libayatana-appindicator3-1 | libappindicator3-1"
+        ],
+        "recommends": ["x11-utils", "pulseaudio-utils | pipewire-pulse", "wtype"],
+        "desktopTemplate": "installer/voxflow.desktop"
+      },
+      "rpm": {
+        "depends": [
+          "libwebkit2gtk-4.1.so.0()(64bit)",
+          "libgtk-3.so.0()(64bit)",
+          "libasound.so.2()(64bit)",
+          "libayatana-appindicator3.so.1()(64bit)"
+        ],
+        "desktopTemplate": "installer/voxflow.desktop"
+      },
+      "appimage": {
+        "bundleMediaFramework": false
+      }
+    }
+  }
+}

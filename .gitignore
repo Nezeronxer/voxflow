@@ -12,6 +12,7 @@ _journal_block.md
 /voxflow/src-tauri/resources/whisper-cuda/
 /voxflow/src-tauri/resources/whisper-darwin-arm64/
 /voxflow/src-tauri/resources/whisper-darwin-x64/
+/voxflow/src-tauri/resources/whisper-linux-x64/
 /voxflow/src-tauri/resources/models/
 /voxflow/src-tauri/resources/vad/
 /voxflow/src-tauri/resources/windows-redist/

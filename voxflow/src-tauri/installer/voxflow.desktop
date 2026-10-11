@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name={{name}}
+GenericName=Voice dictation
+GenericName[ru]=Голосовой ввод
+Comment=Local-first voice dictation
+Comment[ru]=Локальная диктовка голосом
+Exec={{exec}}
+Icon={{icon}}
+Terminal=false
+Categories=Utility;Audio;AudioVideo;Accessibility;
+Keywords=dictation;voice;speech;transcription;диктовка;голос;
+StartupWMClass=voxflow

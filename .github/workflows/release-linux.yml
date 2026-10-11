@@ -1,0 +1,141 @@
+name: Build VoxFlow Linux Packages
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux:
+    name: Linux x64 (deb, rpm, AppImage)
+    # Самый старый поддерживаемый раннер: AppImage и deb наследуют версию glibc.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      # Старый strip из linuxdeploy ломается на современных библиотеках.
+      NO_STRIP: "true"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.13"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22.23.1"
+          cache: npm
+          cache-dependency-path: voxflow/package-lock.json
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: "1.96.1"
+          components: rustfmt, clippy
+
+      - name: Verify release version consistency
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            python script/check_versions.py --tag "$GITHUB_REF_NAME"
+          else
+            python script/check_versions.py
+          fi
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake pkg-config xvfb \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            libasound2-dev libssl-dev libx11-dev libxtst-dev libxi-dev libevdev-dev \
+            libwayland-dev patchelf file rpm
+
+      - name: Install frontend dependencies
+        working-directory: voxflow
+        run: npm ci
+
+      - name: Frontend unit tests
+        working-directory: voxflow
+        run: npm test
+
+      - name: Frontend build
+        working-directory: voxflow
+        run: npm run build
+
+      - name: NPM high-severity audit
+        working-directory: voxflow
+        run: npm audit --audit-level=high
+
+      # Tauri проверяет glob'ы ресурсов уже в build.rs, поэтому рантайм
+      # (whisper.cpp + Silero VAD, версии и SHA-256 закреплены) нужен до clippy.
+      - name: Build verified Linux runtime resources
+        run: ./script/build_linux_runtime.sh
+
+      - name: Rust format check
+        working-directory: voxflow
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Rust clippy
+        working-directory: voxflow
+        run: cargo clippy --locked --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+
+      - name: Rust unit tests
+        working-directory: voxflow
+        run: xvfb-run -a cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Build deb, rpm and AppImage
+        working-directory: voxflow
+        run: npx tauri build --bundles deb,rpm,appimage
+
+      - name: Collect and verify packages
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version voxflow/package.json)"
+          bundle="voxflow/src-tauri/target/release/bundle"
+          out="release/linux"
+          mkdir -p "$out"
+
+          pick() { # glob -> single file
+            local matches=( $1 )
+            if [[ ${#matches[@]} -ne 1 || ! -s "${matches[0]}" ]]; then
+              echo "Expected exactly one non-empty file for $1" >&2
+              exit 1
+            fi
+            printf '%s' "${matches[0]}"
+          }
+
+          # Имя AppImage зашито в updater.rs: VoxFlow-<версия>-linux-x64.AppImage.
+          cp "$(pick "$bundle/appimage/*.AppImage")" "$out/VoxFlow-${version}-linux-x64.AppImage"
+          cp "$(pick "$bundle/deb/*.deb")" "$out/VoxFlow-${version}-linux-x64.deb"
+          cp "$(pick "$bundle/rpm/*.rpm")" "$out/VoxFlow-${version}-linux-x64.rpm"
+          chmod +x "$out/VoxFlow-${version}-linux-x64.AppImage"
+
+          # В пакетах должны лежать рантайм, VAD и .desktop с категориями.
+          dpkg-deb -c "$out/VoxFlow-${version}-linux-x64.deb" | grep -q 'whisper-linux-x64/whisper-cli'
+          dpkg-deb -c "$out/VoxFlow-${version}-linux-x64.deb" | grep -q 'vad/silero_vad.onnx'
+          dpkg-deb -I "$out/VoxFlow-${version}-linux-x64.deb" | grep -q 'libwebkit2gtk-4.1-0'
+          dpkg-deb --fsys-tarfile "$out/VoxFlow-${version}-linux-x64.deb" \
+            | tar -xO --wildcards './usr/share/applications/*.desktop' | grep -q '^Categories=Utility;Audio;'
+          rpm -qp --requires "$out/VoxFlow-${version}-linux-x64.rpm" | grep -q 'libwebkit2gtk-4.1'
+
+          (cd "$out" && sha256sum VoxFlow-* > SHA256SUMS-linux.txt && sha256sum --check SHA256SUMS-linux.txt)
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: VoxFlow-Linux-x64
+          path: |
+            release/linux/VoxFlow-*
+            release/linux/SHA256SUMS-linux.txt
+          if-no-files-found: error
+          retention-days: 14
