@@ -167,7 +167,7 @@ export default function Recognition({
     setRewritePreview("");
 
     if (!originalPrompt) {
-      setVoiceError("Сначала напишите базовый prompt для переработки.");
+      setVoiceError("Сначала напишите базовый промпт для переработки.");
       setVoiceStatus("");
       return;
     }
@@ -283,7 +283,7 @@ export default function Recognition({
   function startWebSpeechInstruction() {
     const originalPrompt = promptText.trim();
     if (!originalPrompt) {
-      setVoiceError("Сначала напишите базовый prompt для переработки.");
+      setVoiceError("Сначала напишите базовый промпт для переработки.");
       setVoiceStatus("");
       return;
     }
@@ -358,7 +358,7 @@ export default function Recognition({
   function startVoiceInstruction() {
     const originalPrompt = promptText.trim();
     if (!originalPrompt) {
-      setVoiceError("Сначала напишите базовый prompt для переработки.");
+      setVoiceError("Сначала напишите базовый промпт для переработки.");
       setVoiceStatus("");
       return;
     }
@@ -574,7 +574,7 @@ export default function Recognition({
             onChange={(e) =>
               update({ smart_prompt_instruction: e.currentTarget.value })
             }
-            placeholder="Заполняется автоматически из prompt выше; можно вручную уточнить, если нужен более строгий стиль"
+            placeholder="Заполняется автоматически из промпта выше; можно вручную уточнить, если нужен более строгий стиль"
             rows={5}
           />
         </div>

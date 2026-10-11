@@ -140,6 +140,7 @@ export default function Snippets() {
             <input
               type="text"
               placeholder="Триггер (например, /адрес)"
+              aria-label="Триггер (например, /адрес)"
               value={trigger}
               onChange={(e) => setTrigger(e.currentTarget.value)}
               style={{ flex: "0 0 220px" }}
@@ -157,6 +158,7 @@ export default function Snippets() {
           </div>
           <textarea
             placeholder="Содержимое сниппета…"
+            aria-label="Содержимое сниппета…"
             value={content}
             onChange={(e) => setContent(e.currentTarget.value)}
             disabled={busy}

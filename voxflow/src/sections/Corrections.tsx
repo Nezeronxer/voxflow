@@ -108,6 +108,7 @@ export default function Corrections({
           <input
             type="text"
             placeholder="Распознано (как слышится)"
+            aria-label="Распознано (как слышится)"
             value={wrong}
             onChange={(e) => setWrong(e.currentTarget.value)}
             onKeyDown={(e) => e.key === "Enter" && onAdd()}
@@ -115,6 +116,7 @@ export default function Corrections({
           <input
             type="text"
             placeholder="Правильно"
+            aria-label="Правильно"
             value={right}
             onChange={(e) => setRight(e.currentTarget.value)}
             onKeyDown={(e) => e.key === "Enter" && onAdd()}
