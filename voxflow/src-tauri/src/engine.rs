@@ -1129,39 +1129,67 @@ fn engine_loop(rx: Receiver<EngineCmd>, ctx: EngineCtx) {
     // Capture (cpal Stream) создаётся и уничтожается только здесь — он !Send.
     let mut capture: Option<Capture> = None;
     while let Ok(cmd) = rx.recv() {
-        match cmd {
-            EngineCmd::Start => start_capture_into(&mut capture, &ctx, false),
-            EngineCmd::StartLatched => {
-                start_capture_into(&mut capture, &ctx, true);
-            }
-            EngineCmd::Stop => stop_and_process(&mut capture, &ctx),
-            EngineCmd::StopTap => stop_tap_and_process(&mut capture, &ctx),
-            EngineCmd::Toggle => {
-                if capture.is_some() {
-                    stop_and_process(&mut capture, &ctx);
-                } else {
-                    start_capture_into(&mut capture, &ctx, false);
+        // Паника в обработчике команды не должна убивать поток движка: иначе
+        // хоткей молча перестаёт работать до перезапуска приложения.
+        let shutdown = run_guarded("engine_loop", || {
+            match cmd {
+                EngineCmd::Start => start_capture_into(&mut capture, &ctx, false),
+                EngineCmd::StartLatched => {
+                    start_capture_into(&mut capture, &ctx, true);
+                }
+                EngineCmd::Stop => stop_and_process(&mut capture, &ctx),
+                EngineCmd::StopTap => stop_tap_and_process(&mut capture, &ctx),
+                EngineCmd::Toggle => {
+                    if capture.is_some() {
+                        stop_and_process(&mut capture, &ctx);
+                    } else {
+                        start_capture_into(&mut capture, &ctx, false);
+                    }
+                }
+                EngineCmd::Cancel => cancel_current(&mut capture, &ctx),
+                EngineCmd::ImproveSelection => improve_selection(&ctx),
+                EngineCmd::ManualEdit => note_manual_edit(&ctx),
+                EngineCmd::Warmup => {
+                    // В отдельном потоке: warmup сам спит и грузит модели —
+                    // канал команд блокировать нельзя (Start/Stop должны жить).
+                    let wctx = ctx.clone();
+                    std::thread::spawn(move || warmup(wctx));
+                }
+                EngineCmd::Shutdown => {
+                    let _activity = ctx.cancel_activity_lock.lock();
+                    ctx.cancel_active.store(false, Ordering::SeqCst);
+                    close_correction_capture(&ctx);
+                    restore_auto_mute(&ctx);
+                    if let Some(mut srv) = ctx.server.lock().take() {
+                        let _ = srv.child.kill();
+                    }
+                    return true;
                 }
             }
-            EngineCmd::Cancel => cancel_current(&mut capture, &ctx),
-            EngineCmd::ImproveSelection => improve_selection(&ctx),
-            EngineCmd::ManualEdit => note_manual_edit(&ctx),
-            EngineCmd::Warmup => {
-                // В отдельном потоке: warmup сам спит и грузит модели —
-                // канал команд блокировать нельзя (Start/Stop должны жить).
-                let wctx = ctx.clone();
-                std::thread::spawn(move || warmup(wctx));
-            }
-            EngineCmd::Shutdown => {
-                let _activity = ctx.cancel_activity_lock.lock();
-                ctx.cancel_active.store(false, Ordering::SeqCst);
-                close_correction_capture(&ctx);
-                restore_auto_mute(&ctx);
-                if let Some(mut srv) = ctx.server.lock().take() {
-                    let _ = srv.child.kill();
-                }
-                break;
-            }
+            false
+        });
+        match shutdown {
+            Some(true) => break,
+            Some(false) => {}
+            None => set_status(&ctx, "idle"),
+        }
+    }
+}
+
+/// Выполнить `f`, превратив панику в лог и `None`. Потоки движка и финала сами
+/// не умеют сообщить о панике: без этого плашка навсегда застревала в
+/// «распознаю», а поток команд умирал.
+fn run_guarded<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|m| (*m).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            log::error!("{what}: паника: {msg}");
+            None
         }
     }
 }
@@ -2837,10 +2865,15 @@ fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
         }
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
-            if let Err(err) = process_utterance(&ctx2, samples, rate, Some(live), my_gen, target_fp)
-            {
-                log::error!("process_utterance: {err:#}");
-                report_process_err(&ctx2.app, &err);
+            match run_guarded("process_utterance", || {
+                process_utterance(&ctx2, samples, rate, Some(live), my_gen, target_fp)
+            }) {
+                Some(Err(err)) => {
+                    log::error!("process_utterance: {err:#}");
+                    report_process_err(&ctx2.app, &err);
+                }
+                Some(Ok(())) => {}
+                None => emit_error(&ctx2.app, "Сбой при обработке диктовки"),
             }
             // Статус idle эмитим только если новая диктовка ещё не началась —
             // иначе перетёрли бы «recording» свежей диктовки (C3/C4).
@@ -2867,9 +2900,15 @@ fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
         fp
     });
     std::thread::spawn(move || {
-        if let Err(err) = process_utterance(&ctx2, samples, rate, None, my_gen, target_fp) {
-            log::error!("process_utterance: {err:#}");
-            report_process_err(&ctx2.app, &err);
+        match run_guarded("process_utterance", || {
+            process_utterance(&ctx2, samples, rate, None, my_gen, target_fp)
+        }) {
+            Some(Err(err)) => {
+                log::error!("process_utterance: {err:#}");
+                report_process_err(&ctx2.app, &err);
+            }
+            Some(Ok(())) => {}
+            None => emit_error(&ctx2.app, "Сбой при обработке диктовки"),
         }
         if ctx2.gen.load(Ordering::SeqCst) == my_gen {
             set_status(&ctx2, "idle");
@@ -6389,6 +6428,14 @@ mod seg_tests {
         assert!(!should_emit_norecog(180));
         assert!(!should_emit_norecog(499));
         assert!(should_emit_norecog(500));
+    }
+
+    /// Регрессия: паника в финале убивала поток, `idle` не приходил, и плашка
+    /// висела в «распознаю» до перезапуска.
+    #[test]
+    fn a_panic_in_the_final_thread_is_contained() {
+        assert_eq!(run_guarded("t", || 7), Some(7));
+        assert_eq!(run_guarded("t", || -> u8 { panic!("boom") }), None);
     }
 
     #[test]
