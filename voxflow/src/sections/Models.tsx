@@ -21,15 +21,6 @@ import type {
 // Коэффициент EMA-сглаживания мгновенной скорости: резкие скачки сети не дёргают ETA.
 const SPEED_EMA = 0.3;
 
-// Слабые пресеты создают ложный выбор и заметно уступают Turbo. Новым
-// пользователям их не показываем; уже установленную/активную legacy-модель
-// оставляем видимой, чтобы её можно было безопасно сменить или удалить.
-const WEAK_WHISPER_MODELS = new Set([
-  "ggml-tiny.bin",
-  "ggml-base.bin",
-  "ggml-small.bin",
-]);
-
 const PRIMARY_ENGINE_OPTIONS = [
   { value: "whisper_server", label: "Whisper Server (все языки)" },
   { value: "gigaam", label: "GigaAM RU / Parakeet EN" },
@@ -284,11 +275,7 @@ export default function Models({
     refresh();
   }
 
-  // Слабые Whisper-пресеты показываем, только если уже стоят или выбраны.
-  const visible = models.filter(
-    (m) =>
-      !WEAK_WHISPER_MODELS.has(m.name) || m.installed || settings.model === m.name,
-  );
+  const visible = models;
   // Наверху — то, что уже на диске или качается; остальное свёрнуто.
   const inUse = visible.filter((m) => m.installed || progress[m.name]);
   const others = visible.filter((m) => !m.installed && !progress[m.name]);

@@ -220,10 +220,6 @@ export function listModels(): Promise<ModelInfo[]> {
     const models: ModelInfo[] = [
       { name: "gigaam-v3", label: "GigaAM-v3 — быстрый русский", size_mb: 217, installed: true, kind: "gigaam" },
       { name: "parakeet-v3", label: "Parakeet TDT v3 — быстрый English (явный EN)", size_mb: 640, installed: true, kind: "parakeet" },
-      { name: "ggml-tiny.bin", label: "Tiny — минимальная задержка (78 МБ)", size_mb: 78, installed: false, kind: "whisper" },
-      { name: "ggml-base.bin", label: "Base — быстрая, для слабых ПК (148 МБ)", size_mb: 148, installed: false, kind: "whisper" },
-      { name: "ggml-small.bin", label: "Small — компромисс качество/скорость (488 МБ)", size_mb: 488, installed: false, kind: "whisper" },
-      { name: "ggml-medium.bin", label: "Medium — повышенная точность без Large (1.53 ГБ)", size_mb: 1530, installed: false, kind: "whisper" },
       { name: "ggml-large-v3-turbo-q5_0.bin", label: "Large v3 Turbo Q5 — рекомендуется (все языки, 574 МБ)", size_mb: 574, installed: true, kind: "whisper" },
       { name: "ggml-large-v3-turbo-q8_0.bin", label: "Large v3 Turbo Q8 — точнее Q5, всё ещё быстрый (874 МБ)", size_mb: 874, installed: false, kind: "whisper" },
       { name: "ggml-large-v3-turbo.bin", label: "Large v3 Turbo — мощная, тяжелее (1.6 ГБ)", size_mb: 1620, installed: false, kind: "whisper" },

@@ -133,6 +133,7 @@ export default function Dictionary() {
           <input
             type="text"
             placeholder="Термин (как слышится)"
+            aria-label="Термин (как слышится)"
             value={term}
             onChange={(e) => setTerm(e.currentTarget.value)}
             onKeyDown={(e) => e.key === "Enter" && onAdd()}
@@ -141,6 +142,7 @@ export default function Dictionary() {
           <input
             type="text"
             placeholder="Замена (необязательно)"
+            aria-label="Замена (необязательно)"
             value={replacement}
             onChange={(e) => setReplacement(e.currentTarget.value)}
             onKeyDown={(e) => e.key === "Enter" && onAdd()}

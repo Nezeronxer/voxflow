@@ -325,6 +325,13 @@ impl Settings {
             self.double_tap_latch = true;
             self.double_tap_behavior_version = DOUBLE_TAP_BEHAVIOR_VERSION;
         }
+        // Tiny/Base/Small/Medium убраны из каталога: переводим на рекомендуемую.
+        if matches!(
+            self.model.as_str(),
+            "ggml-tiny.bin" | "ggml-base.bin" | "ggml-small.bin" | "ggml-medium.bin"
+        ) {
+            self.model = crate::models::RECOMMENDED_WHISPER_NAME.into();
+        }
         if self.ai_backend_behavior_version < AI_BACKEND_BEHAVIOR_VERSION {
             // 2.0.0 сохраняла Ollama/Qwen3 как дефолт даже без явного
             // выбора. Мигрируем только точный нетронутый набор. Другая
@@ -618,6 +625,25 @@ mod tests {
             reloaded.double_tap_behavior_version,
             DOUBLE_TAP_BEHAVIOR_VERSION
         );
+    }
+
+    #[test]
+    fn removed_whisper_models_migrate_to_recommended() {
+        for old in [
+            "ggml-tiny.bin",
+            "ggml-base.bin",
+            "ggml-small.bin",
+            "ggml-medium.bin",
+        ] {
+            let mut s: Settings =
+                serde_json::from_str(&format!(r#"{{"model":"{old}"}}"#)).expect("parse");
+            s.normalize_user_values();
+            assert_eq!(s.model, crate::models::RECOMMENDED_WHISPER_NAME);
+        }
+        let mut s: Settings =
+            serde_json::from_str(r#"{"model":"ggml-large-v3.bin"}"#).expect("parse");
+        s.normalize_user_values();
+        assert_eq!(s.model, "ggml-large-v3.bin");
     }
 
     #[test]

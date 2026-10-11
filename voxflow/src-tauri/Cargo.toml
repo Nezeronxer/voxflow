@@ -1,6 +1,6 @@
 [package]
 name = "voxflow"
-version = "2.1.1"
+version = "2.2.0"
 description = "Local-first voice dictation for desktop"
 authors = ["Nezeronxer"]
 license = "LicenseRef-Proprietary"
@@ -55,6 +55,11 @@ plist = "1.9.0"
 # system-wide `AXFocusedApplication` attribute can briefly be absent, which used
 # to turn an otherwise valid dictation into an empty AppContext.
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "libc", "NSRunningApplication", "NSWindow", "NSWorkspace"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Буфер обмена на Wayland (протокол data-control) вместо XWayland; на X11 и в
+# GNOME (нет data-control) arboard остаётся на X11-бэкенде.
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 
 # mock_app() для теста загрузки моделей без окна. Не на Windows: с фичей
 # `test` тестовый exe там падает на старте (STATUS_ENTRYPOINT_NOT_FOUND).

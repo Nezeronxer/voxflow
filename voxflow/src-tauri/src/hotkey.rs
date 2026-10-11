@@ -363,6 +363,7 @@ pub fn spawn(
     capture_active: Arc<AtomicBool>,
     correction_capture: Arc<AtomicBool>,
 ) {
+    let _ = REMOTE_TX.set(tx.clone());
     spawn_platform(
         tx,
         settings,
@@ -371,6 +372,45 @@ pub fn spawn(
         capture_active,
         correction_capture,
     );
+}
+
+/// Блокируется, пока слушатель жив. `Err` — не удалось запустить.
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn listen_platform<F: FnMut(Event) + 'static>(callback: F) -> Result<(), String> {
+    listen(callback).map_err(|err| format!("{err:?}"))
+}
+
+/// X11 слушает rdev (XRecord). На Wayland клавиши чужих окон композитор не
+/// отдаёт, поэтому читаем evdev; без прав — понятное сообщение и системный
+/// шорткат на `voxflow --toggle` (см. `handle_remote_args`).
+#[cfg(target_os = "linux")]
+fn listen_platform<F: Fn(Event) + Send + Sync + 'static>(callback: F) -> Result<(), String> {
+    if crate::linux_env::session() == crate::linux_env::Session::Wayland {
+        return crate::linux_evdev::run(Arc::new(callback));
+    }
+    listen(callback).map_err(|err| format!("{err:?}"))
+}
+
+static REMOTE_TX: std::sync::OnceLock<Sender<EngineCmd>> = std::sync::OnceLock::new();
+
+/// Команды второго запуска: `voxflow --toggle | --start | --stop | --cancel`.
+/// Нужны там, где глобальный перехват клавиш невозможен (Wayland без доступа к
+/// /dev/input): пользователь вешает команду на системный шорткат.
+/// Возвращает true, если аргументы были командой (окно показывать не надо).
+pub fn handle_remote_args(args: &[String]) -> bool {
+    let Some(cmd) = args.iter().find_map(|a| match a.as_str() {
+        "--toggle" => Some(EngineCmd::Toggle),
+        "--start" => Some(EngineCmd::Start),
+        "--stop" => Some(EngineCmd::Stop),
+        "--cancel" => Some(EngineCmd::Cancel),
+        _ => None,
+    }) else {
+        return false;
+    };
+    if let Some(tx) = REMOTE_TX.get() {
+        let _ = tx.send(cmd);
+    }
+    true
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -386,6 +426,7 @@ fn spawn_platform(
         .name("voxflow-hotkey".into())
         .spawn(move || {
             let state = Arc::new(Mutex::new(HotState::new()));
+            let mut last_message: Option<String> = None;
             loop {
                 let edit_modifiers = Arc::new(Mutex::new(EditModifierState::default()));
                 let callback_state = Arc::clone(&state);
@@ -444,18 +485,23 @@ fn spawn_platform(
                     dispatch(&callback_state, &callback_tx, event.event_type, snapshot);
                 };
 
-                let message = match listen(callback) {
+                let message = match listen_platform(callback) {
                     Err(err) => {
-                        log::error!("rdev listen error: {err:?}; retrying");
-                        format!("Глобальная горячая клавиша недоступна ({err:?}). VoxFlow повторит подключение.")
+                        log::error!("hotkey listen error: {err}; retrying");
+                        format!("Глобальная горячая клавиша недоступна ({err}). VoxFlow повторит подключение.")
                     }
                     Ok(()) => {
-                        log::warn!("rdev listener stopped unexpectedly; retrying");
+                        log::warn!("hotkey listener stopped unexpectedly; retrying");
                         "Глобальная горячая клавиша остановилась. VoxFlow повторит подключение."
                             .to_string()
                     }
                 };
-                let _ = app.emit("error", serde_json::json!({ "message": message }));
+                // Постоянная причина (нет прав на /dev/input) не повод
+                // повторять одно и то же уведомление каждые 2 секунды.
+                if last_message.as_deref() != Some(message.as_str()) {
+                    let _ = app.emit("error", serde_json::json!({ "message": message }));
+                    last_message = Some(message);
+                }
                 std::thread::sleep(Duration::from_secs(2));
             }
         })

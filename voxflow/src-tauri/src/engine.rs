@@ -305,6 +305,10 @@ struct EngineCtx {
     /// даже если два detached-потока финала как-то совпали по gen, второй НЕ дублирует
     /// текст в активном поле. Это вторая линия защиты от «дубля вставки».
     last_injected_gen: Arc<AtomicU64>,
+    /// Поколение, начиная с которого финалы ещё нужны: Esc поднимает его, Start - нет.
+    cancel_floor: Arc<AtomicU64>,
+    /// Очередь финалов в полёте: вставка строго по порядку поколений.
+    final_queue: Arc<FinalQueue>,
     /// Резидентный GigaAM-v3 (русский ASR, ONNX/CPU): грузится на warmup и живёт
     /// всю сессию — холодного старта на диктовке нет. Mutex сериализует
     /// партиал-тики и финал (Session::run требует &mut).
@@ -363,6 +367,8 @@ pub fn spawn(
         last_external_target: Arc::new(Mutex::new(None)),
         gen: Arc::new(AtomicU64::new(0)),
         last_injected_gen: Arc::new(AtomicU64::new(0)),
+        cancel_floor: Arc::new(AtomicU64::new(0)),
+        final_queue: Arc::new(FinalQueue::default()),
         gigaam: Arc::new(Mutex::new(None)),
         parakeet: Arc::new(Mutex::new(None)),
         vad: Arc::new(Mutex::new(None)),
@@ -1129,39 +1135,67 @@ fn engine_loop(rx: Receiver<EngineCmd>, ctx: EngineCtx) {
     // Capture (cpal Stream) создаётся и уничтожается только здесь — он !Send.
     let mut capture: Option<Capture> = None;
     while let Ok(cmd) = rx.recv() {
-        match cmd {
-            EngineCmd::Start => start_capture_into(&mut capture, &ctx, false),
-            EngineCmd::StartLatched => {
-                start_capture_into(&mut capture, &ctx, true);
-            }
-            EngineCmd::Stop => stop_and_process(&mut capture, &ctx),
-            EngineCmd::StopTap => stop_tap_and_process(&mut capture, &ctx),
-            EngineCmd::Toggle => {
-                if capture.is_some() {
-                    stop_and_process(&mut capture, &ctx);
-                } else {
-                    start_capture_into(&mut capture, &ctx, false);
+        // Паника в обработчике команды не должна убивать поток движка: иначе
+        // хоткей молча перестаёт работать до перезапуска приложения.
+        let shutdown = run_guarded("engine_loop", || {
+            match cmd {
+                EngineCmd::Start => start_capture_into(&mut capture, &ctx, false),
+                EngineCmd::StartLatched => {
+                    start_capture_into(&mut capture, &ctx, true);
+                }
+                EngineCmd::Stop => stop_and_process(&mut capture, &ctx),
+                EngineCmd::StopTap => stop_tap_and_process(&mut capture, &ctx),
+                EngineCmd::Toggle => {
+                    if capture.is_some() {
+                        stop_and_process(&mut capture, &ctx);
+                    } else {
+                        start_capture_into(&mut capture, &ctx, false);
+                    }
+                }
+                EngineCmd::Cancel => cancel_current(&mut capture, &ctx),
+                EngineCmd::ImproveSelection => improve_selection(&ctx),
+                EngineCmd::ManualEdit => note_manual_edit(&ctx),
+                EngineCmd::Warmup => {
+                    // В отдельном потоке: warmup сам спит и грузит модели —
+                    // канал команд блокировать нельзя (Start/Stop должны жить).
+                    let wctx = ctx.clone();
+                    std::thread::spawn(move || warmup(wctx));
+                }
+                EngineCmd::Shutdown => {
+                    let _activity = ctx.cancel_activity_lock.lock();
+                    ctx.cancel_active.store(false, Ordering::SeqCst);
+                    close_correction_capture(&ctx);
+                    restore_auto_mute(&ctx);
+                    if let Some(mut srv) = ctx.server.lock().take() {
+                        let _ = srv.child.kill();
+                    }
+                    return true;
                 }
             }
-            EngineCmd::Cancel => cancel_current(&mut capture, &ctx),
-            EngineCmd::ImproveSelection => improve_selection(&ctx),
-            EngineCmd::ManualEdit => note_manual_edit(&ctx),
-            EngineCmd::Warmup => {
-                // В отдельном потоке: warmup сам спит и грузит модели —
-                // канал команд блокировать нельзя (Start/Stop должны жить).
-                let wctx = ctx.clone();
-                std::thread::spawn(move || warmup(wctx));
-            }
-            EngineCmd::Shutdown => {
-                let _activity = ctx.cancel_activity_lock.lock();
-                ctx.cancel_active.store(false, Ordering::SeqCst);
-                close_correction_capture(&ctx);
-                restore_auto_mute(&ctx);
-                if let Some(mut srv) = ctx.server.lock().take() {
-                    let _ = srv.child.kill();
-                }
-                break;
-            }
+            false
+        });
+        match shutdown {
+            Some(true) => break,
+            Some(false) => {}
+            None => set_status(&ctx, "idle"),
+        }
+    }
+}
+
+/// Выполнить `f`, превратив панику в лог и `None`. Потоки движка и финала сами
+/// не умеют сообщить о панике: без этого плашка навсегда застревала в
+/// «распознаю», а поток команд умирал.
+fn run_guarded<T>(what: &str, f: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(v) => Some(v),
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|m| (*m).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            log::error!("{what}: паника: {msg}");
+            None
         }
     }
 }
@@ -2783,6 +2817,52 @@ fn stop_tap_and_process(capture: &mut Option<Capture>, ctx: &EngineCtx) {
     dbg_log("hotkey: quick tap discarded as a double-tap gesture candidate");
 }
 
+/// Финалы в полёте. Распознавание длится по-разному, и без очереди второй
+/// короткий финал вставлялся бы раньше первого длинного.
+#[derive(Default)]
+struct FinalQueue {
+    pending: Mutex<std::collections::BTreeSet<u64>>,
+    changed: parking_lot::Condvar,
+}
+
+/// Место финала в очереди; освобождается при любом выходе, включая панику.
+struct FinalTicket {
+    queue: Arc<FinalQueue>,
+    gen: u64,
+}
+
+impl Drop for FinalTicket {
+    fn drop(&mut self) {
+        self.queue.pending.lock().remove(&self.gen);
+        self.queue.changed.notify_all();
+    }
+}
+
+impl FinalQueue {
+    fn enter(queue: &Arc<Self>, gen: u64) -> FinalTicket {
+        queue.pending.lock().insert(gen);
+        FinalTicket {
+            queue: Arc::clone(queue),
+            gen,
+        }
+    }
+
+    /// Ждёт, пока все более ранние финалы вставлены, отменены или упали.
+    /// По таймауту идёт дальше: зависший финал не держит очередь вечно.
+    fn wait_turn(&self, gen: u64, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        let mut pending = self.pending.lock();
+        while pending.range(..gen).next().is_some() {
+            if self.changed.wait_until(&mut pending, deadline).timed_out() {
+                log::warn!("очередь финалов: предыдущий финал завис, вставляем без него");
+                return;
+            }
+        }
+    }
+}
+
+const FINAL_ORDER_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
     let rate = c.sample_rate();
     // Переполнение буфера записи (audio P2-1): хвост диктовки отброшен —
@@ -2836,11 +2916,18 @@ fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
             sound::play(false);
         }
         let ctx2 = ctx.clone();
+        let ticket = FinalQueue::enter(&ctx.final_queue, my_gen);
         std::thread::spawn(move || {
-            if let Err(err) = process_utterance(&ctx2, samples, rate, Some(live), my_gen, target_fp)
-            {
-                log::error!("process_utterance: {err:#}");
-                report_process_err(&ctx2.app, &err);
+            let _ticket = ticket;
+            match run_guarded("process_utterance", || {
+                process_utterance(&ctx2, samples, rate, Some(live), my_gen, target_fp)
+            }) {
+                Some(Err(err)) => {
+                    log::error!("process_utterance: {err:#}");
+                    report_process_err(&ctx2.app, &err);
+                }
+                Some(Ok(())) => {}
+                None => emit_error(&ctx2.app, "Сбой при обработке диктовки"),
             }
             // Статус idle эмитим только если новая диктовка ещё не началась —
             // иначе перетёрли бы «recording» свежей диктовки (C3/C4).
@@ -2866,10 +2953,18 @@ fn finish_capture_and_process(c: Capture, ctx: &EngineCtx) {
         ));
         fp
     });
+    let ticket = FinalQueue::enter(&ctx.final_queue, my_gen);
     std::thread::spawn(move || {
-        if let Err(err) = process_utterance(&ctx2, samples, rate, None, my_gen, target_fp) {
-            log::error!("process_utterance: {err:#}");
-            report_process_err(&ctx2.app, &err);
+        let _ticket = ticket;
+        match run_guarded("process_utterance", || {
+            process_utterance(&ctx2, samples, rate, None, my_gen, target_fp)
+        }) {
+            Some(Err(err)) => {
+                log::error!("process_utterance: {err:#}");
+                report_process_err(&ctx2.app, &err);
+            }
+            Some(Ok(())) => {}
+            None => emit_error(&ctx2.app, "Сбой при обработке диктовки"),
         }
         if ctx2.gen.load(Ordering::SeqCst) == my_gen {
             set_status(&ctx2, "idle");
@@ -2929,7 +3024,8 @@ fn cancel_current(capture: &mut Option<Capture>, ctx: &EngineCtx) {
         }
         {
             let _activity = ctx.cancel_activity_lock.lock();
-            ctx.gen.fetch_add(1, Ordering::SeqCst);
+            let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
+            ctx.cancel_floor.store(next, Ordering::SeqCst);
             ctx.cancel_active.store(false, Ordering::SeqCst);
         }
         set_status(ctx, "idle");
@@ -3290,8 +3386,22 @@ fn generation_is_current(current: u64, expected: u64) -> bool {
     current == expected
 }
 
+/// Нужен ли ещё финал поколения `expected`. Новое нажатие хоткея финал прошлой
+/// диктовки НЕ отменяет: в режиме «только плашка» (клавиши не печатаются) он
+/// просто вставляется следом, иначе фраза, не успевшая распознаться до
+/// следующего нажатия, пропадала целиком. Отменяет только Esc (`cancel_floor`).
+/// Живая печать (always/auto) делит поле с новой диктовкой - там поколение строгое.
+fn final_still_wanted(current: u64, expected: u64, cancel_floor: u64, preview_only: bool) -> bool {
+    generation_is_current(current, expected) || (preview_only && expected >= cancel_floor)
+}
+
 fn final_generation_is_current(ctx: &EngineCtx, expected: u64) -> bool {
-    generation_is_current(ctx.gen.load(Ordering::Acquire), expected)
+    final_still_wanted(
+        ctx.gen.load(Ordering::Acquire),
+        expected,
+        ctx.cancel_floor.load(Ordering::Acquire),
+        ctx.settings.lock().stream_mode == "never",
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3513,6 +3623,7 @@ fn advance_generation_with_live_cleanup(ctx: &EngineCtx, cancel_active: bool) ->
         }
     }
     let next = ctx.gen.fetch_add(1, Ordering::SeqCst) + 1;
+    ctx.cancel_floor.store(next, Ordering::SeqCst);
     ctx.cancel_active.store(cancel_active, Ordering::SeqCst);
     next
 }
@@ -3878,7 +3989,7 @@ fn process_utterance(
     // send text off-device, validate the target again immediately before that
     // possible egress; the earlier cloud-ASR guard is too old by this point.
     if !snippet_expanded && potentially_remote_rewrite(&s) {
-        if ctx.gen.load(Ordering::SeqCst) != my_gen {
+        if !final_generation_is_current(ctx, my_gen) {
             dbg_log("финал: поколение устарело до remote rewrite — данные не отправляем");
             let _ = std::fs::remove_file(&wav);
             return Ok(());
@@ -3892,7 +4003,7 @@ fn process_utterance(
             let _ = std::fs::remove_file(&wav);
             return Ok(());
         };
-        if ctx.gen.load(Ordering::SeqCst) != my_gen {
+        if !final_generation_is_current(ctx, my_gen) {
             dbg_log("финал: поколение устарело во время target-check перед rewrite");
             let _ = std::fs::remove_file(&wav);
             return Ok(());
@@ -3968,7 +4079,7 @@ fn process_utterance(
     // Если за время обработки уже стартовала НОВАЯ диктовка — этот поток «осиротел».
     // Не вставляем ничего (иначе многократная вставка при быстрой диктовке подряд).
     // Чистим за собой временный WAV и выходим.
-    if ctx.gen.load(Ordering::SeqCst) != my_gen {
+    if !final_generation_is_current(ctx, my_gen) {
         dbg_log("финал: поколение устарело (началась новая диктовка) — вставку пропускаем");
         let _ = std::fs::remove_file(&wav);
         return Ok(());
@@ -3987,6 +4098,7 @@ fn process_utterance(
     // Target detection may call platform accessibility APIs. Keep it outside
     // the keyboard lock so a new hotkey can invalidate this generation while
     // detection is running instead of waiting behind it.
+    ctx.final_queue.wait_turn(my_gen, FINAL_ORDER_TIMEOUT);
     let context_started = Instant::now();
     let final_target = current_or_restored_target(ctx, &mut target_fp, "перед вставкой");
     context_ms += context_started.elapsed().as_millis() as u64;
@@ -4012,7 +4124,7 @@ fn process_utterance(
     // slow target query above is deliberately outside both locks.
     let inject_guard = ctx.inject_lock.lock();
     let commit_guard = ctx.cancel_activity_lock.lock();
-    if ctx.gen.load(Ordering::SeqCst) != my_gen {
+    if !final_generation_is_current(ctx, my_gen) {
         dbg_log("финал: поколение устарело после target-check — вставку пропускаем");
         drop(inject_guard);
         let _ = std::fs::remove_file(&wav);
@@ -6370,10 +6482,65 @@ mod seg_tests {
         assert!(!resident_model_ready(&model));
     }
 
+    /// Регрессия фикса «финал не отбрасывается»: второй финал готов раньше
+    /// первого, но вставки идут строго 1, 2.
+    #[test]
+    fn finals_are_inserted_in_generation_order() {
+        let queue = Arc::new(FinalQueue::default());
+        let t1 = FinalQueue::enter(&queue, 1);
+        let t2 = FinalQueue::enter(&queue, 2);
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let (q2, o2) = (Arc::clone(&queue), Arc::clone(&order));
+        let second = std::thread::spawn(move || {
+            q2.wait_turn(2, Duration::from_secs(5));
+            o2.lock().push(2);
+            drop(t2);
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        queue.wait_turn(1, Duration::from_secs(5));
+        order.lock().push(1);
+        drop(t1);
+        second.join().unwrap();
+        assert_eq!(*order.lock(), vec![1, 2]);
+    }
+
+    #[test]
+    fn a_hung_earlier_final_does_not_block_forever() {
+        let queue = Arc::new(FinalQueue::default());
+        let _hung = FinalQueue::enter(&queue, 1);
+        let started = Instant::now();
+        queue.wait_turn(2, Duration::from_millis(50));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Регрессия: паника в финале убивала поток, `idle` не приходил, и плашка
+    /// висела в «распознаю» до перезапуска.
+    #[test]
+    fn a_panic_in_the_final_thread_is_contained() {
+        assert_eq!(run_guarded("t", || 7), Some(7));
+        assert_eq!(run_guarded("t", || -> u8 { panic!("boom") }), None);
+    }
+
     #[test]
     fn stale_generation_is_rejected_before_expensive_fallbacks() {
         assert!(generation_is_current(9, 9));
         assert!(!generation_is_current(10, 9));
+    }
+
+    /// Регрессия: новое нажатие хоткея, пока предыдущая фраза ещё распознаётся,
+    /// выбрасывало её целиком (debug.log: «поколение устарело ... вставку
+    /// пропускаем» при asr=4026мс). Теперь отменяет только Esc.
+    #[test]
+    fn next_hotkey_press_does_not_drop_the_previous_final() {
+        // Старт поколения 10 поверх финала 9; Esc ещё не нажимали (floor 0).
+        assert!(final_still_wanted(10, 9, 0, true));
+        // Esc в поколении 9 поднял floor до 10: финал 9 отменён.
+        assert!(!final_still_wanted(10, 9, 10, true));
+        // Финал, начавшийся после Esc, нужен.
+        assert!(final_still_wanted(11, 10, 10, true));
+        // Живая печать делит поле с новой диктовкой: поколение строгое.
+        assert!(!final_still_wanted(10, 9, 0, false));
+        assert!(final_still_wanted(9, 9, 0, false));
     }
 
     #[test]

@@ -363,6 +363,10 @@ fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<
             }
             #[cfg(not(target_os = "macos"))]
             {
+                #[cfg(target_os = "linux")]
+                if let Some(result) = wayland_incremental(prev, next) {
+                    return (result.map(|_| CmdResult::Done), None);
+                }
                 (
                     enigo_of(enigo)
                         .and_then(|e| incremental_keys(e, prev, next))
@@ -378,6 +382,10 @@ fn run_real(enigo: &mut Option<Enigo>, cmd: &Cmd) -> (Result<CmdResult>, Option<
 
 /// Обёртка печати с ленивым Enigo (для веток run_real без `?`).
 fn try_type(enigo: &mut Option<Enigo>, text: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(result) = crate::linux_env::wayland_type(text) {
+        return result;
+    }
     type_text(enigo_of(enigo)?, text)
 }
 
@@ -540,6 +548,48 @@ fn incremental_keys(e: &mut Enigo, prev: &str, next: &str) -> Result<()> {
     Ok(())
 }
 
+/// Wayland: enigo (XTest) не достаёт нативные окна, правим текст через wtype/ydotool.
+/// `None` — сессия не Wayland.
+#[cfg(target_os = "linux")]
+fn wayland_incremental(prev: &str, next: &str) -> Option<Result<()>> {
+    let (backspaces, suffix) = incremental_edit(prev, next);
+    let erased = crate::linux_env::wayland_backspaces(backspaces)?;
+    Some(erased.and_then(|()| {
+        if suffix.is_empty() {
+            Ok(())
+        } else {
+            crate::linux_env::wayland_type(&suffix).unwrap_or(Ok(()))
+        }
+    }))
+}
+
+/// Ctrl+<буква> через wtype/ydotool; `None` — не Wayland, клавиши шлёт enigo.
+#[cfg(not(target_os = "macos"))]
+fn wayland_chord(letter: char) -> Option<Result<()>> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_env::wayland_chord(letter, false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = letter;
+        None
+    }
+}
+
+/// В фокусе терминал X11: там вставка и копирование идут через Ctrl+Shift.
+#[cfg(not(target_os = "macos"))]
+fn terminal_shift() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux_env::terminal_active()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn macos_incremental_keys(prev: &str, next: &str) -> Result<()> {
     let (backspaces, suffix) = incremental_edit(prev, next);
@@ -599,6 +649,20 @@ fn clipboard_get_text_retry() -> Result<String> {
 /// None — буфер пуст либо формат, который arboard не читает (CF_HDROP и пр.,
 /// см. ClipSnapshot).
 fn clipboard_snapshot() -> Option<ClipSnapshot> {
+    // X11/Wayland: владелец буфера отвечает на запрос через свой поток, сразу
+    // после чужого set чтение иногда пусто. Пустой буфер на Linux перепроверяем
+    // (до 40 мс), иначе картинку пользователя не заметим и не восстановим.
+    #[cfg(target_os = "linux")]
+    for _ in 0..2 {
+        if let Some(snapshot) = clipboard_snapshot_once() {
+            return Some(snapshot);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    clipboard_snapshot_once()
+}
+
+fn clipboard_snapshot_once() -> Option<ClipSnapshot> {
     let mut cb = arboard::Clipboard::new().ok()?;
     if let Ok(t) = cb.get_text() {
         return Some(ClipSnapshot::Text(t));
@@ -719,18 +783,33 @@ fn paste_text(
         #[cfg(not(windows))]
         let vkey = Key::Unicode('v');
 
-        // --- до этой черты ошибки безопасны (V ещё не доставлена) ---
-        let e = enigo_of(enigo_slot)?;
-        e.key(modkey, Direction::Press)
-            .map_err(|e| anyhow!("mod down: {e}"))?;
-        if let Err(err) = e.key(vkey, Direction::Click) {
-            // V не доставлена — откатываем модификатор и сообщаем об ошибке, fallback в печать безопасен.
+        // Wayland: клавиши шлют wtype/ydotool (терминал там не определить -> Ctrl+V).
+        if let Some(result) = wayland_chord('v') {
+            result?;
+        } else {
+            // --- до этой черты ошибки безопасны (V ещё не доставлена) ---
+            let shift = terminal_shift();
+            let e = enigo_of(enigo_slot)?;
+            e.key(modkey, Direction::Press)
+                .map_err(|e| anyhow!("mod down: {e}"))?;
+            if shift {
+                let _ = e.key(Key::Shift, Direction::Press);
+            }
+            if let Err(err) = e.key(vkey, Direction::Click) {
+                // V не доставлена — откатываем модификаторы и сообщаем об ошибке, fallback в печать безопасен.
+                if shift {
+                    let _ = e.key(Key::Shift, Direction::Release);
+                }
+                let _ = e.key(modkey, Direction::Release);
+                return Err(anyhow!("v: {err}"));
+            }
+            // --- V ОТПРАВЛЕНА: дальше только best-effort, возвращаем строго Ok ---
+            // Отпускание модификатора best-effort: ошибка здесь НЕ должна вызвать дубль.
+            if shift {
+                let _ = e.key(Key::Shift, Direction::Release);
+            }
             let _ = e.key(modkey, Direction::Release);
-            return Err(anyhow!("v: {err}"));
         }
-        // --- V ОТПРАВЛЕНА: дальше только best-effort, возвращаем строго Ok ---
-        // Отпускание модификатора best-effort: ошибка здесь НЕ должна вызвать дубль.
-        let _ = e.key(modkey, Direction::Release);
     }
 
     // Короткий settle нужен только перед восстановлением старого clipboard.
@@ -761,7 +840,7 @@ fn run_copy_selection(
         macos_keys::command_chord(macos_keys::KEY_C)
     };
     #[cfg(not(target_os = "macos"))]
-    let copy_res = enigo_of(enigo_slot).and_then(send_copy_chord);
+    let copy_res = copy_chord(enigo_slot);
     if let Err(e) = copy_res {
         return (Err(e), Some(DeferredRestore::if_unchanged(prev, sentinel)));
     }
@@ -784,6 +863,14 @@ fn run_copy_selection(
 }
 
 #[cfg(not(target_os = "macos"))]
+fn copy_chord(enigo_slot: &mut Option<Enigo>) -> Result<()> {
+    if let Some(result) = wayland_chord('c') {
+        return result;
+    }
+    enigo_of(enigo_slot).and_then(send_copy_chord)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn send_copy_chord(e: &mut Enigo) -> Result<()> {
     let modkey = Key::Control;
     #[cfg(windows)]
@@ -791,9 +878,17 @@ fn send_copy_chord(e: &mut Enigo) -> Result<()> {
     #[cfg(not(windows))]
     let ckey = Key::Unicode('c');
 
+    // Ctrl+C в терминале шлёт SIGINT: там копирование это Ctrl+Shift+C.
+    let shift = terminal_shift();
     e.key(modkey, Direction::Press)
         .map_err(|e| anyhow!("mod down: {e}"))?;
+    if shift {
+        let _ = e.key(Key::Shift, Direction::Press);
+    }
     let click = e.key(ckey, Direction::Click).map_err(|e| anyhow!("c: {e}"));
+    if shift {
+        let _ = e.key(Key::Shift, Direction::Release);
+    }
     let _ = e.key(modkey, Direction::Release);
     click
 }
@@ -1007,7 +1102,18 @@ mod tests {
             .expect("set_image 2x2");
 
         // Снимок видит именно картинку (текста в буфере нет).
-        let snap = clipboard_snapshot().expect("снимок непустого буфера");
+        let Some(snap) = clipboard_snapshot() else {
+            // Linux без менеджера буфера (xvfb в CI): X11-буфер не отдаёт картинку
+            // обратно даже после повторов. Это среда, а не код: на других ОС и в
+            // обычном сеансе снимок обязан быть.
+            #[cfg(target_os = "linux")]
+            {
+                eprintln!("пропуск: буфер этой Linux-среды не вернул картинку после set_image");
+                return;
+            }
+            #[cfg(not(target_os = "linux"))]
+            panic!("снимок непустого буфера");
+        };
         match &snap {
             ClipSnapshot::Image(img) => assert_eq!((img.width, img.height), (2, 2)),
             ClipSnapshot::Text(t) => panic!("в снимке текст вместо картинки: {t:?}"),
