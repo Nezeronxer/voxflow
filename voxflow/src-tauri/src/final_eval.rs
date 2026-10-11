@@ -242,14 +242,56 @@ mod tests {
             ("pad500", Params { pad: 8000, ..b }),
             ("thr0.25", Params { thr: 0.25, ..b }),
             ("thr0.5", Params { thr: 0.5, ..b }),
-            ("seg15", Params { max_seg: 15 * 16000, ..b }),
-            ("seg20", Params { max_seg: 20 * 16000, ..b }),
-            ("seg28", Params { max_seg: 28 * 16000, ..b }),
-            ("cut_longest8s", Params { cut: Cut::LongestPauseMid(8), ..b }),
-            ("cut_longest4s", Params { cut: Cut::LongestPauseMid(4), ..b }),
+            (
+                "seg15",
+                Params {
+                    max_seg: 15 * 16000,
+                    ..b
+                },
+            ),
+            (
+                "seg20",
+                Params {
+                    max_seg: 20 * 16000,
+                    ..b
+                },
+            ),
+            (
+                "seg28",
+                Params {
+                    max_seg: 28 * 16000,
+                    ..b
+                },
+            ),
+            (
+                "cut_longest8s",
+                Params {
+                    cut: Cut::LongestPauseMid(8),
+                    ..b
+                },
+            ),
+            (
+                "cut_longest4s",
+                Params {
+                    cut: Cut::LongestPauseMid(4),
+                    ..b
+                },
+            ),
             ("dc", Params { dc: true, ..b }),
-            ("rms0.06", Params { rms_target: Some(0.06), ..b }),
-            ("rms0.10", Params { rms_target: Some(0.10), ..b }),
+            (
+                "rms0.06",
+                Params {
+                    rms_target: Some(0.06),
+                    ..b
+                },
+            ),
+            (
+                "rms0.10",
+                Params {
+                    rms_target: Some(0.10),
+                    ..b
+                },
+            ),
         ];
 
         let files: Vec<String> = std::fs::read_to_string(&list)
@@ -263,7 +305,11 @@ mod tests {
         let mut per_file: Vec<(String, f64, f32)> = Vec::new();
         let mut used = 0;
         for f in &files {
-            let stem = Path::new(f).file_stem().unwrap().to_string_lossy().to_string();
+            let stem = Path::new(f)
+                .file_stem()
+                .unwrap()
+                .to_string_lossy()
+                .to_string();
             let Ok(reference) = std::fs::read_to_string(format!("{refdir}/{stem}.txt")) else {
                 continue;
             };
@@ -306,14 +352,23 @@ mod tests {
         for (s, w, d) in per_file.iter().take(8) {
             println!("  худшие base: {s} WER {:.2} ({d:.0} с)", w);
         }
-        println!("{:<16} {:>8} {:>8} {:>8}", "вариант", "все", "long", "short");
+        println!(
+            "{:<16} {:>8} {:>8} {:>8}",
+            "вариант", "все", "long", "short"
+        );
         for (name, m) in &acc {
             let r = |k: &str| {
                 m.get(k)
                     .map(|(e, n)| format!("{:.2}%", 100.0 * *e as f64 / (*n).max(1) as f64))
                     .unwrap_or_default()
             };
-            println!("{:<16} {:>8} {:>8} {:>8}", name, r("all"), r("long"), r("short"));
+            println!(
+                "{:<16} {:>8} {:>8} {:>8}",
+                name,
+                r("all"),
+                r("long"),
+                r("short")
+            );
         }
     }
 }
