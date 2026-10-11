@@ -1106,9 +1106,13 @@ mod tests {
             // Linux без менеджера буфера (xvfb в CI): X11-буфер не отдаёт картинку
             // обратно даже после повторов. Это среда, а не код: на других ОС и в
             // обычном сеансе снимок обязан быть.
-            assert!(cfg!(target_os = "linux"), "снимок непустого буфера");
-            eprintln!("пропуск: буфер этой Linux-среды не вернул картинку после set_image");
-            return;
+            #[cfg(target_os = "linux")]
+            {
+                eprintln!("пропуск: буфер этой Linux-среды не вернул картинку после set_image");
+                return;
+            }
+            #[cfg(not(target_os = "linux"))]
+            panic!("снимок непустого буфера");
         };
         match &snap {
             ClipSnapshot::Image(img) => assert_eq!((img.width, img.height), (2, 2)),
