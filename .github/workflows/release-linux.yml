@@ -79,7 +79,7 @@ jobs:
       # Tauri проверяет glob'ы ресурсов уже в build.rs, поэтому рантайм
       # (whisper.cpp + Silero VAD, версии и SHA-256 закреплены) нужен до clippy.
       - name: Build verified Linux runtime resources
-        run: ./script/build_linux_runtime.sh
+        run: bash script/build_linux_runtime.sh
 
       - name: Rust format check
         working-directory: voxflow

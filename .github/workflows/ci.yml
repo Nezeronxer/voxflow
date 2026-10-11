@@ -30,6 +30,13 @@ jobs:
       - name: Verify package, Cargo, Tauri, and Inno versions
         run: python script/check_versions.py
 
+      # 2.2.0 не вышел из-за скрипта без права исполнения: ловим это до тега.
+      - name: Verify release scripts are executable and parse
+        run: |
+          bad=$(git ls-files -s 'script/*.sh' | grep -v '^100755' || true)
+          if [ -n "$bad" ]; then echo "not executable in git:"; echo "$bad"; exit 1; fi
+          for f in script/*.sh; do bash -n "$f"; done
+
   frontend:
     name: Frontend build
     runs-on: ubuntu-24.04
