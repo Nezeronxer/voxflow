@@ -7,6 +7,8 @@ mod cloud_stt;
 mod commands;
 mod db;
 mod engine;
+#[cfg(test)]
+mod final_eval;
 mod gemini;
 mod gigaam;
 mod hotkey;
