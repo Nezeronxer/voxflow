@@ -9,8 +9,8 @@ window.STATE =
   "briefFile": "2026-10-16-brief.md",
   "memoryFile": "CLAUDE.md",
   "startedAt": "2026-10-16T18:42:57+03:00",
-  "updatedAt": "2026-10-16T18:58:07+03:00",
-  "finishedAt": "2026-10-16T18:58:07+03:00",
+  "updatedAt": "2026-10-16T19:00:17+03:00",
+  "finishedAt": "2026-10-16T19:00:17+03:00",
   "stages": [
     {
       "id": "preflight",
@@ -57,13 +57,14 @@ window.STATE =
     {
       "id": "final",
       "status": "done",
-      "finishedAt": "2026-10-16T18:58:07+03:00",
-      "note": "v2.3.1 опубликован, установлен на мак, полная GigaAM загружена"
+      "finishedAt": "2026-10-16T19:00:17+03:00",
+      "note": "v2.3.1 опубликован, установлен на мак, полная GigaAM загружена",
+      "startedAt": "2026-10-16T18:59:38+03:00"
     }
   ],
   "requirements": {
     "total": 12,
-    "done": 12,
+    "done": 7,
     "inTicket": 0,
     "inSpec": 0,
     "placeholder": 0,
@@ -104,12 +105,15 @@ window.STATE =
     {
       "id": "03",
       "title": "Установка с той же подписью",
-      "status": "in-progress",
+      "status": "done",
       "reqs": [
         "R06",
         "R07"
       ],
-      "startedAt": "2026-10-16T18:57:59+03:00"
+      "startedAt": "2026-10-16T18:57:59+03:00",
+      "finishedAt": "2026-10-16T18:59:38+03:00",
+      "commit": "-",
+      "tests": "DR совпал, хоткей ловится"
     }
   ],
   "singlePass": null,
@@ -125,15 +129,6 @@ window.STATE =
   "additions": [],
   "coverage": null,
   "blind": {
-    "drift": [
-      "R01 до решения G01 - боевая модель не менялась"
-    ],
-    "resolved": [
-      "R01 → G01: полная GigaAM основная в 2.3.1",
-      "R02/R03/R05: релиз опубликован, установлен, подпись подтверждена на артефакте"
-    ],
-    "open": [
-      "R07: установка из .dmg двойным кликом - один шаг «Всё равно открыть» (без Apple Developer)"
-    ]
+    "verdict": "3 из 4 выполнены, поиск примеров - частично (следов в коде нет, есть в спеке)"
   }
 }
