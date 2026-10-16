@@ -38,6 +38,31 @@ pub const GIGAAM_FILES: &[(&str, u64)] = &[
     ("v3_e2e_rnnt_vocab.txt", 13_354),
 ];
 
+/// Имена файлов одного набора весов (int8 или fp32) внутри каталога модели.
+#[derive(Clone, Copy)]
+pub struct Files {
+    pub encoder: &'static str,
+    pub decoder: &'static str,
+    pub joint: &'static str,
+    pub vocab: &'static str,
+}
+
+pub const INT8_FILES: Files = Files {
+    encoder: "v3_e2e_rnnt_encoder.int8.onnx",
+    decoder: "v3_e2e_rnnt_decoder.int8.onnx",
+    joint: "v3_e2e_rnnt_joint.int8.onnx",
+    vocab: "v3_e2e_rnnt_vocab.txt",
+};
+
+/// fp32-набор нужен только замеру D-038 (в каталог не вошёл).
+#[cfg(test)]
+pub const FP32_FILES: Files = Files {
+    encoder: "v3_e2e_rnnt_encoder.onnx",
+    decoder: "v3_e2e_rnnt_decoder.onnx",
+    joint: "v3_e2e_rnnt_joint.onnx",
+    vocab: "v3_e2e_rnnt_vocab.txt",
+};
+
 const SAMPLE_RATE: usize = 16_000;
 const N_FFT: usize = 320; // = win_length (center=false)
 const HOP: usize = 160;
@@ -94,6 +119,10 @@ pub struct GigaAm {
 
 impl GigaAm {
     pub fn load(dir: &Path, threads: usize) -> Result<Self> {
+        Self::load_files(dir, threads, &INT8_FILES)
+    }
+
+    pub fn load_files(dir: &Path, threads: usize, files: &Files) -> Result<Self> {
         let t0 = Instant::now();
         let mk = |file: &str, th: usize| -> Result<Session> {
             Session::builder()
@@ -105,12 +134,11 @@ impl GigaAm {
         };
         // Вся тяжесть в энкодере; decoder/joint — крошечные пошаговые вызовы,
         // многопоточность там только мешает (оверхед планировщика на каждый кадр).
-        let encoder = mk("v3_e2e_rnnt_encoder.int8.onnx", threads.max(1))?;
-        let decoder = mk("v3_e2e_rnnt_decoder.int8.onnx", 1)?;
-        let joint = mk("v3_e2e_rnnt_joint.int8.onnx", 1)?;
+        let encoder = mk(files.encoder, threads.max(1))?;
+        let decoder = mk(files.decoder, 1)?;
+        let joint = mk(files.joint, 1)?;
 
-        let vocab_raw =
-            std::fs::read_to_string(dir.join("v3_e2e_rnnt_vocab.txt")).context("чтение vocab")?;
+        let vocab_raw = std::fs::read_to_string(dir.join(files.vocab)).context("чтение vocab")?;
         let mut vocab = vec![String::new(); VOCAB_SIZE];
         for line in vocab_raw.lines() {
             let line = line.trim_end_matches('\r');
@@ -180,16 +208,8 @@ impl GigaAm {
         })
     }
 
-    /// Распознать 16 кГц mono f32. Для буферов длиннее ~30 с качество деградирует
-    /// (pos_emb) — длинное аудио режь по VAD-паузам снаружи (engine).
-    pub fn transcribe(&mut self, samples_16k: &[f32]) -> Result<String> {
-        let t_total = Instant::now();
-        if samples_16k.len() < N_FFT {
-            return Ok(String::new());
-        }
-
-        // ── Фронтенд: log-mel [1, 64, T] ──
-        let t_fe = Instant::now();
+    /// Лог-мел признаки [64 * T] (по строкам мелов) и число кадров T.
+    pub(crate) fn log_mel(&self, samples_16k: &[f32]) -> (Vec<f32>, usize) {
         let n_frames = (samples_16k.len() - N_FFT) / HOP + 1;
         let mut features = vec![0f32; N_MELS * n_frames];
         let mut spec = [0f32; N_BINS];
@@ -217,6 +237,20 @@ impl GigaAm {
                 features[m * n_frames + t] = e.clamp(1e-9, 1e9).ln();
             }
         }
+        (features, n_frames)
+    }
+
+    /// Распознать 16 кГц mono f32. Для буферов длиннее ~30 с качество деградирует
+    /// (pos_emb) — длинное аудио режь по VAD-паузам снаружи (engine).
+    pub fn transcribe(&mut self, samples_16k: &[f32]) -> Result<String> {
+        let t_total = Instant::now();
+        if samples_16k.len() < N_FFT {
+            return Ok(String::new());
+        }
+
+        // ── Фронтенд: log-mel [1, 64, T] ──
+        let t_fe = Instant::now();
+        let (features, n_frames) = self.log_mel(samples_16k);
         let frontend_ms = t_fe.elapsed().as_millis() as u64;
 
         // ── Энкодер: [1,64,T] → encoded [1,768,T'], encoded_len i32 ──
@@ -346,7 +380,7 @@ impl GigaAm {
 
 /// Семантика re.sub(r"\A\s|\s\B|(\s)\b", ...) из эталона: ведущие пробелы убрать;
 /// внутренний пробел оставить (одним), только если дальше идёт словесный символ.
-fn clean_spaces(s: &str) -> String {
+pub(crate) fn clean_spaces(s: &str) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len());
     for (i, &ch) in chars.iter().enumerate() {

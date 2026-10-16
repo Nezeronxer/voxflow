@@ -224,14 +224,93 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    /// CTC-голова GigaAM (один ONNX, greedy: argmax, склейка повторов, без blank).
+    struct Ctc {
+        sess: ort::session::Session,
+        vocab: Vec<String>,
+    }
+
+    impl Ctc {
+        fn load(dir: &Path, threads: usize) -> Self {
+            let sess = ort::session::Session::builder()
+                .unwrap()
+                .with_intra_threads(threads)
+                .unwrap()
+                .commit_from_file(dir.join("v3_e2e_ctc.onnx"))
+                .unwrap();
+            println!(
+                "ctc inputs {:?} outputs {:?}",
+                sess.inputs()
+                    .iter()
+                    .map(|i| i.name().to_string())
+                    .collect::<Vec<_>>(),
+                sess.outputs()
+                    .iter()
+                    .map(|i| i.name().to_string())
+                    .collect::<Vec<_>>()
+            );
+            let raw = std::fs::read_to_string(dir.join("v3_e2e_ctc_vocab.txt")).unwrap();
+            let mut vocab = vec![String::new(); 257];
+            for l in raw.lines() {
+                if let Some((t, id)) = l.trim_end_matches('\r').rsplit_once(' ') {
+                    if let Ok(i) = id.parse::<usize>() {
+                        vocab[i] = t.replace('\u{2581}', " ");
+                    }
+                }
+            }
+            Ctc { sess, vocab }
+        }
+
+        fn transcribe(&mut self, g: &crate::gigaam::GigaAm, samples: &[f32]) -> String {
+            if samples.len() < 320 {
+                return String::new();
+            }
+            let (feats, n) = g.log_mel(samples);
+            let f = ort::value::Tensor::from_array((vec![1i64, 64, n as i64], feats)).unwrap();
+            let l = ort::value::Tensor::from_array((vec![1i64], vec![n as i64])).unwrap();
+            let out = self
+                .sess
+                .run(ort::inputs!["features" => f, "feature_lengths" => l])
+                .unwrap();
+            let (shape, data) = out[0].try_extract_tensor::<f32>().unwrap();
+            let (t, v) = (shape[1] as usize, shape[2] as usize);
+            assert_eq!(v, 257, "словарь CTC");
+            let mut prev = usize::MAX;
+            let mut s = String::new();
+            for i in 0..t {
+                let row = &data[i * v..(i + 1) * v];
+                let best = (0..v).max_by(|&a, &b| row[a].total_cmp(&row[b])).unwrap();
+                if best != prev && best != 256 {
+                    s.push_str(&self.vocab[best]);
+                }
+                prev = best;
+            }
+            crate::gigaam::clean_spaces(&s)
+        }
+    }
+
     #[test]
     #[ignore = "requires local models, private dataset and a pseudo-reference directory"]
     fn final_accuracy_eval() {
         let list = std::env::var("VOXFLOW_EVAL_LIST").expect("VOXFLOW_EVAL_LIST");
         let refdir = std::env::var("VOXFLOW_EVAL_REF").expect("VOXFLOW_EVAL_REF");
         let only = std::env::var("VOXFLOW_EVAL_ONLY").ok();
-        let dir = crate::paths::gigaam_dir();
-        let mut g = crate::gigaam::GigaAm::load(&dir, 6).expect("gigaam");
+        // VOXFLOW_EVAL_MODEL=int8|fp32, VOXFLOW_EVAL_DIR - каталог весов (по умолчанию боевой).
+        let dir = std::env::var("VOXFLOW_EVAL_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| crate::paths::gigaam_dir());
+        let files = match std::env::var("VOXFLOW_EVAL_MODEL").as_deref() {
+            Ok("fp32") => crate::gigaam::FP32_FILES,
+            _ => crate::gigaam::INT8_FILES,
+        };
+        let ctc_mode = std::env::var("VOXFLOW_EVAL_MODEL").as_deref() == Ok("ctc");
+        let mut g = if ctc_mode {
+            // фронтенд общий, веса RNNT нужны только ради log_mel
+            crate::gigaam::GigaAm::load(&crate::paths::gigaam_dir(), 6).expect("gigaam")
+        } else {
+            crate::gigaam::GigaAm::load_files(&dir, 6, &files).expect("gigaam")
+        };
+        let mut ctc = ctc_mode.then(|| Ctc::load(&dir, 6));
         let mut vad = SileroVad::load(&crate::paths::vad_model_path(None)).expect("vad");
         let _ = g.transcribe(&vec![0.0f32; 8000]);
 
@@ -304,6 +383,10 @@ mod tests {
         let mut acc: BTreeMap<&str, BTreeMap<&str, (usize, usize)>> = BTreeMap::new();
         let mut per_file: Vec<(String, f64, f32)> = Vec::new();
         let mut used = 0;
+        // RTF: время распознавания (без VAD) / длина звука, только вариант base.
+        let (mut asr_ms, mut audio_ms) = (0u128, 0u128);
+        // время файлов длиной 9-11 с (мс на ~10-секундной записи)
+        let mut ten: Vec<u128> = Vec::new();
         for f in &files {
             let stem = Path::new(f)
                 .file_stem()
@@ -335,7 +418,20 @@ mod tests {
                         .get_or_insert_with(|| vad_probs(&mut vad, &samples))
                         .clone()
                 };
-                let text = long_variant(&probs, &s, p, &mut |seg| g.transcribe(seg)).unwrap();
+                let t0 = std::time::Instant::now();
+                let text = long_variant(&probs, &s, p, &mut |seg| match ctc.as_mut() {
+                    Some(c) => Ok(c.transcribe(&g, seg)),
+                    None => g.transcribe(seg),
+                })
+                .unwrap();
+                if *name == "base" {
+                    let ms = t0.elapsed().as_millis();
+                    asr_ms += ms;
+                    audio_ms += (secs * 1000.0) as u128;
+                    if (9.0..=11.0).contains(&secs) {
+                        ten.push(ms);
+                    }
+                }
                 let (e, n) = word_errors(&reference, &text);
                 for bk in ["all", bucket] {
                     let a = acc.entry(name).or_default().entry(bk).or_default();
@@ -348,6 +444,12 @@ mod tests {
             }
         }
         println!("файлов с эталоном: {used}");
+        println!(
+            "RTF base: {:.4} ({asr_ms} мс на {audio_ms} мс звука); файлов 9-11 с: {}, среднее {:.0} мс",
+            asr_ms as f64 / audio_ms.max(1) as f64,
+            ten.len(),
+            ten.iter().sum::<u128>() as f64 / ten.len().max(1) as f64
+        );
         per_file.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         for (s, w, d) in per_file.iter().take(8) {
             println!("  худшие base: {s} WER {:.2} ({d:.0} с)", w);
