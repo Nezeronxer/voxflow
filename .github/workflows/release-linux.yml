@@ -128,7 +128,16 @@ jobs:
           rpm_pkg="$out/VoxFlow-${version}-linux-x64.rpm"
           deb_list="$(dpkg-deb -c "$deb")"
           deb_info="$(dpkg-deb -I "$deb")"
-          desktop="$(dpkg-deb --fsys-tarfile "$deb" | tar -xO --wildcards './usr/share/applications/*.desktop')"
+          # Распаковка вместо tar --wildcards: не зависит от формы путей в архиве (с ./ или без).
+          deb_dir="$(mktemp -d)"
+          dpkg-deb -x "$deb" "$deb_dir"
+          desktop_files=( "$deb_dir"/usr/share/applications/*.desktop )
+          if [[ ${#desktop_files[@]} -ne 1 || ! -f "${desktop_files[0]}" ]]; then
+            echo "Package check failed: deb: expected exactly one usr/share/applications/*.desktop; found: $(find "$deb_dir" -name '*.desktop' | tr '\n' ' ')" >&2
+            exit 1
+          fi
+          desktop="$(cat "${desktop_files[0]}")"
+          rm -rf "$deb_dir"
           rpm_requires="$(rpm -qp --requires "$rpm_pkg")"
 
           check() { # имя, текст, шаблон
