@@ -120,12 +120,36 @@ export function sharedWordPrefix(prev: string[], next: string[]): number {
   return same;
 }
 
-// Подпись капсулы «GigaAM · RU»: модель из "status".model и язык из lang.
-// Нет ни того, ни другого (старый бэкенд) - null, метку не рисуем.
+// Метка ИИ-обработки из "status".ai: kind - local | cloud | off | missing.
+export type OverlayAi = { kind?: string; name?: string | null };
+export type OverlayMetaPart = { text: string; warn: boolean };
+
+// Подпись капсулы «GigaAM · ИИ gemma4:e2b»: распознавание из "status".model и
+// ИИ-обработка из "status".ai. model: undefined - старый бэкенд (части нет),
+// null/пусто - модели нет («Нет модели», тревожно). Нет обеих частей - null.
 export function overlayMetaLabel(
   model: string | null | undefined,
-  lang: string | null | undefined,
-): string | null {
-  const parts = [model?.trim(), lang?.toUpperCase()].filter((p): p is string => !!p);
-  return parts.length ? parts.join(" · ") : null;
+  ai: OverlayAi | null | undefined,
+): OverlayMetaPart[] | null {
+  const parts: OverlayMetaPart[] = [];
+  if (model !== undefined) {
+    const m = typeof model === "string" ? model.trim() : "";
+    parts.push(m ? { text: m, warn: false } : { text: "Нет модели", warn: true });
+  }
+  const name = typeof ai?.name === "string" ? ai.name.trim() : "";
+  switch (ai?.kind) {
+    case "local":
+      parts.push({ text: name ? `ИИ ${name}` : "ИИ локально", warn: false });
+      break;
+    case "cloud":
+      parts.push({ text: "ИИ облако", warn: false });
+      break;
+    case "off":
+      parts.push({ text: "ИИ выкл.", warn: false });
+      break;
+    case "missing":
+      parts.push({ text: "ИИ не найдена", warn: true });
+      break;
+  }
+  return parts.length ? parts : null;
 }

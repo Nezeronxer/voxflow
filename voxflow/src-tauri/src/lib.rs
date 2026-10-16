@@ -213,6 +213,8 @@ pub fn run() {
             spawn_prompt_rules_refresh(startup_settings.clone());
 
             spawn_local_ai_detect(handle.clone(), startup_settings.clone());
+            // Выбранная локальная ИИ-модель не установлена - взять установленную (D-043).
+            local_ai::spawn_adopt_installed(handle.clone(), startup_settings.clone());
             local_llm::warmup(&startup_settings);
 
             // Показать окно настроек при запуске, НО не при автозапуске (тогда — в трей).

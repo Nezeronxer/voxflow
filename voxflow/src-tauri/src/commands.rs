@@ -181,6 +181,10 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
     }
     // Сменился язык или движок - подобрать уже установленную модель под маршрут
     // (D-042), качать только если для него нет ни одной.
+    // Сменился ИИ-бэкенд - подобрать установленную локальную модель (D-043).
+    if settings.ai_backend != previous.ai_backend {
+        crate::local_ai::spawn_adopt_installed(app.clone(), settings.clone());
+    }
     if lang_changed || settings.engine != previous.engine {
         models::ensure_default_models(app, &settings);
     }

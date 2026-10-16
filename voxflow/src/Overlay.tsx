@@ -5,7 +5,7 @@
 //
 // Состояния капсулы (классы aq-* в overlay.css):
 //   idle   - тонкая приглушённая полоска, при наведении подсказка с клавишей;
-//   rec    - 5 белых полосок по громкости ("level") + метка модели/языка;
+//   rec    - 5 белых полосок по громкости ("level") + метка моделей (распознавание · ИИ);
 //   stream - пришёл partial: живой текст, слева мини-волна из 3 полосок;
 //   trans  - три точки с бегущей волной яркости;
 //   latch  - подтверждение двойного тапа одной строкой;
@@ -24,6 +24,7 @@ import FpsMeter from "./components/FpsMeter";
 import "./overlay.css";
 import {
   overlayMetaLabel,
+  type OverlayAi,
   previewPillMode,
   resolveOverlayPreviewEvent,
   sharedWordPrefix,
@@ -48,8 +49,8 @@ type PillMode = "idle" | "rec" | "stream" | "trans" | "latch" | "notice";
 // Контракт мультиязычности (RU/EN/auto): события "partial" и "status" МОГУТ
 // нести опциональное поле lang: "ru" | "en" | null — язык, определённый STT.
 // Бэкенд начнёт слать его следующей волной; до неё (и при lang:null) фронт
-// работает как раньше — бейдж просто скрыт. types.ts правит другая волна,
-// поэтому расширение типизировано локально, поверх существующих контрактов.
+// работает как раньше. Бейдж языка капсула больше не рисует: метка занята
+// моделями распознавания и ИИ. Расширение типизировано локально.
 type DetectedLang = "ru" | "en" | null;
 type PartialWithLang = PartialEvent & {
   lang?: DetectedLang;
@@ -68,8 +69,10 @@ type StatusPayload =
       seq?: number;
       latched?: boolean;
       // Короткое имя распознавателя ("GigaAM" | "Parakeet" | "Whisper" | "Облако").
-      // Нет поля - старый бэкенд, метку не трогаем; null - метку прячем.
+      // Нет поля - старый бэкенд, метку не трогаем; null - модели нет.
       model?: string | null;
+      // ИИ-обработка: { kind: local | cloud | off | missing, name }.
+      ai?: OverlayAi | null;
     };
 type DragPointer = {
   id: number;
@@ -90,8 +93,8 @@ type DragPointer = {
 // Сообщается бэкенду командой overlay_box.
 const BOX: Record<PillMode, { w: number; h: number }> = {
   idle: { w: 266, h: 60 },
-  rec: { w: 180, h: 56 },
-  trans: { w: 164, h: 56 },
+  rec: { w: 320, h: 56 },
+  trans: { w: 320, h: 56 },
   stream: { w: 446, h: 82 },
   latch: { w: 306, h: 56 },
   notice: { w: 346, h: 74 },
@@ -129,11 +132,11 @@ export default function Overlay() {
   // D: метка «оффлайн» — облако было недоступно, сработал авто-fallback на
   // локальное распознавание ("stt_mode" offline=true). Сбрасывается на новой записи.
   const [offline, setOffline] = useState(false);
-  // Язык текущей диктовки от бэкенда (lang в "partial"/"status"). null =
-  // не определён / старый бэкенд без поля → бейдж скрыт. Сброс на новой записи.
-  const [lang, setLang] = useState<DetectedLang>(null);
-  // Активная модель из "status".model; null - бэкенд не прислал, метки нет.
-  const [model, setModel] = useState<string | null>(null);
+  // Модель распознавания из "status".model: undefined - бэкенд не прислал
+  // (части метки нет), null - модели нет. Сброс на новой записи.
+  const [model, setModel] = useState<string | null | undefined>(undefined);
+  // Модель ИИ-обработки из "status".ai; null - бэкенд не прислал.
+  const [ai, setAi] = useState<OverlayAi | null>(null);
 
   // Поток ПО СЛОВАМ: partial-тики приходят раз в 220–420 мс целыми кусками, и
   // распознавание переписывает хвост. Общий префикс слов остаётся на месте,
@@ -247,9 +250,11 @@ export default function Overlay() {
         textRef.current = "Добавь автоматические тесты для Windows";
         committedLenRef.current = Array.from("Добавь автоматические тесты").length;
         paintWords();
-        setLang("ru");
       }
-      if (demo) setModel("GigaAM");
+      if (demo) {
+        setModel("GigaAM");
+        setAi({ kind: "local", name: "gemma4:e2b" });
+      }
     }, 60);
     return () => clearTimeout(timer);
   }, []);
@@ -381,16 +386,15 @@ export default function Overlay() {
         setLatchNotice(null);
       }, 1150);
     };
-    // Применить lang из события: поля нет (undefined) — старый бэкенд, ничего
-    // не меняем; null/незнакомое значение — язык не определён, бейдж прячем.
-    const applyLang = (l: DetectedLang | undefined) => {
-      if (l === undefined) return;
-      setLang(l === "ru" || l === "en" ? l : null);
-    };
-    // То же для model: поля нет - не трогаем, пустое/не строка - прячем метку.
+    // model из события: поля нет - старый бэкенд, не трогаем; пустое/не строка -
+    // модели нет («Нет модели»).
     const applyModel = (m: string | null | undefined) => {
       if (m === undefined) return;
       setModel(typeof m === "string" && m.trim() ? m.trim() : null);
+    };
+    const applyAi = (a: OverlayAi | null | undefined) => {
+      if (a === undefined) return;
+      setAi(a && typeof a === "object" ? a : null);
     };
 
     const offStatus = subscribe<StatusPayload>("status", (e) => {
@@ -416,8 +420,8 @@ export default function Overlay() {
         // уже показанный partial. Полный сброс делаем только на реальном входе.
         if (prev !== "recording") {
           setOffline(false);
-          setLang(null);
-          setModel(null);
+          setModel(undefined);
+          setAi(null);
           // Дедуп по seq порог здесь НЕ трогаем (счётчик монотонный): у новой
           // диктовки seq строго больше, а эхо прошлой отфильтруется.
           resetTextEngine();
@@ -434,10 +438,10 @@ export default function Overlay() {
         resetTextEngine();
         kickLevel(); // дать уровням опасть, цикл сам заснёт
       }
-      // lang из самого события (если бэкенд прислал) — ПОСЛЕ сброса на recording,
-      // чтобы lang, пришедший вместе со стартом записи, не был тут же затёрт.
-      applyLang(typeof p === "object" && p !== null ? p.lang : undefined);
+      // Метка из самого события - ПОСЛЕ сброса на recording, чтобы model/ai,
+      // пришедшие вместе со стартом записи, не были тут же затёрты.
       applyModel(typeof p === "object" && p !== null ? p.model : undefined);
+      applyAi(typeof p === "object" && p !== null ? p.ai : undefined);
     });
 
     const offPartial = subscribe<PartialWithLang>("partial", (e) => {
@@ -452,9 +456,6 @@ export default function Overlay() {
       const preview = resolved.preview;
       // Финал (вставленный текст) в плашке не показываем — только то, что слышно.
       if (preview == null || preview.isFinal) return;
-      // Язык от STT (опционален): обновляем после дедупа — эхо прошлой записи
-      // не перетирает бейдж текущей. setState с тем же значением React гасит сам.
-      applyLang(e.payload?.lang);
       if (textRef.current === preview.text && committedLenRef.current === preview.committedLen) {
         return;
       }
@@ -533,10 +534,10 @@ export default function Overlay() {
       : latchNotice != null
         ? "latch"
         : previewPillMode(status, hasPreview, false);
-  // Метка «GigaAM · RU» живёт только во время диктовки.
+  // Метка «GigaAM · ИИ gemma4:e2b» живёт только во время диктовки.
   const metaLabel =
     mode === "rec" || mode === "stream" || mode === "trans"
-      ? overlayMetaLabel(model, lang)
+      ? overlayMetaLabel(model, ai)
       : null;
   const showOffline = offline && mode === "stream";
 
@@ -802,10 +803,15 @@ export default function Overlay() {
           </>
         ) : null}
 
-        {/* Метка модели/языка и «офлайн» - справа внутри капсулы, не наезжает на текст. */}
+        {/* Метка моделей и «офлайн» - справа внутри капсулы, не наезжает на полоски и текст. */}
         {(metaLabel || showOffline) && (
           <span className="aq-meta">
-            {metaLabel && <span>{metaLabel}</span>}
+            {metaLabel?.map((part, i) => (
+              <span key={i} className={part.warn ? "aq-warn" : undefined}>
+                {i > 0 ? " · " : ""}
+                {part.text}
+              </span>
+            ))}
             {showOffline && (
               <span className="aq-offline" title="Облако недоступно - локальное распознавание">
                 офлайн

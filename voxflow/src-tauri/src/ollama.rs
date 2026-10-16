@@ -34,6 +34,33 @@ fn base(url: &str) -> String {
 /// Список установленных моделей через GET /api/tags. Возвращает имена из
 /// `models[*].name`. Если curl упал или ответ — не JSON, отдаёт понятную ошибку.
 pub fn list_models(url: &str) -> Result<Vec<String>> {
+    list_models_within(url, 15)
+}
+
+/// Последний удачный ответ /api/tags: (адрес, модели). Пишет только фоновая
+/// проба (`list_models_within`), читает метка капсулы - без сети на пути emit.
+static LAST_TAGS: parking_lot::Mutex<Option<(String, Vec<String>)>> = parking_lot::Mutex::new(None);
+
+/// Есть ли модель среди установленных: `llama3` равна `llama3:latest`.
+pub fn has_model(installed: &[String], want: &str) -> bool {
+    let want = want.trim();
+    !want.is_empty()
+        && installed
+            .iter()
+            .any(|m| m == want || m.strip_suffix(":latest") == Some(want))
+}
+
+/// Модель точно не установлена по последней пробе этого адреса. Нет пробы -
+/// не знаем, поэтому `false`.
+pub fn known_missing(url: &str, model: &str) -> bool {
+    match LAST_TAGS.lock().as_ref() {
+        Some((u, models)) if *u == base(url) => !has_model(models, model),
+        _ => false,
+    }
+}
+
+/// То же, что [`list_models`], с таймаутом curl в секундах.
+pub fn list_models_within(url: &str, timeout_s: u32) -> Result<Vec<String>> {
     let base_url = base(url);
     net::ensure_https_or_loopback_base(&base_url, "Ollama URL")?;
     let endpoint = format!("{base_url}/api/tags");
@@ -43,7 +70,10 @@ pub fn list_models(url: &str) -> Result<Vec<String>> {
     // (HTTPS_PROXY/HTTP_PROXY) подхватится автоматически для нелокальных адресов.
     let mut cmd = net::curl();
     net::apply_proxy(&mut cmd, "");
-    cmd.arg("-s").arg("-m").arg("15").arg(&endpoint);
+    cmd.arg("-s")
+        .arg("-m")
+        .arg(timeout_s.to_string())
+        .arg(&endpoint);
 
     let out = cmd
         .output()
@@ -74,6 +104,7 @@ pub fn list_models(url: &str) -> Result<Vec<String>> {
         })
         .unwrap_or_default();
 
+    *LAST_TAGS.lock() = Some((base_url, models.clone()));
     Ok(models)
 }
 

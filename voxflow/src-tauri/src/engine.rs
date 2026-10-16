@@ -4119,6 +4119,7 @@ fn process_utterance(
                     "lang": l,
                     "seq": my_gen,
                     "model": model_label(&s, false),
+                    "ai": ai_status(&s),
                 }),
             );
         }
@@ -4995,21 +4996,68 @@ fn set_status(ctx: &EngineCtx, status: &str) {
 }
 
 fn set_status_with_latch(ctx: &EngineCtx, status: &str, latched: bool) {
-    let model = {
+    let payload = {
         let s = ctx.settings.lock();
-        let cloud = s.cloud_stt_active()
-            || (s.cloud_asr && s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key));
-        model_label(&s, cloud)
+        status_payload(&s, status, ctx.gen.load(Ordering::SeqCst), latched)
     };
-    let _ = ctx.app.emit(
-        "status",
-        serde_json::json!({
-            "status": status,
-            "seq": ctx.gen.load(Ordering::SeqCst),
-            "latched": latched,
-            "model": model,
-        }),
-    );
+    let _ = ctx.app.emit("status", payload);
+}
+
+/// Объект события "status". Каждый emit несёт `model` и `ai`: капсула держит
+/// метку по последнему статусу, и статус без полей не должен её прятать.
+fn status_payload(s: &Settings, status: &str, seq: u64, latched: bool) -> serde_json::Value {
+    let cloud = s.cloud_stt_active()
+        || (s.cloud_asr && s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key));
+    serde_json::json!({
+        "status": status,
+        "seq": seq,
+        "latched": latched,
+        "model": model_label(s, cloud),
+        "ai": ai_status(s),
+    })
+}
+
+/// Метка ИИ-обработки для капсулы (поле `ai` в "status"): `kind` -
+/// local | cloud | off | missing, `name` - короткое имя локальной модели.
+/// Только stat-проверки и кэш последней пробы Ollama - без сети на пути emit.
+fn ai_status(s: &Settings) -> serde_json::Value {
+    let local = |name: &str| {
+        let name = short_ai_name(name);
+        if name.is_empty() {
+            ("missing", None)
+        } else {
+            ("local", Some(name))
+        }
+    };
+    let (kind, name) = match s.ai_backend.trim() {
+        "builtin" if crate::local_llm::configured(s) => local(&s.builtin_llm_model),
+        "builtin" => ("missing", None),
+        "ollama" if !crate::net::is_loopback_base_url(&s.ollama_url) => ("cloud", None),
+        "ollama" if crate::ollama::known_missing(&s.ollama_url, &s.ollama_model) => {
+            ("missing", None)
+        }
+        "ollama" => local(&s.ollama_model),
+        "openai_compat" if crate::net::is_loopback_base_url(&s.rewrite_base_url) => {
+            local(&s.rewrite_model)
+        }
+        "gemini" | "openai_compat" => ("cloud", None),
+        _ => ("off", None),
+    };
+    serde_json::json!({ "kind": kind, "name": name })
+}
+
+/// Короткое имя для капсулы: `gemma4:e2b-it-qat` → `gemma4:e2b`,
+/// `qwen2.5-3b-instruct` → `qwen2.5-3b`, `llama3:latest` → `llama3`.
+fn short_ai_name(name: &str) -> String {
+    let n = name.trim();
+    let n = n.strip_suffix(":latest").unwrap_or(n);
+    match n.split_once(':') {
+        Some((family, tag)) => format!("{family}:{}", tag.split('-').next().unwrap_or(tag)),
+        None => n
+            .trim_end_matches("-instruct")
+            .trim_end_matches("-it")
+            .to_string(),
+    }
 }
 
 /// Метка распознавателя для капсулы (поле `model` в "status"): что будет
@@ -6728,6 +6776,38 @@ mod seg_tests {
         assert!(should_probe_gigaam_for_auto("After"));
         assert!(should_probe_gigaam_for_auto("Коротко"));
         assert!(!should_probe_gigaam_for_auto("Обнови README.md сегодня"));
+    }
+
+    #[test]
+    fn recording_status_carries_model_and_ai_labels() {
+        let s = Settings {
+            ai_backend: "ollama".into(),
+            ollama_url: "https://ollama.example.com".into(),
+            ..Settings::default()
+        };
+        let p = status_payload(&s, "recording", 7, false);
+        assert_eq!(p["status"], "recording");
+        assert_eq!(p["seq"], 7);
+        // Поле есть всегда (null = нет модели), иначе капсула не отличит
+        // «нет модели» от старого бэкенда.
+        assert!(p.as_object().unwrap().contains_key("model"));
+        assert_eq!(p["ai"]["kind"], "cloud");
+        let off = status_payload(&Settings::default(), "recording", 1, true);
+        assert_eq!(
+            off["ai"],
+            serde_json::json!({ "kind": "off", "name": null })
+        );
+        assert_eq!(off["latched"], true);
+    }
+
+    #[test]
+    fn short_ai_name_fits_the_capsule() {
+        assert_eq!(short_ai_name("gemma4:e2b-it-qat"), "gemma4:e2b");
+        assert_eq!(short_ai_name("qwen3:4b"), "qwen3:4b");
+        assert_eq!(short_ai_name(" llama3:latest "), "llama3");
+        assert_eq!(short_ai_name("qwen2.5-3b-instruct"), "qwen2.5-3b");
+        assert_eq!(short_ai_name("gemma-3-4b-it"), "gemma-3-4b");
+        assert_eq!(short_ai_name(""), "");
     }
 
     #[test]

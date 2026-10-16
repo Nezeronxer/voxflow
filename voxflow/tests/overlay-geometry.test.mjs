@@ -51,8 +51,8 @@ test("capsule is a dark matte pill without the old orb, glow or gradients", () =
 test("capsule stays compact and every CSS state fits its Tauri window box", () => {
   const expectedBoxes = {
     idle: { w: 266, h: 60 },
-    rec: { w: 180, h: 56 },
-    trans: { w: 164, h: 56 },
+    rec: { w: 320, h: 56 },
+    trans: { w: 320, h: 56 },
     stream: { w: 446, h: 82 },
     latch: { w: 306, h: 56 },
     notice: { w: 346, h: 74 },
@@ -86,8 +86,8 @@ test("capsule stays compact and every CSS state fits its Tauri window box", () =
   // Крайний размер каждого режима: с меткой модели для rec/trans, max-* для растущих.
   const contracts = [
     ["idle", ".aq-idle", "width", ".aq-idle", "height"],
-    ["rec", ".aq-rec.aq-has-meta", "width", ".aq-rec", "height"],
-    ["trans", ".aq-trans.aq-has-meta", "width", ".aq-trans", "height"],
+    ["rec", ".aq-rec.aq-has-meta", "max-width", ".aq-rec", "height"],
+    ["trans", ".aq-trans.aq-has-meta", "max-width", ".aq-trans", "height"],
     ["stream", ".aq-stream", "max-width", ".aq-stream", "max-height"],
     ["latch", ".aq-latch", "max-width", ".aq-latch", "height"],
     ["notice", ".aq-notice", "max-width", ".aq-notice", "max-height"],
@@ -149,10 +149,34 @@ test("double-tap latch is the same one-line capsule with plain text", () => {
   assert.match(overlaySource, /latchNotice\?\.message \|\| "Без удержания"/);
 });
 
-test("status model field drives the meta label and is optional", () => {
+test("status model and ai fields drive the meta label and are optional", () => {
   assert.match(overlaySource, /model\?: string \| null/);
+  assert.match(overlaySource, /ai\?: OverlayAi \| null/);
   assert.match(overlaySource, /applyModel\(typeof p === "object" && p !== null \? p\.model : undefined\)/);
-  assert.match(overlaySource, /overlayMetaLabel\(model, lang\)/);
+  assert.match(overlaySource, /applyAi\(typeof p === "object" && p !== null \? p\.ai : undefined\)/);
+  assert.match(overlaySource, /overlayMetaLabel\(model, ai\)/);
+});
+
+test("meta label is visible in rec, readable and never overlaps the bars", () => {
+  // Метка считается в rec/stream/trans и рисуется в капсуле rec вместе с полосками.
+  assert.match(overlaySource, /mode === "rec" \|\| mode === "stream" \|\| mode === "trans"\s*\? overlayMetaLabel/);
+  assert.match(overlaySource, /aq-pill aq-\$\{mode\}\$\{metaLabel \|\| showOffline \? " aq-has-meta" : ""\}/);
+  const meta = finalRule(".aq-meta");
+  // Читаемо: 11-12 px и светлый текст (альфа не ниже 0.7) на тёмной капсуле.
+  const size = px(declaration(meta, "font-size"));
+  assert.ok(size >= 11 && size <= 12, `meta font-size ${size}`);
+  const alpha = Number(/rgba\([^)]*,\s*([\d.]+)\)/.exec(declaration(meta, "color"))[1]);
+  assert.ok(alpha >= 0.7, `meta color alpha ${alpha}`);
+  assert.doesNotMatch(meta, /opacity:\s*0[;\s]|display:\s*none|visibility/);
+  assert.notEqual(declaration(finalRule(".aq-warn"), "color"), undefined);
+  // Не наезжает: полоски не сжимаются, метка сжимается с многоточием и
+  // помещается в rec рядом с полосками (паддинги 28 + рамка 2 + полоски 27 + gap 10).
+  assert.equal(declaration(finalRule(".aq-bars"), "flex"), "none");
+  assert.equal(declaration(meta, "min-width"), "0");
+  assert.equal(declaration(meta, "overflow"), "hidden");
+  assert.equal(declaration(meta, "text-overflow"), "ellipsis");
+  const recMax = px(declaration(finalRule(".aq-rec.aq-has-meta"), "max-width"));
+  assert.ok(px(declaration(meta, "max-width")) <= recMax - 28 - 2 - 27 - 10);
 });
 
 test("overlay honors reduced motion for both CSS and rAF-driven animation", () => {

@@ -95,10 +95,16 @@ test("word stream keeps the stable prefix and re-animates only the rewritten tai
   assert.deepEqual(previewState.wordTokens("  "), []);
 });
 
-test("meta label joins model and language and hides without data", () => {
-  assert.equal(previewState.overlayMetaLabel("GigaAM", "ru"), "GigaAM · RU");
-  assert.equal(previewState.overlayMetaLabel("Облако", null), "Облако");
-  assert.equal(previewState.overlayMetaLabel(undefined, "en"), "EN");
-  assert.equal(previewState.overlayMetaLabel(null, null), null);
-  assert.equal(previewState.overlayMetaLabel("  ", undefined), null);
+test("meta label shows recognizer and AI model, warns when missing", () => {
+  const label = (model, ai) =>
+    previewState.overlayMetaLabel(model, ai)?.map((p) => (p.warn ? `!${p.text}` : p.text)).join(" · ") ?? null;
+  assert.equal(label("GigaAM", { kind: "local", name: "gemma4:e2b" }), "GigaAM · ИИ gemma4:e2b");
+  assert.equal(label("Облако", { kind: "off", name: null }), "Облако · ИИ выкл.");
+  assert.equal(label("GigaAM", { kind: "missing", name: null }), "GigaAM · !ИИ не найдена");
+  assert.equal(label("Whisper", { kind: "cloud" }), "Whisper · ИИ облако");
+  assert.equal(label(null, { kind: "local", name: "" }), "!Нет модели · ИИ локально");
+  assert.equal(label("  ", undefined), "!Нет модели");
+  // Старый бэкенд без полей - метки нет.
+  assert.equal(label(undefined, undefined), null);
+  assert.equal(label(undefined, { kind: "unknown" }), null);
 });

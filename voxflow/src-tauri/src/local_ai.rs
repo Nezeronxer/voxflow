@@ -459,6 +459,138 @@ pub fn pick_installed(installed: &[String], machine: &Machine) -> Option<String>
     installed.first().cloned()
 }
 
+/// На что переключить локальный ИИ, если выбранная модель не установлена (D-043).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LocalAiAdopt {
+    /// Встроенный llama.cpp с этой моделью каталога.
+    Builtin(String),
+    /// Ollama с этим тегом.
+    Ollama(String),
+}
+
+/// Чистый выбор установленной локальной модели ИИ-обработки.
+///
+/// - `builtin_ready` - готовые встроенные модели (порядок каталога, пусто без рантайма);
+/// - `ollama` - модели локальной Ollama, `None` - не ответила;
+/// - `ollama_local` - адрес Ollama на петле: удалённую не трогаем, это уже не локальный ИИ.
+///
+/// `None` - оставить как есть: выбранная модель на месте, бэкенд облачный или
+/// выключен, либо ставить нечего. Недоступная Ollama - не повод уводить с неё:
+/// она могла ещё не стартовать, а модель там есть.
+pub fn plan_local_ai(
+    backend: &str,
+    builtin_model: &str,
+    builtin_ready: &[String],
+    ollama_model: &str,
+    ollama: Option<&[String]>,
+    ollama_local: bool,
+    machine: &Machine,
+) -> Option<LocalAiAdopt> {
+    // Самая крупная из готовых встроенных - последняя в порядке каталога.
+    let builtin_pick = || builtin_ready.last().cloned().map(LocalAiAdopt::Builtin);
+    let ollama_pick = || {
+        let list = ollama.filter(|_| ollama_local)?;
+        if crate::ollama::has_model(list, ollama_model) {
+            return Some(LocalAiAdopt::Ollama(ollama_model.trim().to_string()));
+        }
+        pick_installed(list, machine).map(LocalAiAdopt::Ollama)
+    };
+    match backend.trim() {
+        "builtin" if builtin_ready.iter().any(|m| m == builtin_model.trim()) => None,
+        "builtin" => builtin_pick().or_else(ollama_pick),
+        "ollama" if !ollama_local => None,
+        "ollama" => match ollama {
+            None => None,
+            Some(list) if crate::ollama::has_model(list, ollama_model) => None,
+            Some(list) if !list.is_empty() => ollama_pick(),
+            Some(_) => builtin_pick(),
+        },
+        _ => None,
+    }
+}
+
+/// В фоне подобрать установленную локальную ИИ-модель вместо отсутствующей и
+/// записать её в настройки. Ничего не качает. Зовётся на старте и при смене
+/// `ai_backend`: правку модели руками (например, перед `ollama pull`) не перебиваем.
+pub fn spawn_adopt_installed(app: tauri::AppHandle, snapshot: crate::settings::Settings) {
+    if !matches!(snapshot.ai_backend.trim(), "builtin" | "ollama") {
+        return;
+    }
+    if let Err(e) = std::thread::Builder::new()
+        .name("voxflow-ai-adopt".into())
+        .spawn(move || {
+            let ollama_local = crate::net::is_loopback_base_url(&snapshot.ollama_url);
+            // Петля отвечает мгновенно; секунда - запас на занятую машину.
+            let ollama = ollama_local
+                .then(|| crate::ollama::list_models_within(&snapshot.ollama_url, 1).ok())
+                .flatten();
+            let plan = plan_local_ai(
+                &snapshot.ai_backend,
+                &snapshot.builtin_llm_model,
+                &crate::local_llm::ready_models(),
+                &snapshot.ollama_model,
+                ollama.as_deref(),
+                ollama_local,
+                &probe_machine(),
+            );
+            if let Some(plan) = plan {
+                adopt(&app, &snapshot, plan);
+            }
+        })
+    {
+        log::warn!("не удалось запустить подбор локального ИИ: {e}");
+    }
+}
+
+fn adopt(app: &tauri::AppHandle, snapshot: &crate::settings::Settings, plan: LocalAiAdopt) {
+    use tauri::{Emitter, Manager};
+    let Some(state) = app.try_state::<crate::commands::AppState>() else {
+        return;
+    };
+    // Проверка и запись под одним захватом: save_settings не вклинится между ними,
+    // а правка пользователя за время пробы отменяет подмену.
+    let next = {
+        let mut cur = state.settings.lock();
+        if cur.ai_backend != snapshot.ai_backend
+            || cur.builtin_llm_model != snapshot.builtin_llm_model
+            || cur.ollama_model != snapshot.ollama_model
+            || cur.ollama_url != snapshot.ollama_url
+        {
+            return;
+        }
+        let mut next = cur.clone();
+        match &plan {
+            LocalAiAdopt::Builtin(id) => {
+                next.ai_backend = "builtin".into();
+                next.builtin_llm_model = id.clone();
+            }
+            LocalAiAdopt::Ollama(tag) => {
+                next.ai_backend = "ollama".into();
+                next.ollama_model = tag.clone();
+            }
+        }
+        if let Err(e) = crate::settings::save(&state.db.lock(), &next) {
+            log::error!("подбор локального ИИ: не записал {plan:?}: {e:#}");
+            return;
+        }
+        *cur = next.clone();
+        next
+    };
+    if snapshot.ai_backend == "builtin" {
+        crate::local_llm::stop();
+    }
+    log::info!(
+        "локальный ИИ: {} / {} не установлена, используем {plan:?}",
+        snapshot.ai_backend,
+        if snapshot.ai_backend == "builtin" {
+            &snapshot.builtin_llm_model
+        } else {
+            &snapshot.ollama_model
+        }
+    );
+    let _ = app.emit("settings_changed", next.redacted_for_renderer());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,5 +774,91 @@ mod tests {
             Some("my-own-model:latest")
         );
         assert_eq!(pick_installed(&[], &unified(16)), None);
+    }
+
+    #[test]
+    fn plan_local_ai_adopts_installed_local_model() {
+        let m = unified(16);
+        let tags = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let none: Vec<String> = Vec::new();
+        let gemma4 = tags(&["gemma4:e2b-it-qat"]);
+        // Случай с этого мака: встроенной нет, в Ollama другая модель.
+        assert_eq!(
+            plan_local_ai(
+                "builtin",
+                "qwen2.5-3b-instruct",
+                &none,
+                "gemma3:4b",
+                Some(&gemma4),
+                true,
+                &m
+            ),
+            Some(LocalAiAdopt::Ollama("gemma4:e2b-it-qat".into()))
+        );
+        assert_eq!(
+            plan_local_ai(
+                "ollama",
+                "qwen2.5-3b-instruct",
+                &none,
+                "gemma3:4b",
+                Some(&gemma4),
+                true,
+                &m
+            ),
+            Some(LocalAiAdopt::Ollama("gemma4:e2b-it-qat".into()))
+        );
+        // Выбранная на месте - не трогаем (llama3 == llama3:latest).
+        assert_eq!(
+            plan_local_ai(
+                "ollama",
+                "x",
+                &none,
+                "llama3",
+                Some(&tags(&["llama3:latest"])),
+                true,
+                &m
+            ),
+            None
+        );
+        let ready = tags(&["qwen3-1.7b", "qwen3-4b"]);
+        assert_eq!(
+            plan_local_ai("builtin", "qwen3-1.7b", &ready, "", None, true, &m),
+            None
+        );
+        // Другая встроенная - важнее Ollama, берём самую крупную.
+        assert_eq!(
+            plan_local_ai("builtin", "qwen3-8b", &ready, "", Some(&gemma4), true, &m),
+            Some(LocalAiAdopt::Builtin("qwen3-4b".into()))
+        );
+        // Ollama жива, но пуста - на встроенную; не ответила - оставляем.
+        assert_eq!(
+            plan_local_ai("ollama", "", &ready, "qwen3:4b", Some(&none), true, &m),
+            Some(LocalAiAdopt::Builtin("qwen3-4b".into()))
+        );
+        assert_eq!(
+            plan_local_ai("ollama", "", &ready, "qwen3:4b", None, true, &m),
+            None
+        );
+        // Удалённая Ollama, облако, выключенный ИИ и пустая машина - не трогаем.
+        assert_eq!(
+            plan_local_ai("ollama", "", &ready, "q", Some(&none), false, &m),
+            None
+        );
+        assert_eq!(
+            plan_local_ai("builtin", "q", &none, "", Some(&gemma4), false, &m),
+            None
+        );
+        assert_eq!(
+            plan_local_ai("gemini", "q", &ready, "", Some(&gemma4), true, &m),
+            None
+        );
+        assert_eq!(
+            plan_local_ai("off", "q", &ready, "", Some(&gemma4), true, &m),
+            None
+        );
+        assert_eq!(
+            plan_local_ai("builtin", "q", &none, "", None, true, &m),
+            None
+        );
     }
 }

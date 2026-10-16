@@ -244,6 +244,19 @@ pub fn model_installed(id: &str) -> bool {
     path.is_file() && marker_path(&path).is_file()
 }
 
+/// Готовые к работе модели каталога (порядок каталога - от лёгкой к тяжёлой).
+/// Без рантайма llama-server ни одна не готова. Только stat-проверки.
+pub fn ready_models() -> Vec<String> {
+    if !runtime_installed(crate::paths::llm_gpu_active()) {
+        return Vec::new();
+    }
+    CATALOG
+        .iter()
+        .filter(|m| model_installed(m.id))
+        .map(|m| m.id.to_string())
+        .collect()
+}
+
 /// Готов ли встроенный ИИ к работе с выбранной моделью.
 pub fn configured(s: &crate::settings::Settings) -> bool {
     model_installed(&s.builtin_llm_model) && runtime_installed(crate::paths::llm_gpu_active())
