@@ -581,20 +581,19 @@ pub(crate) fn plan_local_models(
         } else {
             RECOMMENDED_WHISPER_NAME.to_string()
         })
-    } else if gigaam_engine && russian && !gigaam_any && !whisper_any {
+    } else if gigaam_engine && russian && !gigaam_any {
+        // GigaAM - основная для русского (D-038/D-040): качаем в фоне, даже если
+        // пока распознаёт установленная Whisper.
         Some(GIGAAM_NAME.to_string())
     } else {
         None
     };
-    // Русский уже распознаёт установленная Whisper - полную GigaAM не тянем.
-    let ru_on_whisper = russian && !gigaam_any && whisper_any;
     let uses_gigaam = gigaam_engine && (russian || auto);
     ModelPlan {
         set_model,
         download,
         download_fp32: wants_fp32_download(uses_gigaam, installed.fp32_opted_out)
-            && !installed.gigaam_fp32
-            && !ru_on_whisper,
+            && !installed.gigaam_fp32,
     }
 }
 
@@ -624,23 +623,21 @@ fn adopt_installed_whisper(app: &AppHandle, from: &str, to: &str) {
     let Some(state) = app.try_state::<crate::commands::AppState>() else {
         return;
     };
-    let mut next = state.settings.lock().clone();
-    if next.model != from {
-        return;
-    }
-    next.model = to.to_string();
-    if let Err(e) = crate::settings::save(&state.db.lock(), &next) {
-        log::error!("ensure_default_models: не записал модель {to}: {e:#}");
-        return;
-    }
-    {
+    // Проверка и запись под одним захватом: save_settings не вклинится между ними.
+    let next = {
         let mut cur = state.settings.lock();
         if cur.model != from {
             return;
         }
-        cur.model = to.to_string();
-        next = cur.clone();
-    }
+        let mut next = cur.clone();
+        next.model = to.to_string();
+        if let Err(e) = crate::settings::save(&state.db.lock(), &next) {
+            log::error!("ensure_default_models: не записал модель {to}: {e:#}");
+            return;
+        }
+        *cur = next.clone();
+        next
+    };
     log::info!("ensure_default_models: {from} нет, используем установленную {to}");
     let _ = app.emit("settings_changed", next.redacted_for_renderer());
 }
@@ -1321,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_ru_without_gigaam_falls_back_to_installed_whisper() {
+    fn plan_ru_without_gigaam_uses_whisper_now_and_fetches_gigaam() {
         let plan = plan_local_models(
             "ru",
             "gigaam",
@@ -1333,8 +1330,8 @@ mod tests {
             plan,
             ModelPlan {
                 set_model: Some(OTHER.into()),
-                download: None,
-                download_fp32: false,
+                download: Some(GIGAAM_NAME.into()),
+                download_fp32: true,
             }
         );
     }
