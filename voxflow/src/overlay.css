@@ -121,7 +121,8 @@
   height: auto;
   min-height: 34px;
   max-height: 60px;
-  padding: 8px 14px 8px 12px;
+  /* 7+18+7 + рамка 2 = 34: одна строка ровно по высоте rec, без скачка. */
+  padding: 7px 14px 7px 12px;
   justify-content: flex-start;
   border-radius: 17px;
 }
@@ -262,6 +263,8 @@
 }
 .aq-offline {
   color: rgba(242, 242, 245, 0.32);
+  /* Ради title-подсказки; событие всплывает к .aq-root, drag не страдает. */
+  pointer-events: auto;
 }
 @keyframes aq-fade {
   from {

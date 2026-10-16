@@ -112,6 +112,11 @@ test("capsule stays compact and every CSS state fits its Tauri window box", () =
   assert.equal(declaration(finalRule(".aq-stream"), "max-width"), "420px");
   assert.equal(declaration(finalRule(".aq-stream"), "min-height"), "34px");
   assert.equal(declaration(finalRule(".aq-stream"), "max-height"), "60px");
+  // Однострочный stream = rec по высоте: паддинги + строка 18 + рамка 2.
+  const [padY] = declaration(finalRule(".aq-stream"), "padding").split(" ");
+  const lineH = px(declaration(finalRule(".aq-text"), "line-height"));
+  assert.equal(2 * px(padY) + lineH + 2, 34);
+  assert.equal(declaration(finalRule(".aq-offline"), "pointer-events"), "auto");
 });
 
 test("idle is a tiny muted capsule and reveals the hotkey hint only on hover", () => {
