@@ -94,3 +94,11 @@ test("word stream keeps the stable prefix and re-animates only the rewritten tai
   assert.equal(previewState.sharedWordPrefix(grown, []), 0);
   assert.deepEqual(previewState.wordTokens("  "), []);
 });
+
+test("meta label joins model and language and hides without data", () => {
+  assert.equal(previewState.overlayMetaLabel("GigaAM", "ru"), "GigaAM · RU");
+  assert.equal(previewState.overlayMetaLabel("Облако", null), "Облако");
+  assert.equal(previewState.overlayMetaLabel(undefined, "en"), "EN");
+  assert.equal(previewState.overlayMetaLabel(null, null), null);
+  assert.equal(previewState.overlayMetaLabel("  ", undefined), null);
+});

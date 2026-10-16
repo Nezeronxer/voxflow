@@ -37,36 +37,25 @@ function overlayBox(mode) {
   return { w: Number(match[1]), h: Number(match[2]) };
 }
 
-test("final v2 cascade preserves the 13px dictation orb contract", () => {
-  const orb = finalRule(".aq-orbwrap");
-  assert.equal(declaration(orb, "width"), "13px");
-  assert.equal(declaration(orb, "height"), "13px");
-
-  const glow = finalRule(".aq-orb-glow");
-  assert.equal(declaration(glow, "width"), "26px");
-  assert.equal(declaration(glow, "height"), "26px");
-  assert.equal(declaration(glow, "margin"), "-13px 0 0 -13px");
-
-  const ring = finalRule(".aq-ring");
-  assert.equal(declaration(ring, "width"), "14.5px");
-  assert.equal(declaration(ring, "height"), "14.5px");
-  assert.equal(declaration(ring, "margin"), "-7.25px 0 0 -7.25px");
-
-  const orbPaint = finalRule(".aq-orb");
-  assert.equal(
-    declaration(orbPaint, "filter"),
-    "drop-shadow(0 0 2px rgba(58, 210, 155, 0.42))",
-  );
+test("capsule is a dark matte pill without the old orb, glow or gradients", () => {
+  const pill = finalRule(".aq-pill");
+  assert.equal(declaration(pill, "border-radius"), "999px");
+  assert.equal(declaration(pill, "background"), "rgba(17, 17, 20, 0.88)");
+  assert.equal(declaration(pill, "backdrop-filter"), "blur(20px)");
+  assert.doesNotMatch(css, /aq-orb|aq-ring|radial-gradient/);
+  assert.doesNotMatch(overlaySource, /aq-orb|glowEl|Слушаю|Улучшаю текст/);
+  // Полоски - белые, без градиента.
+  assert.equal(declaration(finalRule(".aq-bar"), "background"), "#f2f2f5");
 });
 
-test("floating bar remains compact and every CSS state fits its Tauri window box", () => {
+test("capsule stays compact and every CSS state fits its Tauri window box", () => {
   const expectedBoxes = {
     idle: { w: 266, h: 60 },
-    rec: { w: 260, h: 66 },
-    trans: { w: 256, h: 64 },
-    stream: { w: 384, h: 104 },
-    latch: { w: 264, h: 66 },
-    notice: { w: 356, h: 70 },
+    rec: { w: 180, h: 56 },
+    trans: { w: 164, h: 56 },
+    stream: { w: 446, h: 82 },
+    latch: { w: 306, h: 56 },
+    notice: { w: 346, h: 74 },
   };
   assert.deepEqual(
     Object.fromEntries(Object.keys(expectedBoxes).map((mode) => [mode, overlayBox(mode)])),
@@ -94,48 +83,41 @@ test("floating bar remains compact and every CSS state fits its Tauri window box
   assert.equal(declaration(stage, "padding"), "8px 9px 10px");
   const stageHorizontal = 18;
   const stageVertical = 18;
+  // Крайний размер каждого режима: с меткой модели для rec/trans, max-* для растущих.
   const contracts = [
-    ["idle", ".aq-idle", "width", "height"],
-    ["rec", ".aq-rec", "width", "height"],
-    ["trans", ".aq-trans", "width", "height"],
-    ["stream", ".aq-stream", "max-width", "max-height"],
-    ["latch", ".aq-latch", "width", "height"],
+    ["idle", ".aq-idle", "width", ".aq-idle", "height"],
+    ["rec", ".aq-rec.aq-has-meta", "width", ".aq-rec", "height"],
+    ["trans", ".aq-trans.aq-has-meta", "width", ".aq-trans", "height"],
+    ["stream", ".aq-stream", "max-width", ".aq-stream", "max-height"],
+    ["latch", ".aq-latch", "max-width", ".aq-latch", "height"],
+    ["notice", ".aq-notice", "max-width", ".aq-notice", "max-height"],
   ];
-  for (const [mode, selector, widthProperty, heightProperty] of contracts) {
-    const rule = finalRule(selector);
-    const contentWidth = px(declaration(rule, widthProperty));
-    const contentHeight = px(declaration(rule, heightProperty));
-    assert.ok(
-      contentWidth + stageHorizontal <= expectedBoxes[mode].w,
-      `${mode} width exceeds BOX`,
-    );
-    assert.ok(
-      contentHeight + stageVertical <= expectedBoxes[mode].h,
-      `${mode} height exceeds BOX`,
-    );
+  for (const [mode, wSelector, widthProperty, hSelector, heightProperty] of contracts) {
+    const contentWidth = px(declaration(finalRule(wSelector), widthProperty));
+    const contentHeight = px(declaration(finalRule(hSelector), heightProperty));
+    assert.ok(contentWidth + stageHorizontal <= expectedBoxes[mode].w, `${mode} width exceeds BOX`);
+    assert.ok(contentHeight + stageVertical <= expectedBoxes[mode].h, `${mode} height exceeds BOX`);
   }
 
-  assert.equal(declaration(finalRule(".aq-idle"), "width"), "56px");
-  assert.equal(declaration(finalRule(".aq-idle"), "height"), "10px");
-  assert.equal(declaration(finalRule(".aq-idle:hover"), "width"), "172px");
-  assert.equal(declaration(finalRule(".aq-idle:hover"), "height"), "30px");
-  assert.ok(
-    px(declaration(finalRule(".aq-idle:hover"), "width")) + stageHorizontal <=
-      expectedBoxes.idle.w,
-    "expanded idle hover must fit the fixed idle Tauri window",
-  );
-  assert.equal(declaration(finalRule(".aq-stream"), "max-width"), "270px");
-  assert.equal(declaration(finalRule(".aq-notice"), "max-width"), "270px");
+  // Размеры состояний по спецификации §1-§2.
+  const size = (selector) => [
+    declaration(finalRule(selector), "width"),
+    declaration(finalRule(selector), "height"),
+  ];
+  assert.deepEqual(size(".aq-idle"), ["40px", "10px"]);
+  assert.equal(declaration(finalRule(".aq-idle"), "opacity"), "0.55");
+  assert.deepEqual(size(".aq-rec"), ["96px", "34px"]);
+  assert.deepEqual(size(".aq-trans"), ["64px", "34px"]);
+  assert.equal(declaration(finalRule(".aq-stream"), "min-width"), "160px");
+  assert.equal(declaration(finalRule(".aq-stream"), "max-width"), "420px");
+  assert.equal(declaration(finalRule(".aq-stream"), "min-height"), "34px");
+  assert.equal(declaration(finalRule(".aq-stream"), "max-height"), "60px");
 });
 
-test("idle is a tiny outlined capsule and reveals the rich controls only on hover", () => {
-  const idle = finalRule(".aq-idle");
-  assert.equal(declaration(idle, "border-radius"), "999px");
-  assert.equal(declaration(idle, "overflow"), "hidden");
-
-  const idleCopy = finalRule(".aq-idle-copy");
-  assert.equal(declaration(idleCopy, "opacity"), "0");
-  assert.equal(declaration(finalRule(".aq-idle:hover .aq-idle-copy"), "opacity"), "1");
+test("idle is a tiny muted capsule and reveals the hotkey hint only on hover", () => {
+  assert.equal(declaration(finalRule(".aq-tip"), "opacity"), "0");
+  assert.equal(declaration(finalRule(".aq-idle:hover .aq-tip"), "opacity"), "1");
+  assert.match(overlaySource, /Зажмите \{hotkeyTip\} - диктовка/);
 });
 
 test("live preview survives transcribing and word updates bypass React state", () => {
@@ -156,24 +138,28 @@ test("live preview survives transcribing and word updates bypass React state", (
   assert.match(overlaySource, /if \(seq > currentSeqRef\.current\) currentSeqRef\.current = seq/);
 });
 
-test("recording and double-tap latch share geometry without a second pop animation", () => {
-  const recording = finalRule(".aq-rec");
-  const latch = finalRule(".aq-latch");
-  assert.equal(declaration(latch, "width"), declaration(recording, "width"));
-  assert.equal(declaration(latch, "height"), declaration(recording, "height"));
-  assert.equal(declaration(latch, "animation"), "none");
+test("double-tap latch is the same one-line capsule with plain text", () => {
+  assert.equal(declaration(finalRule(".aq-latch"), "height"), declaration(finalRule(".aq-rec"), "height"));
+  assert.doesNotMatch(overlaySource, /2×|aq-latch-mark/);
+  assert.match(overlaySource, /latchNotice\?\.message \|\| "Без удержания"/);
+});
+
+test("status model field drives the meta label and is optional", () => {
+  assert.match(overlaySource, /model\?: string \| null/);
+  assert.match(overlaySource, /applyModel\(typeof p === "object" && p !== null \? p\.model : undefined\)/);
+  assert.match(overlaySource, /overlayMetaLabel\(model, lang\)/);
 });
 
 test("overlay honors reduced motion for both CSS and rAF-driven animation", () => {
   assert.match(overlaySource, /matchMedia\("\(prefers-reduced-motion: reduce\)"\)/);
   assert.match(overlaySource, /const reducedMotion = reducedMotionRef\.current/);
-  assert.match(overlaySource, /reducedMotion \? 0 : clamp01\(glowPosRef\.current\)/);
+  assert.match(overlaySource, /fresh && !reducedMotion \? 0\.08/);
   assert.doesNotMatch(overlaySource, /SPRING_[KC]/);
   assert.match(overlaySource, /1 - Math\.exp\(-dt \/ tau\)/);
   const reducedMotion = /@media \(prefers-reduced-motion: reduce\) \{([\s\S]*)\}\s*$/.exec(css);
   assert.ok(reducedMotion, "missing final reduced-motion cascade");
   assert.match(reducedMotion[1], /\.aq-bar/);
-  assert.match(reducedMotion[1], /\.aq-orb-glow/);
+  assert.match(reducedMotion[1], /\.aq-dot/);
   assert.match(reducedMotion[1], /animation:\s*none !important/);
 });
 

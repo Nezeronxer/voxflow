@@ -1,20 +1,20 @@
-// Плавающий индикатор диктовки в стиле Aqua Voice (overlay-окно, url #/overlay).
-// Фон окна полностью прозрачный; пилюля по центру понизу, перетаскивается мышью
-// из всей небольшой overlay-зоны. Короткий tap по самой пилюле вызывает диктовку,
-// движение мышью — перенос окна.
+// Плавающая плашка диктовки - тёмная капсула (overlay-окно, url #/overlay).
+// Фон окна полностью прозрачный; капсула по центру понизу, перетаскивается мышью
+// из всей небольшой overlay-зоны. Короткий tap по капсуле вызывает диктовку,
+// движение мышью - перенос окна.
 //
-// Состояния пилюли (классы aq-* в overlay.css):
-//   idle   — компактная полоска с горячей клавишей и языком;
-//   rec    — орб с градиентом и glow от громкости + 12 баров ("level");
-//   stream — пришёл partial с текстом: до 360×82, новые слова всплывают по одному;
-//   trans  — компактная пилюля с кольцом-спиннером поверх орба;
-//   latch  — подтверждение двойного тапа: запись зафиксирована без удержания;
-//   notice — краткое предупреждение (no_model / error) поверх любого состояния.
+// Состояния капсулы (классы aq-* в overlay.css):
+//   idle   - тонкая приглушённая полоска, при наведении подсказка с клавишей;
+//   rec    - 5 белых полосок по громкости ("level") + метка модели/языка;
+//   stream - пришёл partial: живой текст, слева мини-волна из 3 полосок;
+//   trans  - три точки с бегущей волной яркости;
+//   latch  - подтверждение двойного тапа одной строкой;
+//   notice - краткое предупреждение (no_model / error) поверх любого состояния.
 //
-// Переходы геометрии — короткая CSS-анимация:
-// анимируются transform/opacity; width/height меняются ОДИН раз на смену
-// состояния (одиночный layout — допустимо). Громкость и live-текст обновляются
-// через ref'ы/rAF напрямую, БЕЗ setState на кадр (60 fps).
+// Переходы геометрии - короткая CSS-анимация: анимируются transform/opacity,
+// width/height меняются один раз на смену состояния (одиночный layout -
+// допустимо). Громкость и live-текст обновляются через ref'ы/rAF напрямую,
+// без setState на кадр (60 fps).
 
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -23,6 +23,7 @@ import { getSettings, IS_TAURI_RUNTIME, subscribe } from "./api";
 import FpsMeter from "./components/FpsMeter";
 import "./overlay.css";
 import {
+  overlayMetaLabel,
   previewPillMode,
   resolveOverlayPreviewEvent,
   sharedWordPrefix,
@@ -66,6 +67,9 @@ type StatusPayload =
       lang?: DetectedLang;
       seq?: number;
       latched?: boolean;
+      // Короткое имя распознавателя ("GigaAM" | "Parakeet" | "Whisper" | "Облако").
+      // Нет поля - старый бэкенд, метку не трогаем; null - метку прячем.
+      model?: string | null;
     };
 type DragPointer = {
   id: number;
@@ -79,41 +83,34 @@ type DragPointer = {
   applyChain?: Promise<void> | null;
 };
 
-// Желаемый размер overlay-окна под каждый режим (ЛОГИЧЕСКИЕ px): пилюля + поля
-// под glow/тень. Цифры синхронизированы с финальным v2-каскадом overlay.css;
-// небольшой запас не даёт тени/кольцу обрезаться на целом и дробном scale.
-// Сообщается бэкенду командой overlay_box (реализует интегратор).
+// Желаемый размер overlay-окна под каждый режим (логические px): капсула +
+// поля stage (18×18) + запас под тень. Синхронизировано с overlay.css (крайние
+// размеры: rec/trans с меткой, stream/latch/notice по max-*); idle совпадает с
+// OVERLAY_IDLE_BOX в lib.rs и окном overlay в tauri.conf.json.
+// Сообщается бэкенду командой overlay_box.
 const BOX: Record<PillMode, { w: number; h: number }> = {
   idle: { w: 266, h: 60 },
-  rec: { w: 260, h: 66 },
-  trans: { w: 256, h: 64 },
-  stream: { w: 384, h: 104 },
-  latch: { w: 264, h: 66 },
-  notice: { w: 356, h: 70 },
+  rec: { w: 180, h: 56 },
+  trans: { w: 164, h: 56 },
+  stream: { w: 446, h: 82 },
+  latch: { w: 306, h: 56 },
+  notice: { w: 346, h: 74 },
 };
 const DRAG_HIT_PADDING = 6;
 
-// Раскладка громкости по 12 барам: центр громче краёв (сглаженный «холм» Aqua).
-const BAR_WEIGHTS = [0.5, 0.5, 0.7, 0.7, 1, 1, 1, 1, 0.8, 0.8, 0.6, 0.6];
+// Раскладка громкости по 5 полоскам: центр громче краёв. В stream показываются
+// только средние три (индексы 1..3) - те же ref'ы, тот же rAF-цикл.
+const BAR_WEIGHTS = [0.55, 0.8, 1, 0.8, 0.55];
 const BAR_COUNT = BAR_WEIGHTS.length;
+const STREAM_BARS = [1, 2, 3];
 // Экспоненциальное сглаживание устойчиво даже после пропущенного кадра WebView:
-// атака быстрая, спад чуть мягче — волна следует голосу без рывка/«догоняния».
+// атака быстрая, спад чуть мягче - волна следует голосу без рывка.
 const LEVEL_ATTACK_S = 0.045;
 const LEVEL_RELEASE_S = 0.11;
-// Высота бара: 2..18 px по кривой 2+16·v^1.5; CSS-высота фиксирована 18 px,
+// Высота полоски 4..18 px по кривой 4+14·v^1.5; CSS-высота фиксирована 18 px,
 // анимируем transform:scaleY (компосит, без layout на кадр).
+const BAR_MIN_H = 4;
 const BAR_MAX_H = 18;
-
-function compactHotkeyLabel(label: string) {
-  const normalized = label.trim().toLowerCase().replace(/^(right|left)\s+/, "");
-  if (normalized === "option") return "⌥";
-  if (normalized === "control" || normalized === "ctrl") return "Ctrl";
-  if (normalized === "command" || normalized === "cmd") return "⌘";
-  if (normalized === "shift") return "Shift";
-  if (normalized === "alt") return "Alt";
-  if (normalized === "win") return "Win";
-  return label;
-}
 
 const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
 
@@ -135,6 +132,8 @@ export default function Overlay() {
   // Язык текущей диктовки от бэкенда (lang в "partial"/"status"). null =
   // не определён / старый бэкенд без поля → бейдж скрыт. Сброс на новой записи.
   const [lang, setLang] = useState<DetectedLang>(null);
+  // Активная модель из "status".model; null - бэкенд не прислал, метки нет.
+  const [model, setModel] = useState<string | null>(null);
 
   // Поток ПО СЛОВАМ: partial-тики приходят раз в 220–420 мс целыми кусками, и
   // распознавание переписывает хвост. Общий префикс слов остаётся на месте,
@@ -167,16 +166,13 @@ export default function Overlay() {
   const needScrollRef = useRef(false);
   const scrollRafRef = useRef<number | null>(null);
 
-  // --- Громкость ("level", ~33 мс): сглаженные бары + glow орба. Анимационное
+  // --- Громкость ("level", ~33 мс): сглаженные полоски. Анимационное
   // состояние живёт в ref'ах, значения пишутся в DOM напрямую.
   const rmsRef = useRef(0); // последний rms с бэкенда (0..1)
   const lastLevelAtRef = useRef(0); // performance.now() последнего "level"
   const levelSeqRef = useRef(-1); // дедуп level отдельным счётчиком (не смешиваем с partial)
   const barPosRef = useRef(new Float64Array(BAR_COUNT));
-  const glowPosRef = useRef(0);
   const barEls = useRef<(HTMLSpanElement | null)[]>(new Array(BAR_COUNT).fill(null));
-  const glowEl = useRef<HTMLSpanElement | null>(null);
-  const orbEl = useRef<HTMLSpanElement | null>(null);
   const levelRafRef = useRef<number | null>(null);
   const levelLastRef = useRef(0);
   const reducedMotionRef = useRef(false);
@@ -253,6 +249,7 @@ export default function Overlay() {
         paintWords();
         setLang("ru");
       }
+      if (demo) setModel("GigaAM");
     }, 60);
     return () => clearTimeout(timer);
   }, []);
@@ -291,7 +288,10 @@ export default function Overlay() {
         if (!needScrollRef.current) return;
         needScrollRef.current = false;
         const el = scrollRef.current;
-        if (el) el.scrollTop = el.scrollHeight;
+        if (!el) return;
+        el.scrollTop = el.scrollHeight;
+        // Маска по верхнему краю нужна, только когда начало фразы ушло вверх.
+        el.classList.toggle("aq-clip", el.scrollHeight > el.clientHeight + 1);
       });
     };
     const stopScrollRaf = () => {
@@ -311,26 +311,24 @@ export default function Overlay() {
     // Полный сброс потока (новая диктовка / уход в покой).
     const resetTextEngine = () => showText("", 0);
 
-    // --- rAF-цикл громкости: устойчивое экспоненциальное сглаживание баров/glow.
-    // Работает,
-    // только пока есть свежие "level" или уровни не успокоились; в покое НЕ крутится
-    // (нет события — бары на CSS-минимуме, без фейковой анимации). Все записи — только
-    // transform/opacity (компосит), ни одного setState на кадр.
+    // --- rAF-цикл громкости: устойчивое экспоненциальное сглаживание полосок.
+    // Работает, только пока есть свежие "level" или уровни не успокоились; в покое
+    // не крутится. Все записи - только transform/opacity, ни одного setState на кадр.
+    // reduced-motion: полоски сразу встают на уровень, без шиммера и догоняния.
     const levelTick = (now: number) => {
       const dt = Math.min(0.05, levelLastRef.current ? (now - levelLastRef.current) / 1000 : 0.0167);
       levelLastRef.current = now;
-      // «Свежо» = поток level живой (<250 мс) и идёт запись; иначе цель 0 — опадаем.
+      // «Свежо» = поток level живой (<250 мс) и идёт запись; иначе цель 0 - опадаем.
       const fresh =
         statusRef.current === "recording" && now - lastLevelAtRef.current < 250;
       const rms = fresh ? rmsRef.current : 0;
       const barPos = barPosRef.current;
       const reducedMotion = reducedMotionRef.current;
       let busy = false;
-      // Шиммер ДЕТЕРМИНИРОВАННЫЙ: sin с фазой по индексу бара, период 500 мс,
-      // амплитуда 0.08 — никакой случайности; гасится вместе с потоком level.
+      // Шиммер детерминированный: sin с фазой по индексу, период 500 мс.
       const ph = (now / 500) * Math.PI * 2;
       for (let i = 0; i < BAR_COUNT; i++) {
-        const shimmer = fresh ? 0.08 * rms * Math.sin(ph + i * 0.9) : 0;
+        const shimmer = fresh && !reducedMotion ? 0.08 * rms * Math.sin(ph + i * 0.9) : 0;
         const target = clamp01(rms * BAR_WEIGHTS[i] + shimmer);
         const tau = target > barPos[i] ? LEVEL_ATTACK_S : LEVEL_RELEASE_S;
         const alpha = reducedMotion ? 1 : 1 - Math.exp(-dt / tau);
@@ -339,34 +337,15 @@ export default function Overlay() {
         const el = barEls.current[i];
         if (el) {
           const v = clamp01(barPos[i]);
-          // Высота 2+16·v^1.5 (2..18 px) через scaleY от фиксированных 18 px.
-          el.style.transform = `scaleY(${(2 + 16 * Math.pow(v, 1.5)) / BAR_MAX_H})`;
-          el.style.opacity = String(0.75 + 0.25 * v);
+          const h = BAR_MIN_H + (BAR_MAX_H - BAR_MIN_H) * Math.pow(v, 1.5);
+          el.style.transform = `scaleY(${h / BAR_MAX_H})`;
+          el.style.opacity = String(0.7 + 0.3 * v);
         }
-      }
-      // Glow орба: радиус 0.5+5.5·log10(1+3v) px поверх орба радиусом 6.5 px.
-      // Элемент glow — круг 26 px (радиус 13, градиент гаснет к 70% ≈ 9.1 px),
-      // масштабируем так, чтобы видимый радиус был 6.5+g.
-      const glowTau = rms > glowPosRef.current ? LEVEL_ATTACK_S : LEVEL_RELEASE_S;
-      const glowAlpha = reducedMotion ? 1 : 1 - Math.exp(-dt / glowTau);
-      glowPosRef.current += (rms - glowPosRef.current) * glowAlpha;
-      if (!reducedMotion && Math.abs(rms - glowPosRef.current) > 0.002) busy = true;
-      const g = 0.5 + 5.5 * Math.log10(1 + 3 * clamp01(glowPosRef.current));
-      const gl = glowEl.current;
-      if (gl) {
-        gl.style.transform = `scale(${(6.5 + g) / 9.1})`;
-        gl.style.opacity = String(clamp01((g - 0.5) / 3.3) * 0.85);
-      }
-      // Сам орб дышит голосом (как у Aqua): тишина — 1×, громко — до 1.45×.
-      const orb = orbEl.current;
-      if (orb) {
-        const v = reducedMotion ? 0 : clamp01(glowPosRef.current);
-        orb.style.transform = `scale(${1 + 0.45 * Math.sqrt(v)})`;
       }
       if (!reducedMotion && (busy || fresh)) {
         levelRafRef.current = requestAnimationFrame(levelTick);
       } else {
-        levelRafRef.current = null; // успокоились — спим до следующего "level"
+        levelRafRef.current = null; // успокоились - спим до следующего "level"
         levelLastRef.current = 0;
       }
     };
@@ -408,6 +387,11 @@ export default function Overlay() {
       if (l === undefined) return;
       setLang(l === "ru" || l === "en" ? l : null);
     };
+    // То же для model: поля нет - не трогаем, пустое/не строка - прячем метку.
+    const applyModel = (m: string | null | undefined) => {
+      if (m === undefined) return;
+      setModel(typeof m === "string" && m.trim() ? m.trim() : null);
+    };
 
     const offStatus = subscribe<StatusPayload>("status", (e) => {
       // Совместимость: текущий бэкенд шлёт строку, следующая волна МОЖЕТ слать
@@ -433,6 +417,7 @@ export default function Overlay() {
         if (prev !== "recording") {
           setOffline(false);
           setLang(null);
+          setModel(null);
           // Дедуп по seq порог здесь НЕ трогаем (счётчик монотонный): у новой
           // диктовки seq строго больше, а эхо прошлой отфильтруется.
           resetTextEngine();
@@ -452,6 +437,7 @@ export default function Overlay() {
       // lang из самого события (если бэкенд прислал) — ПОСЛЕ сброса на recording,
       // чтобы lang, пришедший вместе со стартом записи, не был тут же затёрт.
       applyLang(typeof p === "object" && p !== null ? p.lang : undefined);
+      applyModel(typeof p === "object" && p !== null ? p.model : undefined);
     });
 
     const offPartial = subscribe<PartialWithLang>("partial", (e) => {
@@ -547,7 +533,12 @@ export default function Overlay() {
       : latchNotice != null
         ? "latch"
         : previewPillMode(status, hasPreview, false);
-  const compactHotkeyTip = compactHotkeyLabel(hotkeyTip);
+  // Метка «GigaAM · RU» живёт только во время диктовки.
+  const metaLabel =
+    mode === "rec" || mode === "stream" || mode === "trans"
+      ? overlayMetaLabel(model, lang)
+      : null;
+  const showOffline = offline && mode === "stream";
 
   const pillHitRect = () => {
     const rect = pillRef.current?.getBoundingClientRect();
@@ -625,9 +616,10 @@ export default function Overlay() {
   // ВАЖНО: узел .aq-pill ВСЕГДА в DOM и никогда не размонтируется — все переходы
   // размеров/прозрачности идут CSS-transition по смене класса режима, а не через
   // условный рендер корня (иначе transition не сыграет и пилюля «мигнёт»).
-  const showBars = mode === "rec" || mode === "trans";
-  const showOrb = showBars || mode === "stream";
   const isProcessing = status === "transcribing";
+  const barRef = (i: number) => (el: HTMLSpanElement | null) => {
+    barEls.current[i] = el;
+  };
   const applyManualDrag = async (p: DragPointer, requireActive = true) => {
     if (!p.cursorStart) return;
     const overlayWindow = getCurrentWindow();
@@ -764,92 +756,63 @@ export default function Overlay() {
         data-scale={overlayScale.toFixed(2)}
       >
         <div
-          className={`aq-pill aq-${mode}`}
+          className={`aq-pill aq-${mode}${metaLabel || showOffline ? " aq-has-meta" : ""}`}
           ref={pillRef}
           data-mode={mode}
           data-status={status}
           title={
             offline && isProcessing
-              ? "Облако недоступно — локальное распознавание"
+              ? "Облако недоступно - локальное распознавание"
               : undefined
           }
         >
-        {/* Тултип idle-hover: всегда в DOM, виден только в .aq-idle:hover (CSS). */}
+        {/* Подсказка idle-hover: всегда в DOM, видна только в .aq-idle:hover (CSS). */}
         <span className="aq-tip" aria-hidden>
-          Зажмите {hotkeyTip} — диктовка
+          Зажмите {hotkeyTip} - диктовка
         </span>
 
-        {/* Бейдж определённого языка: только пока идёт диктовка и бэкенд прислал
-            lang. position:absolute в углу пилюли (см. .aq-lang) — не участвует в
-            layout, поэтому overlay_box/ResizeObserver и hit-rect не меняются. */}
-        {lang != null && (mode === "rec" || mode === "stream" || mode === "trans") && (
-          <span className="aq-lang">{lang.toUpperCase()}</span>
-        )}
-
-        {mode === "idle" ? (
-          <span className="aq-idle-copy">
-            <span className="aq-logo-wave" aria-hidden><i /><i /><i /><i /><i /></span>
-            <strong>{compactHotkeyTip} — говорить</strong>
-            <span className="aq-idle-lang">Авто</span>
-          </span>
-        ) : mode === "notice" ? (
+        {mode === "notice" ? (
           <span className="aq-msg">{notice}</span>
         ) : mode === "latch" ? (
-          <span className="aq-latch-copy">
-            <span className="aq-latch-mark" aria-hidden>
-              2×
-            </span>
-            <span>
-              <strong>{latchNotice?.message || "Без удержания"}</strong>
-              <small>{latchNotice?.detail || "Двойное нажатие"}</small>
-            </span>
+          <span className="aq-msg">{latchNotice?.message || "Без удержания"}</span>
+        ) : mode === "rec" ? (
+          // Высоту/прозрачность полосок пишет rAF-цикл громкости; без "level" - минимум.
+          <span className="aq-bars" aria-hidden>
+            {BAR_WEIGHTS.map((_, i) => (
+              <span key={i} className="aq-bar" ref={barRef(i)} />
+            ))}
           </span>
-        ) : showOrb ? (
+        ) : mode === "trans" ? (
+          <span className="aq-dots" aria-hidden>
+            <span className="aq-dot" />
+            <span className="aq-dot" />
+            <span className="aq-dot" />
+          </span>
+        ) : mode === "stream" ? (
           <>
-            {/* Орб: статичный drop-shadow по спеке + динамический glow-слой, чей
-                transform/opacity пишет rAF-цикл громкости напрямую (без setState). */}
-            <span className="aq-orbwrap" aria-hidden>
-              <span className="aq-orb-glow" ref={glowEl} />
-              <span className="aq-orb" ref={orbEl} />
-              {isProcessing && <span className="aq-ring" />}
+            <span className="aq-bars" aria-hidden>
+              {STREAM_BARS.map((i) => (
+                <span key={i} className="aq-bar" ref={barRef(i)} />
+              ))}
             </span>
-            {mode === "stream" ? (
-              <div className="aq-text" ref={scrollRef}>
-                {/* Слова пишет paintWords напрямую; React детей не рендерит. */}
-                <span ref={attachWordsHost} />
-                {offline && (
-                  <span
-                    className="aq-offline"
-                    title="Облако недоступно — локальное распознавание"
-                  >
-                    офлайн
-                  </span>
-                )}
-              </div>
-            ) : (
-              // 12 баров визуализатора; высоту/прозрачность пишет rAF-цикл громкости.
-              // Пока событий "level" нет (бэкенд не готов) — стоят на CSS-минимуме.
-              mode === "trans" ? (
-                <span className="aq-trans-copy">Улучшаю текст…</span>
-              ) : (
-                <>
-                  <span className="aq-rec-copy">Слушаю</span>
-                  <span className="aq-bars" aria-hidden>
-                    {BAR_WEIGHTS.map((_, i) => (
-                      <span
-                        key={i}
-                        className="aq-bar"
-                        ref={(el) => {
-                          barEls.current[i] = el;
-                        }}
-                      />
-                    ))}
-                  </span>
-                </>
-              )
-            )}
+            <div className="aq-text" ref={scrollRef}>
+              {/* Слова пишет paintWords напрямую; React детей не рендерит. */}
+              <span ref={attachWordsHost} />
+            </div>
           </>
         ) : null}
+
+        {/* Метка модели/языка и «офлайн» - справа внутри капсулы, не наезжает на текст. */}
+        {(metaLabel || showOffline) && (
+          <span className="aq-meta">
+            {metaLabel && <span>{metaLabel}</span>}
+            {showOffline && (
+              <span className="aq-offline" title="Облако недоступно - локальное распознавание">
+                офлайн
+              </span>
+            )}
+          </span>
+        )}
         </div>
       </div>
     </div>

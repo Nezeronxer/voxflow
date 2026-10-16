@@ -119,3 +119,13 @@ export function sharedWordPrefix(prev: string[], next: string[]): number {
   }
   return same;
 }
+
+// Подпись капсулы «GigaAM · RU»: модель из "status".model и язык из lang.
+// Нет ни того, ни другого (старый бэкенд) - null, метку не рисуем.
+export function overlayMetaLabel(
+  model: string | null | undefined,
+  lang: string | null | undefined,
+): string | null {
+  const parts = [model?.trim(), lang?.toUpperCase()].filter((p): p is string => !!p);
+  return parts.length ? parts.join(" · ") : null;
+}

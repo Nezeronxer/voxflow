@@ -1,25 +1,23 @@
-/* Стили overlay-пилюли (Aqua Voice). Подключается ТОЛЬКО из Overlay.tsx; классы
-   с префиксом aq-*, чтобы не пересекаться со старыми .pill-стилями в styles.css.
+/* Плавающая плашка диктовки - тёмная матовая капсула (Overlay.tsx, url #/overlay).
+   Классы с префиксом aq-*, чтобы не пересекаться со стилями окна настроек.
    Прозрачность фона окна обеспечивает body.overlay-body (styles.css).
 
-   Принципы производительности (60 fps, см. Overlay.tsx):
-   - покадровая динамика (бары/glow) пишется JS-ом напрямую и ТОЛЬКО в
-     transform/opacity — композитные свойства, без layout/paint на кадр;
-   - width/height пилюли меняются один раз на СМЕНУ режима (одиночный layout —
-     допустимо) и едут CSS-«пружиной» cubic-bezier(0.22,1.2,0.36,1) 140 мс;
-   - НИКАКИХ постоянных keyframe-анимаций в покое: idle-полоска статична. */
+   Производительность (60 fps):
+   - покадровая динамика (полоски громкости) пишется JS-ом напрямую и только в
+     transform/opacity - без layout/paint на кадр;
+   - width/height капсулы меняются один раз на смену режима (одиночный layout);
+   - в покое никаких постоянных анимаций: idle-полоска статична.
 
-/* ---------- Корень окна: пилюля прижата к низу по центру ---------- */
+   Геометрия синхронизирована с BOX в Overlay.tsx (tests/overlay-geometry). */
 
 .aq-root {
   position: fixed;
   inset: 0;
   display: flex;
-  align-items: flex-end; /* пилюля у нижней кромки, растёт ВВЕРХ */
+  align-items: flex-end; /* капсула у нижней кромки, растёт вверх */
   justify-content: center;
-  /* Нижний отступ — место под glow орба и тень; сверху окно оставляет запас
-     под тултип idle-hover (размер окна задаёт overlay_box из Overlay.tsx). */
-  padding-bottom: 12px;
+  /* Без padding: overlay_box масштабирует всё окно, отступы живут в stage. */
+  padding: 0;
   background: transparent;
   overflow: hidden;
   cursor: grab;
@@ -33,11 +31,12 @@
   display: flex;
   align-items: flex-end;
   justify-content: center;
+  padding: 8px 9px 10px;
   transform-origin: 50% 100%;
-  transition: transform 160ms cubic-bezier(0.22, 1.2, 0.36, 1);
+  transition: transform 200ms cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
-/* ---------- Пилюля: общий каркас + «пружина» переходов ---------- */
+/* ---------- Капсула: общий каркас ---------- */
 
 .aq-pill {
   position: relative;
@@ -45,694 +44,319 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: linear-gradient(180deg, #1c2124 0%, #111416 100%);
-  border: 0.5px solid rgba(255, 255, 255, 0.16);
-  border-radius: 30px;
-  /* Лёгкая посадочная тень, чтобы чёрная пилюля не «прилипала» к светлым окнам. */
-  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+  gap: 10px;
+  height: 34px;
+  padding: 0 14px;
+  background: rgba(17, 17, 20, 0.88);
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.32);
+  color: #f2f2f5;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", system-ui, sans-serif;
   cursor: grab;
   user-select: none;
   -webkit-user-select: none;
-  /* Пружина ≈140 мс с лёгким овершутом (bezier y>1). Геометрия (width/height)
-     меняется только при смене класса режима — единичный layout, не покадровый. */
   transition:
-    width 140ms cubic-bezier(0.22, 1.2, 0.36, 1),
-    height 140ms cubic-bezier(0.22, 1.2, 0.36, 1),
-    transform 140ms cubic-bezier(0.22, 1.2, 0.36, 1),
-    opacity 140ms cubic-bezier(0.22, 1.2, 0.36, 1);
-}
-
-/* Декоративные дети «прозрачны» для мыши: Pointer Events на .aq-pill отличают
-   короткий tap от drag, поэтому перетаскивание работает с любой точки. */
-.aq-tip,
-.aq-lang,
-.aq-orbwrap,
-.aq-bars,
-.aq-latch-copy,
-.aq-msg,
-.aq-trans-copy {
-  pointer-events: none;
-}
-
-/* ---------- Режимы (геометрия 1:1 со спекой Aqua) ---------- */
-
-/* idle: мини-полоска 55×10, приглушена; hover — 80×20 и тултип-подсказка. */
-.aq-idle {
-  width: 55px;
-  height: 10px;
-  opacity: 0.75;
-}
-.aq-idle:hover {
-  width: 80px;
-  height: 20px;
-  opacity: 1;
+    width 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    height 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    padding 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 200ms ease-out,
+    transform 200ms ease-out;
 }
 .aq-pill:active {
   cursor: grabbing;
 }
 
-/* rec: 110×37 — орб слева, 12 баров справа (space-between, поля 13px). */
-.aq-rec,
-.aq-trans {
-  width: 110px;
-  height: 37px;
-  padding: 0 13px;
+/* Декоративные дети прозрачны для мыши: Pointer Events на .aq-pill отличают
+   короткий tap от drag, поэтому перетаскивание работает с любой точки. */
+.aq-tip,
+.aq-meta,
+.aq-bars,
+.aq-dots,
+.aq-msg {
+  pointer-events: none;
+}
+
+/* ---------- Режимы ---------- */
+
+/* idle: тонкая приглушённая полоска; при наведении - подсказка. */
+.aq-idle {
+  width: 40px;
+  height: 10px;
+  padding: 0;
+  opacity: 0.55;
+}
+.aq-idle:hover {
+  opacity: 0.9;
+}
+
+/* rec: 5 полосок громкости; с меткой модели капсула шире. */
+.aq-rec {
+  width: 96px;
+  height: 34px;
+}
+.aq-rec.aq-has-meta {
+  width: 152px;
   justify-content: space-between;
 }
 
-/* trans: та же пилюля, чуть «вдохнула» внутрь + кольцо-спиннер поверх орба. */
+/* trans: три точки с бегущей волной яркости. */
 .aq-trans {
-  transform: scale(0.96);
+  width: 64px;
+  height: 34px;
+}
+.aq-trans.aq-has-meta {
+  width: 136px;
+  justify-content: space-between;
 }
 
-/* stream: карточка по контенту — ширина до 400, высота до ~140 (текст внутри
-   сам скроллится). width/height auto не интерполируются — допустимый одиночный
-   скачок на смене состояния (пружина продолжает играть на transform/opacity). */
+/* stream: растёт по тексту, одна строка (34) или две (до 60). width/height auto
+   не интерполируются - допустимый одиночный скачок на смене состояния. */
 .aq-stream {
   width: auto;
-  min-width: 110px;
-  max-width: 400px;
+  min-width: 160px;
+  max-width: 420px;
   height: auto;
-  padding: 10px 14px 10px 12px;
+  min-height: 34px;
+  max-height: 60px;
+  padding: 8px 14px 8px 12px;
   justify-content: flex-start;
-  gap: 9px;
+  border-radius: 17px;
 }
 
-/* latch: подтверждение double-press, что запись закреплена без удержания. */
+/* latch: та же капсула, одна строка текста. */
 .aq-latch {
-  width: 276px;
-  height: 48px;
-  padding: 7px 12px;
-  justify-content: flex-start;
-  animation: aq-latch-pop 180ms cubic-bezier(0.22, 1.2, 0.36, 1) both;
+  width: auto;
+  min-width: 96px;
+  max-width: 280px;
+  height: 34px;
+  animation: aq-pop 200ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
-/* notice: краткое предупреждение (no_model / error) — тёмная плашка с текстом. */
+/* notice: предупреждение (no_model / error), максимум две строки. */
 .aq-notice {
   width: auto;
-  max-width: 400px;
+  min-width: 96px;
+  max-width: 320px;
   height: auto;
+  min-height: 34px;
+  max-height: 52px;
   padding: 8px 14px;
+  border-radius: 17px;
+  animation: aq-pop 200ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 }
 
-/* ---------- Тултип idle-hover ---------- */
+@keyframes aq-pop {
+  from {
+    opacity: 0;
+    transform: translateY(3px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* ---------- Подсказка idle-hover ---------- */
 
 .aq-tip {
   position: absolute;
   bottom: calc(100% + 8px);
   left: 50%;
   transform: translateX(-50%) translateY(3px);
-  padding: 5px 9px;
-  border-radius: 7px;
-  background: rgba(22, 22, 26, 0.94);
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: rgba(17, 17, 20, 0.92);
   border: 1px solid rgba(255, 255, 255, 0.08);
-  color: rgba(255, 255, 255, 0.9);
+  color: rgba(242, 242, 245, 0.9);
   font-size: 11px;
   font-weight: 500;
   line-height: 1;
   white-space: nowrap;
   opacity: 0;
   transition:
-    opacity 140ms cubic-bezier(0.22, 1.2, 0.36, 1),
-    transform 140ms cubic-bezier(0.22, 1.2, 0.36, 1);
+    opacity 180ms ease-out,
+    transform 180ms ease-out;
 }
-/* Виден только при наведении в покое — в остальных режимах подсказка не нужна. */
 .aq-idle:hover .aq-tip {
   opacity: 1;
   transform: translateX(-50%) translateY(0);
 }
 
-/* ---------- Орб + glow + кольцо transcribing ---------- */
-
-.aq-orbwrap {
-  position: relative;
-  flex: none;
-  width: 13px;
-  height: 13px;
-}
-
-/* Орб 13×13: радиальный градиент голубой→синий + статичный ореол по спеке. */
-.aq-orb {
-  position: absolute;
-  inset: 0;
-  border-radius: 50%;
-  background: radial-gradient(circle at 35% 30%, #6ee7b7 0%, #0f8b7c 70%);
-  filter: drop-shadow(0 0 2px rgba(58, 210, 155, 0.35));
-}
-
-/* Динамический glow: круг 26 px (градиент гаснет к 70% ≈ радиус 9.1 px); JS
-   масштабирует его так, чтобы видимый радиус был 6.5+g, где g=0.5+5.5·log10(1+3v).
-   Дефолт = тишина (g=0.5): scale (6.5+0.5)/9.1, прозрачен до первого "level". */
-.aq-orb-glow {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 26px;
-  height: 26px;
-  margin: -13px 0 0 -13px;
-  border-radius: 50%;
-  background: radial-gradient(
-    circle,
-    rgba(110, 231, 183, 0.85) 0%,
-    rgba(15, 139, 124, 0.4) 40%,
-    rgba(15, 139, 124, 0) 70%
-  );
-  transform: scale(0.769);
-  opacity: 0;
-}
-
-/* Кольцо-спиннер transcribing: 14.5 px поверх орба, прозрачная рамка 2 px с белой
-   «макушкой», полный оборот за 0.4 с. Анимируется только transform (компосит). */
-.aq-ring {
-  position: absolute;
-  left: 50%;
-  top: 50%;
-  width: 14.5px;
-  height: 14.5px;
-  margin: -7.25px 0 0 -7.25px;
-  box-sizing: border-box;
-  border: 2px solid transparent;
-  border-top-color: rgba(255, 255, 255, 0.6);
-  border-radius: 50%;
-  animation: aq-spin 0.4s linear infinite;
-}
-@keyframes aq-spin {
-  to {
-    transform: rotate(360deg);
-  }
-}
-
-/* ---------- 12 баров громкости ---------- */
+/* ---------- Полоски громкости ---------- */
 
 .aq-bars {
-  display: flex;
-  align-items: center; /* бары растут от вертикального центра в обе стороны */
-  gap: 2px;
-  height: 22px;
   flex: none;
+  display: flex;
+  align-items: center; /* растут от центра в обе стороны */
+  gap: 3px;
+  height: 18px;
 }
 
-/* Бар: CSS-высота фиксирована на максимуме 22 px, реальная высота 2+20·v^1.5
-   задаётся JS-ом через transform:scaleY (origin center → симметричный рост).
-   Дефолт = минимум v=0: scaleY(2/22), opacity .75 — пока событий "level" нет
-   (бэкенд не готов), бары честно стоят на минимуме, БЕЗ фейковой анимации. */
+/* CSS-высота фиксирована на максимуме 18 px, реальная 4..18 px задаётся JS-ом
+   через scaleY. Дефолт - минимум, пока нет событий "level" (без фейковой анимации). */
 .aq-bar {
   flex: none;
   width: 3px;
-  height: 22px;
-  border-radius: 4px;
-  background: linear-gradient(
-    180deg,
-    rgba(110, 231, 183, 0.95) 0%,
-    rgba(58, 210, 155, 0.7) 100%
-  );
-  transform: scaleY(0.0909);
+  height: 18px;
+  border-radius: 999px;
+  background: #f2f2f5;
+  transform: scaleY(0.2222);
   transform-origin: center;
-  opacity: 0.75;
+  opacity: 0.7;
+  will-change: transform, opacity;
 }
 
-/* ---------- Поток текста (stream) ---------- */
+/* ---------- Точки обработки ---------- */
 
-/* Текстовая зона — ЕДИНСТВЕННЫЙ интерактивный ребёнок пилюли (drag тут не
-   стартует, колесо скроллит хвост). Хвост держится снизу автоскроллом из
-   Overlay.tsx (≤1 запись scrollTop за кадр) + scroll-behavior:smooth. */
+.aq-dots {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.aq-dot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: #f2f2f5;
+  opacity: 0.3;
+  animation: aq-dot-wave 900ms ease-in-out infinite;
+}
+.aq-dot:nth-child(2) {
+  animation-delay: 150ms;
+}
+.aq-dot:nth-child(3) {
+  animation-delay: 300ms;
+}
+@keyframes aq-dot-wave {
+  0%,
+  60%,
+  100% {
+    opacity: 0.3;
+  }
+  30% {
+    opacity: 1;
+  }
+}
+
+/* ---------- Метка модели / языка / офлайн ---------- */
+
+.aq-meta {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(242, 242, 245, 0.42);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  line-height: 1;
+  white-space: nowrap;
+  animation: aq-fade 180ms ease-out both;
+}
+.aq-offline {
+  color: rgba(242, 242, 245, 0.32);
+}
+@keyframes aq-fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+/* ---------- Живой текст (stream) ---------- */
+
+/* Единственный интерактивный ребёнок капсулы: колесо скроллит хвост. Хвост
+   держится снизу автоскроллом из Overlay.tsx (не больше записи scrollTop за кадр). */
 .aq-text {
   flex: 1;
   min-width: 0;
-  max-height: 114px; /* ~6 строк → пилюля целиком ≤ ~140 px */
+  max-height: 36px; /* две строки по 18 px */
   overflow-y: auto;
-  scroll-behavior: smooth;
-  scrollbar-width: none; /* Firefox: без полосы */
+  scrollbar-width: none;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  word-break: break-word;
   font-size: 13px;
-  line-height: 1.45;
+  line-height: 18px;
   font-weight: 450;
-  color: rgba(255, 255, 255, 0.95);
+  color: #f2f2f5;
   cursor: grab;
 }
 .aq-text::-webkit-scrollbar {
-  display: none; /* WebView2/Chromium: без полосы */
+  display: none;
+}
+/* Начало длинной фразы уходит вверх под мягкую маску (класс ставит Overlay.tsx). */
+.aq-text.aq-clip {
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 16px);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 16px);
 }
 
-/* Слово потока: новое или переписанное слово мягко всплывает (opacity +
-   сдвиг + blur, только компосит), устоявшиеся слова не трогаются. Переход
-   volatile→committed плавно меняет цвет. */
+/* Новое или переписанное слово проявляется (только компосит), совпавший префикс
+   не трогается. inline-block - чтобы работал сдвиг transform. */
 .aq-w {
-  display: inline;
-  animation: aq-w-in 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
-  transition: color 240ms ease;
+  display: inline-block;
+  animation: aq-w-in 160ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  transition: color 200ms ease-out;
 }
 .aq-w.committed {
-  color: rgba(255, 255, 255, 0.96); /* стабильный префикс — белый */
+  color: #f2f2f5;
 }
 .aq-w.volatile {
-  color: rgba(255, 255, 255, 0.5); /* изменчивый хвост — серый */
+  color: #8a8a93;
 }
 @keyframes aq-w-in {
   from {
     opacity: 0;
-    filter: blur(3px);
+    transform: translateY(2px);
+    filter: blur(2px);
   }
   to {
     opacity: 1;
+    transform: none;
     filter: blur(0);
   }
 }
 
-/* ---------- Бейдж определённого языка (RU/EN) ---------- */
-
-/* Ярлычок поверх верхней кромки пилюли, у правого угла. Абсолютное позициони-
-   рование выключает его из layout: размеры пилюли не меняются → overlay_box,
-   ResizeObserver и hit-rect (getBoundingClientRect пилюли) живут как раньше;
-   pointer-events:none (группа выше) — drag с любой точки тоже не страдает.
-   Выступ вверх (top:-7px) помещается в запас окна над пилюлей (BOX в Overlay.tsx:
-   для rec/trans над пилюлей ~15 px). Монохром в духе .aq-offline. */
-.aq-lang {
-  position: absolute;
-  top: -7px;
-  right: 12px;
-  padding: 1px 5px;
-  border-radius: 999px;
-  background: #111416;
-  border: 0.5px solid rgba(255, 255, 255, 0.16);
-  font-size: 9px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  line-height: 1.3;
-  color: rgba(255, 255, 255, 0.7);
-  /* Мягкое проявление при первом lang; смена RU↔EN узел не перемонтирует. */
-  animation: aq-lang-in 160ms ease-out both;
-}
-@keyframes aq-lang-in {
-  from {
-    opacity: 0;
-    transform: translateY(2px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-/* Метка «офлайн» (авто-fallback на локальное распознавание) — ненавязчиво в потоке. */
-.aq-offline {
-  display: inline-block;
-  margin-left: 8px;
-  padding: 1px 6px;
-  border: 1px solid rgba(255, 255, 255, 0.25);
-  border-radius: 999px;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
-  color: rgba(255, 255, 255, 0.55);
-  vertical-align: 1px;
-}
-
-/* ---------- Latch и текст notice ---------- */
-
-.aq-latch-copy {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  min-width: 0;
-}
-.aq-latch-copy span:last-child {
-  display: grid;
-  gap: 1px;
-  min-width: 0;
-}
-.aq-latch-copy strong {
-  color: rgba(255, 255, 255, 0.95);
-  font-size: 12px;
-  font-weight: 650;
-  line-height: 1.15;
-}
-.aq-latch-copy small {
-  color: rgba(255, 255, 255, 0.58);
-  font-size: 10.5px;
-  font-weight: 500;
-  line-height: 1.15;
-}
-.aq-latch-mark {
-  flex: none;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  border-radius: 999px;
-  background: rgba(255, 255, 255, 0.1);
-  border: 0.5px solid rgba(255, 255, 255, 0.22);
-  color: rgba(255, 255, 255, 0.95);
-  font-size: 11px;
-  font-weight: 800;
-  letter-spacing: 0;
-}
-
-.aq-trans-copy {
-  color: rgba(255, 255, 255, 0.78);
-  font-size: 11px;
-  font-weight: 650;
-  letter-spacing: 0;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-@keyframes aq-latch-pop {
-  from {
-    opacity: 0;
-    transform: translateY(4px) scale(0.94);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0) scale(1);
-  }
-}
+/* ---------- Текст latch / notice ---------- */
 
 .aq-msg {
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 12px;
+  min-width: 0;
+  color: #f2f2f5;
+  font-size: 12.5px;
   font-weight: 500;
-  line-height: 1.35;
+  line-height: 16px;
   text-align: center;
-  /* Длинные сообщения не раздувают плашку: максимум две строки с обрезкой. */
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+}
+.aq-latch .aq-msg {
+  -webkit-line-clamp: 1;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 @media (prefers-reduced-motion: reduce) {
   .aq-pill,
   .aq-scale-stage,
   .aq-tip,
-  .aq-latch,
-  .aq-ring,
-  .aq-w {
-    transition-duration: 1ms !important;
-    animation-duration: 1ms !important;
-    animation-iteration-count: 1 !important;
-  }
-}
-
-/* ============================================================
-   VoxFlow 2.0 floating bar
-   Readable at a glance over both light and dark target applications. Geometry
-   mirrors BOX in Overlay.tsx; live animation remains transform/opacity-only.
-   ============================================================ */
-
-.aq-root {
-  /* Keep the viewport itself padding-free: overlay_box scales the entire window,
-     so fixed root padding would overflow and clip the pill at 75%. The stage is
-     transformed as one unit below, including these same visual insets. */
-  padding: 0;
-}
-
-.aq-scale-stage {
-  padding: 8px 9px 10px;
-}
-
-.aq-pill {
-  background: rgba(20, 24, 26, 0.985);
-  border: 1px solid rgba(255, 255, 255, 0.14);
-  border-radius: 14px;
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.34),
-    inset 0 1px 0 rgba(255, 255, 255, 0.045);
-  color: rgba(255, 255, 255, 0.96);
-  font-family: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  backdrop-filter: none;
-  transition:
-    width 90ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    height 90ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    padding 90ms cubic-bezier(0.2, 0.8, 0.2, 1),
-    background-color 80ms ease-out,
-    border-color 80ms ease-out,
-    box-shadow 80ms ease-out,
-    opacity 80ms ease-out,
-    transform 80ms ease-out;
-}
-
-.aq-tip {
-  display: none;
-}
-
-.aq-idle {
-  width: 56px;
-  height: 10px;
-  padding: 0;
-  overflow: hidden;
-  opacity: 0.78;
-  background: rgba(17, 19, 24, 0.48);
-  border: 1px solid rgba(184, 188, 198, 0.72);
-  border-radius: 999px;
-  box-shadow: 0 1px 5px rgba(0, 0, 0, 0.18);
-}
-
-.aq-idle:hover {
-  width: 172px;
-  height: 30px;
-  padding: 0 8px;
-  opacity: 1;
-  overflow: hidden;
-  background: rgba(20, 24, 26, 0.985);
-  border-color: rgba(229, 67, 43, 0.75);
-  border-radius: 12px;
-  box-shadow:
-    0 8px 24px rgba(0, 0, 0, 0.34),
-    inset 0 1px 0 rgba(255, 255, 255, 0.045);
-}
-
-.aq-idle-copy {
-  width: 100%;
-  min-width: 0;
-  display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 5px;
-  pointer-events: none;
-  opacity: 0;
-  transform: scale(0.96);
-  transition:
-    opacity 70ms ease-out,
-    transform 90ms cubic-bezier(0.2, 0.8, 0.2, 1);
-}
-
-.aq-idle:hover .aq-idle-copy {
-  opacity: 1;
-  transform: scale(1);
-}
-
-.aq-idle-copy strong {
-  overflow: hidden;
-  color: rgba(255, 255, 255, 0.92);
-  font-size: 10px;
-  font-weight: 590;
-  letter-spacing: -0.005em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.aq-logo-wave {
-  height: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 1.5px;
-  color: #3ad29b;
-}
-
-.aq-logo-wave i {
-  width: 2px;
-  border-radius: 999px;
-  background: currentColor;
-  box-shadow: 0 0 8px rgba(58, 210, 155, 0.42);
-}
-
-.aq-logo-wave i:nth-child(1),
-.aq-logo-wave i:nth-child(5) { height: 5px; }
-.aq-logo-wave i:nth-child(2),
-.aq-logo-wave i:nth-child(4) { height: 10px; }
-.aq-logo-wave i:nth-child(3) { height: 16px; }
-
-.aq-idle-lang {
-  min-width: 30px;
-  padding-left: 5px;
-  border-left: 1px solid rgba(255, 255, 255, 0.12);
-  color: rgba(255, 255, 255, 0.62);
-  font-size: 9px;
-  font-weight: 550;
-}
-
-.aq-idle-lang::after {
-  content: "⌄";
-  margin-left: 3px;
-  color: rgba(255, 255, 255, 0.42);
-}
-
-.aq-rec {
-  width: 148px;
-  height: 34px;
-  padding: 0 10px;
-  justify-content: flex-start;
-  gap: 7px;
-  border-color: rgba(229, 67, 43, 0.75);
-}
-
-.aq-trans {
-  width: 148px;
-  height: 34px;
-  padding: 0 10px;
-  justify-content: flex-start;
-  gap: 7px;
-  transform: none;
-}
-
-.aq-stream {
-  width: auto;
-  min-width: 180px;
-  max-width: 270px;
-  min-height: 42px;
-  max-height: 66px;
-  padding: 7px 10px;
-  gap: 7px;
-  border-color: rgba(58, 210, 155, 0.6);
-}
-
-.aq-latch {
-  width: 148px;
-  height: 34px;
-  padding: 4px 8px;
-  animation: none;
-}
-
-.aq-notice {
-  width: auto;
-  min-width: 180px;
-  max-width: 270px;
-  min-height: 38px;
-  padding: 6px 9px;
-  border-color: rgba(255, 107, 107, 0.62);
-}
-
-.aq-orbwrap {
-  /* Keep the Aqua geometry that the RMS glow math in Overlay.tsx uses:
-     radius 6.5px, with a 26px glow fading at radius 9.1px. */
-  width: 13px;
-  height: 13px;
-}
-
-/* Орб дышит голосом: scale пишет rAF-цикл громкости в Overlay.tsx. */
-.aq-orb {
-  background: radial-gradient(circle at 35% 28%, #a7f3d0 0%, #3ad29b 54%, #0f8b7c 100%);
-  filter: drop-shadow(0 0 2px rgba(58, 210, 155, 0.42));
-  will-change: transform;
-}
-
-.aq-orb-glow {
-  width: 26px;
-  height: 26px;
-  margin: -13px 0 0 -13px;
-  will-change: transform, opacity;
-}
-
-.aq-ring {
-  width: 14.5px;
-  height: 14.5px;
-  margin: -7.25px 0 0 -7.25px;
-  border-width: 2px;
-  will-change: transform;
-}
-
-.aq-rec-copy {
-  color: rgba(255, 255, 255, 0.82);
-  font-size: 10.5px;
-  font-weight: 620;
-  white-space: nowrap;
-  pointer-events: none;
-}
-
-.aq-bars {
-  height: 18px;
-  gap: 1.5px;
-  margin-left: auto;
-}
-
-.aq-bar {
-  width: 2px;
-  height: 18px;
-  background: linear-gradient(180deg, #a7f3d0, #3ad29b);
-  will-change: transform, opacity;
-}
-
-.aq-text {
-  max-height: 46px;
-  scroll-behavior: auto;
-  color: rgba(255, 255, 255, 0.95);
-  font-size: 11.25px;
-  line-height: 1.38;
-  font-weight: 480;
-}
-
-
-.aq-trans-copy {
-  color: rgba(255, 255, 255, 0.9);
-  font-size: 10.5px;
-  font-weight: 590;
-}
-
-.aq-lang {
-  top: -5px;
-  right: 12px;
-  background: #14181a;
-  border-color: rgba(58, 210, 155, 0.5);
-  color: #a7f3d0;
-}
-
-.aq-msg {
-  font-size: 10.5px;
-  line-height: 1.35;
-}
-
-.aq-latch-copy {
-  gap: 6px;
-}
-
-.aq-latch-copy strong {
-  overflow: hidden;
-  font-size: 9.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.aq-latch-copy small {
-  font-size: 8.5px;
-  white-space: nowrap;
-}
-
-.aq-latch-mark {
-  width: 22px;
-  height: 22px;
-  font-size: 9px;
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .aq-pill,
-  .aq-scale-stage,
-  .aq-idle-copy,
-  .aq-ring,
+  .aq-meta,
   .aq-w,
   .aq-bar,
-  .aq-orb-glow,
-  .aq-reduced-motion-sentinel {
+  .aq-dot {
     transition: none !important;
     animation: none !important;
   }
-
-  .aq-text {
-    scroll-behavior: auto;
+  .aq-dot {
+    opacity: 0.6;
   }
 }
