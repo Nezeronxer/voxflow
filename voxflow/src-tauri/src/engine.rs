@@ -4113,7 +4113,13 @@ fn process_utterance(
         if ctx.gen.load(Ordering::SeqCst) == my_gen {
             let _ = ctx.app.emit(
                 "status",
-                serde_json::json!({ "status": "transcribing", "lang": l, "seq": my_gen }),
+                // Сюда доходит только локальный результат (у облака бейджа нет).
+                serde_json::json!({
+                    "status": "transcribing",
+                    "lang": l,
+                    "seq": my_gen,
+                    "model": model_label(&s, false),
+                }),
             );
         }
     }
@@ -4989,14 +4995,54 @@ fn set_status(ctx: &EngineCtx, status: &str) {
 }
 
 fn set_status_with_latch(ctx: &EngineCtx, status: &str, latched: bool) {
+    let model = {
+        let s = ctx.settings.lock().clone();
+        let cloud = s.cloud_stt_active()
+            || (s.cloud_asr && s.ai_backend == "gemini" && crate::gemini::available(&s.ai_api_key));
+        model_label(&s, cloud)
+    };
     let _ = ctx.app.emit(
         "status",
         serde_json::json!({
             "status": status,
             "seq": ctx.gen.load(Ordering::SeqCst),
             "latched": latched,
+            "model": model,
         }),
     );
+}
+
+/// Метка распознавателя для капсулы (поле `model` в "status"): что будет
+/// распознавать диктовку при текущих настройках и установленных моделях.
+/// shortcut: прогноз по маршруту - если резидентный движок упадёт посреди
+/// диктовки и уйдёт на whisper-откат, метка этого не покажет.
+fn model_label(s: &Settings, cloud: bool) -> Option<&'static str> {
+    let gigaam_ready = crate::models::gigaam_available();
+    pick_model_label(
+        cloud,
+        local_route(s),
+        s.engine == "gigaam" && is_auto_language_alias(&s.language),
+        gigaam_ready,
+        whisper_model_installed(s),
+    )
+}
+
+fn pick_model_label(
+    cloud: bool,
+    route: LocalRoute,
+    auto_gigaam: bool,
+    gigaam_ready: bool,
+    whisper_ready: bool,
+) -> Option<&'static str> {
+    match route {
+        _ if cloud => Some("Облако"),
+        LocalRoute::GigaAm if gigaam_ready => Some("GigaAM"),
+        LocalRoute::Parakeet => Some("Parakeet"),
+        // auto+gigaam: GigaAM - основной финал, whisper лишь уточняет.
+        LocalRoute::Whisper if auto_gigaam && gigaam_ready => Some("GigaAM"),
+        _ if whisper_ready => Some("Whisper"),
+        _ => None,
+    }
 }
 
 fn live_partial_payload(
@@ -6671,6 +6717,37 @@ mod seg_tests {
         assert!(should_probe_gigaam_for_auto("After"));
         assert!(should_probe_gigaam_for_auto("Коротко"));
         assert!(!should_probe_gigaam_for_auto("Обнови README.md сегодня"));
+    }
+
+    #[test]
+    fn model_label_matches_recognizer() {
+        use LocalRoute::*;
+        assert_eq!(
+            pick_model_label(true, GigaAm, false, true, true),
+            Some("Облако")
+        );
+        assert_eq!(
+            pick_model_label(false, GigaAm, false, true, true),
+            Some("GigaAM")
+        );
+        // ru без GigaAM уходит на whisper-откат.
+        assert_eq!(
+            pick_model_label(false, GigaAm, false, false, true),
+            Some("Whisper")
+        );
+        assert_eq!(
+            pick_model_label(false, Parakeet, false, false, false),
+            Some("Parakeet")
+        );
+        assert_eq!(
+            pick_model_label(false, Whisper, true, true, true),
+            Some("GigaAM")
+        );
+        assert_eq!(
+            pick_model_label(false, Whisper, false, true, true),
+            Some("Whisper")
+        );
+        assert_eq!(pick_model_label(false, Whisper, false, false, false), None);
     }
 
     #[test]

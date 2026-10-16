@@ -520,41 +520,156 @@ fn wants_auto_language(language: &str) -> bool {
     )
 }
 
-pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Settings) {
-    let language = settings.language.trim().to_ascii_lowercase();
-    let wants_multilingual = wants_auto_language(&language) || settings.engine != "gigaam";
+/// Что уже лежит на диске и прошло проверку - вход для `plan_local_models`.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InstalledModels {
+    pub gigaam_fp32: bool,
+    pub gigaam_int8: bool,
+    /// Валидные Whisper `.bin`: имя файла и размер.
+    pub whisper: Vec<(String, u64)>,
+    /// Пользователь сам удалил полную GigaAM (метка `gigaam-fp32.skip`).
+    pub fp32_opted_out: bool,
+}
 
-    let configured_model_is_usable = is_whisper_catalog_name(&settings.model);
+/// Решение автоподготовки моделей: что записать в настройки и что качать.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ModelPlan {
+    /// Настроенной Whisper нет - взять эту установленную (`settings.model`).
+    pub set_model: Option<String>,
+    /// Модель по умолчанию, которую надо скачать.
+    pub download: Option<String>,
+    /// Фоновая загрузка полной GigaAM (D-040).
+    pub download_fp32: bool,
+}
+
+/// Чистый выбор без ФС (D-042): уже установленная годная модель важнее загрузки
+/// по умолчанию. `ru` - GigaAM fp32/int8, иначе Whisper; `en` - Parakeet или Whisper
+/// (en+gigaam и раньше ничего не качал); auto и whisper-движки - Whisper.
+/// Облачный провайдер настройки не трогает, загрузки считаются так же.
+pub(crate) fn plan_local_models(
+    language: &str,
+    engine: &str,
+    stt_provider: &str,
+    configured_model: &str,
+    installed: &InstalledModels,
+) -> ModelPlan {
+    let language = language.trim().to_ascii_lowercase();
+    let auto = wants_auto_language(&language);
     let russian = language == "ru" || language == "russian";
-    let uses_gigaam = settings.engine == "gigaam" && (russian || wants_auto_language(&language));
-    let name = if wants_multilingual && configured_model_is_usable {
-        settings.model.clone()
-    } else if wants_multilingual {
-        RECOMMENDED_WHISPER_NAME.to_string()
-    } else if russian {
-        GIGAAM_NAME.to_string()
+    let gigaam_engine = engine == "gigaam";
+    let configured_ok = installed.whisper.iter().any(|(n, _)| n == configured_model);
+    let largest = installed
+        .whisper
+        .iter()
+        .max_by_key(|(_, size)| *size)
+        .map(|(n, _)| n.clone());
+    let whisper_any = configured_ok || largest.is_some();
+    let gigaam_any = installed.gigaam_fp32 || installed.gigaam_int8;
+
+    let set_model = if stt_provider == "local" && !configured_ok {
+        largest
     } else {
+        None
+    };
+    let download = if (!gigaam_engine || auto) && !whisper_any {
+        Some(if is_whisper_catalog_name(configured_model) {
+            configured_model.to_string()
+        } else {
+            RECOMMENDED_WHISPER_NAME.to_string()
+        })
+    } else if gigaam_engine && russian && !gigaam_any && !whisper_any {
+        Some(GIGAAM_NAME.to_string())
+    } else {
+        None
+    };
+    // Русский уже распознаёт установленная Whisper - полную GigaAM не тянем.
+    let ru_on_whisper = russian && !gigaam_any && whisper_any;
+    let uses_gigaam = gigaam_engine && (russian || auto);
+    ModelPlan {
+        set_model,
+        download,
+        download_fp32: wants_fp32_download(uses_gigaam, installed.fp32_opted_out)
+            && !installed.gigaam_fp32
+            && !ru_on_whisper,
+    }
+}
+
+/// Валидные Whisper `.bin` в папке моделей (проверка размера и суммы с маркером).
+fn installed_whisper_models() -> Vec<(String, u64)> {
+    let Ok(rd) = std::fs::read_dir(crate::paths::models_dir()) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("bin")
+                || verify_whisper_model_path(&path).is_err()
+            {
+                return None;
+            }
+            let name = path.file_name()?.to_str()?.to_string();
+            Some((name, entry.metadata().map(|m| m.len()).unwrap_or(0)))
+        })
+        .collect()
+}
+
+/// Записать найденную Whisper в настройки, чтобы UI показывал правду. Если
+/// пользователь за это время сам сменил модель - его выбор не трогаем.
+fn adopt_installed_whisper(app: &AppHandle, from: &str, to: &str) {
+    use tauri::Manager;
+    let Some(state) = app.try_state::<crate::commands::AppState>() else {
         return;
     };
+    let mut next = state.settings.lock().clone();
+    if next.model != from {
+        return;
+    }
+    next.model = to.to_string();
+    if let Err(e) = crate::settings::save(&state.db.lock(), &next) {
+        log::error!("ensure_default_models: не записал модель {to}: {e:#}");
+        return;
+    }
+    {
+        let mut cur = state.settings.lock();
+        if cur.model != from {
+            return;
+        }
+        cur.model = to.to_string();
+        next = cur.clone();
+    }
+    log::info!("ensure_default_models: {from} нет, используем установленную {to}");
+    let _ = app.emit("settings_changed", next.redacted_for_renderer());
+}
 
-    let proxy = settings.proxy_url.clone();
+pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Settings) {
+    let settings = settings.clone();
     // Проверка legacy-файла может включать однократный SHA больших весов, поэтому
     // не блокируем setup/UI. Успешная проверка пишет marker и следующие старты быстры.
     std::thread::spawn(move || {
-        let ready = if find_dir_model(&name).is_some() {
-            verify_dir_model(&name).is_ok()
-        } else {
-            verify_whisper_model_path(&crate::paths::model_path(&name)).is_ok()
+        let installed = InstalledModels {
+            gigaam_fp32: verify_dir_model(GIGAAM_FP32_NAME).is_ok(),
+            gigaam_int8: verify_dir_model(GIGAAM_NAME).is_ok(),
+            whisper: installed_whisper_models(),
+            fp32_opted_out: fp32_opt_out_path().exists(),
         };
-        if !ready {
+        let plan = plan_local_models(
+            &settings.language,
+            &settings.engine,
+            &settings.stt_provider,
+            &settings.model,
+            &installed,
+        );
+        if let Some(to) = &plan.set_model {
+            adopt_installed_whisper(&app, &settings.model, to);
+        }
+        let proxy = settings.proxy_url.clone();
+        if let Some(name) = plan.download {
             if let Err(e) = start_download(app.clone(), name, proxy.clone()) {
                 log::error!("ensure_default_models: {e:#}");
             }
         }
         // Полная GigaAM - в фоне и после int8: пока она не готова, работает int8.
-        if wants_fp32_download(uses_gigaam, fp32_opt_out_path().exists())
-            && verify_dir_model(GIGAAM_FP32_NAME).is_err()
-        {
+        if plan.download_fp32 {
             while GIGAAM_DOWNLOADING.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_secs(2));
             }
@@ -1162,5 +1277,166 @@ mod tests {
         assert!(delete("../voxflow.db").is_err());
         assert!(delete("C:\\Users\\Public\\victim.bin").is_err());
         assert!(is_whisper_catalog_name("ggml-large-v3.bin"));
+    }
+
+    fn installed(fp32: bool, int8: bool, whisper: &[(&str, u64)]) -> InstalledModels {
+        InstalledModels {
+            gigaam_fp32: fp32,
+            gigaam_int8: int8,
+            whisper: whisper.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
+            fp32_opted_out: false,
+        }
+    }
+
+    const TURBO: &str = RECOMMENDED_WHISPER_NAME;
+    const OTHER: &str = "ggml-large-v3.bin";
+
+    #[test]
+    fn plan_ru_uses_installed_gigaam_without_download() {
+        let fp32 = plan_local_models("ru", "gigaam", "local", TURBO, &installed(true, false, &[]));
+        assert_eq!(fp32.download, None);
+        assert!(!fp32.download_fp32);
+        // Только int8: ничего не качаем, кроме фоновой полной (D-040).
+        let int8 = plan_local_models("ru", "gigaam", "local", TURBO, &installed(false, true, &[]));
+        assert_eq!(int8.download, None);
+        assert!(int8.download_fp32);
+    }
+
+    #[test]
+    fn plan_ru_without_gigaam_falls_back_to_installed_whisper() {
+        let plan = plan_local_models(
+            "ru",
+            "gigaam",
+            "local",
+            TURBO,
+            &installed(false, false, &[(OTHER, 3)]),
+        );
+        assert_eq!(
+            plan,
+            ModelPlan {
+                set_model: Some(OTHER.into()),
+                download: None,
+                download_fp32: false,
+            }
+        );
+    }
+
+    #[test]
+    fn plan_en_and_other_languages_never_download_for_gigaam_engine() {
+        for lang in ["en", "de"] {
+            let none = plan_local_models(
+                lang,
+                "gigaam",
+                "local",
+                TURBO,
+                &installed(false, false, &[]),
+            );
+            assert_eq!(none, ModelPlan::default(), "{lang}");
+        }
+        // en без Parakeet, но с чужой Whisper: берём её в настройки.
+        let plan = plan_local_models(
+            "en",
+            "gigaam",
+            "local",
+            TURBO,
+            &installed(false, false, &[(OTHER, 3)]),
+        );
+        assert_eq!(plan.set_model.as_deref(), Some(OTHER));
+        assert_eq!(plan.download, None);
+    }
+
+    #[test]
+    fn plan_auto_picks_largest_valid_whisper() {
+        let plan = plan_local_models(
+            "auto",
+            "gigaam",
+            "local",
+            TURBO,
+            &installed(
+                false,
+                false,
+                &[("ggml-small.bin", 1), (OTHER, 9), ("ggml-base.bin", 2)],
+            ),
+        );
+        assert_eq!(plan.set_model.as_deref(), Some(OTHER));
+        assert_eq!(plan.download, None);
+        // auto+gigaam тянет полную GigaAM как раньше.
+        assert!(plan.download_fp32);
+    }
+
+    #[test]
+    fn plan_configured_whisper_present_changes_nothing() {
+        let plan = plan_local_models(
+            "auto",
+            "whisper_server",
+            "local",
+            TURBO,
+            &installed(false, false, &[(TURBO, 1), (OTHER, 9)]),
+        );
+        assert_eq!(plan, ModelPlan::default());
+    }
+
+    #[test]
+    fn plan_auto_gigaam_with_only_gigaam_still_downloads_whisper() {
+        // GigaAM для auto - как сейчас: Whisper всё равно нужна для смеси языков.
+        let plan = plan_local_models(
+            "auto",
+            "gigaam",
+            "local",
+            TURBO,
+            &installed(true, true, &[]),
+        );
+        assert_eq!(plan.download.as_deref(), Some(TURBO));
+        assert!(!plan.download_fp32);
+    }
+
+    #[test]
+    fn plan_nothing_installed_keeps_previous_downloads() {
+        let ru = plan_local_models(
+            "ru",
+            "gigaam",
+            "local",
+            TURBO,
+            &installed(false, false, &[]),
+        );
+        assert_eq!(ru.download.as_deref(), Some(GIGAAM_NAME));
+        assert!(ru.download_fp32);
+        let auto = plan_local_models(
+            "auto",
+            "whisper_server",
+            "local",
+            OTHER,
+            &installed(false, false, &[]),
+        );
+        assert_eq!(auto.download.as_deref(), Some(OTHER));
+        assert_eq!(auto.set_model, None);
+        let custom = plan_local_models(
+            "auto",
+            "whisper_server",
+            "local",
+            "my.bin",
+            &installed(false, false, &[]),
+        );
+        assert_eq!(custom.download.as_deref(), Some(TURBO));
+    }
+
+    #[test]
+    fn plan_cloud_provider_does_not_touch_settings() {
+        let plan = plan_local_models(
+            "auto",
+            "gigaam",
+            "deepgram",
+            TURBO,
+            &installed(false, false, &[(OTHER, 3)]),
+        );
+        assert_eq!(plan.set_model, None);
+        assert_eq!(plan.download, None);
+    }
+
+    #[test]
+    fn plan_respects_fp32_opt_out() {
+        let mut inst = installed(false, true, &[]);
+        inst.fp32_opted_out = true;
+        assert!(!plan_local_models("ru", "gigaam", "local", TURBO, &inst).download_fp32);
     }
 }

@@ -179,6 +179,11 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
             log::warn!("warmup после смены языка не отправился: {e}");
         }
     }
+    // Сменился язык или движок - подобрать уже установленную модель под маршрут
+    // (D-042), качать только если для него нет ни одной.
+    if lang_changed || settings.engine != previous.engine {
+        models::ensure_default_models(app, &settings);
+    }
     Ok(())
 }
 
