@@ -9,7 +9,7 @@ window.STATE =
   "briefFile": "2026-10-16-brief.md",
   "memoryFile": "CLAUDE.md",
   "startedAt": "2026-10-16T14:00:30+03:00",
-  "updatedAt": "2026-10-16T14:30:36+03:00",
+  "updatedAt": "2026-10-16T14:31:10+03:00",
   "finishedAt": null,
   "stages": [
     {
@@ -48,7 +48,7 @@ window.STATE =
       "id": "build",
       "status": "active",
       "startedAt": "2026-10-16T14:15:37+03:00",
-      "note": "1 из 5 тасков готов"
+      "note": "2 из 5 тасков готовы"
     },
     {
       "id": "review",
@@ -62,8 +62,8 @@ window.STATE =
   ],
   "requirements": {
     "total": 11,
-    "done": 1,
-    "inTicket": 9,
+    "done": 2,
+    "inTicket": 8,
     "inSpec": 0,
     "placeholder": 0,
     "deferred": 0,
@@ -88,10 +88,20 @@ window.STATE =
         "script/setup-macos-signing.sh",
         ".github/workflows/"
       ],
-      "status": "review",
+      "status": "done",
       "retries": 0,
       "repairs": 2,
-      "startedAt": "2026-10-16T14:15:37+03:00"
+      "startedAt": "2026-10-16T14:15:37+03:00",
+      "finishedAt": "2026-10-16T14:31:10+03:00",
+      "commit": "76a4a4a",
+      "tests": {
+        "passed": 0,
+        "failed": 0
+      },
+      "concerns": [
+        "Полная сборка tauri build на самоподписи и шаг CI не гонялись локально - первая проверка в релизном CI",
+        "Ключ на маке владельца создаётся запуском script/setup-macos-signing.sh"
+      ]
     },
     {
       "id": "02",
