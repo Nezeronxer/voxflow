@@ -171,6 +171,20 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
     if settings.ai_backend == "builtin" && previous.ai_backend != "builtin" {
         crate::local_llm::warmup(&settings);
     }
+    // Ollama (D-044): модель держится в памяти, поэтому прежнюю выгружаем,
+    // а новую греем сразу - первая диктовка не ждёт загрузку.
+    let ollama_changed = settings.ai_backend != previous.ai_backend
+        || settings.ollama_model != previous.ollama_model
+        || settings.ollama_url != previous.ollama_url;
+    if ollama_changed {
+        if previous.ai_backend == "ollama" {
+            let (url, model) = (previous.ollama_url.clone(), previous.ollama_model.clone());
+            let _ = std::thread::Builder::new()
+                .name("voxflow-ollama-unload".into())
+                .spawn(move || crate::ollama::unload(&url, &model));
+        }
+        crate::ollama::warmup(&settings);
+    }
     // Язык сменился → фоновый прогрев движка под новые настройки: без него первый
     // Start после переключения на en/auto синхронно грузит ~650 МБ Parakeet и
     // подвешивает начало диктовки на секунды.

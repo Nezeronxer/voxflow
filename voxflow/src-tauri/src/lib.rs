@@ -216,6 +216,7 @@ pub fn run() {
             // Выбранная локальная ИИ-модель не установлена - взять установленную (D-043).
             local_ai::spawn_adopt_installed(handle.clone(), startup_settings.clone());
             local_llm::warmup(&startup_settings);
+            ollama::warmup(&startup_settings);
 
             // Показать окно настроек при запуске, НО не при автозапуске (тогда — в трей).
             // Исключение: не хватает доступов - показываем окно с карточкой «Доступы»,
@@ -1209,6 +1210,11 @@ fn request_shutdown(app: &tauri::AppHandle) {
     }
     local_llm::stop();
     if let Some(state) = app.try_state::<AppState>() {
+        // Модель Ollama держится с keep_alive -1 (D-044) - отпускаем память.
+        let s = state.settings.lock().clone();
+        if s.ai_backend == "ollama" {
+            ollama::unload(&s.ollama_url, &s.ollama_model);
+        }
         state.engine.restore_auto_mute();
         let _ = state.engine_tx.lock().send(EngineCmd::Shutdown);
     }

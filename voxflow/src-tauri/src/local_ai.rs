@@ -588,6 +588,7 @@ fn adopt(app: &tauri::AppHandle, snapshot: &crate::settings::Settings, plan: Loc
             &snapshot.ollama_model
         }
     );
+    crate::ollama::warmup(&next);
     let _ = app.emit("settings_changed", next.redacted_for_renderer());
 }
 

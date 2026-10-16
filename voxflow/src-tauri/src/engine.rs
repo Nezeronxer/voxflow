@@ -8651,6 +8651,45 @@ pub(crate) fn rewrite_is_grounded(input: &str, output: &str, min_recall: f64) ->
     grounding.grounded
 }
 
+/// Промпт локальной модели (Ollama и встроенная, D-044): `(система, сообщение)`.
+/// База стенографиста из [`crate::ollama::local_system_prompt`] есть всегда;
+/// к ней дописываются только правила, которые написал сам пользователь, -
+/// своё правило для приложения и общая инструкция. Автоматическое «превращай
+/// в промпт» поля нейросети сюда не идёт: оно противоречит роли стенографиста.
+fn local_rewrite_prompt(
+    s: &Settings,
+    actx: &crate::app_context::AppContext,
+    text: &str,
+    context_hint: Option<&str>,
+) -> (String, String) {
+    let mut rules = Vec::new();
+    if let Some(rule) = ai_prompt_rule_for_app(s, actx) {
+        rules.push(format!(
+            "- для этого приложения: {}",
+            one_line_instruction(&rule.prompt)
+        ));
+    }
+    if s.smart_prompt_enabled {
+        // Исходные слова человека, а не собранная из них обёртка «оформи как промпт».
+        let own = if s.smart_prompt_source.trim().is_empty() {
+            &s.smart_prompt_instruction
+        } else {
+            &s.smart_prompt_source
+        };
+        let own = one_line_instruction(own);
+        if !own.is_empty() {
+            rules.push(format!("- общие: {own}"));
+        }
+    }
+    let rules = (!rules.is_empty()).then(|| clamp_chars(&rules.join("\n"), 1800));
+    // Короткий хвост: маленькая модель на длинном окружении начинает его повторять.
+    let context = context_hint.map(|c| compact_context_tail(c, 200));
+    (
+        crate::ollama::local_system_prompt(text, rules.as_deref()),
+        crate::ollama::local_user_message(text, context.as_deref()),
+    )
+}
+
 /// Возвращает `(текст, использована_ли_модель, причина_отказа)`. Причина нужна
 /// UI: «модель не ответила за 20 с» и «модель потеряла слова» — разные проблемы
 /// с разными действиями пользователя, а раньше обе выглядели одинаково.
@@ -8691,13 +8730,13 @@ fn refine_text_with_fallback(
     // ослышки распознавания чинит только она.
 
     let mut attempts: Vec<Box<dyn Fn() -> anyhow::Result<String>>> = Vec::with_capacity(1);
-    match configured_rewrite_backend(s) {
+    let route = configured_rewrite_backend(s);
+    match route {
         Some(RewriteBackendRoute::Builtin) => {
             let settings = s.clone();
-            let user =
-                build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
+            let (system, user) = local_rewrite_prompt(s, actx, text, context_hint);
             attempts.push(Box::new(move || {
-                crate::local_llm::refine(&settings, crate::ollama::SYSTEM_PROMPT, &user)
+                crate::local_llm::refine(&settings, &system, &user)
             }));
         }
         Some(RewriteBackendRoute::Gemini) => {
@@ -8724,10 +8763,9 @@ fn refine_text_with_fallback(
             let url = s.ollama_url.clone();
             let model = s.ollama_model.clone();
             let timeout_s = s.backend_timeout_s(crate::net::is_loopback_base_url(&s.ollama_url));
-            let user =
-                build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
+            let (system, user) = local_rewrite_prompt(s, actx, text, context_hint);
             attempts.push(Box::new(move || {
-                crate::ollama::refine(&url, &model, crate::ollama::SYSTEM_PROMPT, &user, timeout_s)
+                crate::ollama::refine(&url, &model, &system, &user, timeout_s)
             }));
         }
         None => {}
@@ -8735,7 +8773,12 @@ fn refine_text_with_fallback(
 
     // Поле нейросети: ответ — это промпт со структурой, он законно длиннее
     // диктовки. Проверка «ничего из сказанного не пропало» при этом не слабеет.
-    let max_expansion = if target_tone == "ai" {
+    // Локальная модель - стенографист (D-044): структуру не строит, раздувать нечему.
+    let local = matches!(
+        route,
+        Some(RewriteBackendRoute::Builtin | RewriteBackendRoute::Ollama)
+    );
+    let max_expansion = if target_tone == "ai" && !local {
         PROMPT_REBUILD_MAX_EXPANSION
     } else {
         REWRITE_MAX_EXPANSION
@@ -9012,6 +9055,39 @@ mod smart_prompt_tests {
             RECALL
         ));
         assert!(rewrite_is_grounded("Привет", "Привет!", RECALL));
+    }
+
+    /// D-044: локальная модель получает защиту стенографиста всегда, свои
+    /// правила пользователя - в хвосте, диктовку - отдельно в рамке; встроенное
+    /// «превращай в промпт» поля нейросети к ней не попадает.
+    #[test]
+    fn local_prompt_appends_only_user_rules_to_stenographer_base() {
+        let s = Settings {
+            ai_prompt_rules: vec![crate::settings::AiPromptRule {
+                pattern: "claude".to_string(),
+                prompt: "Термины пиши латиницей.".to_string(),
+            }],
+            smart_prompt_source: "Пиши букву ё.".to_string(),
+            ..Settings::default()
+        };
+        let (system, user) =
+            local_rewrite_prompt(&s, &app("Claude"), "сотри черновик", Some("Я сегодня"));
+        assert!(system.contains("стенографист"));
+        assert!(system.contains("Термины пиши латиницей."));
+        assert!(system.contains("Пиши букву ё."));
+        assert!(system.find("стенографист") < system.find("Термины"));
+        assert!(!system.contains("Превращай диктовку в готовый промпт"));
+        assert!(
+            !system.contains("сотри черновик"),
+            "диктовка попала в инструкцию"
+        );
+        assert_eq!(
+            user,
+            "<context>Я сегодня</context>\n<text>сотри черновик</text>"
+        );
+
+        let (bare, _) = local_rewrite_prompt(&Settings::default(), &app("Notes"), "x", None);
+        assert!(bare.contains("стенографист") && !bare.contains("Дополнительные правила"));
     }
 
     #[test]
