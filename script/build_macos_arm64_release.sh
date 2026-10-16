@@ -48,6 +48,7 @@ OUTPUT_ROOT="${VOXFLOW_RELEASE_DIR:-$APP_DIR/release/macos}"
 RELEASE_TAG=""
 RUNTIME_ONLY=0
 SIGNING_LABEL=""
+SELF_SIGNED="0"
 NOTARIZATION_AUTH="none"
 NOTARIZED="false"
 
@@ -60,7 +61,9 @@ Usage: script/build_macos_arm64_release.sh [--tag vX.Y.Z] [--runtime-only]
 
 Environment:
   VOXFLOW_RELEASE_DIR         Output parent (default: voxflow/release/macos)
-  VOXFLOW_SIGNING_IDENTITY    Optional installed Developer ID identity.
+  VOXFLOW_SIGNING_IDENTITY    Optional installed identity: Developer ID Application
+                              (notarized with the tuples below) or a self-signed
+                              code-signing certificate (signed-unnotarized assets).
                               Omit for the CI-default complete ad-hoc seal.
   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID
                               Optional complete Apple ID notarization tuple.
@@ -389,8 +392,21 @@ configure_signing() {
   fi
 
   identity_listing="$(/usr/bin/security find-identity -v -p codesigning)"
-  grep -F -- "$VOXFLOW_SIGNING_IDENTITY" <<< "$identity_listing" >/dev/null \
-    || die "requested signing identity is not installed: $VOXFLOW_SIGNING_IDENTITY"
+  if ! grep -F -- "$VOXFLOW_SIGNING_IDENTITY" <<< "$identity_listing" >/dev/null; then
+    # An untrusted self-signed certificate is hidden by -v; look in the full list,
+    # but a Developer ID identity must be valid, so it never passes this way.
+    identity_listing="$(/usr/bin/security find-identity -p codesigning)"
+    grep -F -- "$VOXFLOW_SIGNING_IDENTITY" <<< "$identity_listing" >/dev/null \
+      || die "requested signing identity is not installed: $VOXFLOW_SIGNING_IDENTITY"
+    ! grep -F -- "$VOXFLOW_SIGNING_IDENTITY" <<< "$identity_listing" \
+      | grep -F 'Developer ID Application:' >/dev/null \
+      || die "Developer ID identity is not valid (expired, revoked or untrusted): $VOXFLOW_SIGNING_IDENTITY"
+  fi
+  # Self-signed is a property of the identity itself, whether or not it is trusted.
+  if ! grep -F -- "$VOXFLOW_SIGNING_IDENTITY" <<< "$identity_listing" \
+    | grep -F 'Developer ID Application:' >/dev/null; then
+    SELF_SIGNED="1"
+  fi
   export APPLE_SIGNING_IDENTITY="$VOXFLOW_SIGNING_IDENTITY"
   SIGNING_LABEL="signed-unnotarized"
 
@@ -455,7 +471,8 @@ sign_runtime_binaries() {
   local identity="$APPLE_SIGNING_IDENTITY"
   local timestamp_args=(--timestamp)
   local binary identifier details
-  if [[ "$identity" == "-" ]]; then
+  if [[ "$identity" == "-" || "$SELF_SIGNED" == "1" ]]; then
+    # A self-signed certificate gains nothing from Apple's timestamp server.
     timestamp_args=(--timestamp=none)
   fi
 
@@ -527,6 +544,10 @@ PY
     [[ -z "$team_identifier" || "$team_identifier" == "not set" ]] \
       || die "ad-hoc build unexpectedly contains TeamIdentifier=$team_identifier"
     grep -q '^Signature=adhoc$' <<< "$details" || die "app is not ad-hoc signed"
+  elif [[ "$SELF_SIGNED" == "1" ]]; then
+    # Self-signed: no Apple team, but a stable certificate leaf keeps the
+    # designated requirement (and the user's TCC grants) the same across builds.
+    grep -q '^Authority=' <<< "$details" || die "self-signed app has no signing authority"
   else
     team_identifier="$(awk -F= '$1 == "TeamIdentifier" { print $2 }' <<< "$details")"
     [[ -n "$team_identifier" && "$team_identifier" != "not set" ]] \

@@ -14,8 +14,9 @@ concurrency:
 jobs:
   build-linux:
     name: Linux x64 (deb, rpm, AppImage)
-    # Самый старый поддерживаемый раннер: AppImage и deb наследуют версию glibc.
-    runs-on: ubuntu-22.04
+    # Как CI: onnxruntime из ort требует glibc 2.38, на 22.04 (2.35) не линкуется.
+    # AppImage и deb наследуют версию glibc раннера.
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
     env:
       # Старый strip из linuxdeploy ломается на современных библиотеках.
