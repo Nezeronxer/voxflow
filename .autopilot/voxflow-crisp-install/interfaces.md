@@ -27,3 +27,21 @@
 - Не хватает зависимости/инструмента - не ставь сам, верни `BLOCKED` с названием.
 - Секреты (ключи, пароли, p12) никогда не печатать в вывод, не писать в репозиторий и в ответ.
 - Тексты для пользователя - по-русски, короткое тире «-», без канцелярита.
+
+## Из таска 01 - подпись и Linux
+
+- Секреты CI: `MACOS_SELF_SIGNED_P12_BASE64`, `MACOS_SELF_SIGNED_P12_PASSWORD` (в `workflow_call` и `release.yml`). Developer ID имеет приоритет; без секретов - ad-hoc.
+- Identity `VoxFlow Self-Signed`; режим CI `self-signed-unnotarized`; ассеты `VoxFlow-macOS-X.Y.Z-arm64-signed-unnotarized.dmg` и `.app.zip`; `updater.rs` не менялся.
+- Создание ключа: `./script/setup-macos-signing.sh` (`--repo OWNER/NAME`, по умолчанию `Nezeronxer/voxflow`; `--keychain PATH` - локальный тест без GitHub). Системный диалог пароля при доверии сертификату.
+- DR самоподписи: `identifier "com.nezeronxer.voxflow.macos" and certificate leaf = H"…"` - стабилен между сборками.
+- Linux-релиз на ubuntu-24.04: нужен glibc 2.38+ (Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch).
+
+## Из таска 02 - установщик
+
+- `curl -fsSL https://raw.githubusercontent.com/Nezeronxer/voxflow/master/script/install-macos.sh | bash`; `VOXFLOW_VERSION=x.y.z`, `VOXFLOW_DRY_RUN=1`; код 0 - успех/«уже последняя»/пробный, 1 - ошибка (фраза в stderr).
+- Берёт единственный `-arm64*.dmg` релиза, суммы из `SHA256SUMS.txt` (или `SHA256SUMS`), `codesign --verify` перед заменой.
+
+## Из таска 03 - доступы
+
+- Tauri: `permissions_status()` → `{ microphone: "granted"|"notDetermined"|"denied", accessibility, inputMonitoring, missing: [...] }`; `permission_request(kind)`.
+- Фронт: `PermissionsCard` в `Dashboard`, логика в `permissionsState.ts`. Онбординг при запуске больше не открывает настройки сам и не шлёт тост.

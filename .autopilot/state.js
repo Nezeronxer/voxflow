@@ -9,7 +9,7 @@ window.STATE =
   "briefFile": "2026-10-16-brief.md",
   "memoryFile": "CLAUDE.md",
   "startedAt": "2026-10-16T14:00:30+03:00",
-  "updatedAt": "2026-10-16T14:12:02+03:00",
+  "updatedAt": "2026-10-16T14:30:36+03:00",
   "finishedAt": null,
   "stages": [
     {
@@ -33,20 +33,27 @@ window.STATE =
     },
     {
       "id": "spec",
-      "status": "active",
-      "startedAt": "2026-10-16T14:12:02+03:00"
+      "status": "done",
+      "startedAt": "2026-10-16T14:12:02+03:00",
+      "finishedAt": "2026-10-16T14:15:37+03:00"
     },
     {
       "id": "plan",
-      "status": "pending"
+      "status": "done",
+      "startedAt": "2026-10-16T14:15:37+03:00",
+      "finishedAt": "2026-10-16T14:15:37+03:00",
+      "note": "5 тасков, ярус T2, 2 волны"
     },
     {
       "id": "build",
-      "status": "pending"
+      "status": "active",
+      "startedAt": "2026-10-16T14:15:37+03:00",
+      "note": "1 из 5 тасков готов"
     },
     {
       "id": "review",
-      "status": "pending"
+      "status": "active",
+      "startedAt": "2026-10-16T14:30:36+03:00"
     },
     {
       "id": "final",
@@ -55,8 +62,8 @@ window.STATE =
   ],
   "requirements": {
     "total": 11,
-    "done": 0,
-    "inTicket": 0,
+    "done": 1,
+    "inTicket": 9,
     "inSpec": 0,
     "placeholder": 0,
     "deferred": 0,
@@ -81,9 +88,10 @@ window.STATE =
         "script/setup-macos-signing.sh",
         ".github/workflows/"
       ],
-      "status": "pending",
+      "status": "review",
       "retries": 0,
-      "repairs": 0
+      "repairs": 2,
+      "startedAt": "2026-10-16T14:15:37+03:00"
     },
     {
       "id": "02",
@@ -104,9 +112,10 @@ window.STATE =
         "script/install-macos.sh",
         "README.md"
       ],
-      "status": "pending",
+      "status": "repair",
       "retries": 0,
-      "repairs": 0
+      "repairs": 2,
+      "startedAt": "2026-10-16T14:21:13+03:00"
     },
     {
       "id": "03",
@@ -125,9 +134,20 @@ window.STATE =
         "voxflow/src-tauri/src/lib.rs",
         "voxflow/src/"
       ],
-      "status": "pending",
+      "status": "done",
       "retries": 0,
-      "repairs": 0
+      "repairs": 1,
+      "startedAt": "2026-10-16T14:15:37+03:00",
+      "finishedAt": "2026-10-16T14:30:36+03:00",
+      "commit": "a8ab5f5",
+      "tests": {
+        "passed": 460,
+        "failed": 0
+      },
+      "concerns": [
+        "Системное окно микрофона и показ окна при автозапуске без доступов руками не проверены",
+        "При автозапуске без доступов окно показывается при каждом входе, пока их не выдадут"
+      ]
     },
     {
       "id": "04",
@@ -149,9 +169,10 @@ window.STATE =
         "voxflow/src-tauri/src/engine.rs",
         "DECISIONS.md"
       ],
-      "status": "pending",
+      "status": "in-progress",
       "retries": 0,
-      "repairs": 0
+      "repairs": 0,
+      "startedAt": "2026-10-16T14:15:37+03:00"
     },
     {
       "id": "05",
@@ -179,7 +200,10 @@ window.STATE =
     }
   ],
   "singlePass": null,
-  "tests": null,
+  "tests": {
+    "passed": 460,
+    "failed": 0
+  },
   "debt": {
     "placeholders": [],
     "assumptions": [

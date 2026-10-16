@@ -26,3 +26,5 @@
 - [ ] `npm audit --audit-level=high` в voxflow/ зелёный (иначе `npm audit fix`, меняется только lock)
 - [ ] Полный набор гейтов CI локально: cargo fmt --check, clippy, cargo test --lib, tsc, node --test, vite build
 - [ ] Заметки и D-039 написаны
+- [ ] В окно .dmg macOS (сборка в `script/build_macos_arm64_release.sh`) добавлен файл «Если macOS ругается.txt» с одним шагом: «Системные настройки → Конфиденциальность и безопасность → Всё равно открыть», плюс строка про установку одной командой (R07.1, перенесено из таска 02)
+- [ ] Имя файла контрольных сумм в релизе - как в `release.yml` (`SHA256SUMS.txt`); `script/install-macos.sh` его находит
