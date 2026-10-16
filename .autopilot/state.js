@@ -9,7 +9,7 @@ window.STATE =
   "briefFile": "2026-10-16-brief.md",
   "memoryFile": "CLAUDE.md",
   "startedAt": "2026-10-16T14:00:30+03:00",
-  "updatedAt": "2026-10-16T14:31:10+03:00",
+  "updatedAt": "2026-10-16T14:32:03+03:00",
   "finishedAt": null,
   "stages": [
     {
@@ -48,7 +48,7 @@ window.STATE =
       "id": "build",
       "status": "active",
       "startedAt": "2026-10-16T14:15:37+03:00",
-      "note": "2 из 5 тасков готовы"
+      "note": "3 из 5 тасков готовы"
     },
     {
       "id": "review",
@@ -62,8 +62,8 @@ window.STATE =
   ],
   "requirements": {
     "total": 11,
-    "done": 2,
-    "inTicket": 8,
+    "done": 6,
+    "inTicket": 4,
     "inSpec": 0,
     "placeholder": 0,
     "deferred": 0,
@@ -122,10 +122,15 @@ window.STATE =
         "script/install-macos.sh",
         "README.md"
       ],
-      "status": "repair",
+      "status": "done",
       "retries": 0,
       "repairs": 2,
-      "startedAt": "2026-10-16T14:21:13+03:00"
+      "startedAt": "2026-10-16T14:21:13+03:00",
+      "finishedAt": "2026-10-16T14:32:03+03:00",
+      "commit": "4b702a8",
+      "concerns": [
+        "Ветки замены, закрытия приложения и прерывания не гонялись вживую - первая настоящая установка будет на этом маке после релиза"
+      ]
     },
     {
       "id": "03",
