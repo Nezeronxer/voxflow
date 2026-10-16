@@ -27,6 +27,8 @@ pub struct ModelInfo {
 
 /// Имя каталожного пункта GigaAM (это НЕ файл — набор из 4 файлов в models/gigaam/).
 pub const GIGAAM_NAME: &str = "gigaam-v3";
+/// Полная (fp32) GigaAM-v3: точнее int8 (D-038, D-040), своя папка рядом с int8.
+pub const GIGAAM_FP32_NAME: &str = "gigaam-v3-fp32";
 /// Имя каталожного пункта Parakeet TDT v3 (набор из 4 файлов в models/parakeet/).
 pub const PARAKEET_NAME: &str = "parakeet-v3";
 /// Единственный рекомендованный Whisper-пресет: multilingual, пригоден для RU/EN
@@ -38,6 +40,7 @@ pub const RECOMMENDED_WHISPER_NAME: &str = "ggml-large-v3-turbo-q5_0.bin";
 /// одновременно — два параллельных curl в один .part порвали бы файл.
 /// Whisper-модели сторожит WHISPER_ACTIVE ниже.
 static GIGAAM_DOWNLOADING: AtomicBool = AtomicBool::new(false);
+static GIGAAM_FP32_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 static PARAKEET_DOWNLOADING: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]
@@ -62,6 +65,29 @@ const GIGAAM_ARTIFACTS: &[Artifact] = &[
         name: "v3_e2e_rnnt_joint.int8.onnx",
         size_bytes: 687_791,
         sha256: "ade116563dbf66e503b0994efab6b5861412743e52bf31c39fc3fffa3783d5d1",
+    },
+    Artifact {
+        name: "v3_e2e_rnnt_vocab.txt",
+        size_bytes: 13_354,
+        sha256: "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7",
+    },
+];
+
+const GIGAAM_FP32_ARTIFACTS: &[Artifact] = &[
+    Artifact {
+        name: "v3_e2e_rnnt_encoder.onnx",
+        size_bytes: 885_084_534,
+        sha256: "cd60b3764a832e8560ae6d3ad0b10adc1a42ffae412b9476f25620aae4f4a508",
+    },
+    Artifact {
+        name: "v3_e2e_rnnt_decoder.onnx",
+        size_bytes: 4_599_910,
+        sha256: "7b0a16d67fd2cb37061decc93c69e364a9ab27afee3c57495d55b1c974cf7231",
+    },
+    Artifact {
+        name: "v3_e2e_rnnt_joint.onnx",
+        size_bytes: 2_712_896,
+        sha256: "602ff7017a93311aad34df1437c8d7f49911353c13d6eae7a6ee7b041339465c",
     },
     Artifact {
         name: "v3_e2e_rnnt_vocab.txt",
@@ -121,6 +147,16 @@ const DIR_MODELS: &[DirModel] = &[
         downloading: &GIGAAM_DOWNLOADING,
     },
     DirModel {
+        name: GIGAAM_FP32_NAME,
+        label: "GigaAM-v3 полная - точнее (885 МБ)",
+        size_mb: 885,
+        kind: "gigaam",
+        base_url: "https://huggingface.co/istupakov/gigaam-v3-onnx/resolve/322c3b29492673eb7d0b434bfa9dfb8653e34d02/",
+        files: GIGAAM_FP32_ARTIFACTS,
+        dir: gigaam_fp32_dir,
+        downloading: &GIGAAM_FP32_DOWNLOADING,
+    },
+    DirModel {
         name: PARAKEET_NAME,
         label: "Parakeet TDT v3 — быстрый English (явный EN)",
         size_mb: 640,
@@ -178,6 +214,11 @@ const CATALOG: &[Entry] = &[
 /// Каталог models/gigaam/ (4 ONNX/vocab файла GigaAM-v3).
 fn gigaam_dir() -> std::path::PathBuf {
     crate::paths::models_dir().join(crate::gigaam::GIGAAM_DIR)
+}
+
+/// Каталог models/gigaam-fp32/ (полная модель; int8 лежит отдельно).
+pub fn gigaam_fp32_dir() -> std::path::PathBuf {
+    crate::paths::models_dir().join(crate::gigaam::GIGAAM_FP32_DIR)
 }
 
 pub fn list() -> Vec<ModelInfo> {
@@ -376,6 +417,66 @@ pub fn dir_model_ready(name: &str) -> bool {
         .all(|artifact| artifact_fast_ready(&dir.join(artifact.name), *artifact))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GigaVariant {
+    Fp32,
+    Int8,
+}
+
+/// fp32 не прошла проверку или не загрузилась: до перезапуска идём на int8,
+/// а не мучаем каждую диктовку повторной загрузкой.
+static FP32_BROKEN: AtomicBool = AtomicBool::new(false);
+
+/// Есть чем распознавать русский: int8 или fp32.
+pub fn gigaam_available() -> bool {
+    gigaam_variant().is_some()
+}
+
+pub fn mark_gigaam_fp32_broken() {
+    FP32_BROKEN.store(true, Ordering::SeqCst);
+}
+
+fn files_present(dir: &std::path::Path, files: &[Artifact]) -> bool {
+    files
+        .iter()
+        .all(|a| artifact_fast_ready(&dir.join(a.name), *a))
+}
+
+/// Какая GigaAM нужна сейчас: готовая и не битая fp32, иначе int8, иначе ничего.
+fn gigaam_variant_in(
+    fp32_dir: &std::path::Path,
+    int8_dir: &std::path::Path,
+    fp32_broken: bool,
+) -> Option<GigaVariant> {
+    if !fp32_broken && files_present(fp32_dir, GIGAAM_FP32_ARTIFACTS) {
+        Some(GigaVariant::Fp32)
+    } else if files_present(int8_dir, GIGAAM_ARTIFACTS) {
+        Some(GigaVariant::Int8)
+    } else {
+        None
+    }
+}
+
+pub fn gigaam_variant() -> Option<GigaVariant> {
+    gigaam_variant_in(
+        &gigaam_fp32_dir(),
+        &gigaam_dir(),
+        FP32_BROKEN.load(Ordering::SeqCst),
+    )
+}
+
+/// Нужна ли фоновая загрузка полной модели: только тем, кто реально использует
+/// GigaAM (движок gigaam, язык русский или авто), если не удалял её сам.
+fn wants_fp32_download(uses_gigaam: bool, opted_out: bool) -> bool {
+    uses_gigaam && !opted_out
+}
+
+/// Метка «полную модель удалил сам пользователь»: автозагрузка её не возвращает,
+/// пока он не нажмёт «Скачать» (это и есть способ остаться на быстрой int8).
+fn fp32_opt_out_path() -> std::path::PathBuf {
+    crate::paths::models_dir().join("gigaam-fp32.skip")
+}
+
 pub fn verify_dir_model(name: &str) -> Result<()> {
     let model = find_dir_model(name).ok_or_else(|| anyhow!("Неизвестная модель: {name}"))?;
     let dir = (model.dir)();
@@ -389,6 +490,10 @@ pub fn delete(name: &str) -> Result<()> {
     // Каталожная ONNX-модель — это каталог, а не одиночный файл: сносим целиком
     // (вместе с .part).
     if let Some(m) = find_dir_model(name) {
+        if name == GIGAAM_FP32_NAME {
+            FP32_BROKEN.store(false, Ordering::SeqCst);
+            let _ = std::fs::write(fp32_opt_out_path(), b"");
+        }
         let dir = (m.dir)();
         if dir.exists() {
             std::fs::remove_dir_all(dir)?;
@@ -408,19 +513,25 @@ pub fn delete(name: &str) -> Result<()> {
 /// сразу получить multilingual Whisper large-v3-turbo для language=auto.
 /// GigaAM/Parakeet остаются выбираемыми спец-маршрутами, но не являются
 /// стартовым default: пользователь просил out-of-the-box мультиязычность.
+fn wants_auto_language(language: &str) -> bool {
+    matches!(
+        language,
+        "auto" | "all" | "any" | "multi" | "multilingual" | "*"
+    )
+}
+
 pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Settings) {
     let language = settings.language.trim().to_ascii_lowercase();
-    let wants_multilingual = matches!(
-        language.as_str(),
-        "auto" | "all" | "any" | "multi" | "multilingual" | "*"
-    ) || settings.engine != "gigaam";
+    let wants_multilingual = wants_auto_language(&language) || settings.engine != "gigaam";
 
     let configured_model_is_usable = is_whisper_catalog_name(&settings.model);
+    let russian = language == "ru" || language == "russian";
+    let uses_gigaam = settings.engine == "gigaam" && (russian || wants_auto_language(&language));
     let name = if wants_multilingual && configured_model_is_usable {
         settings.model.clone()
     } else if wants_multilingual {
         RECOMMENDED_WHISPER_NAME.to_string()
-    } else if language == "ru" || language == "russian" {
+    } else if russian {
         GIGAAM_NAME.to_string()
     } else {
         return;
@@ -436,8 +547,19 @@ pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Setting
             verify_whisper_model_path(&crate::paths::model_path(&name)).is_ok()
         };
         if !ready {
-            if let Err(e) = start_download(app, name, proxy) {
+            if let Err(e) = start_download(app.clone(), name, proxy.clone()) {
                 log::error!("ensure_default_models: {e:#}");
+            }
+        }
+        // Полная GigaAM - в фоне и после int8: пока она не готова, работает int8.
+        if wants_fp32_download(uses_gigaam, fp32_opt_out_path().exists())
+            && verify_dir_model(GIGAAM_FP32_NAME).is_err()
+        {
+            while GIGAAM_DOWNLOADING.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            if let Err(e) = start_download(app, GIGAAM_FP32_NAME.to_string(), proxy) {
+                log::error!("ensure_default_models fp32: {e:#}");
             }
         }
     });
@@ -502,6 +624,9 @@ pub fn start_download(app: AppHandle, name: String, proxy: String) -> Result<()>
 }
 
 fn spawn_download(app: AppHandle, name: String, proxy: String) -> Result<()> {
+    if name == GIGAAM_FP32_NAME {
+        let _ = std::fs::remove_file(fp32_opt_out_path());
+    }
     if let Some(m) = find_dir_model(&name) {
         // Уже качается → молча выходим: события прогресса и так летят от первого
         // потока, второй curl поверх того же .part устроил бы кашу.
@@ -666,6 +791,9 @@ fn run_download_dir(app: &AppHandle, m: &DirModel, proxy: &str) -> Result<()> {
         "model:progress",
         serde_json::json!({ "name": m.name, "received": total, "total": total }),
     );
+    if m.name == GIGAAM_FP32_NAME {
+        FP32_BROKEN.store(false, Ordering::SeqCst);
+    }
     let _ = app.emit("model:done", serde_json::json!({ "name": m.name }));
     Ok(())
 }
@@ -793,6 +921,112 @@ mod tests {
         assert!(model
             .base_url
             .contains("322c3b29492673eb7d0b434bfa9dfb8653e34d02"));
+    }
+
+    #[test]
+    fn gigaam_fp32_is_a_separate_pinned_catalog_entry() {
+        let fp32 = find_dir_model(GIGAAM_FP32_NAME).expect("fp32 в каталоге");
+        let int8 = find_dir_model(GIGAAM_NAME).expect("int8 в каталоге");
+        // Размеры и SHA-256 взяты из HF API (lfs.oid) для ревизии 322c3b29.
+        let expected = [
+            (
+                "v3_e2e_rnnt_encoder.onnx",
+                885_084_534_u64,
+                "cd60b3764a832e8560ae6d3ad0b10adc1a42ffae412b9476f25620aae4f4a508",
+            ),
+            (
+                "v3_e2e_rnnt_decoder.onnx",
+                4_599_910,
+                "7b0a16d67fd2cb37061decc93c69e364a9ab27afee3c57495d55b1c974cf7231",
+            ),
+            (
+                "v3_e2e_rnnt_joint.onnx",
+                2_712_896,
+                "602ff7017a93311aad34df1437c8d7f49911353c13d6eae7a6ee7b041339465c",
+            ),
+            (
+                "v3_e2e_rnnt_vocab.txt",
+                13_354,
+                "39abae20e692998290c574e606f11a9edef2902a1995463fcff63d1490cf22b7",
+            ),
+        ];
+        let actual: Vec<_> = fp32
+            .files
+            .iter()
+            .map(|a| (a.name, a.size_bytes, a.sha256))
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(fp32.base_url, int8.base_url);
+        assert_eq!(fp32.size_mb, 885);
+        assert_ne!((fp32.dir)(), (int8.dir)(), "папки не смешиваются");
+        assert_eq!(list()[1].name, GIGAAM_FP32_NAME);
+    }
+
+    /// Файлы нужного размера без содержимого (sparse): для проверки выбора
+    /// хватает размеров, как и у `dir_model_ready`.
+    fn fake_dir(dir: &std::path::Path, files: &[Artifact], skip_last: bool) {
+        std::fs::create_dir_all(dir).unwrap();
+        let n = if skip_last {
+            files.len() - 1
+        } else {
+            files.len()
+        };
+        for a in &files[..n] {
+            std::fs::File::create(dir.join(a.name))
+                .unwrap()
+                .set_len(a.size_bytes)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn gigaam_variant_prefers_ready_fp32_and_falls_back_to_int8() {
+        let tmp = std::env::temp_dir().join(format!("vf-variant-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (fp32, int8) = (tmp.join("fp32"), tmp.join("int8"));
+        assert_eq!(gigaam_variant_in(&fp32, &int8, false), None);
+
+        fake_dir(&int8, GIGAAM_ARTIFACTS, false);
+        // fp32 не скачана -> int8.
+        assert_eq!(
+            gigaam_variant_in(&fp32, &int8, false),
+            Some(GigaVariant::Int8)
+        );
+        // fp32 недокачана (нет последнего файла) -> int8.
+        fake_dir(&fp32, GIGAAM_FP32_ARTIFACTS, true);
+        assert_eq!(
+            gigaam_variant_in(&fp32, &int8, false),
+            Some(GigaVariant::Int8)
+        );
+        // fp32 готова -> fp32.
+        fake_dir(&fp32, GIGAAM_FP32_ARTIFACTS, false);
+        assert_eq!(
+            gigaam_variant_in(&fp32, &int8, false),
+            Some(GigaVariant::Fp32)
+        );
+        // fp32 не загрузилась (битая) -> int8 несмотря на размеры.
+        assert_eq!(
+            gigaam_variant_in(&fp32, &int8, true),
+            Some(GigaVariant::Int8)
+        );
+        // int8 нет, fp32 не битая -> fp32 одна.
+        std::fs::remove_dir_all(&int8).unwrap();
+        assert_eq!(
+            gigaam_variant_in(&fp32, &int8, false),
+            Some(GigaVariant::Fp32)
+        );
+        assert_eq!(gigaam_variant_in(&fp32, &int8, true), None);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn fp32_background_download_follows_russian_use_and_user_opt_out() {
+        // использует GigaAM (ru/авто, движок gigaam) - качаем
+        assert!(wants_fp32_download(true, false));
+        // не использует (другой движок или язык), даже если int8 лежит - нет
+        assert!(!wants_fp32_download(false, false));
+        // пользователь удалил полную сам - не навязываем
+        assert!(!wants_fp32_download(true, true));
     }
 
     #[test]

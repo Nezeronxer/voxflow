@@ -1017,6 +1017,21 @@ fn warmup(ctx: EngineCtx) {
             )),
         }
     }
+    // Полная GigaAM скачалась -> подменяем int8 в фоне, без участия диктовки.
+    // Подписка одна на процесс: warmup зовётся на каждый EngineCmd::Warmup.
+    static FP32_LISTENING: AtomicBool = AtomicBool::new(false);
+    if !FP32_LISTENING.swap(true, Ordering::SeqCst) {
+        use tauri::Listener;
+        let c = ctx.clone();
+        ctx.app.listen("model:done", move |ev| {
+            if ev
+                .payload()
+                .contains(&format!("\"{}\"", crate::models::GIGAAM_FP32_NAME))
+            {
+                upgrade_gigaam_in_background(c.clone());
+            }
+        });
+    }
     // Прогрев резидентного движка по маршруту (роутер языков, PLAN §2).
     let warm_gigaam = |ctx: &EngineCtx| match ensure_gigaam(ctx, &s) {
         Ok(()) => {
@@ -1059,10 +1074,7 @@ fn warmup(ctx: EngineCtx) {
         }
         LocalRoute::Whisper => {}
     }
-    if s.language == "auto"
-        && s.engine == "gigaam"
-        && crate::gigaam::dir_ready(&paths::gigaam_dir())
-    {
+    if s.language == "auto" && s.engine == "gigaam" && crate::models::gigaam_available() {
         warm_gigaam(&ctx);
     }
     if s.engine == "whisper_cli" {
@@ -1439,7 +1451,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
     #[cfg(target_os = "macos")]
     if s.engine == "whisper_server"
         && (s.language.eq_ignore_ascii_case("ru") || is_auto_language_alias(&s.language))
-        && crate::gigaam::dir_ready(&paths::gigaam_dir())
+        && crate::models::gigaam_available()
         && resident_model_ready(&ctx.gigaam)
     {
         // macOS UX: универсальный Whisper large слишком медленный для живых
@@ -4609,26 +4621,97 @@ fn adaptive_prompt(db: &Arc<Mutex<Connection>>) -> Option<String> {
     Some(top.join(" "))
 }
 
+/// Загрузить и сверить полную fp32 (SHA-256 с маркером, затем веса). Тяжёлая
+/// часть: вызывать вне лока `ctx.gigaam` и вне горячего пути диктовки.
+fn load_gigaam_fp32(threads: usize) -> anyhow::Result<crate::gigaam::GigaAm> {
+    crate::models::verify_dir_model(crate::models::GIGAAM_FP32_NAME)?;
+    let mut g = crate::gigaam::GigaAm::load_files(
+        &crate::models::gigaam_fp32_dir(),
+        threads,
+        &crate::gigaam::FP32_FILES,
+    )?;
+    let _ = g.transcribe(&vec![0.0f32; 8000]); // прогрев до подмены
+    Ok(g)
+}
+
+fn report_fp32_failure(ctx: &EngineCtx, e: &anyhow::Error) {
+    log::warn!("gigaam fp32: {e:#}; работаем на быстрой int8");
+    crate::models::mark_gigaam_fp32_broken();
+    let _ = ctx.app.emit(
+        "model:error",
+        serde_json::json!({
+            "name": crate::models::GIGAAM_FP32_NAME,
+            "error": "Полная модель GigaAM не загрузилась, диктовка идёт на быстрой версии. Удалите полную модель и скачайте её заново.",
+        }),
+    );
+}
+
 /// Гарантировать загруженный резидентный GigaAM (загрузка ~1 c, один раз).
 /// Лок держится на время загрузки — параллельный вызов дождётся и увидит Some.
+/// Уже загруженная модель не меняется здесь никогда: подмену int8 на fp32 делает
+/// `upgrade_gigaam_in_background`, чтобы диктовка не ждала 885 МБ.
+/// Любой отказ fp32 -> понятное сообщение в «Моделях» и работа на int8.
 fn ensure_gigaam(ctx: &EngineCtx, s: &Settings) -> anyhow::Result<()> {
+    use crate::models::{GigaVariant, GIGAAM_NAME};
     let mut guard = ctx.gigaam.lock();
     if guard.is_some() {
         return Ok(());
+    }
+    let threads = s.effective_threads() as usize;
+    if crate::models::gigaam_variant() == Some(GigaVariant::Fp32) {
+        let t = Instant::now();
+        match load_gigaam_fp32(threads) {
+            Ok(g) => {
+                dbg_log(&format!(
+                    "gigaam fp32: загружен за {} мс",
+                    t.elapsed().as_millis()
+                ));
+                *guard = Some(g);
+                return Ok(());
+            }
+            Err(e) => report_fp32_failure(ctx, &e),
+        }
     }
     let dir = paths::gigaam_dir();
     if !crate::gigaam::dir_ready(&dir) {
         return Err(anyhow::Error::new(ModelMissing));
     }
-    crate::models::verify_dir_model(crate::models::GIGAAM_NAME)?;
+    crate::models::verify_dir_model(GIGAAM_NAME)?;
     let t = Instant::now();
-    let g = crate::gigaam::GigaAm::load(&dir, s.effective_threads() as usize)?;
+    let g = crate::gigaam::GigaAm::load(&dir, threads)?;
     dbg_log(&format!(
         "gigaam: загружен за {} мс",
         t.elapsed().as_millis()
     ));
     *guard = Some(g);
     Ok(())
+}
+
+/// Идёт фоновая загрузка fp32: вторая параллельная не стартует (885 МБ дважды).
+static FP32_UPGRADING: AtomicBool = AtomicBool::new(false);
+
+/// Фоновая загрузка fp32 сразу по готовности полной модели: пока она грузится
+/// (вне лока), диктовка идёт на int8; пустой слот заполняется тем же путём.
+/// В памяти остаётся одна модель.
+fn upgrade_gigaam_in_background(ctx: EngineCtx) {
+    use crate::models::GigaVariant;
+    if FP32_UPGRADING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let fp32_loaded = ctx.gigaam.lock().as_ref().is_some_and(|g| g.fp32);
+        if !fp32_loaded && crate::models::gigaam_variant() == Some(GigaVariant::Fp32) {
+            let threads = ctx.settings.lock().effective_threads() as usize;
+            match load_gigaam_fp32(threads) {
+                Ok(g) => {
+                    *ctx.gigaam.lock() = Some(g);
+                    dbg_log("gigaam fp32: загружена в фоне");
+                }
+                Err(e) => report_fp32_failure(&ctx, &e),
+            }
+        }
+        FP32_UPGRADING.store(false, Ordering::SeqCst);
+    });
 }
 
 /// Гарантировать загруженный резидентный Parakeet (en/auto) — по образцу
@@ -4818,16 +4901,14 @@ fn whisper_model_installed(s: &Settings) -> bool {
 fn no_model_installed(s: &Settings) -> bool {
     let whisper_ready = || whisper_model_installed(s);
     match local_route(s) {
-        LocalRoute::GigaAm => {
-            !crate::models::dir_model_ready(crate::models::GIGAAM_NAME) && !whisper_ready()
-        }
+        LocalRoute::GigaAm => !crate::models::gigaam_available() && !whisper_ready(),
         LocalRoute::Parakeet => {
             !crate::models::dir_model_ready(crate::models::PARAKEET_NAME) && !whisper_ready()
         }
         LocalRoute::Whisper
             if s.engine == "gigaam"
                 && is_auto_language_alias(&s.language)
-                && crate::models::dir_model_ready(crate::models::GIGAAM_NAME) =>
+                && crate::models::gigaam_available() =>
         {
             false
         }
@@ -5122,7 +5203,7 @@ fn local_asr(
                                 let lang = detect_lang_label(&t);
                                 if s.language == "auto"
                                     && lang == Some("ru")
-                                    && crate::gigaam::dir_ready(&paths::gigaam_dir())
+                                    && crate::models::gigaam_available()
                                 {
                                     match ensure_gigaam(ctx, s) {
                                         Ok(()) => {
@@ -5187,7 +5268,7 @@ fn local_asr(
     if route == LocalRoute::Whisper
         && s.engine == "gigaam"
         && is_auto_language_alias(&s.language)
-        && crate::gigaam::dir_ready(&paths::gigaam_dir())
+        && crate::models::gigaam_available()
     {
         let t_vad = Instant::now();
         let speech = match ctx.vad_final.lock().as_mut() {
@@ -5242,7 +5323,7 @@ fn local_asr(
     };
     if is_auto_language_alias(&s.language)
         && s.engine == "gigaam"
-        && crate::gigaam::dir_ready(&paths::gigaam_dir())
+        && crate::models::gigaam_available()
         && should_probe_gigaam_for_auto(&whisper_text)
     {
         // GigaAM уже отработал перед whisper-ом — второй полный прогон не нужен.

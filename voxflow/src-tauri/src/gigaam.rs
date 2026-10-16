@@ -29,6 +29,9 @@ impl<T, R> OrtCtx<T> for std::result::Result<T, ort::Error<R>> {
 /// Подкаталог в models_dir, куда складываются файлы модели.
 pub const GIGAAM_DIR: &str = "gigaam";
 
+/// Подкаталог полной (fp32) модели, отдельно от int8.
+pub const GIGAAM_FP32_DIR: &str = "gigaam-fp32";
+
 /// Файлы модели (имя на HF, точный размер в байтах) — для скачивания/валидации.
 /// vocab сверяем только на >0 байт (текст может прилететь с CRLF).
 pub const GIGAAM_FILES: &[(&str, u64)] = &[
@@ -54,8 +57,7 @@ pub const INT8_FILES: Files = Files {
     vocab: "v3_e2e_rnnt_vocab.txt",
 };
 
-/// fp32-набор нужен только замеру D-038 (в каталог не вошёл).
-#[cfg(test)]
+/// Полные fp32-веса (D-040): основная модель, когда скачана и сверена.
 pub const FP32_FILES: Files = Files {
     encoder: "v3_e2e_rnnt_encoder.onnx",
     decoder: "v3_e2e_rnnt_decoder.onnx",
@@ -115,6 +117,8 @@ pub struct GigaAm {
     dft_cos: Vec<[f32; N_FFT]>,
     dft_sin: Vec<[f32; N_FFT]>,
     pub last_stats: TranscribeStats,
+    /// Загружены полные fp32-веса (а не int8).
+    pub fp32: bool,
 }
 
 impl GigaAm {
@@ -205,6 +209,7 @@ impl GigaAm {
             dft_cos,
             dft_sin,
             last_stats: TranscribeStats::default(),
+            fp32: files.encoder == FP32_FILES.encoder,
         })
     }
 
@@ -470,6 +475,38 @@ mod tests {
                 st.total_ms
             );
         }
+    }
+
+    /// Полная модель из своей папки (`VOXFLOW_TEST_DATA_DIR/models/gigaam-fp32`)
+    /// грузится, проходит проверку SHA-256 и распознаёт запись из `dataset/`
+    /// примерно в 10 секунд быстрее 1,5 с.
+    #[test]
+    #[ignore = "requires fp32 GigaAM in VOXFLOW_TEST_DATA_DIR and private dataset WAVs"]
+    fn gigaam_fp32_loads_from_own_dir_and_transcribes_10s_fast() {
+        let dir = crate::models::gigaam_fp32_dir();
+        crate::models::verify_dir_model(crate::models::GIGAAM_FP32_NAME).expect("sha fp32");
+        let mut g = GigaAm::load_files(&dir, 6, &FP32_FILES).expect("load fp32");
+        assert!(g.fp32);
+        let wav = std::fs::read_dir(crate::paths::dataset_dir())
+            .expect("dataset")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+            .find(|p| {
+                hound::WavReader::open(p).is_ok_and(|r| {
+                    let sec = r.duration() as f32 / r.spec().sample_rate as f32;
+                    r.spec().sample_rate == 16000 && (9.0..=11.0).contains(&sec)
+                })
+            })
+            .expect("в dataset нет записи 9-11 с");
+        let samples = read_wav_16k(wav.to_str().unwrap());
+        let _ = g.transcribe(&samples[..8000]); // прогрев
+        let text = g.transcribe(&samples).expect("transcribe");
+        let st = g.last_stats;
+        println!("fp32: {text:?} total={}мс", st.total_ms);
+        assert!(text
+            .chars()
+            .any(|c| ('а'..='я').contains(&c.to_ascii_lowercase())));
+        assert!(st.total_ms < 1500, "слишком медленно: {} мс", st.total_ms);
     }
 
     #[test]
