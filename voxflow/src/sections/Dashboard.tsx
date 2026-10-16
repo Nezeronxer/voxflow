@@ -8,6 +8,7 @@ import {
   subscribe,
   toggleDictation,
 } from "../api";
+import PermissionsCard from "../components/PermissionsCard";
 import { Icon, prettyHotkey } from "../ui";
 import type {
   ActiveAppContext,
@@ -245,6 +246,8 @@ export default function Dashboard({
           слов сегодня{stats.streak_days > 1 ? ` · ${stats.streak_days} дн. подряд` : ""}
         </div>
       </header>
+
+      <PermissionsCard />
 
       <section className={`deck state-${status}`} aria-live="polite">
         <div>

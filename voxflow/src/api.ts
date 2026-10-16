@@ -25,6 +25,7 @@ import type {
   SecretKind,
 } from "./types";
 import { DEFAULT_SETTINGS } from "./types";
+import type { PermissionKind, PermissionsStatus } from "./permissionsState";
 
 /**
  * The production application always runs inside Tauri.  The lightweight web
@@ -205,6 +206,26 @@ export async function clearSecret(secret: SecretKind): Promise<boolean> {
   } catch (error) {
     console.error(`[voxflow] clear_secret(${secret}) failed:`, error);
     return false;
+  }
+}
+
+/** Вне Tauri и на не-macOS Rust отвечает «всё выдано» - карточки нет. */
+export function permissionsStatus(): Promise<PermissionsStatus> {
+  const granted: PermissionsStatus = {
+    microphone: "granted",
+    accessibility: true,
+    inputMonitoring: true,
+  };
+  if (!IS_TAURI_RUNTIME) return Promise.resolve(granted);
+  return safe<PermissionsStatus>(() => invoke<PermissionsStatus>("permissions_status"), granted);
+}
+
+export async function requestPermission(kind: PermissionKind): Promise<void> {
+  if (!IS_TAURI_RUNTIME) return;
+  try {
+    await invoke("permission_request", { kind });
+  } catch (error) {
+    console.error(`[voxflow] permission_request(${kind}) failed:`, error);
   }
 }
 

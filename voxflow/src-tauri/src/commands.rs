@@ -234,6 +234,16 @@ pub fn delete_model(name: String) -> R<()> {
 // ─────────────────────────── Диктовка ───────────────────────────
 
 #[tauri::command]
+pub fn permissions_status() -> crate::macos_permissions::PermissionsReport {
+    crate::macos_permissions::report()
+}
+
+#[tauri::command]
+pub fn permission_request(kind: String) -> R<()> {
+    crate::macos_permissions::request(&kind)
+}
+
+#[tauri::command]
 pub fn toggle_dictation(state: State<AppState>) -> R<()> {
     state.engine_tx.lock().send(EngineCmd::Toggle).map_err(err)
 }

@@ -216,7 +216,9 @@ pub fn run() {
             local_llm::warmup(&startup_settings);
 
             // Показать окно настроек при запуске, НО не при автозапуске (тогда — в трей).
-            if !autostarted {
+            // Исключение: не хватает доступов - показываем окно с карточкой «Доступы»,
+            // иначе пользователь не узнает, почему молчит горячая клавиша.
+            if !autostarted || !macos_permissions::report().missing.is_empty() {
                 if let Some(main) = handle.get_webview_window("main") {
                     let _ = main.show();
                     let _ = main.set_focus();
@@ -246,6 +248,8 @@ pub fn run() {
             commands::download_model,
             commands::cancel_model_download,
             commands::delete_model,
+            commands::permissions_status,
+            commands::permission_request,
             commands::toggle_dictation,
             commands::overlay_click,
             commands::is_recording,
