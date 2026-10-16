@@ -9,7 +9,7 @@ window.STATE =
   "briefFile": "2026-10-16-brief.md",
   "memoryFile": "CLAUDE.md",
   "startedAt": "2026-10-16T14:00:30+03:00",
-  "updatedAt": "2026-10-16T14:42:36+03:00",
+  "updatedAt": "2026-10-16T15:10:19+03:00",
   "finishedAt": null,
   "stages": [
     {
@@ -48,22 +48,25 @@ window.STATE =
       "id": "build",
       "status": "active",
       "startedAt": "2026-10-16T14:15:37+03:00",
-      "note": "4 из 5 тасков готовы"
+      "note": "доп. таск 06 по решению пользователя (G01)"
     },
     {
       "id": "review",
-      "status": "active",
-      "startedAt": "2026-10-16T14:30:36+03:00"
+      "status": "done",
+      "startedAt": "2026-10-16T14:30:36+03:00",
+      "finishedAt": "2026-10-16T15:04:35+03:00"
     },
     {
       "id": "final",
-      "status": "pending"
+      "status": "active",
+      "startedAt": "2026-10-16T15:04:35+03:00",
+      "note": "релизная сборка v2.3.0 идёт; слепая приёмка"
     }
   ],
   "requirements": {
-    "total": 11,
-    "done": 7,
-    "inTicket": 3,
+    "total": 12,
+    "done": 10,
+    "inTicket": 2,
     "inSpec": 0,
     "placeholder": 0,
     "deferred": 0,
@@ -218,10 +221,65 @@ window.STATE =
         "RELEASE_NOTES.md",
         "DECISIONS.md"
       ],
-      "status": "in-progress",
+      "status": "done",
       "retries": 0,
-      "repairs": 0,
-      "startedAt": "2026-10-16T14:42:36+03:00"
+      "repairs": 1,
+      "startedAt": "2026-10-16T14:42:36+03:00",
+      "finishedAt": "2026-10-16T15:04:35+03:00",
+      "commit": "e7e6d3b",
+      "tests": {
+        "passed": 460,
+        "failed": 0
+      },
+      "concerns": [
+        "Файл в окне .dmg без заданной позиции; полный DMG с самоподписью проверит релизный CI"
+      ]
+    },
+    {
+      "id": "06",
+      "title": "Полная модель GigaAM основной для русского (2.3.1)",
+      "requirements": [
+        "G01",
+        "R01",
+        "R01.2",
+        "R01.3",
+        "R01.4",
+        "R01.5"
+      ],
+      "blockedBy": [
+        "04"
+      ],
+      "wave": 3,
+      "zone": [
+        "models.rs",
+        "gigaam.rs",
+        "engine.rs",
+        "voxflow/src/sections/",
+        "DECISIONS.md"
+      ],
+      "status": "in-progress",
+      "startedAt": "2026-10-16T15:10:19+03:00",
+      "retries": 0,
+      "repairs": 0
+    },
+    {
+      "id": "07",
+      "title": "Релиз 2.3.1",
+      "requirements": [
+        "G01",
+        "R03"
+      ],
+      "blockedBy": [
+        "06"
+      ],
+      "wave": 4,
+      "zone": [
+        "версии",
+        "RELEASE_NOTES.md"
+      ],
+      "status": "pending",
+      "retries": 0,
+      "repairs": 0
     }
   ],
   "singlePass": null,
@@ -245,5 +303,17 @@ window.STATE =
     "deferred": 1,
     "note": "микрофон (R06.3), «всё остальное» на GitHub, рычаги точности расписаны; .dmg-предупреждение - вне рамок по ответу"
   },
-  "blind": null
+  "blind": {
+    "agreed": [
+      "R04 частично до выхода релиза",
+      "R06 в коде"
+    ],
+    "drift": [
+      "R01: манифест done (честная запись D-038), слепая проверка - нет: боевая модель не менялась, чёткость не выросла",
+      "R07: без предупреждений только установка командой; .dmg - один ручной шаг (согласовано в брифинге)"
+    ],
+    "pending": [
+      "R02 установка, R03 публикация, R05 подпись на артефакте - ждут релизной сборки"
+    ]
+  }
 }
