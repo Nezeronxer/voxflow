@@ -9,7 +9,7 @@ window.STATE =
   "briefFile": "2026-10-16-brief.md",
   "memoryFile": "CLAUDE.md",
   "startedAt": "2026-10-16T14:00:30+03:00",
-  "updatedAt": "2026-10-16T14:32:03+03:00",
+  "updatedAt": "2026-10-16T14:42:36+03:00",
   "finishedAt": null,
   "stages": [
     {
@@ -48,7 +48,7 @@ window.STATE =
       "id": "build",
       "status": "active",
       "startedAt": "2026-10-16T14:15:37+03:00",
-      "note": "3 из 5 тасков готовы"
+      "note": "4 из 5 тасков готовы"
     },
     {
       "id": "review",
@@ -62,8 +62,8 @@ window.STATE =
   ],
   "requirements": {
     "total": 11,
-    "done": 6,
-    "inTicket": 4,
+    "done": 7,
+    "inTicket": 3,
     "inSpec": 0,
     "placeholder": 0,
     "deferred": 0,
@@ -184,10 +184,19 @@ window.STATE =
         "voxflow/src-tauri/src/engine.rs",
         "DECISIONS.md"
       ],
-      "status": "in-progress",
+      "status": "done",
       "retries": 0,
-      "repairs": 0,
-      "startedAt": "2026-10-16T14:15:37+03:00"
+      "repairs": 1,
+      "startedAt": "2026-10-16T14:15:37+03:00",
+      "finishedAt": "2026-10-16T14:42:36+03:00",
+      "commit": "1d4270a",
+      "tests": {
+        "passed": 422,
+        "failed": 0
+      },
+      "concerns": [
+        "fp32 RNNT лучше int8 на 0,39 п.п. во всех группах и не медленнее, но ниже порога 0,5 п.п. - не принят, решение пользователю в отчёте"
+      ]
     },
     {
       "id": "05",
@@ -209,9 +218,10 @@ window.STATE =
         "RELEASE_NOTES.md",
         "DECISIONS.md"
       ],
-      "status": "pending",
+      "status": "in-progress",
       "retries": 0,
-      "repairs": 0
+      "repairs": 0,
+      "startedAt": "2026-10-16T14:42:36+03:00"
     }
   ],
   "singlePass": null,

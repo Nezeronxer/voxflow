@@ -45,3 +45,7 @@
 
 - Tauri: `permissions_status()` → `{ microphone: "granted"|"notDetermined"|"denied", accessibility, inputMonitoring, missing: [...] }`; `permission_request(kind)`.
 - Фронт: `PermissionsCard` в `Dashboard`, логика в `permissionsState.ts`. Онбординг при запуске больше не открывает настройки сам и не шлёт тост.
+
+## Из таска 04 - точность
+
+- Боевой GigaAM - int8, без изменений (D-038). `final_eval.rs`: `VOXFLOW_EVAL_MODEL=int8|fp32|ctc`, `VOXFLOW_EVAL_DIR` - только тесты.
