@@ -708,6 +708,42 @@ validate_app_bundle() {
   validate_signing_state "$app"
 }
 
+add_dmg_help_file() {
+  local dmg="$1"
+  local help_file="$ROOT_DIR/script/dmg/Если macOS ругается.txt"
+  local rw="$TEMP_ROOT/dmg-rw.dmg"
+  local out="$TEMP_ROOT/dmg-help.dmg"
+  local mount="$TEMP_ROOT/dmg-help-mount"
+
+  [[ -f "$help_file" ]] || die "missing $help_file"
+  rm -f "$rw" "$out"
+  /usr/bin/hdiutil convert "$dmg" -format UDRW -o "$rw" -quiet
+  mkdir -p "$mount"
+  MOUNT_POINT="$mount"
+  /usr/bin/hdiutil attach -nobrowse -mountpoint "$mount" "$rw" -quiet
+  /usr/bin/ditto "$help_file" "$mount/Если macOS ругается.txt"
+  local detached=0 try
+  for try in 1 2 3 4 5; do
+    if /usr/bin/hdiutil detach "$mount" -quiet; then detached=1; break; fi
+    sleep 2
+  done
+  if [[ "$detached" != 1 ]]; then
+    /usr/bin/hdiutil detach "$mount" -force -quiet \
+      || die "cannot detach $mount after writing the help file into the DMG"
+  fi
+  MOUNT_POINT=""
+  /usr/bin/hdiutil convert "$rw" -format UDZO -o "$out" -quiet
+  # Содержимое образа изменилось: подпись Tauri больше не действует, подписываем заново.
+  # Метка времени Apple нужна только Developer ID (иначе нотаризация образа не пройдёт).
+  local timestamp_arg=--timestamp
+  if [[ "$APPLE_SIGNING_IDENTITY" == "-" || "$SELF_SIGNED" == "1" ]]; then
+    timestamp_arg=--timestamp=none
+  fi
+  /usr/bin/codesign --force --sign "$APPLE_SIGNING_IDENTITY" "$timestamp_arg" "$out"
+  mv -f "$out" "$dmg"
+  rm -f "$rw"
+}
+
 build_bundles() {
   local version="$1"
   local tauri_cli="$APP_DIR/node_modules/@tauri-apps/cli/tauri.js"
@@ -737,6 +773,7 @@ build_bundles() {
   [[ "${#dmg_candidates[@]}" == 1 ]] \
     || die "expected exactly one DMG, found ${#dmg_candidates[@]}"
   source_dmg="${dmg_candidates[0]}"
+  add_dmg_help_file "$source_dmg"
   notarize_dmg "$source_dmg"
   validate_notarization_state "$APP_BUNDLE" "$source_dmg"
   package_outputs "$source_dmg" "$version"
@@ -754,6 +791,7 @@ verify_dmg() {
   mkdir -p "$MOUNT_POINT"
   /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT_POINT" "$dmg" -quiet
   [[ -L "$MOUNT_POINT/Applications" ]] || die "DMG is missing the Applications alias"
+  [[ -f "$MOUNT_POINT/Если macOS ругается.txt" ]] || die "DMG is missing the help file"
   validate_app_bundle "$MOUNT_POINT/VoxFlow.app" "$version"
   /usr/bin/hdiutil detach "$MOUNT_POINT" -quiet
   rmdir "$MOUNT_POINT" 2>/dev/null || true

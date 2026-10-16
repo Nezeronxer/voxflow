@@ -173,7 +173,7 @@ export default function SettingsHub({
           )}
           {egress.summary}
         </span>
-        <span>VoxFlow 2.2.1</span>
+        <span>VoxFlow 2.3.0</span>
       </footer>
     </div>
   );
