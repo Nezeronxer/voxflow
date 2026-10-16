@@ -122,12 +122,26 @@ jobs:
           chmod +x "$out/VoxFlow-${version}-linux-x64.AppImage"
 
           # В пакетах должны лежать рантайм, VAD и .desktop с категориями.
-          dpkg-deb -c "$out/VoxFlow-${version}-linux-x64.deb" | grep -q 'whisper-linux-x64/whisper-cli'
-          dpkg-deb -c "$out/VoxFlow-${version}-linux-x64.deb" | grep -q 'vad/silero_vad.onnx'
-          dpkg-deb -I "$out/VoxFlow-${version}-linux-x64.deb" | grep -q 'libwebkit2gtk-4.1-0'
-          dpkg-deb --fsys-tarfile "$out/VoxFlow-${version}-linux-x64.deb" \
-            | tar -xO --wildcards './usr/share/applications/*.desktop' | grep -q '^Categories=Utility;Audio;'
-          rpm -qp --requires "$out/VoxFlow-${version}-linux-x64.rpm" | grep -q 'libwebkit2gtk-4.1'
+          # Вывод сначала в переменную: `cmd | grep -q` под pipefail падает из-за SIGPIPE,
+          # когда grep выходит на первом совпадении.
+          deb="$out/VoxFlow-${version}-linux-x64.deb"
+          rpm_pkg="$out/VoxFlow-${version}-linux-x64.rpm"
+          deb_list="$(dpkg-deb -c "$deb")"
+          deb_info="$(dpkg-deb -I "$deb")"
+          desktop="$(dpkg-deb --fsys-tarfile "$deb" | tar -xO --wildcards './usr/share/applications/*.desktop')"
+          rpm_requires="$(rpm -qp --requires "$rpm_pkg")"
+
+          check() { # имя, текст, шаблон
+            if ! grep -q -- "$3" <<<"$2"; then
+              echo "Package check failed: $1 (pattern: $3)" >&2
+              exit 1
+            fi
+          }
+          check "deb: whisper-cli" "$deb_list" 'whisper-linux-x64/whisper-cli'
+          check "deb: silero_vad.onnx" "$deb_list" 'vad/silero_vad.onnx'
+          check "deb: Depends libwebkit2gtk-4.1-0" "$deb_info" 'libwebkit2gtk-4.1-0'
+          check "deb: .desktop Categories" "$desktop" '^Categories=Utility;Audio;'
+          check "rpm: Requires libwebkit2gtk-4.1" "$rpm_requires" 'libwebkit2gtk-4.1'
 
           (cd "$out" && sha256sum VoxFlow-* > SHA256SUMS-linux.txt && sha256sum --check SHA256SUMS-linux.txt)
 
