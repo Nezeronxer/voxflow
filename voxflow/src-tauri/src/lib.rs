@@ -270,7 +270,6 @@ pub fn run() {
             commands::ai_list_models,
             commands::rewrite_prompt_with_instruction,
             commands::transform_text,
-            commands::default_app_profile_presets,
             commands::stt_test,
             commands::local_ai_detect,
             commands::local_ai_pull,

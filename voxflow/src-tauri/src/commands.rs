@@ -12,7 +12,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::db;
 use crate::engine::{EngineCmd, EngineHandle};
 use crate::models;
-use crate::settings::{self, ProfileOverride, Settings};
+use crate::settings::{self, Settings};
 
 /// Чек-итемы подменю «Язык» в трее (Авто/Русский/English). Клоны живут здесь,
 /// чтобы save_settings синхронизировал галки при ЛЮБОМ источнике смены языка
@@ -519,24 +519,19 @@ pub fn show_main_window(app: AppHandle) -> R<()> {
 
 // ─────────────────────────── ИИ / исправления ───────────────────────────
 
+/// Активное окно для главного экрана: только имя, на обработку не влияет (D-046).
 #[derive(Serialize)]
 pub struct ActiveAppContext {
     exe: String,
     title: String,
-    profile: String,
-    builtin_profile: String,
 }
 
 #[tauri::command]
-pub fn active_app_context(state: State<AppState>) -> ActiveAppContext {
+pub fn active_app_context() -> ActiveAppContext {
     let actx = crate::app_context::detect();
-    let overrides = state.settings.lock().app_profile_overrides.clone();
-    let profile = crate::app_context::category_for(&actx.exe, &actx.title, &overrides);
     ActiveAppContext {
         exe: actx.exe,
         title: actx.title,
-        builtin_profile: actx.category,
-        profile,
     }
 }
 
@@ -910,84 +905,6 @@ pub fn transform_text(state: State<AppState>, text: String, transform: String) -
             message: format!("Ошибка transform: {e}"),
         },
     }
-}
-
-#[tauri::command]
-pub fn default_app_profile_presets() -> Vec<ProfileOverride> {
-    vec![
-        ProfileOverride {
-            pattern: "telegram".into(),
-            profile: "casual".into(),
-        },
-        ProfileOverride {
-            pattern: "whatsapp".into(),
-            profile: "casual".into(),
-        },
-        ProfileOverride {
-            pattern: "discord".into(),
-            profile: "casual".into(),
-        },
-        ProfileOverride {
-            pattern: "gmail".into(),
-            profile: "formal".into(),
-        },
-        ProfileOverride {
-            pattern: "outlook".into(),
-            profile: "formal".into(),
-        },
-        ProfileOverride {
-            pattern: "codex".into(),
-            profile: "ai".into(),
-        },
-        ProfileOverride {
-            pattern: "chatgpt".into(),
-            profile: "ai".into(),
-        },
-        ProfileOverride {
-            pattern: "claude".into(),
-            profile: "ai".into(),
-        },
-        ProfileOverride {
-            pattern: "gemini".into(),
-            profile: "ai".into(),
-        },
-        ProfileOverride {
-            pattern: "perplexity".into(),
-            profile: "ai".into(),
-        },
-        ProfileOverride {
-            pattern: "deepseek".into(),
-            profile: "ai".into(),
-        },
-        ProfileOverride {
-            pattern: "grok".into(),
-            profile: "ai".into(),
-        },
-        ProfileOverride {
-            pattern: "openrouter".into(),
-            profile: "ai".into(),
-        },
-        ProfileOverride {
-            pattern: "code.exe".into(),
-            profile: "code".into(),
-        },
-        ProfileOverride {
-            pattern: "cursor".into(),
-            profile: "code".into(),
-        },
-        ProfileOverride {
-            pattern: "windsurf".into(),
-            profile: "code".into(),
-        },
-        ProfileOverride {
-            pattern: "word".into(),
-            profile: "doc".into(),
-        },
-        ProfileOverride {
-            pattern: "google docs".into(),
-            profile: "doc".into(),
-        },
-    ]
 }
 
 /// Проба облачного STT: шлёт короткий WAV-тишины (0.4 c) выбранному провайдеру и

@@ -8,13 +8,8 @@
 //!
 //! Маршрутизация задаётся ДАННО-УПРАВЛЯЕМОЙ таблицей правил в [`classify`]
 //! (массив `(маркеры, профиль)`, проверяемый по порядку приоритета).
-//! Пользователь может расширить/переопределить её своими правилами через
-//! [`category_for`] (см. `Settings::app_profile_overrides`).
-//!
-//! В пользовательских правилах допустим псевдоним профиля `"code"` — это
-//! удобное имя для случая «диктовка как есть, без переписывания»; внутренне
-//! он отображается в `"verbatim"` (то же самое: rewrite выключен). См.
-//! [`VALID_PROFILES`] и [`category_for`].
+//! Категория только описывает окно: на обработку текста она не влияет,
+//! профилей по программам нет (D-046).
 //!
 //! На macOS контекст снимается best-effort нативными read-only
 //! Accessibility/CoreFoundation вызовами; на остальных не-Windows
@@ -472,9 +467,6 @@ pub fn ai_target(exe: &str, title: &str) -> Option<&'static str> {
 /// Приоритет (важное — выше): `verbatim` (код/терминалы) → `ai` →
 /// `formal` (почта/деловое) → `work` (рабочие сервисы) → `casual` (личные
 /// мессенджеры) → `doc` (документы) → `neutral`.
-///
-/// Это ВСТРОЕННАЯ таблица БЕЗ учёта пользовательских правил. Для классификации
-/// с учётом `Settings::app_profile_overrides` используйте [`category_for`].
 pub fn classify(exe: &str, title: &str) -> String {
     // Удобная замыкающая проверка: содержит ли exe ИЛИ title подстроку.
     let any = |needle: &str| exe.contains(needle) || title.contains(needle);
@@ -627,104 +619,10 @@ pub fn classify(exe: &str, title: &str) -> String {
     "neutral".to_string()
 }
 
-/// Допустимые имена профилей (для валидации пользовательских правил).
-///
-/// `"code"` — псевдоним: для пользователя это понятное имя «диктовать как
-/// есть», но внутренне он отображается в `"verbatim"` (см. [`category_for`]),
-/// чтобы сработал существующий verbatim-гейт движка (rewrite выключен).
-const VALID_PROFILES: &[&str] = &[
-    "verbatim", "code", "ai", "formal", "work", "casual", "doc", "neutral",
-];
-
-/// Классифицирует приложение с учётом ПОЛЬЗОВАТЕЛЬСКИХ переопределений.
-///
-/// Сначала по порядку проверяются `overrides`: если `pattern` (в нижнем
-/// регистре) встречается как подстрока в `exe` ИЛИ `title` (тоже приводятся
-/// к нижнему регистру), и профиль правила валиден — возвращается этот профиль.
-/// Псевдоним `"code"` при этом отображается в `"verbatim"` (rewrite выключен).
-/// Невалидные правила (профиль вне множества `{verbatim, code, ai, formal,
-/// work, casual, doc, neutral}` или пустой `pattern`) пропускаются; при этом
-/// в лог пишется краткое предупреждение (`log::warn!`, без секретов), чтобы
-/// проблему было видно при диагностике.
-///
-/// Если ни одно пользовательское правило не сработало — результат
-/// определяет встроенная таблица [`classify`].
-///
-/// Аргументы могут приходить в любом регистре: нормализация выполняется внутри.
-pub fn category_for(
-    exe: &str,
-    title: &str,
-    overrides: &[crate::settings::ProfileOverride],
-) -> String {
-    let exe_lc = exe.to_lowercase();
-    let title_lc = title.to_lowercase();
-
-    for ov in overrides {
-        let pat = ov.pattern.trim().to_lowercase();
-        if pat.is_empty() {
-            // Пустой паттерн сматчил бы что угодно — пропускаем как невалидный.
-            // Профиль не логируем как секрет — это публичная настройка, но
-            // паттерн всё равно пуст, поэтому сообщение лаконично.
-            log::warn!(
-                "app_profile_overrides: правило с пустым pattern пропущено (профиль {:?})",
-                ov.profile.trim()
-            );
-            continue;
-        }
-        let profile = ov.profile.trim();
-        if !VALID_PROFILES.contains(&profile) {
-            // Неизвестный профиль — правило игнорируем.
-            log::warn!(
-                "app_profile_overrides: неизвестный профиль {:?} в правиле (pattern {:?}) пропущен",
-                profile,
-                pat
-            );
-            continue;
-        }
-        if exe_lc.contains(&pat) || title_lc.contains(&pat) {
-            // `code` — пользовательский псевдоним verbatim (rewrite выключен).
-            let resolved = if profile == "code" {
-                "verbatim"
-            } else {
-                profile
-            };
-            return resolved.to_string();
-        }
-    }
-
-    classify(&exe_lc, &title_lc)
-}
-
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{ai_target, category_for};
-    use crate::settings::ProfileOverride;
-
-    fn ov(pattern: &str, profile: &str) -> ProfileOverride {
-        ProfileOverride {
-            pattern: pattern.to_string(),
-            profile: profile.to_string(),
-        }
-    }
-
-    #[test]
-    fn override_beats_builtin_profile() {
-        let rules = vec![ov("telegram", "formal")];
-        assert_eq!(category_for("telegram.exe", "Chat", &rules), "formal");
-    }
-
-    #[test]
-    fn first_matching_override_wins() {
-        let rules = vec![ov("chrome", "ai"), ov("chatgpt", "formal")];
-        assert_eq!(category_for("chrome.exe", "ChatGPT", &rules), "ai");
-    }
-
-    #[test]
-    fn empty_and_invalid_overrides_are_skipped() {
-        let rules = vec![ov("  ", "formal"), ov("telegram", "unknown")];
-        assert_eq!(category_for("telegram.exe", "Chat", &rules), "casual");
-    }
+    use super::ai_target;
 
     /// Раздел «Промпты» опирается на конкретную модель, а не на общий профиль
     /// `"ai"`: правила оформления у вендоров разные.
@@ -743,19 +641,6 @@ mod tests {
         // Не AI-окно и незнакомый чат вендорских правил не получают.
         assert_eq!(ai_target("telegram.exe", "Chat"), None);
         assert_eq!(ai_target("chrome.exe", "Poe"), None);
-    }
-
-    #[test]
-    fn code_alias_resolves_to_verbatim() {
-        let rules = vec![ov("cursor", "code")];
-        assert_eq!(category_for("cursor.exe", "main.rs", &rules), "verbatim");
-    }
-
-    #[test]
-    fn matching_is_case_insensitive_across_exe_and_title() {
-        let rules = vec![ov("CoDeX", "ai"), ov("Quarterly", "doc")];
-        assert_eq!(category_for("codex.exe", "Prompt", &rules), "ai");
-        assert_eq!(category_for("word.exe", "Quarterly Plan", &rules), "doc");
     }
 
     #[test]

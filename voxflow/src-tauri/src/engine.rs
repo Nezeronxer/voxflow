@@ -3292,11 +3292,8 @@ fn improve_selection_inner(ctx: &EngineCtx, my_gen: u64) -> anyhow::Result<()> {
     }
 
     let actx = crate::app_context::detect();
-    let mut tone =
-        crate::app_context::category_for(&actx.exe, &actx.title, &s.app_profile_overrides);
-    if tone == "neutral" || tone == "verbatim" || tone == "code" {
-        tone = "doc".into();
-    }
+    // Обработка одна для всех программ (D-046): «улучшить» - всегда документный стиль.
+    let tone = String::from("doc");
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
     // «Улучшить выделенное»: живой черновик не печатался, окружение = выделение.
@@ -4002,15 +3999,11 @@ fn process_utterance(
         let _ = std::fs::remove_file(&wav);
         return Ok(());
     };
-    let asr_tone =
-        crate::app_context::category_for(&asr_actx.exe, &asr_actx.title, &s.app_profile_overrides);
     let asr_prompt = if use_cloud_stt {
         let asr_previous_context_tail = asr_actx
             .focused_text_tail(ASR_PROMPT_PREVIOUS_CHARS)
             .or_else(|| last_dictation_context(ctx, &asr_actx));
         build_asr_prompt(
-            &asr_actx,
-            &asr_tone,
             asr_previous_context_tail.as_deref(),
             &dict,
             &snippets,
@@ -4161,10 +4154,9 @@ fn process_utterance(
     // final TOCTOU guard, so reuse the captured context for tone/postprocessing.
     let mut actx = asr_actx.clone();
     dbg_log(&format!(
-        "app: exe={} title_len={} → {}",
+        "app: exe={} title_len={}",
         actx.exe,
-        actx.title.chars().count(),
-        actx.category
+        actx.title.chars().count()
     ));
     // Постобработка (правила) + выученные исправления.
     let t_post = Instant::now();
@@ -4229,9 +4221,8 @@ fn process_utterance(
         actx = fresh_actx;
     }
 
-    // Тон по приложению считаем через category_for — он учитывает пользовательские
-    // app_profile_overrides (ветка B) ПЕРЕД встроенной таблицей классификации.
-    let tone = crate::app_context::category_for(&actx.exe, &actx.title, &s.app_profile_overrides);
+    // Профилей по программам нет (D-046): обработка одна для всех окон.
+    let tone = String::from("neutral");
     // Prefer what is already in the focused field over VoxFlow's own memory.
     // This keeps sentence casing/punctuation continuous even when the existing
     // text was typed manually or inserted by another application.
@@ -4242,7 +4233,7 @@ fn process_utterance(
     // ── Рерайт по смыслу под активное приложение (Gemini/Ollama/OpenAI-compatible) ──
     // Зовём модель везде, где настроен бэкенд, кроме кода/дословного режима:
     // именно она исправляет ослышки распознавания («Open I» → «OpenAI»), а
-    // локальные правила этого не умеют. Стиль задаёт профиль приложения.
+    // локальные правила этого не умеют. Обработка одна для всех программ (D-046).
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
     let context_hint = rewrite_context_hint(ctx, &actx, None, &field_before_context, live_inserted);
@@ -8132,8 +8123,6 @@ fn push_unique_prompt_item(
 }
 
 fn build_asr_prompt(
-    actx: &crate::app_context::AppContext,
-    tone: &str,
     previous_context_tail: Option<&str>,
     dict: &[postprocess::Dict],
     snippets: &[postprocess::Snippet],
@@ -8142,15 +8131,6 @@ fn build_asr_prompt(
     let mut parts = vec![
         "Speech recognition context only: transcribe what was said, preserve Russian/English/other language switches, do not rewrite. Recording stop is not necessarily a sentence boundary: do not add a final period when the utterance is grammatically unfinished.".to_string(),
     ];
-
-    let app = app_label_for_payload(actx);
-    if !app.trim().is_empty() {
-        if tone.trim().is_empty() || tone == "neutral" {
-            parts.push(format!("Active app: {app}."));
-        } else {
-            parts.push(format!("Active app: {app}; style context: {tone}."));
-        }
-    }
 
     if let Some(raw_previous) = previous_context_tail.filter(|value| !value.trim().is_empty()) {
         let terminal_newline = raw_previous
@@ -8241,14 +8221,6 @@ fn build_asr_prompt(
     }
 }
 
-fn app_label_for_payload(actx: &crate::app_context::AppContext) -> String {
-    if !actx.exe.trim().is_empty() {
-        one_line_instruction(&actx.exe)
-    } else {
-        "неизвестно".to_string()
-    }
-}
-
 fn build_smart_prompt_instruction_from_source(source: &str) -> Option<String> {
     let cleaned = compact_instruction_source(source);
     if cleaned.is_empty() {
@@ -8303,10 +8275,6 @@ fn ai_prompt_rule_for_app<'a>(
         .find(|rule| !rule.prompt.trim().is_empty() && app_matches_pattern(actx, &rule.pattern))
 }
 
-fn builtin_ai_context(actx: &crate::app_context::AppContext) -> bool {
-    crate::app_context::classify(&actx.exe.to_lowercase(), &actx.title.to_lowercase()) == "ai"
-}
-
 /// Правила оформления промпта для активного окна — если пересборка включена в
 /// разделе «Промпты» и пользователь не задал своё правило.
 ///
@@ -8342,7 +8310,7 @@ fn effective_smart_instruction_for_app(
     tone: &str,
 ) -> (Option<String>, bool) {
     let matched_rule = ai_prompt_rule_for_app(s, actx);
-    let ai_context = matched_rule.is_some() || tone == "ai" || builtin_ai_context(actx);
+    let ai_context = matched_rule.is_some() || tone == "ai";
 
     let mut parts = Vec::new();
     if ai_context {
@@ -8381,21 +8349,20 @@ fn effective_smart_instruction_for_app(
 /// системный промпт выбрал нужный workflow даже если фактический активный app
 /// не похож на Gmail/Slack/ChatGPT.
 fn build_voiceflow_payload(
-    actx: &crate::app_context::AppContext,
     text: &str,
     tone: &str,
     smart_instruction: Option<&str>,
     context_hint: Option<&str>,
 ) -> String {
-    let actual = app_label_for_payload(actx);
+    // Имя активной программы в модель не идёт (D-046): обработка одна для всех окон.
     let app = match tone {
-        "ai" => format!("AI prompt ({actual})"),
-        "formal" => format!("Gmail ({actual})"),
-        "work" => format!("Slack ({actual})"),
-        "casual" | "very_casual" => format!("Telegram ({actual})"),
-        "doc" => format!("Google Docs ({actual})"),
-        "verbatim" | "code" => format!("VS Code ({actual})"),
-        _ => actual.to_string(),
+        "ai" => "AI prompt",
+        "formal" => "Gmail",
+        "work" => "Slack",
+        "casual" | "very_casual" => "Telegram",
+        "doc" => "Google Docs",
+        "verbatim" | "code" => "VS Code",
+        _ => "",
     };
     let mut payload = format!("[ПРИЛОЖЕНИЕ]: {app}\n");
     if let Some(instruction) = smart_instruction
@@ -8753,8 +8720,7 @@ fn refine_text_with_fallback(
         }
         Some(RewriteBackendRoute::OpenAiCompat) => {
             let settings = s.clone();
-            let user =
-                build_voiceflow_payload(actx, text, target_tone, smart_instruction, context_hint);
+            let user = build_voiceflow_payload(text, target_tone, smart_instruction, context_hint);
             attempts.push(Box::new(move || {
                 crate::rewrite::refine(&settings, crate::ollama::SYSTEM_PROMPT, &user)
             }));
@@ -8951,14 +8917,13 @@ mod smart_prompt_tests {
     fn voiceflow_payload_includes_saved_prompt_for_neural_rewrite() {
         let prompt = "Делай из диктовки промпт для Codex и явно упоминай Computer Use.";
         let payload = build_voiceflow_payload(
-            &app("ChatGPT"),
             "я объясни мне по поводу архитектуры проекта а ещё используй компьютер юз",
             "ai",
             Some(prompt),
             None,
         );
 
-        assert!(payload.contains("[ПРИЛОЖЕНИЕ]: AI prompt (chrome.exe)"));
+        assert!(payload.contains("[ПРИЛОЖЕНИЕ]: AI prompt\n"));
         assert!(!payload.contains("ChatGPT"));
         assert!(payload.contains("[ПОЛЬЗОВАТЕЛЬСКАЯ ИНСТРУКЦИЯ]:"));
         assert!(payload.contains("Делай из диктовки промпт для Codex"));
@@ -8982,7 +8947,6 @@ mod smart_prompt_tests {
     #[test]
     fn voiceflow_payload_includes_context_as_environment_not_dictation() {
         let payload = build_voiceflow_payload(
-            &app("Telegram"),
             "наверное задержусь на работе",
             "casual",
             None,
@@ -9241,7 +9205,7 @@ mod smart_prompt_tests {
     }
 
     #[test]
-    fn builtin_codex_context_forces_ai_prompt_without_saved_rule() {
+    fn ai_window_without_saved_rule_gets_no_special_processing() {
         let s = Settings {
             smart_prompt_enabled: false,
             ai_prompt_rules: Vec::new(),
@@ -9259,12 +9223,11 @@ mod smart_prompt_tests {
             selected_text: String::new(),
         };
 
-        let (instruction, is_ai) = effective_smart_instruction_for_app(&s, &actx, "work");
+        let (instruction, is_ai) = effective_smart_instruction_for_app(&s, &actx, "neutral");
 
-        assert!(is_ai);
-        assert!(instruction
-            .expect("ai default instruction")
-            .contains("готовый промпт"));
+        // D-046: окно само по себе обработку не меняет.
+        assert!(!is_ai);
+        assert!(instruction.is_none());
     }
 
     /// Раздел «Промпты»: пересборка выключена — поведение ровно как раньше,
@@ -9491,8 +9454,6 @@ mod smart_prompt_tests {
         }];
 
         let prompt = build_asr_prompt(
-            &app("Codex"),
-            "ai",
             Some("предыдущий хвост про Tauri и whisper.cpp"),
             &dict,
             &snippets,
@@ -9511,20 +9472,12 @@ mod smart_prompt_tests {
         assert!(prompt.chars().count() <= ASR_PROMPT_MAX_CHARS);
 
         let unfinished =
-            build_asr_prompt(&app("Codex"), "ai", Some("Я хочу, чтобы ты"), &[], &[], &[])
-                .expect("unfinished prompt");
+            build_asr_prompt(Some("Я хочу, чтобы ты"), &[], &[], &[]).expect("unfinished prompt");
         assert!(unfinished.contains("grammatically unfinished"));
         assert!(!unfinished.contains("Я хочу, чтобы ты."));
 
-        let newline_boundary = build_asr_prompt(
-            &app("Codex"),
-            "ai",
-            Some("Я хочу, чтобы ты\n"),
-            &[],
-            &[],
-            &[],
-        )
-        .expect("newline boundary prompt");
+        let newline_boundary = build_asr_prompt(Some("Я хочу, чтобы ты\n"), &[], &[], &[])
+            .expect("newline boundary prompt");
         assert!(newline_boundary.contains("explicit line boundary"));
         assert!(
             !newline_boundary.contains("Previous same-field text tail (grammatically unfinished;")

@@ -66,6 +66,7 @@ export interface Settings {
   deepgram_model: string;
   deepgram_key: string;
   proxy_url: string;
+  /** Устарело (D-046): не используется, хранится для обратной совместимости. */
   app_profile_overrides: ProfileOverride[];
   ai_prompt_rules: AiPromptRule[];
   /** Пересобирать диктовку в промпт по правилам целевой нейросети. */
@@ -168,8 +169,6 @@ export interface AiPromptRule {
 export interface ActiveAppContext {
   exe: string;
   title: string;
-  profile: string;
-  builtin_profile: string;
 }
 
 export interface TransformResult {

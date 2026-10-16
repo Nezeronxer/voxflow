@@ -14,7 +14,6 @@ import type {
   SnippetEntry,
   CorrectionEntry,
   ActiveAppContext,
-  ProfileOverride,
   PromptModelView,
   PromptRulesRefresh,
   LocalAiState,
@@ -480,24 +479,12 @@ export function activeAppContext(): Promise<ActiveAppContext> {
     return Promise.resolve({
       exe: "Codex",
       title: "VoxFlow 2.0 implementation",
-      profile: "ai",
-      builtin_profile: "ai",
     });
   }
   return safe<ActiveAppContext>(() => invoke<ActiveAppContext>("active_app_context"), {
     exe: "",
     title: "",
-    profile: "neutral",
-    builtin_profile: "neutral",
   });
-}
-
-export function defaultAppProfilePresets(): Promise<ProfileOverride[]> {
-  if (!IS_TAURI_RUNTIME) return Promise.resolve([]);
-  return safe<ProfileOverride[]>(
-    () => invoke<ProfileOverride[]>("default_app_profile_presets"),
-    [],
-  );
 }
 
 export function transformText(

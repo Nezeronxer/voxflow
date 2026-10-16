@@ -8,7 +8,6 @@ import Ai from "./Ai";
 import Stt from "./Stt";
 import Corrections from "./Corrections";
 import LocalLlm from "./LocalLlm";
-import Applications from "./Applications";
 
 /**
  * Разделы названы тем, что человек ищет, а не тем, как устроен код.
@@ -18,7 +17,7 @@ import Applications from "./Applications";
  * язык распознавания редактировался и в «Основных», и в «Моделях». Пользователь
  * не нашёл поле своего ключа, хотя оно было на месте с 2.0.17.
  */
-export type SettingsPageId = "dictation" | "text" | "applications" | "app";
+export type SettingsPageId = "dictation" | "text" | "app";
 
 const SETTINGS_NAV: {
   id: SettingsPageId;
@@ -40,13 +39,6 @@ const SETTINGS_NAV: {
     title: "Обработка текста",
     desc: "Что делать с текстом перед вставкой: чистка, нейросеть и её модели, исправления.",
     icon: Icon.Wand,
-  },
-  {
-    id: "applications",
-    label: "Приложения",
-    title: "Приложения",
-    desc: "Стиль текста для каждой программы.",
-    icon: Icon.Code,
   },
   {
     id: "app",
@@ -146,10 +138,6 @@ export default function SettingsHub({
                 <Ai settings={settings} update={update} persist={persist} part="advanced" />
               </Advanced>
             </>
-          )}
-
-          {page === "applications" && (
-            <Applications settings={settings} update={update} embedded />
           )}
 
           {page === "app" && (

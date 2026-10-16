@@ -42,20 +42,6 @@ function languageLabel(language: string): string {
   return "Авто · RU/EN";
 }
 
-function profileLabel(profile: string): string {
-  const labels: Record<string, string> = {
-    ai: "Промпты",
-    code: "Код",
-    formal: "Формальный",
-    work: "Рабочий",
-    casual: "Общение",
-    doc: "Документы",
-    verbatim: "Дословно",
-    neutral: "Нейтральный",
-  };
-  return labels[profile] ?? "Нейтральный";
-}
-
 function modelLabel(settings: Settings): string {
   if (settings.stt_provider === "deepgram") return settings.deepgram_model || "Deepgram";
   if (settings.stt_provider === "openai_compat") {
@@ -128,8 +114,6 @@ export default function Dashboard({
   const [activeApp, setActiveApp] = useState<ActiveAppContext>({
     exe: "",
     title: "",
-    profile: "neutral",
-    builtin_profile: "neutral",
   });
   const [busy, setBusy] = useState(false);
   const [latencyMs, setLatencyMs] = useState<number | null>(null);
@@ -292,13 +276,6 @@ export default function Dashboard({
             </span>
           </div>
           <div className="context-cell">
-            <Icon.Wand className="ico" />
-            <span>
-              <strong>{profileLabel(activeApp.profile)}</strong>
-              <small>Стиль</small>
-            </span>
-          </div>
-          <div className="context-cell">
             <Icon.Cube className="ico" />
             <span>
               <strong>{modelLabel(settings)}</strong>
@@ -382,11 +359,6 @@ export default function Dashboard({
           <button type="button" onClick={() => onOpenSettings("text")}>
             <Icon.Wand className="ico" />
             <span>Обработка текста<small>{settings.verbatim ? "Дословно" : "Умная чистка"}</small></span>
-            <b>›</b>
-          </button>
-          <button type="button" onClick={() => onOpenSettings("applications")}>
-            <Icon.Code className="ico" />
-            <span>Приложения<small>Стиль под каждое окно</small></span>
             <b>›</b>
           </button>
         </aside>
