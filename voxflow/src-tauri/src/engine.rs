@@ -2275,6 +2275,16 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
     let mut last_gap_cut: Option<usize> = None; // рез по последней микропаузе сегмента
     let mut last_emitted: Option<(String, String)> = None;
     let mut settled_emitted_for_end = 0usize;
+    // D-045: в режиме «только плашка» длинный активный сегмент показываем
+    // временными кусками по микропаузам: каждый тик распознаёт только хвост
+    // [sub_start..], а не весь сегмент до 25 с. Закрытие сегмента по-прежнему
+    // распознаёт его целиком (тот же текст, что и до правки, D-035).
+    let preview_only = a.stream_mode == "never";
+    let mut sub_start = 0usize;
+    let mut sub_texts: Vec<String> = Vec::new();
+    let mut last_asr_ms = 0u64;
+    let mut stats = PreviewLatency::default();
+    let mut prev_snap = Instant::now();
 
     // Свой стриминговый VAD-state на диктовку.
     if let Some(v) = a.vad.lock().as_mut() {
@@ -2290,20 +2300,16 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
     let mut mono16: Vec<f32> = Vec::new();
 
     loop {
-        // Fast first words, then lower the inference cadence for a long
-        // uninterrupted phrase. Together with the 8 s segment cap this keeps
-        // preview work bounded and leaves the shared resident model available
-        // to final ASR soon after key-up.
-        let active_samples = mono16.len().saturating_sub(seg_start);
-        let cadence_ms = if tick_ms < 400 && active_samples >= 4 * 16000 {
-            420
-        } else {
-            tick_ms
-        };
-        std::thread::sleep(Duration::from_millis(cadence_ms));
+        // Первые слова - быстро, длинная фраза - реже; вместе с коротким окном
+        // прохода (D-045) это держит работу превью ограниченной, и финал после
+        // отпускания клавиши не ждёт модель дольше одного короткого прохода.
+        let active_samples = mono16.len().saturating_sub(sub_start.max(seg_start));
+        let sleep_ms = preview_sleep_ms(tick_ms, active_samples, last_asr_ms);
+        std::thread::sleep(Duration::from_millis(sleep_ms));
         if a.stop.load(Ordering::Acquire) {
             break;
         }
+        let snap = Instant::now();
         let (tail, ncur) = audio::tail_since(&a.buffer, cursor);
         cursor = ncur;
         mono16.extend(rs.feed(&tail));
@@ -2368,6 +2374,7 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                     );
                 }
             }
+            prev_snap = snap;
             continue; // в активном сегменте речи ещё нет — ASR не дёргаем
         }
         let cut = segment_cut_bound(
@@ -2384,10 +2391,20 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             continue;
         };
         let Some(gm) = g.as_mut() else { continue };
+        sub_start = sub_start.max(seg_start);
+        let sub_cut = if preview_only && cut.is_none() {
+            preview_sub_cut(sub_start, mono16.len(), last_speech_end, last_gap_cut)
+        } else {
+            None
+        };
+        let t_asr = Instant::now();
         let (committed_raw, volatile_raw) = if let Some(bound) = cut {
             let bound = bound.clamp(seg_start, mono16.len());
             let txt = gm.transcribe(&mono16[seg_start..bound]).unwrap_or_default();
             drop(g);
+            last_asr_ms = stats.pass(bound - seg_start, t_asr, prev_snap);
+            sub_texts.clear();
+            sub_start = bound;
             let t = txt.trim().to_string();
             // Спекулятивный маршрут показывает всё, что распознал, включая
             // латиницу английской речи: финал сам решит, чем её уточнить.
@@ -2415,14 +2432,27 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                 String::new(),
             )
         } else {
-            let txt = gm.transcribe(&mono16[seg_start..]).unwrap_or_default();
+            let to = sub_cut.unwrap_or(mono16.len());
+            let txt = gm.transcribe(&mono16[sub_start..to]).unwrap_or_default();
             drop(g);
-            let volatile = txt.trim();
-            (
-                render_segments_for_postprocess(&committed_segs),
-                volatile.to_string(),
-            )
+            last_asr_ms = stats.pass(to - sub_start, t_asr, prev_snap);
+            let txt = txt.trim();
+            let mut volatile = sub_texts.join(" ");
+            if !txt.is_empty() {
+                if !volatile.is_empty() {
+                    volatile.push(' ');
+                }
+                volatile.push_str(txt);
+            }
+            if sub_cut.is_some() {
+                if !txt.is_empty() {
+                    sub_texts.push(txt.to_string());
+                }
+                sub_start = to;
+            }
+            (render_segments_for_postprocess(&committed_segs), volatile)
         };
+        prev_snap = snap;
 
         let (committed, volatile, full) = clean_live_partial(
             &committed_raw,
@@ -2495,6 +2525,7 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
             _ => {}
         }
     }
+    stats.log(std::any::type_name::<T>());
 }
 
 /// Аргументы петли частичных результатов (упакованы, чтобы не плодить параметры).
@@ -5650,6 +5681,91 @@ const LOCAL_ASR_MAX_SEG_SAMPLES: usize = 25 * 16000;
 /// записях: 15 с — 5,0% расхождения, 25 с — 2,1%. Перекрытие соседних кусков
 /// со склейкой по совпавшим словам проверено и хуже (6,6%, дубли на стыке).
 const PREVIEW_MAX_SEG_SAMPLES: usize = LOCAL_ASR_MAX_SEG_SAMPLES;
+/// Лимит временного куска плашки внутри длинного активного сегмента (D-045).
+/// Проход ASR растёт линейно с окном: на 25 с полная GigaAM считает ~1 с, и
+/// текст отставал от речи на 2-3 с. Кусок до 8 с держит проход коротким.
+const PREVIEW_SUB_SAMPLES: usize = 8 * 16000;
+/// Минимальная пауза между проходами превью: поток не забирает ядро целиком.
+const PREVIEW_MIN_SLEEP_MS: u64 = 60;
+
+/// Сон перед следующим тиком превью. Длинная фраза - реже (420 мс), и время
+/// прошлого прохода ASR вычитается: период = max(каденс, проход), а не их сумма,
+/// иначе каждая новая порция слов ждала сон плюс два прохода.
+fn preview_sleep_ms(tick_ms: u64, active_samples: usize, last_asr_ms: u64) -> u64 {
+    let cadence = if tick_ms < 400 && active_samples >= 4 * 16000 {
+        420
+    } else {
+        tick_ms
+    };
+    cadence
+        .saturating_sub(last_asr_ms)
+        .max(PREVIEW_MIN_SLEEP_MS)
+}
+
+/// Где закрыть временный кусок плашки - по микропаузе, как и сегмент
+/// ([`segment_cut_bound`] с лимитом [`PREVIEW_SUB_SAMPLES`]). Паузу ≥1200 мс
+/// сюда не передаём: её обрабатывает настоящий рез сегмента раньше.
+fn preview_sub_cut(
+    sub_start: usize,
+    now: usize,
+    last_speech_end: usize,
+    last_gap_cut: Option<usize>,
+) -> Option<usize> {
+    segment_cut_bound(
+        sub_start,
+        now,
+        0,
+        last_speech_end,
+        last_gap_cut,
+        PREVIEW_SUB_SAMPLES,
+    )
+    .map(|b| b.clamp(sub_start, now))
+}
+
+/// Дешёвый замер задержки живого превью за диктовку: одна строка в debug.log.
+#[derive(Default)]
+struct PreviewLatency {
+    passes: u32,
+    window_max: usize,
+    asr_sum: u64,
+    asr_max: u64,
+    lag_sum: u64,
+    lag_max: u64,
+}
+
+impl PreviewLatency {
+    /// Учесть проход: `t_asr` - начало ASR, `prev_snap` - снимок прошлого
+    /// показа (самый старый звук, которого ещё нет в плашке). Вернёт asr, мс.
+    fn pass(&mut self, window: usize, t_asr: Instant, prev_snap: Instant) -> u64 {
+        let asr = t_asr.elapsed().as_millis() as u64;
+        let lag = prev_snap.elapsed().as_millis() as u64;
+        self.passes += 1;
+        self.window_max = self.window_max.max(window);
+        self.asr_sum += asr;
+        self.asr_max = self.asr_max.max(asr);
+        self.lag_sum += lag;
+        self.lag_max = self.lag_max.max(lag);
+        asr
+    }
+
+    fn log(&self, engine: &str) {
+        if self.passes == 0 {
+            return;
+        }
+        let n = u64::from(self.passes);
+        dbg_log(&format!(
+            "[lat] preview: engine={} passes={} window_max={}мс asr_avg={}мс asr_max={}мс lag_avg={}мс lag_max={}мс",
+            engine.rsplit("::").next().unwrap_or(engine),
+            self.passes,
+            self.window_max / 16,
+            self.asr_sum / n,
+            self.asr_max,
+            self.lag_sum / n,
+            self.lag_max,
+        ));
+    }
+}
+
 /// Насколько сегменту позволено перерасти лимит, пока ждём микропаузу.
 const SEG_CAP_OVERRUN_SAMPLES: usize = 4000 * 16;
 
@@ -5696,6 +5812,45 @@ mod seg_tests {
     use super::*;
 
     const MAX_SEG: usize = 8 * 16000;
+
+    #[test]
+    fn preview_sleep_subtracts_the_last_asr_pass() {
+        // Короткая фраза - обычный тик, длинная - реже.
+        assert_eq!(preview_sleep_ms(220, 16000, 0), 220);
+        assert_eq!(preview_sleep_ms(220, 5 * 16000, 0), 420);
+        // Проход уже съел часть каденса - спим только остаток.
+        assert_eq!(preview_sleep_ms(220, 5 * 16000, 300), 120);
+        // Проход дольше каденса - сразу следующий тик, но не впритык.
+        assert_eq!(preview_sleep_ms(220, 5 * 16000, 900), PREVIEW_MIN_SLEEP_MS);
+        // Parakeet с медленным тиком не ускоряется до 420.
+        assert_eq!(preview_sleep_ms(500, 5 * 16000, 100), 400);
+    }
+
+    #[test]
+    fn preview_sub_window_stays_short_and_cuts_at_micro_pauses() {
+        let s = 16000;
+        // Кусок короче лимита - распознаём хвост целиком.
+        assert_eq!(preview_sub_cut(0, 5 * s, 5 * s, Some(3 * s)), None);
+        // Лимит достигнут, микропауза в последней четверти - режем по ней.
+        assert_eq!(
+            preview_sub_cut(0, PREVIEW_SUB_SAMPLES, PREVIEW_SUB_SAMPLES, Some(7 * s)),
+            Some(7 * s)
+        );
+        // Микропауза уже использована прошлым куском - не режем повторно.
+        assert_eq!(
+            preview_sub_cut(
+                7 * s,
+                7 * s + PREVIEW_SUB_SAMPLES,
+                7 * s + PREVIEW_SUB_SAMPLES,
+                Some(7 * s)
+            ),
+            None
+        );
+        // Без микропаузы окно всё равно ограничено, рез не дальше «сейчас».
+        let now = PREVIEW_SUB_SAMPLES + SEG_CAP_OVERRUN_SAMPLES;
+        let cut = preview_sub_cut(0, now, now, None).expect("окно ограничено");
+        assert!(cut <= now);
+    }
 
     #[test]
     fn overlong_segment_is_cut_at_a_micro_pause_never_mid_word() {
@@ -5949,6 +6104,172 @@ mod seg_tests {
             new_sum <= old_sum,
             "рез по микропаузе не должен уводить плашку дальше от финала"
         );
+    }
+
+    /// Живое превью в реальном времени: часы аудио идут и во время прохода ASR,
+    /// как в [`local_partial_loop`]. На каждый показ - окно прохода, время ASR и
+    /// задержка: сколько прошло от снимка прошлого тика (самый старый звук,
+    /// которого ещё не было в плашке) до показа нового текста.
+    fn preview_latency_sim(
+        g: &mut crate::gigaam::GigaAm,
+        samples: &[f32],
+        speech: &[bool],
+        tuned: bool,
+    ) -> Vec<(usize, u64, u64)> {
+        const TICK_MS: u64 = 220;
+        let mut out = Vec::new();
+        let (mut seg_start, mut last_speech_end, mut vad_pos) = (0usize, 0usize, 0usize);
+        let mut seg_has_speech = false;
+        let mut gap_start: Option<usize> = None;
+        let mut last_gap_cut: Option<usize> = None;
+        let (mut now, mut prev_snap) = (0usize, 0usize);
+        let mut last_asr_ms = 0u64;
+        let mut sub_start = 0usize;
+        loop {
+            let active = now.saturating_sub(if tuned { sub_start } else { seg_start });
+            let sleep = if tuned {
+                preview_sleep_ms(TICK_MS, active, last_asr_ms)
+            } else if active >= 4 * 16000 {
+                420
+            } else {
+                TICK_MS
+            };
+            now += sleep as usize * 16;
+            if now > samples.len() {
+                break;
+            }
+            while vad_pos + crate::vad::CHUNK <= now {
+                let voiced = speech[vad_pos / crate::vad::CHUNK];
+                vad_pos += crate::vad::CHUNK;
+                if voiced {
+                    last_speech_end = vad_pos;
+                    seg_has_speech = true;
+                    gap_start = None;
+                } else if seg_has_speech {
+                    let from = *gap_start.get_or_insert(vad_pos - crate::vad::CHUNK);
+                    if vad_pos - from >= SEG_GAP_MIN_SAMPLES {
+                        last_gap_cut = Some((from + vad_pos) / 2);
+                    }
+                }
+            }
+            if !seg_has_speech {
+                prev_snap = now;
+                last_asr_ms = 0;
+                continue;
+            }
+            let cut = segment_cut_bound(
+                seg_start,
+                now,
+                vad_pos.saturating_sub(last_speech_end),
+                last_speech_end,
+                last_gap_cut,
+                PREVIEW_MAX_SEG_SAMPLES,
+            );
+            sub_start = sub_start.max(seg_start);
+            let sub_cut = (tuned && cut.is_none())
+                .then(|| preview_sub_cut(sub_start, now, last_speech_end, last_gap_cut))
+                .flatten();
+            let (from, to) = match (cut, sub_cut) {
+                (Some(b), _) => (seg_start, b.clamp(seg_start, now)),
+                (None, Some(b)) => (sub_start, b),
+                (None, None) => (if tuned { sub_start } else { seg_start }, now),
+            };
+            let t = Instant::now();
+            let _ = g.transcribe(&samples[from..to]);
+            last_asr_ms = t.elapsed().as_millis() as u64;
+            out.push((
+                to - from,
+                last_asr_ms,
+                ((now - prev_snap) / 16) as u64 + last_asr_ms,
+            ));
+            if sub_cut.is_some() {
+                sub_start = to;
+            }
+            if cut.is_some() {
+                sub_start = to;
+                seg_start = to;
+                seg_has_speech = last_speech_end > to;
+                gap_start = None;
+                last_gap_cut = None;
+            }
+            prev_snap = now;
+            now += last_asr_ms as usize * 16;
+        }
+        out
+    }
+
+    /// Задержка живого превью на реальных записях, до и после правки D-045.
+    ///
+    /// `VOXFLOW_TEST_DATA_DIR=... cargo test --lib preview_latency -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local GigaAM models and the private dataset"]
+    fn preview_latency_on_dataset() {
+        let files: usize = std::env::var("VOXFLOW_EVAL_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let threads = Settings::default().effective_threads() as usize;
+        // Как в приложении: полная модель, если стоит, иначе int8.
+        let mut g = load_gigaam_fp32(threads).unwrap_or_else(|_| {
+            crate::gigaam::GigaAm::load(&crate::paths::gigaam_dir(), threads).expect("gigaam")
+        });
+        println!("модель: {}", if g.fp32 { "fp32" } else { "int8" });
+        let mut vad =
+            crate::vad::SileroVad::load(&crate::paths::vad_model_path(None)).expect("vad");
+        let _ = g.transcribe(&vec![0.0f32; 16000]);
+        let mut wavs: Vec<std::path::PathBuf> = std::fs::read_dir(crate::paths::dataset_dir())
+            .expect("dataset")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("wav"))
+            .collect();
+        wavs.sort();
+        // Сначала длинные: задержка растёт именно на них.
+        let mut wavs: Vec<_> = wavs
+            .into_iter()
+            .rev()
+            .take(files * 4)
+            .map(|p| (std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0), p))
+            .collect();
+        wavs.sort_by_key(|(len, _)| std::cmp::Reverse(*len));
+        let wavs: Vec<_> = wavs.into_iter().take(files).map(|(_, p)| p).collect();
+        let report = |name: &str, rows: &[(usize, u64, u64)]| {
+            let pct = |mut v: Vec<u64>, p: usize| {
+                v.sort_unstable();
+                v.get((v.len().saturating_sub(1)) * p / 100)
+                    .copied()
+                    .unwrap_or(0)
+            };
+            let lag: Vec<u64> = rows.iter().map(|r| r.2).collect();
+            let asr: Vec<u64> = rows.iter().map(|r| r.1).collect();
+            let long: Vec<u64> = rows
+                .iter()
+                .filter(|r| r.0 >= 15 * 16000)
+                .map(|r| r.2)
+                .collect();
+            println!(
+                "{name}: показов {} окно max {:.1}с, asr p50 {} p95 {} мс, lag p50 {} p95 {} max {} мс, lag на окне ≥15 с p50 {} p95 {} мс",
+                rows.len(),
+                rows.iter().map(|r| r.0).max().unwrap_or(0) as f32 / 16000.0,
+                pct(asr.clone(), 50),
+                pct(asr, 95),
+                pct(lag.clone(), 50),
+                pct(lag.clone(), 95),
+                lag.iter().max().copied().unwrap_or(0),
+                pct(long.clone(), 50),
+                pct(long, 95),
+            );
+        };
+        let (mut before, mut after) = (Vec::new(), Vec::new());
+        for wav in &wavs {
+            let samples = read_wav_16k(wav);
+            let speech = speech_track(&mut vad, &samples);
+            before.extend(preview_latency_sim(&mut g, &samples, &speech, false));
+            after.extend(preview_latency_sim(&mut g, &samples, &speech, true));
+        }
+        println!("записей {}", wavs.len());
+        report("было ", &before);
+        report("стало", &after);
     }
 
     /// Прогон одной записи через финальный локальный путь (GigaAM +
