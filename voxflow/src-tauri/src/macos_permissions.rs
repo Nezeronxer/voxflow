@@ -289,6 +289,7 @@ mod imp {
 
 use serde::Serialize;
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MicState {
