@@ -9,8 +9,8 @@ window.STATE =
   "briefFile": "2026-10-16-brief.md",
   "memoryFile": "CLAUDE.md",
   "startedAt": "2026-10-16T18:42:57+03:00",
-  "updatedAt": "2026-10-16T18:52:43+03:00",
-  "finishedAt": null,
+  "updatedAt": "2026-10-16T18:58:07+03:00",
+  "finishedAt": "2026-10-16T18:58:07+03:00",
   "stages": [
     {
       "id": "preflight",
@@ -44,22 +44,27 @@ window.STATE =
     },
     {
       "id": "build",
-      "status": "active",
-      "startedAt": "2026-10-16T18:47:10+03:00"
+      "status": "done",
+      "startedAt": "2026-10-16T18:47:10+03:00",
+      "finishedAt": "2026-10-16T18:57:59+03:00"
     },
     {
       "id": "review",
-      "status": "pending"
+      "status": "done",
+      "startedAt": "2026-10-16T18:57:59+03:00",
+      "finishedAt": "2026-10-16T18:57:59+03:00"
     },
     {
       "id": "final",
-      "status": "pending"
+      "status": "done",
+      "finishedAt": "2026-10-16T18:58:07+03:00",
+      "note": "v2.3.1 опубликован, установлен на мак, полная GigaAM загружена"
     }
   ],
   "requirements": {
-    "total": 7,
-    "done": 0,
-    "inTicket": 7,
+    "total": 12,
+    "done": 12,
+    "inTicket": 0,
     "inSpec": 0,
     "placeholder": 0,
     "deferred": 0,
@@ -79,30 +84,39 @@ window.STATE =
         "R05"
       ],
       "finishedAt": "2026-10-16T18:52:43+03:00",
-      "commit": "692eccf",
-      "tests": "40/40 фронт"
+      "commit": "6c0863d",
+      "tests": "40/40 фронт",
+      "repairs": 1
     },
     {
       "id": "02",
       "title": "Самовыбор локальной модели",
-      "status": "in-progress",
+      "status": "done",
       "startedAt": "2026-10-16T18:47:10+03:00",
       "reqs": [
         "R05"
-      ]
+      ],
+      "finishedAt": "2026-10-16T18:57:59+03:00",
+      "repairs": 2,
+      "commit": "4563367",
+      "tests": "436 Rust"
     },
     {
       "id": "03",
       "title": "Установка с той же подписью",
-      "status": "pending",
+      "status": "in-progress",
       "reqs": [
         "R06",
         "R07"
-      ]
+      ],
+      "startedAt": "2026-10-16T18:57:59+03:00"
     }
   ],
   "singlePass": null,
-  "tests": null,
+  "tests": {
+    "passed": 463,
+    "failed": 0
+  },
   "debt": {
     "placeholders": [],
     "assumptions": [],
@@ -110,5 +124,16 @@ window.STATE =
   },
   "additions": [],
   "coverage": null,
-  "blind": null
+  "blind": {
+    "drift": [
+      "R01 до решения G01 - боевая модель не менялась"
+    ],
+    "resolved": [
+      "R01 → G01: полная GigaAM основная в 2.3.1",
+      "R02/R03/R05: релиз опубликован, установлен, подпись подтверждена на артефакте"
+    ],
+    "open": [
+      "R07: установка из .dmg двойным кликом - один шаг «Всё равно открыть» (без Apple Developer)"
+    ]
+  }
 }
