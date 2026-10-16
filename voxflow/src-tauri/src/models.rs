@@ -529,6 +529,8 @@ pub(crate) struct InstalledModels {
     pub whisper: Vec<(String, u64)>,
     /// Пользователь сам удалил полную GigaAM (метка `gigaam-fp32.skip`).
     pub fp32_opted_out: bool,
+    /// Настроенная Whisper качается или лежит недокачанной (`.part`).
+    pub configured_pending: bool,
 }
 
 /// Решение автоподготовки моделей: что записать в настройки и что качать.
@@ -566,7 +568,9 @@ pub(crate) fn plan_local_models(
     let whisper_any = configured_ok || largest.is_some();
     let gigaam_any = installed.gigaam_fp32 || installed.gigaam_int8;
 
-    let set_model = if stt_provider == "local" && !configured_ok {
+    // Недокачанная настроенная модель - выбор пользователя: не переписываем,
+    // до готовности распознаёт установленная через fallback в `resolve_model`.
+    let set_model = if stt_provider == "local" && !configured_ok && !installed.configured_pending {
         largest
     } else {
         None
@@ -651,6 +655,10 @@ pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Setting
             gigaam_int8: verify_dir_model(GIGAAM_NAME).is_ok(),
             whisper: installed_whisper_models(),
             fp32_opted_out: fp32_opt_out_path().exists(),
+            configured_pending: crate::paths::model_path(&settings.model)
+                .with_extension("part")
+                .exists()
+                || WHISPER_ACTIVE.lock().as_deref() == Some(settings.model.as_str()),
         };
         let plan = plan_local_models(
             &settings.language,
@@ -1285,7 +1293,17 @@ mod tests {
             gigaam_int8: int8,
             whisper: whisper.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
             fp32_opted_out: false,
+            configured_pending: false,
         }
+    }
+
+    #[test]
+    fn plan_keeps_configured_model_while_its_download_is_pending() {
+        let mut inst = installed(false, false, &[(OTHER, 3)]);
+        inst.configured_pending = true;
+        let plan = plan_local_models("auto", "gigaam", "local", TURBO, &inst);
+        assert_eq!(plan.set_model, None);
+        assert_eq!(plan.download, None);
     }
 
     const TURBO: &str = RECOMMENDED_WHISPER_NAME;
