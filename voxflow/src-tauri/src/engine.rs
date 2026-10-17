@@ -8710,8 +8710,10 @@ fn rewrite_context_hint(
         live_inserted,
     );
 
+    // Видно поле - оно и есть правда: прошлые фрагменты в нём уже лежат (или
+    // человек их стёр), а второй их копией модель дописывала их ещё раз.
     let memory = ctx.dictation_memory.lock();
-    if target_matches_memory(&memory, actx) {
+    if parts.is_empty() && target_matches_memory(&memory, actx) {
         if !memory.summary.trim().is_empty() {
             parts.push(format!(
                 "Краткая выжимка более ранней диктовки: {}",
@@ -9240,6 +9242,71 @@ fn rewrite_grounding(
     }
 }
 
+/// Слова с позицией начала и основой, включая служебные: для выравнивания
+/// ответа модели по диктовке нужны все слова, а не только содержательные.
+fn rewrite_word_spans(value: &str) -> Vec<(usize, String)> {
+    let mut spans = Vec::new();
+    let mut start = None;
+    for (i, c) in value
+        .char_indices()
+        .chain(std::iter::once((value.len(), ' ')))
+    {
+        match (c.is_alphanumeric(), start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                spans.push((s, rewrite_stem(&value[s..i])));
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    spans
+}
+
+/// Маленькая локальная модель, вопреки промпту, иногда начинает ответ с
+/// текста из `<context>` - и прошлая диктовка вставлялась в поле второй раз.
+/// Срезает такой префикс: все слова до начала диктовки взяты из контекста,
+/// слов не меньше двух. Берётся самая поздняя такая точка - служебное «и» в
+/// повторе не должно обрезать его на полпути.
+fn strip_context_echo(input: &str, output: &str, context: &str) -> Option<String> {
+    let input_words = rewrite_word_spans(input);
+    let output_words = rewrite_word_spans(output);
+    if input_words.is_empty() {
+        return None;
+    }
+    let context_stems: HashSet<String> = rewrite_word_spans(context)
+        .into_iter()
+        .map(|(_, stem)| stem)
+        .collect();
+    let m = input_words.len().min(2);
+    let mut cut = None;
+    for p in 1..=output_words.len().saturating_sub(m) {
+        if !context_stems.contains(&output_words[p - 1].1) {
+            break;
+        }
+        let starts_dictation = output_words[p..p + m]
+            .iter()
+            .zip(&input_words[..m])
+            .all(|(o, i)| o.1 == i.1);
+        if p >= 2 && starts_dictation {
+            cut = Some(output_words[p].0);
+        }
+    }
+    cut.map(|at| output[at..].to_string())
+}
+
+/// Сколько содержательных слов ответа нет в диктовке, зато есть в контексте:
+/// это повтор уже написанного, а не исправление ослышки.
+fn context_echo_words(input: &str, output: &str, context: &str) -> usize {
+    let input_stems: HashSet<String> = rewrite_content_stems(input).into_iter().collect();
+    let context_stems: HashSet<String> = rewrite_content_stems(context).into_iter().collect();
+    rewrite_content_stems(output)
+        .into_iter()
+        .filter(|stem| !input_stems.contains(stem) && context_stems.contains(stem))
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 /// Та же защита для UI-команд (`transform_text`, переработка промпта) — там
 /// раньше не было вообще ничего, и обрезанный ответ затирал текст пользователя.
 /// `min_recall = 0.0` для намеренно сокращающих преобразований: остаётся только
@@ -9392,7 +9459,23 @@ fn refine_text_with_fallback(
     for attempt in attempts {
         match attempt() {
             Ok(r) if !r.trim().is_empty() => {
-                let refined = postprocess::normalize_spaces(r.trim());
+                let mut refined = postprocess::normalize_spaces(r.trim());
+                if let Some(context) = context_hint {
+                    if let Some(stripped) = strip_context_echo(text, &refined, context) {
+                        dbg_log(
+                            "рерайт: модель повторила контекст в начале ответа - повтор срезан",
+                        );
+                        refined = stripped;
+                    }
+                    let echoed = context_echo_words(text, &refined, context);
+                    if echoed >= 2 {
+                        failure = Some("модель повторила уже написанный текст".to_string());
+                        log::warn!(
+                            "рерайт отклонён: в ответе {echoed} слов из контекста, которых нет в диктовке"
+                        );
+                        continue;
+                    }
+                }
                 let grounding =
                     rewrite_grounding(text, &refined, s.rewrite_min_recall, max_expansion);
                 if grounding.grounded {
@@ -9619,6 +9702,37 @@ mod smart_prompt_tests {
         // Без live-вставки окружение берётся из поля как есть.
         let parts = rewrite_context_visible_parts(&actx, None, "Привет", false);
         assert!(parts.join(" ").contains("Привет как дела"));
+    }
+
+    #[test]
+    fn rewrite_context_echo_is_stripped_or_counted() {
+        let context =
+            "Последние вставленные фрагменты: Удали Ugram и установи Telegram обычный, изстова.";
+        let input = "и перенеси туда сессию";
+        let echoed = "Удали Ugram и установи Telegram обычный, изстова, и перенеси туда сессию.";
+        assert_eq!(
+            strip_context_echo(input, echoed, context).as_deref(),
+            Some("и перенеси туда сессию.")
+        );
+        assert_eq!(
+            context_echo_words(input, "и перенеси туда сессию.", context),
+            0
+        );
+        assert!(context_echo_words(input, echoed, context) >= 2);
+        // Без повтора ничего не срезается, исправление одного слова по контексту - не повтор.
+        assert_eq!(
+            strip_context_echo(input, "И перенеси туда сессию.", context),
+            None
+        );
+        assert_eq!(
+            context_echo_words("установи у грам", "Установи Ugram.", context),
+            1
+        );
+        // Диктовка сама повторяет контекст - резать нечего.
+        assert_eq!(
+            strip_context_echo("Удали Ugram", "Удали Ugram.", context),
+            None
+        );
     }
 
     /// Порог по умолчанию из настроек — тесты гарда идут через него.
