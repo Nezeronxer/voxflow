@@ -2486,8 +2486,14 @@ fn local_partial_loop<T: LocalStt>(a: LocalLoopArgs<T>) {
                 String::new(),
             )
         } else {
-            let to = sub_cut.unwrap_or(mono16.len());
-            let txt = gm.transcribe(&mono16[sub_start..to]).unwrap_or_default();
+            let to = sub_cut
+                .unwrap_or_else(|| preview_window_end(sub_start, mono16.len(), last_speech_end));
+            // Пустое окно (после речи одна тишина) - показывать нечего нового.
+            let txt = if to > sub_start {
+                gm.transcribe(&mono16[sub_start..to]).unwrap_or_default()
+            } else {
+                String::new()
+            };
             drop(g);
             last_asr_ms = stats.pass(to - sub_start, t_asr, prev_snap);
             let txt = txt.trim();
@@ -5795,6 +5801,13 @@ fn preview_sleep_ms(tick_ms: u64, active_samples: usize, last_asr_ms: u64) -> u6
 /// Где закрыть временный кусок плашки - по микропаузе, как и сегмент
 /// ([`segment_cut_bound`] с лимитом [`PREVIEW_SUB_SAMPLES`]). Паузу ≥1200 мс
 /// сюда не передаём: её обрабатывает настоящий рез сегмента раньше.
+/// Конец окна живого прохода: звук после последней речи VAD финал вырезает
+/// (`compact_speech_for_final_asr`), поэтому и плашка его не распознаёт - иначе
+/// тихий фоновый голос в паузе показывался, а в поле не попадал.
+fn preview_window_end(sub_start: usize, now: usize, last_speech_end: usize) -> usize {
+    (last_speech_end + SEG_TAIL_SAMPLES).clamp(sub_start, now)
+}
+
 fn preview_sub_cut(
     sub_start: usize,
     now: usize,
@@ -6286,6 +6299,166 @@ mod seg_tests {
             now += last_asr_ms as usize * 16;
         }
         out
+    }
+
+    /// Последний текст плашки перед отпусканием клавиши - тем же порядком, что
+    /// [`local_partial_loop`] после D-045 (короткие окна прохода, рез по паузам).
+    fn preview_last_shown(
+        g: &mut crate::gigaam::GigaAm,
+        samples: &[f32],
+        speech: &[bool],
+    ) -> String {
+        const TICK_MS: u64 = 220;
+        let (mut seg_start, mut last_speech_end, mut vad_pos) = (0usize, 0usize, 0usize);
+        let mut seg_has_speech = false;
+        let mut gap_start: Option<usize> = None;
+        let mut last_gap_cut: Option<usize> = None;
+        let (mut now, mut last_asr_ms, mut sub_start) = (0usize, 0u64, 0usize);
+        let mut committed: Vec<String> = Vec::new();
+        let mut sub_texts: Vec<String> = Vec::new();
+        let mut shown = String::new();
+        loop {
+            now +=
+                preview_sleep_ms(TICK_MS, now.saturating_sub(sub_start), last_asr_ms) as usize * 16;
+            if now > samples.len() {
+                break;
+            }
+            while vad_pos + crate::vad::CHUNK <= now {
+                let voiced = speech[vad_pos / crate::vad::CHUNK];
+                vad_pos += crate::vad::CHUNK;
+                if voiced {
+                    last_speech_end = vad_pos;
+                    seg_has_speech = true;
+                    gap_start = None;
+                } else if seg_has_speech {
+                    let from = *gap_start.get_or_insert(vad_pos - crate::vad::CHUNK);
+                    if vad_pos - from >= SEG_GAP_MIN_SAMPLES {
+                        last_gap_cut = Some((from + vad_pos) / 2);
+                    }
+                }
+            }
+            if !seg_has_speech {
+                last_asr_ms = 0;
+                continue;
+            }
+            let cut = segment_cut_bound(
+                seg_start,
+                now,
+                vad_pos.saturating_sub(last_speech_end),
+                last_speech_end,
+                last_gap_cut,
+                PREVIEW_MAX_SEG_SAMPLES,
+            );
+            sub_start = sub_start.max(seg_start);
+            let t = Instant::now();
+            let volatile = if let Some(b) = cut {
+                let b = b.clamp(seg_start, now);
+                let txt = g.transcribe(&samples[seg_start..b]).unwrap_or_default();
+                if !txt.trim().is_empty() {
+                    committed.push(txt.trim().to_string());
+                }
+                sub_texts.clear();
+                sub_start = b;
+                seg_start = b;
+                seg_has_speech = last_speech_end > b;
+                gap_start = None;
+                last_gap_cut = None;
+                String::new()
+            } else {
+                let sub_cut = preview_sub_cut(sub_start, now, last_speech_end, last_gap_cut);
+                let to =
+                    sub_cut.unwrap_or_else(|| preview_window_end(sub_start, now, last_speech_end));
+                let txt = if to > sub_start {
+                    g.transcribe(&samples[sub_start..to]).unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let txt = txt.trim().to_string();
+                let mut v = sub_texts.join(" ");
+                if !txt.is_empty() {
+                    if !v.is_empty() {
+                        v.push(' ');
+                    }
+                    v.push_str(&txt);
+                }
+                if sub_cut.is_some() {
+                    if !txt.is_empty() {
+                        sub_texts.push(txt);
+                    }
+                    sub_start = to;
+                }
+                v
+            };
+            last_asr_ms = t.elapsed().as_millis() as u64;
+            let mut full = committed.join(" ");
+            if !volatile.is_empty() {
+                if !full.is_empty() {
+                    full.push(' ');
+                }
+                full.push_str(&volatile);
+            }
+            if !full.is_empty() {
+                shown = full;
+            }
+            now += last_asr_ms as usize * 16;
+        }
+        shown
+    }
+
+    /// Где плашка перед отпусканием сильнее всего расходится с финалом.
+    ///
+    /// `VOXFLOW_TEST_DATA_DIR=... cargo test --lib preview_vs_final_worst -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local GigaAM models and the private dataset"]
+    fn preview_vs_final_worst() {
+        let files: usize = std::env::var("VOXFLOW_EVAL_LIMIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(80);
+        let threads = Settings::default().effective_threads() as usize;
+        let mut g =
+            crate::gigaam::GigaAm::load(&crate::paths::gigaam_dir(), threads).expect("gigaam");
+        let vad_path = crate::paths::vad_model_path(None);
+        let mut vad = crate::vad::SileroVad::load(&vad_path).expect("vad");
+        let vad_final = Arc::new(Mutex::new(Some(
+            crate::vad::SileroVad::load(&vad_path).expect("vad"),
+        )));
+        let _ = g.transcribe(&vec![0.0f32; 8000]);
+        let mut wavs: Vec<std::path::PathBuf> = std::fs::read_dir(crate::paths::dataset_dir())
+            .expect("dataset")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("wav"))
+            .collect();
+        wavs.sort();
+        let wavs = wavs.split_off(wavs.len().saturating_sub(files));
+        let mut rows = Vec::new();
+        for wav in &wavs {
+            let samples = read_wav_16k(wav);
+            let compact = compact_speech_for_final_asr(&vad_final, &samples);
+            let fin = local_transcribe_long(&vad_final, &compact, &mut |seg| g.transcribe(seg))
+                .unwrap_or_default()
+                .replace(SEMANTIC_PARAGRAPH_MARKER, " ");
+            if fin.trim().is_empty() {
+                continue;
+            }
+            let speech = speech_track(&mut vad, &samples);
+            let shown = preview_last_shown(&mut g, &samples, &speech);
+            let w = crate::wer(&fin, &shown).unwrap_or(1.0);
+            rows.push((
+                w,
+                wav.file_name().unwrap().to_string_lossy().to_string(),
+                samples.len() as f32 / 16000.0,
+                fin,
+                shown,
+            ));
+        }
+        let mean = rows.iter().map(|r| r.0).sum::<f64>() / rows.len().max(1) as f64;
+        rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+        println!("записей {}, среднее расхождение {mean:.3}", rows.len());
+        for (w, name, secs, fin, shown) in rows.iter().take(12) {
+            println!("{w:.3} {name} {secs:.1}c\n  финал:  {fin}\n  плашка: {shown}");
+        }
     }
 
     /// Задержка живого превью на реальных записях, до и после правки D-045.
@@ -7319,6 +7492,17 @@ mod seg_tests {
 
     /// Горячий путь auto-финала: русская речь (в т.ч. с латинскими терминами)
     /// принимается от GigaAM мгновенно; латиница/пусто — уточнение whisper-ом.
+    #[test]
+    fn preview_window_stops_after_the_last_speech() {
+        let tail = SEG_TAIL_SAMPLES;
+        // После речи 2 с тишины: окно кончается хвостом речи, не «сейчас».
+        assert_eq!(preview_window_end(0, 5 * 16000, 16000), 16000 + tail);
+        // Речь идёт прямо сейчас - окно до конца буфера.
+        assert_eq!(preview_window_end(0, 16000, 16000), 16000);
+        // Окно не уходит назад за начало прохода.
+        assert_eq!(preview_window_end(3 * 16000, 5 * 16000, 16000), 3 * 16000);
+    }
+
     #[test]
     fn parakeet_auto_final_trusted_takes_only_latin() {
         assert!(parakeet_auto_final_trusted(
