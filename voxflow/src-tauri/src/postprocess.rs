@@ -162,7 +162,71 @@ pub fn process(text: &str, s: &Settings, dict: &[Dict], snippets: &[Snippet]) ->
     if s.auto_punct {
         t = capitalize_sentences(&t);
     }
+    // 7) После капитализации: «iPhone» в начале фразы не станет «IPhone».
+    t = latinize_brands(&t);
     normalize_spaces(&t)
+}
+
+/// Основа кириллической записи -> название. ASR пишет английские термины в
+/// русской речи кириллицей («на гидхаб»); раньше латиницей их делал только
+/// ИИ-корректор финала, и плашка расходилась с тем, что вставилось.
+const BRANDS: &[(&str, &str)] = &[
+    ("гитхаб", "GitHub"),
+    ("гидхаб", "GitHub"),
+    ("гитлаб", "GitLab"),
+    ("ютуб", "YouTube"),
+    ("телеграм", "Telegram"),
+    ("дискорд", "Discord"),
+    ("гугл", "Google"),
+    ("впн", "VPN"),
+    ("айфон", "iPhone"),
+    ("айпад", "iPad"),
+    ("макбук", "MacBook"),
+    ("виндовс", "Windows"),
+    ("виндоус", "Windows"),
+    ("андроид", "Android"),
+    ("линукс", "Linux"),
+    ("вотсап", "WhatsApp"),
+    ("ватсап", "WhatsApp"),
+    ("инстаграм", "Instagram"),
+    ("спотифай", "Spotify"),
+    ("дропбокс", "Dropbox"),
+    ("клод", "Claude"),
+    ("чатгпт", "ChatGPT"),
+    ("фигм", "Figma"),
+];
+
+/// Падежные окончания: «на Ютубе» -> «на YouTube» (латинское название не склоняют).
+const BRAND_ENDINGS: &[&str] = &[
+    "", "а", "у", "е", "ом", "ой", "ы", "ах", "ам", "ами", "ов", "и", "ю", "ем",
+];
+
+fn brand_for(word: &str) -> Option<&'static str> {
+    let w = word.to_lowercase().replace('ё', "е");
+    BRANDS.iter().find_map(|(stem, brand)| {
+        let rest = w.strip_prefix(stem)?;
+        // «фигм» без окончания - не слово.
+        (BRAND_ENDINGS.contains(&rest) && !(rest.is_empty() && *stem == "фигм")).then_some(*brand)
+    })
+}
+
+fn latinize_brands(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let flush = |word: &mut String, out: &mut String| {
+        out.push_str(brand_for(word).unwrap_or(word));
+        word.clear();
+    };
+    for ch in text.chars() {
+        if ch.is_alphabetic() {
+            word.push(ch);
+        } else {
+            flush(&mut word, &mut out);
+            out.push(ch);
+        }
+    }
+    flush(&mut word, &mut out);
+    out
 }
 
 fn apply_dictionary_once(text: &str, dict: &[Dict]) -> String {
@@ -2466,6 +2530,25 @@ mod filler_tests {
         assert_eq!(
             expand_template_with("X {clipboard} Y", "d", "t", None),
             "X {clipboard} Y"
+        );
+    }
+
+    #[test]
+    fn brands_in_russian_speech_become_latin_in_any_case() {
+        let s = st(false, false);
+        assert_eq!(
+            process("выложи это на гидхаб", &s, &[], &[]),
+            "выложи это на GitHub"
+        );
+        assert_eq!(
+            process("Ютуб и Телеграме через ВПН, макбука нет", &s, &[], &[]),
+            "YouTube и Telegram через VPN, MacBook нет"
+        );
+        assert_eq!(latinize_brands("Айфоне. В фигме"), "iPhone. В Figma");
+        // Русские слова с той же основой не трогаем.
+        assert_eq!(
+            latinize_brands("пришла телеграмма, гуглить"),
+            "пришла телеграмма, гуглить"
         );
     }
 
