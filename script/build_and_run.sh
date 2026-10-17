@@ -58,11 +58,22 @@ build_app() {
     }
     (cd "$APP_DIR" && "$npm_bin" ci)
   fi
+  # Ad-hoc подпись меняется с каждой сборкой - macOS сбрасывает доступы;
+  # постоянная самоподпись из связки ключей их сохраняет.
+  local identity="${VOXFLOW_SIGNING_IDENTITY:-}"
+  if [[ -z "$identity" ]]; then
+    if security find-identity -v -p codesigning 2>/dev/null | grep -q '"VoxFlow Self-Signed"'; then
+      identity="VoxFlow Self-Signed"
+    else
+      identity="-"
+      echo "warning: ключа VoxFlow Self-Signed нет - ad-hoc подпись, доступы macOS слетят (./script/setup-macos-signing.sh)" >&2
+    fi
+  fi
   (
     cd "$APP_DIR"
     export PATH="$(dirname "$NODE_BIN"):$PATH"
     MACOSX_DEPLOYMENT_TARGET=11.0 \
-      APPLE_SIGNING_IDENTITY="${VOXFLOW_SIGNING_IDENTITY:--}" \
+      APPLE_SIGNING_IDENTITY="$identity" \
       "$NODE_BIN" "$TAURI_CLI" build --ci --target "$TARGET_TRIPLE" --bundles app
   )
   [[ -d "$BUILD_APP" ]] || {

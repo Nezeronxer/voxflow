@@ -158,7 +158,7 @@ const DIR_MODELS: &[DirModel] = &[
     },
     DirModel {
         name: PARAKEET_NAME,
-        label: "Parakeet TDT v3 — быстрый English (явный EN)",
+        label: "Parakeet TDT v3 — быстрый English (EN и Авто)",
         size_mb: 640,
         kind: "parakeet",
         base_url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/8f23f0c03c8761650bdb5b40aaf3e40d2c15f1ce/",

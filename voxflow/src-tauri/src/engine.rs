@@ -928,6 +928,38 @@ fn gigaam_auto_final_trusted(text: &str) -> bool {
     looks_like_russian_speech(text)
 }
 
+/// Второй шаг auto: GigaAM не узнал русский - Parakeet принимается, если отдал
+/// латиницу без кириллицы (английская речь). Кириллица/пусто - решает whisper.
+fn parakeet_auto_final_trusted(text: &str) -> bool {
+    let t = text.trim();
+    !has_cyrillic(t) && t.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+/// Движок живого preview в auto: тот же выбор, что у финала - GigaAM, а
+/// нерусский сегмент перераспознаёт Parakeet (GigaAM пишет английский мусором).
+struct AutoLangStt {
+    ru: Arc<Mutex<Option<crate::gigaam::GigaAm>>>,
+    en: Arc<Mutex<Option<crate::parakeet::Parakeet>>>,
+}
+impl LocalStt for AutoLangStt {
+    fn transcribe(&mut self, samples_16k: &[f32]) -> anyhow::Result<String> {
+        let t = match self.ru.lock().as_mut() {
+            Some(g) => g.transcribe(samples_16k)?,
+            None => String::new(),
+        };
+        if t.trim().is_empty() || gigaam_auto_final_trusted(&t) {
+            return Ok(t);
+        }
+        if let Some(p) = self.en.try_lock().as_mut().and_then(|g| g.as_mut()) {
+            let pt = p.transcribe(samples_16k)?;
+            if parakeet_auto_final_trusted(&pt) {
+                return Ok(pt);
+            }
+        }
+        Ok(t)
+    }
+}
+
 /// Бейдж языка живого preview.
 ///
 /// Неспекулятивный маршрут (preview и финал — один движок) держит фиксированный
@@ -1076,6 +1108,12 @@ fn warmup(ctx: EngineCtx) {
     }
     if s.language == "auto" && s.engine == "gigaam" && crate::models::gigaam_available() {
         warm_gigaam(&ctx);
+        // С Parakeet auto-финал до whisper почти не доходит: whisper-server
+        // (3,5 ГБ у large) поднимется лениво, только если понадобится.
+        if crate::parakeet::dir_ready(&paths::parakeet_dir()) {
+            warm_parakeet(&ctx);
+            return;
+        }
     }
     if s.engine == "whisper_cli" {
         dbg_log("warmup: cli — пропуск");
@@ -1431,19 +1469,35 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
             // показываем быстрый GigaAM-preview только в кружке (без live-вставки).
             let mut preview_settings = s.clone();
             preview_settings.stream_mode = "never".into();
-            start_local_partial_loop(
-                capture,
-                ctx,
-                &preview_settings,
-                target_fp,
-                Arc::clone(&ctx.gigaam),
-                LocalLoopTuning {
-                    tick_ms: 220,
-                    max_seg_samples: PREVIEW_MAX_SEG_SAMPLES,
-                    fixed_lang: Some("ru"),
-                    speculative: true,
-                },
-            );
+            let tuning = LocalLoopTuning {
+                tick_ms: 220,
+                max_seg_samples: PREVIEW_MAX_SEG_SAMPLES,
+                fixed_lang: Some("ru"),
+                speculative: true,
+            };
+            if resident_model_ready(&ctx.parakeet) {
+                let auto = AutoLangStt {
+                    ru: Arc::clone(&ctx.gigaam),
+                    en: Arc::clone(&ctx.parakeet),
+                };
+                start_local_partial_loop(
+                    capture,
+                    ctx,
+                    &preview_settings,
+                    target_fp,
+                    Arc::new(Mutex::new(Some(auto))),
+                    tuning,
+                );
+            } else {
+                start_local_partial_loop(
+                    capture,
+                    ctx,
+                    &preview_settings,
+                    target_fp,
+                    Arc::clone(&ctx.gigaam),
+                    tuning,
+                );
+            }
             return;
         }
         dbg_log("partial: auto+gigaam preview недоступен — пробуем whisper-стрим");
@@ -5422,6 +5476,17 @@ fn local_asr(
                                 "[lat] vad={vad_ms}мс auto gigaam: audio={}мс frontend={}мс encoder={}мс decoder={}мс asr={}мс",
                                 st.audio_ms, st.frontend_ms, st.encoder_ms, st.decoder_ms, st.total_ms
                             ));
+                            // Пустой GigaAM - скорее шум: Parakeet на нём выдумывает
+                            // «Yeah.», такие записи проверяет гейт уверенности whisper.
+                            if !t.trim().is_empty() && !gigaam_auto_final_trusted(&t) {
+                                if let Some(pt) = auto_parakeet_final(ctx, s, samples_16k) {
+                                    emit_stt_mode(&ctx.app, "parakeet", false);
+                                    return Ok((
+                                        postprocess::dedup_repeated_ngrams(&pt),
+                                        Some("en"),
+                                    ));
+                                }
+                            }
                             // Без whisper-модели уточнять нечем — отдаём GigaAM
                             // как есть (прежнее поведение auto-fallback).
                             if gigaam_auto_final_trusted(&t) || !whisper_model_installed(s) {
@@ -5492,6 +5557,31 @@ fn local_asr(
     }
     let lang = detect_lang_label(&whisper_text);
     Ok((whisper_text, lang))
+}
+
+/// Auto-финал после недоверенного GigaAM: Parakeet, если он установлен и
+/// распознал английский. None - решать дальше whisper-у.
+fn auto_parakeet_final(ctx: &EngineCtx, s: &Settings, samples_16k: &[f32]) -> Option<String> {
+    if !crate::parakeet::dir_ready(&paths::parakeet_dir()) {
+        return None;
+    }
+    if let Err(e) = ensure_parakeet(ctx, s) {
+        log::warn!("auto: parakeet недоступен ({e})");
+        return None;
+    }
+    let mut guard = ctx.parakeet.lock();
+    let p = guard.as_mut()?;
+    match local_transcribe_long(&ctx.vad_final, samples_16k, &mut |seg| p.transcribe(seg)) {
+        Ok(t) if parakeet_auto_final_trusted(&t) => {
+            dbg_log("auto: GigaAM не узнал русский - взят английский Parakeet");
+            Some(t)
+        }
+        Ok(_) => None,
+        Err(e) => {
+            log::warn!("auto: parakeet ошибка: {e:#}");
+            None
+        }
+    }
 }
 
 /// Разовая (на сессию) подсказка для explicit en без установленного Parakeet:
@@ -6309,6 +6399,38 @@ mod seg_tests {
         let s = Settings::default();
         let processed = process_dictation_text(&deduped, &s, &[], &[], &[]);
         println!("processed: {:?}", processed.text);
+    }
+
+    /// Замер auto-языка: каждая запись из VOXFLOW_EVAL_DIR через GigaAM и
+    /// Parakeet, рядом - что выбрал бы auto-финал без whisper.
+    ///
+    /// `VOXFLOW_EVAL_DIR=... cargo test --lib eval_auto_language -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires local GigaAM/Parakeet models and private WAVs"]
+    fn eval_auto_language() {
+        let dir = std::env::var("VOXFLOW_EVAL_DIR").expect("VOXFLOW_EVAL_DIR");
+        let threads = Settings::default().effective_threads() as usize;
+        let mut g =
+            crate::gigaam::GigaAm::load(&crate::paths::gigaam_dir(), threads).expect("gigaam");
+        let mut p = crate::parakeet::Parakeet::load(&crate::paths::parakeet_dir(), threads)
+            .expect("parakeet");
+        let mut wavs: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+            .collect();
+        wavs.sort();
+        for w in wavs {
+            let samples = read_wav_16k(&w);
+            let gt = g.transcribe(&samples).unwrap_or_default();
+            let pt = p.transcribe(&samples).unwrap_or_default();
+            println!(
+                "{}\n  gigaam  : {gt:?} trusted={}\n  parakeet: {pt:?} trusted={}",
+                w.file_name().unwrap().to_string_lossy(),
+                gigaam_auto_final_trusted(&gt),
+                parakeet_auto_final_trusted(&pt),
+            );
+        }
     }
 
     #[test]
@@ -7197,6 +7319,18 @@ mod seg_tests {
 
     /// Горячий путь auto-финала: русская речь (в т.ч. с латинскими терминами)
     /// принимается от GigaAM мгновенно; латиница/пусто — уточнение whisper-ом.
+    #[test]
+    fn parakeet_auto_final_trusted_takes_only_latin() {
+        assert!(parakeet_auto_final_trusted(
+            "Send me the link to the meeting notes."
+        ));
+        assert!(parakeet_auto_final_trusted("Yes."));
+        assert!(!parakeet_auto_final_trusted("Скинь мне ссылку на Гит хап."));
+        assert!(!parakeet_auto_final_trusted("Open настройки"));
+        assert!(!parakeet_auto_final_trusted("  "));
+        assert!(!parakeet_auto_final_trusted("123"));
+    }
+
     #[test]
     fn gigaam_auto_final_trusted_accepts_russian_rejects_latin_and_empty() {
         assert!(gigaam_auto_final_trusted("привет, это тест диктовки"));
