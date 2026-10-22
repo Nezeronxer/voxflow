@@ -86,6 +86,7 @@ VoxFlow просит три доступа: микрофон, «Универса
 |---|---|---|
 | macOS Apple Silicon | macOS 11+, ARM64 | `VoxFlow-macOS-<версия>-arm64-signed-unnotarized.dmg` |
 | Windows | Windows 10/11, x64 | `VoxFlow-Setup-2.0.9.exe` |
+| Linux | x64, glibc 2.38+ | `VoxFlow-<версия>-linux-x64.AppImage`, `.deb`, `.rpm`, `.pkg.tar.zst` (Arch) |
 
 Windows-установщик работает per-user и не требует отдельной установки VC++
 Redistributable с повышением прав: нужные Microsoft VC++ CRT/OpenMP DLL лежат
@@ -98,6 +99,20 @@ unsigned setup, пока владелец не предоставит Authentico
 macOS: релизы подписаны постоянным самоподписанным ключом (без нотаризации),
 поэтому доступы выдаются один раз. Linux: deb/rpm/AppImage собираются на
 ubuntu-24.04, нужен glibc 2.38+ (Ubuntu 24.04+, Debian 13+, Fedora 39+, Arch).
+
+### Arch Linux, Manjaro, EndeavourOS
+
+Пакет для pacman лежит в каждом релизе. Поставить последнюю версию одной командой
+(скачивает пакет, сверяет SHA-256 с `SHA256SUMS-linux.txt`, ставит через `pacman -U`):
+
+```sh
+cd /tmp && tag=$(curl -fsSL https://api.github.com/repos/Nezeronxer/voxflow/releases/latest | sed -n 's/.*"tag_name": *"\(v[^"]*\)".*/\1/p') && v=${tag#v} && curl -fLO "https://github.com/Nezeronxer/voxflow/releases/download/$tag/VoxFlow-$v-linux-x64.pkg.tar.zst" -fLO "https://github.com/Nezeronxer/voxflow/releases/download/$tag/SHA256SUMS-linux.txt" && sha256sum --check --ignore-missing SHA256SUMS-linux.txt && sudo pacman -U "VoxFlow-$v-linux-x64.pkg.tar.zst"
+```
+
+Дальше обновления ставит само приложение: скачивает новый `.pkg.tar.zst`, сверяет
+SHA-256 и запускает `pkexec pacman -U` (система спросит пароль). Если в системе нет
+агента polkit (например, голый Hyprland), VoxFlow покажет команду `sudo pacman -U …`
+для терминала. Удалить: `sudo pacman -R voxflow`.
 
 Intel Mac не входит в подтверждённую матрицу 2.0: текущий ONNX Runtime для
 GigaAM/Parakeet не предоставляет используемый проектом macOS x86_64 runtime.

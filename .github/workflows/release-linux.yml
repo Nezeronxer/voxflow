@@ -13,7 +13,7 @@ concurrency:
 
 jobs:
   build-linux:
-    name: Linux x64 (deb, rpm, AppImage)
+    name: Linux x64 (deb, rpm, AppImage, pacman)
     # Как CI: onnxruntime из ort требует glibc 2.38, на 22.04 (2.35) не линкуется.
     # AppImage и deb наследуют версию glibc раннера.
     runs-on: ubuntu-24.04
@@ -152,6 +152,25 @@ jobs:
           check "deb: .desktop Categories" "$desktop" '^Categories=Utility;Audio;'
           check "rpm: Requires libwebkit2gtk-4.1" "$rpm_requires" 'libwebkit2gtk-4.1'
 
+      # Tauri 2 не собирает pacman-пакеты: перекладываем готовый deb в
+      # .pkg.tar.zst через makepkg в archlinux:latest. Скрипт сам проверяет
+      # pacman -Qip, список файлов и установку в чистом контейнере (ldd).
+      - name: Build and verify Arch package
+        run: |
+          set -euo pipefail
+          version="$(jq -r .version voxflow/package.json)"
+          bash script/build_arch_package.sh \
+            "release/linux/VoxFlow-${version}-linux-x64.deb" "$version" release/linux
+          pkg="release/linux/VoxFlow-${version}-linux-x64.pkg.tar.zst"
+          if [[ ! -s "$pkg" ]]; then
+            echo "Arch package missing: $pkg" >&2
+            exit 1
+          fi
+
+      - name: Write Linux checksums
+        run: |
+          set -euo pipefail
+          out="release/linux"
           (cd "$out" && sha256sum VoxFlow-* > SHA256SUMS-linux.txt && sha256sum --check SHA256SUMS-linux.txt)
 
       - name: Upload Linux artifact

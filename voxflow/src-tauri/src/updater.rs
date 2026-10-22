@@ -4,6 +4,11 @@
 //! installer, macOS gets the matching DMG. Both platforms install
 //! automatically; the platform-specific part is only *how* the verified
 //! download is applied (spawn the installer vs. swap the app bundle).
+//!
+//! Linux: AppImage меняется файлом поверх себя; копия, поставленная пакетом
+//! Arch (`pacman -Qqo` называет владельцем пакет `voxflow`), берёт
+//! `.pkg.tar.zst` и ставит его через `pkexec pacman -U`. deb/rpm - только
+//! кнопка на страницу релиза.
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
@@ -17,6 +22,12 @@ const REPO: &str = "voxflow";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/Nezeronxer/voxflow/releases/latest";
 const RELEASE_DOWNLOAD_PREFIX: &str = "https://github.com/Nezeronxer/voxflow/releases/download/";
 const USER_AGENT: &str = "VoxFlow-Updater";
+const ARCH_PACKAGE_SUFFIX: &str = ".pkg.tar.zst";
+/// Имя пакета в PKGBUILD (`script/arch/PKGBUILD`).
+#[cfg(target_os = "linux")]
+const ARCH_PACKAGE_NAME: &str = "voxflow";
+#[cfg(target_os = "linux")]
+const PACMAN: &str = "/usr/bin/pacman";
 
 #[cfg(target_os = "macos")]
 const MACOS_BUNDLE_IDS: [&str; 2] = [
@@ -33,6 +44,7 @@ enum UpdateTarget {
     MacosArm64,
     MacosX64,
     LinuxX64,
+    LinuxArchX64,
     Unsupported,
 }
 
@@ -43,6 +55,7 @@ impl UpdateTarget {
             Self::MacosArm64 => Some(("VoxFlow-macOS-", "-arm64.dmg")),
             Self::MacosX64 => Some(("VoxFlow-macOS-", "-x64.dmg")),
             Self::LinuxX64 => Some(("VoxFlow-", "-linux-x64.AppImage")),
+            Self::LinuxArchX64 => Some(("VoxFlow-", "-linux-x64.pkg.tar.zst")),
             Self::Unsupported => None,
         }
     }
@@ -53,6 +66,7 @@ impl UpdateTarget {
             Self::MacosArm64 => "macOS ARM64",
             Self::MacosX64 => "macOS x64",
             Self::LinuxX64 => "Linux x64",
+            Self::LinuxArchX64 => "Arch Linux x64",
             Self::Unsupported => "этой платформы",
         }
     }
@@ -73,7 +87,10 @@ fn current_update_target() -> UpdateTarget {
     }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
-        return UpdateTarget::LinuxX64;
+        return linux_update_target(
+            std::env::var_os("APPIMAGE").is_some(),
+            installed_by_pacman(),
+        );
     }
     #[allow(unreachable_code)]
     UpdateTarget::Unsupported
@@ -489,11 +506,97 @@ fn apply_downloaded_update(dest: &Path, _latest_version: &str) -> Result<UpdateI
     })
 }
 
-/// Linux: заменить запущенный AppImage проверенным файлом и перезапустить его.
-/// Замена идёт переименованием (новый inode), поэтому работающий образ не ломается.
+/// Принадлежит ли запущенный бинарник пакету Arch `voxflow`.
+#[cfg(target_os = "linux")]
+fn installed_by_pacman() -> bool {
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    Command::new(PACMAN)
+        .arg("-Qqo")
+        .arg(&exe)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|out| {
+            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == ARCH_PACKAGE_NAME
+        })
+        .unwrap_or(false)
+}
+
+/// Перезапуск после установки: старый процесс завершится сам, новый ждёт,
+/// пока освободится single-instance.
+#[cfg(target_os = "linux")]
+fn spawn_linux_relaunch(exe: &Path) {
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(r#"sleep 3; exec "$0""#)
+        .arg(exe)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+}
+
+/// Arch: поставить проверенный `.pkg.tar.zst` через `pkexec pacman -U`.
+/// Нет pkexec, нет агента polkit или пароль не введён - файл остаётся на
+/// месте, а ошибка несёт команду для терминала.
+#[cfg(target_os = "linux")]
+fn apply_arch_package(dest: &Path) -> Result<UpdateInstallResult> {
+    // Путь берём до установки: после pacman -U /proc/self/exe смотрит на удалённый файл.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/voxflow"));
+    let out = Command::new("pkexec")
+        .arg(PACMAN)
+        .args(["-U", "--noconfirm"])
+        .arg(dest)
+        .stdin(std::process::Stdio::null())
+        .output();
+    let reason = match out {
+        Ok(out) if out.status.success() => None,
+        // 126 - окно пароля закрыто, 127 - не авторизовано или нет агента polkit.
+        Ok(out) if matches!(out.status.code(), Some(126 | 127)) => Some(
+            "система не дала прав на установку (пароль не введён или нет агента polkit)"
+                .to_string(),
+        ),
+        Ok(out) => Some(format!(
+            "pacman не смог поставить пакет: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Err(e) => Some(format!("не удалось запустить pkexec: {e}")),
+    };
+    if let Some(reason) = reason {
+        // Вызывающий стирает `dest` при ошибке, поэтому уносим файл под постоянное имя.
+        let kept = dest.with_file_name("VoxFlow-update-linux-x64.pkg.tar.zst");
+        let path = if std::fs::rename(dest, &kept).is_ok() {
+            kept
+        } else {
+            dest.to_path_buf()
+        };
+        return Err(anyhow!(
+            "{reason}. Установите обновление в терминале:\n{}",
+            pacman_manual_command(&path)
+        ));
+    }
+    let _ = std::fs::remove_file(dest);
+    spawn_linux_relaunch(&exe);
+    Ok(UpdateInstallResult {
+        launched: true,
+        path: exe.display().to_string(),
+        message: "Обновление установлено. VoxFlow перезапустится.".into(),
+    })
+}
+
+/// Linux: пакет Arch ставит pacman, иначе заменить запущенный AppImage
+/// проверенным файлом и перезапустить его. Замена идёт переименованием
+/// (новый inode), поэтому работающий образ не ломается.
 #[cfg(target_os = "linux")]
 fn apply_downloaded_update(dest: &Path, _latest_version: &str) -> Result<UpdateInstallResult> {
     use std::os::unix::fs::PermissionsExt;
+
+    // Имя уже сверено с целью этой копии, суффикс пакета бывает только на Arch.
+    if dest.to_string_lossy().ends_with(ARCH_PACKAGE_SUFFIX) {
+        return apply_arch_package(dest);
+    }
 
     let current = std::env::var_os("APPIMAGE")
         .map(PathBuf::from)
@@ -515,15 +618,7 @@ fn apply_downloaded_update(dest: &Path, _latest_version: &str) -> Result<UpdateI
         return Err(anyhow!("не удалось заменить {}: {e}", current.display()));
     }
     let _ = std::fs::remove_file(dest);
-    // Старый процесс завершится сам; новый ждёт, пока освободится single-instance.
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg(r#"sleep 3; exec "$0""#)
-        .arg(&current)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    spawn_linux_relaunch(&current);
     Ok(UpdateInstallResult {
         launched: true,
         path: current.display().to_string(),
@@ -663,7 +758,7 @@ fn spawn_macos_relaunch(app: &Path, backup: &Path) {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg_attr(windows, allow(dead_code))]
 fn sh_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', r"'\''"))
 }
@@ -866,15 +961,36 @@ fn cleanup_old_macos_app_bundles_in(
     Ok(removed)
 }
 
-/// Linux ставит обновление только поверх AppImage (его можно заменить файлом).
-/// Для deb/rpm пакетный менеджер сам владеет файлами, поэтому там кнопка
-/// ведёт на страницу релиза.
+/// Linux ставит обновление поверх AppImage (его можно заменить файлом) и
+/// пакетом Arch через pacman. Для deb/rpm пакетный менеджер сам владеет
+/// файлами, поэтому там кнопка ведёт на страницу релиза.
 fn target_auto_install(target: UpdateTarget) -> bool {
     match target {
         UpdateTarget::Unsupported => false,
         UpdateTarget::LinuxX64 => std::env::var_os("APPIMAGE").is_some(),
+        // Пакет Arch ставит pkexec; без polkit пользователь получит команду.
+        UpdateTarget::LinuxArchX64 => true,
         _ => true,
     }
+}
+
+/// Какой ассет нужен этой Linux-копии. AppImage важнее: его файл меняем сами,
+/// даже если pacman что-то знает о пути. Пакет Arch - только когда файл
+/// приложения принадлежит пакету `voxflow`; deb/rpm остаются на `LinuxX64`
+/// без автоустановки, как раньше.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_update_target(appimage: bool, pacman_owned: bool) -> UpdateTarget {
+    if !appimage && pacman_owned {
+        UpdateTarget::LinuxArchX64
+    } else {
+        UpdateTarget::LinuxX64
+    }
+}
+
+/// Команда для терминала, если pkexec не смог поставить пакет сам.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn pacman_manual_command(path: &Path) -> String {
+    format!("sudo pacman -U {}", sh_quote(path))
 }
 
 fn update_info_from_release_for(
@@ -1003,6 +1119,7 @@ fn asset_name_matches_version(name: &str, target: UpdateTarget, version: &str) -
         .iter()
         .any(|expected| expected == name),
         UpdateTarget::LinuxX64 => name == format!("VoxFlow-{version}-linux-x64.AppImage"),
+        UpdateTarget::LinuxArchX64 => name == format!("VoxFlow-{version}-linux-x64.pkg.tar.zst"),
         UpdateTarget::Unsupported => false,
     }
 }
@@ -1117,9 +1234,13 @@ fn installer_download_path(asset_name: &str) -> PathBuf {
             }
         })
         .collect();
-    let (stem, ext) = match safe_name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem, ext),
-        _ => (safe_name.as_str(), "bin"),
+    // pacman -U узнаёт пакет по полному `.pkg.tar.zst`, последней точки мало.
+    let (stem, ext) = match safe_name.strip_suffix(ARCH_PACKAGE_SUFFIX) {
+        Some(stem) if !stem.is_empty() => (stem, &ARCH_PACKAGE_SUFFIX[1..]),
+        _ => match safe_name.rsplit_once('.') {
+            Some((stem, ext)) if !stem.is_empty() => (stem, ext),
+            _ => (safe_name.as_str(), "bin"),
+        },
     };
     crate::paths::unique_tmp_path(stem, ext)
 }
@@ -1303,6 +1424,69 @@ mod tests {
     }
 
     #[test]
+    fn arch_pacman_install_selects_pkg_tar_zst_and_appimage_keeps_appimage() {
+        let base = "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0";
+        let release = serde_json::json!({
+            "tag_name": "v99.0.0",
+            "assets": [
+                { "name": "VoxFlow-99.0.0-linux-x64.deb", "size": 1,
+                  "browser_download_url": format!("{base}/VoxFlow-99.0.0-linux-x64.deb") },
+                { "name": "VoxFlow-99.0.0-linux-x64.AppImage", "size": 123,
+                  "browser_download_url": format!("{base}/VoxFlow-99.0.0-linux-x64.AppImage") },
+                { "name": "VoxFlow-99.0.0-linux-x64.pkg.tar.zst", "size": 456,
+                  "browser_download_url": format!("{base}/VoxFlow-99.0.0-linux-x64.pkg.tar.zst") }
+            ]
+        });
+
+        // Поставлено пакетом Arch: берём .pkg.tar.zst и ставим сами.
+        let arch =
+            update_info_from_release_for(&release, linux_update_target(false, true)).unwrap();
+        assert_eq!(arch.asset_name, "VoxFlow-99.0.0-linux-x64.pkg.tar.zst");
+        assert_eq!(arch.asset_size, 456);
+        assert!(arch.auto_install);
+
+        // AppImage остаётся AppImage, даже если pacman что-то знает о файле.
+        for owned in [false, true] {
+            let appimage =
+                update_info_from_release_for(&release, linux_update_target(true, owned)).unwrap();
+            assert_eq!(appimage.asset_name, "VoxFlow-99.0.0-linux-x64.AppImage");
+        }
+        // deb/rpm - как раньше: цель та же, что у AppImage.
+        assert_eq!(linux_update_target(false, false), UpdateTarget::LinuxX64);
+
+        assert!(validate_asset_name_for(
+            "VoxFlow-99.0.0-linux-x64.pkg.tar.zst",
+            UpdateTarget::LinuxX64
+        )
+        .is_err());
+        assert!(validate_asset_name_for(
+            "VoxFlow-99.0.0-linux-x64.AppImage",
+            UpdateTarget::LinuxArchX64
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn arch_release_without_package_is_not_offered() {
+        let release = serde_json::json!({
+            "tag_name": "v99.0.0",
+            "assets": [{
+                "name": "VoxFlow-99.0.0-linux-x64.AppImage", "size": 1,
+                "browser_download_url": "https://github.com/Nezeronxer/voxflow/releases/download/v99.0.0/VoxFlow-99.0.0-linux-x64.AppImage"
+            }]
+        });
+        assert!(update_info_from_release_for(&release, UpdateTarget::LinuxArchX64).is_err());
+    }
+
+    #[test]
+    fn arch_manual_command_quotes_the_downloaded_path() {
+        assert_eq!(
+            pacman_manual_command(Path::new("/home/a b/it's.pkg.tar.zst")),
+            r"sudo pacman -U '/home/a b/it'\''s.pkg.tar.zst'"
+        );
+    }
+
+    #[test]
     fn selects_platform_specific_asset_from_release_json() {
         let release = serde_json::json!({
             "tag_name": "v99.0.0",
@@ -1395,6 +1579,11 @@ mod tests {
                 .and_then(|ext| ext.to_str()),
             Some("dmg")
         );
+        // pacman -U принимает только файл с полным расширением пакета.
+        let pkg = installer_download_path("VoxFlow-2.4.0-linux-x64.pkg.tar.zst");
+        let name = pkg.file_name().and_then(|n| n.to_str()).unwrap();
+        assert!(name.ends_with(".pkg.tar.zst"), "{name}");
+        assert!(name.starts_with("VoxFlow-2_4_0-linux-x64-"), "{name}");
     }
 
     #[test]

@@ -92,6 +92,7 @@ jobs:
           mapfile -t appimages < <(find release/linux -type f -name 'VoxFlow-*-linux-x64.AppImage')
           mapfile -t debs < <(find release/linux -type f -name 'VoxFlow-*-linux-x64.deb')
           mapfile -t rpms < <(find release/linux -type f -name 'VoxFlow-*-linux-x64.rpm')
+          mapfile -t arch_pkgs < <(find release/linux -type f -name 'VoxFlow-*-linux-x64.pkg.tar.zst')
           mapfile -t linux_checksums < <(find release/linux -type f -name 'SHA256SUMS-linux.txt')
 
           if [[ ${#installers[@]} -ne 1 || ${#windows_checksums[@]} -ne 1 ]]; then
@@ -103,8 +104,8 @@ jobs:
             exit 1
           fi
 
-          if [[ ${#appimages[@]} -ne 1 || ${#debs[@]} -ne 1 || ${#rpms[@]} -ne 1 || ${#linux_checksums[@]} -ne 1 ]]; then
-            echo "Expected exactly one Linux AppImage, deb, rpm, and checksum file" >&2
+          if [[ ${#appimages[@]} -ne 1 || ${#debs[@]} -ne 1 || ${#rpms[@]} -ne 1 || ${#arch_pkgs[@]} -ne 1 || ${#linux_checksums[@]} -ne 1 ]]; then
+            echo "Expected exactly one Linux AppImage, deb, rpm, pkg.tar.zst, and checksum file" >&2
             exit 1
           fi
 
@@ -118,6 +119,7 @@ jobs:
             "${appimages[0]}"
             "${debs[0]}"
             "${rpms[0]}"
+            "${arch_pkgs[0]}"
             "${linux_checksums[0]}"
           )
           declare -A seen_names=()

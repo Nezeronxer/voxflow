@@ -1,0 +1,57 @@
+# Пакет Arch Linux из готового deb релиза: Tauri 2 не собирает pacman-пакеты,
+# а перекомпиляция под Arch дала бы второй, непроверенный бинарник.
+# Собирает script/build_arch_package.sh: кладёт рядом voxflow.deb и LICENSE,
+# задаёт VOXFLOW_PKGVER и VOXFLOW_DEB_SHA256. Имя пакета `voxflow` зашито
+# в updater.rs (ARCH_PACKAGE_NAME) - по нему обновление узнаёт установку pacman.
+
+pkgname=voxflow
+pkgver="${VOXFLOW_PKGVER:?VOXFLOW_PKGVER не задан}"
+pkgrel=1
+pkgdesc="Локальная диктовка: горячая клавиша, речь, текст в активное окно"
+arch=('x86_64')
+url="https://github.com/Nezeronxer/voxflow"
+license=('LicenseRef-VoxFlow-Proprietary')
+# NEEDED бинарника voxflow (objdump -p) по пакетам Arch; libayatana-appindicator
+# грузится через dlopen для значка в трее. whisper-cli/whisper-server - только glibc.
+# CI ставит пакет в чистый контейнер и проверяет ldd на «not found».
+depends=(
+  'webkit2gtk-4.1'
+  'gtk3'
+  'gtk-layer-shell'
+  'libsoup3'
+  'gdk-pixbuf2'
+  'cairo'
+  'glib2'
+  'dbus'
+  'alsa-lib'
+  'libx11'
+  'libxtst'
+  'libayatana-appindicator'
+  'gcc-libs'
+  'glibc'
+)
+optdepends=(
+  'wtype: вставка текста на Wayland'
+  'ydotool: вставка текста на Wayland без wtype'
+  'libpulse: pactl для приглушения звука во время диктовки'
+  'xorg-xprop: определение активного окна на X11'
+)
+# Бинарники уже собраны и проверены в deb: не трогаем их strip-ом и не
+# выделяем пустой пакет voxflow-debug.
+options=('!strip' '!debug')
+source=('voxflow.deb' 'LICENSE')
+noextract=('voxflow.deb')
+sha256sums=("${VOXFLOW_DEB_SHA256:?VOXFLOW_DEB_SHA256 не задан}" 'SKIP')
+
+package() {
+  local unpacked="$srcdir/deb"
+  mkdir -p "$unpacked"
+  bsdtar -xf "$srcdir/voxflow.deb" -C "$unpacked"
+  local data=("$unpacked"/data.tar.*)
+  if [[ ${#data[@]} -ne 1 || ! -f "${data[0]}" ]]; then
+    echo "deb без data.tar.*" >&2
+    return 1
+  fi
+  bsdtar -xf "${data[0]}" -C "$pkgdir"
+  install -Dm644 "$srcdir/LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
