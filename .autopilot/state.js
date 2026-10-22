@@ -1,71 +1,67 @@
 window.STATE =
 {
-  "slug": "voxflow-flow-bar-redesign",
-  "title": "VoxFlow: новый кружок и текст, локальная модель, установка",
+  "version": 2,
+  "slug": "voxflow-memory-diet",
+  "dir": "2026-10-22-voxflow-memory-diet--wip",
+  "title": "VoxFlow: меньше оперативной памяти, релиз для всех ОС",
   "mode": "semi",
-  "depth": "deep",
-  "polish": null,
+  "depth": "normal",
   "tier": "T1",
-  "briefFile": "2026-10-16-brief.md",
+  "briefFile": "2026-10-22-brief.md",
   "memoryFile": "CLAUDE.md",
-  "startedAt": "2026-10-16T18:42:57+03:00",
-  "updatedAt": "2026-10-16T19:00:17+03:00",
-  "finishedAt": "2026-10-16T19:00:17+03:00",
+  "memoryOwner": "autopilot",
+  "skillDir": "/Users/nezeronxer/.claude/skills/autopilot",
+  "baseCommit": null,
+  "startedAt": "2026-10-22T20:11:56+03:00",
+  "updatedAt": "2026-10-22T20:27:03+03:00",
+  "finishedAt": null,
   "stages": [
     {
       "id": "preflight",
       "status": "done",
-      "startedAt": "2026-10-16T18:42:57+03:00",
-      "finishedAt": "2026-10-16T18:42:57+03:00"
+      "startedAt": "2026-10-22T20:11:56+03:00",
+      "finishedAt": "2026-10-22T20:12:30+03:00"
     },
     {
       "id": "manifest",
       "status": "done",
-      "startedAt": "2026-10-16T18:42:57+03:00",
-      "finishedAt": "2026-10-16T18:42:57+03:00"
+      "startedAt": "2026-10-22T20:12:30+03:00",
+      "finishedAt": "2026-10-22T20:14:07+03:00"
     },
     {
       "id": "briefing",
       "status": "done",
-      "startedAt": "2026-10-16T18:42:57+03:00",
-      "finishedAt": "2026-10-16T18:47:10+03:00"
+      "startedAt": "2026-10-22T20:14:07+03:00",
+      "finishedAt": "2026-10-22T20:18:25+03:00"
     },
     {
       "id": "spec",
       "status": "done",
-      "startedAt": "2026-10-16T18:47:10+03:00",
-      "finishedAt": "2026-10-16T18:47:10+03:00"
+      "startedAt": "2026-10-22T20:18:25+03:00",
+      "finishedAt": "2026-10-22T20:26:38+03:00"
     },
     {
       "id": "plan",
-      "status": "done",
-      "startedAt": "2026-10-16T18:47:10+03:00",
-      "finishedAt": "2026-10-16T18:47:10+03:00"
+      "status": "active",
+      "startedAt": "2026-10-22T20:26:38+03:00"
     },
     {
       "id": "build",
-      "status": "done",
-      "startedAt": "2026-10-16T18:47:10+03:00",
-      "finishedAt": "2026-10-16T18:57:59+03:00"
+      "status": "pending"
     },
     {
       "id": "review",
-      "status": "done",
-      "startedAt": "2026-10-16T18:57:59+03:00",
-      "finishedAt": "2026-10-16T18:57:59+03:00"
+      "status": "pending"
     },
     {
       "id": "final",
-      "status": "done",
-      "finishedAt": "2026-10-16T19:00:17+03:00",
-      "note": "v2.3.1 опубликован, установлен на мак, полная GigaAM загружена",
-      "startedAt": "2026-10-16T18:59:38+03:00"
+      "status": "pending"
     }
   ],
   "requirements": {
-    "total": 12,
-    "done": 7,
-    "inTicket": 0,
+    "total": 8,
+    "done": 0,
+    "inTicket": 8,
     "inSpec": 0,
     "placeholder": 0,
     "deferred": 0,
@@ -74,61 +70,262 @@ window.STATE =
   "tickets": [
     {
       "id": "01",
-      "title": "Капсула и живой текст",
-      "status": "done",
-      "startedAt": "2026-10-16T18:47:10+03:00",
-      "reqs": [
+      "title": "Модели занимают меньше памяти и выгружаются в простое",
+      "requirements": [
         "R01",
         "R02",
         "R03",
-        "R04",
-        "R05"
+        "R07i"
       ],
-      "finishedAt": "2026-10-16T18:52:43+03:00",
-      "commit": "6c0863d",
-      "tests": "40/40 фронт",
-      "repairs": 1
+      "blockedBy": [],
+      "wave": 1,
+      "zone": [
+        "voxflow/src-tauri/src/{engine,gigaam,parakeet,vad,settings,local_llm,commands,models,lib,final_eval}.rs",
+        "voxflow/src-tauri/Cargo.toml",
+        "voxflow/src/",
+        "voxflow/tests/",
+        "DECISIONS.md"
+      ],
+      "review": "да — потеря текста (выгрузка модели рядом с горячим путём диктовки, D-024)",
+      "model": "сильная",
+      "status": "pending",
+      "retries": 0,
+      "repairs": 0
     },
     {
       "id": "02",
-      "title": "Самовыбор локальной модели",
-      "status": "done",
-      "startedAt": "2026-10-16T18:47:10+03:00",
-      "reqs": [
-        "R05"
+      "title": "Пакет для Arch в релизе и обновление на Arch",
+      "requirements": [
+        "R05",
+        "R06",
+        "R08i"
       ],
-      "finishedAt": "2026-10-16T18:57:59+03:00",
-      "repairs": 2,
-      "commit": "4563367",
-      "tests": "436 Rust"
+      "blockedBy": [],
+      "wave": 1,
+      "zone": [
+        ".github/workflows/release-linux.yml",
+        ".github/workflows/release.yml",
+        "voxflow/src-tauri/src/updater.rs",
+        "voxflow/src-tauri/src/linux_env.rs",
+        "script/",
+        "install",
+        "README.md"
+      ],
+      "review": "нет",
+      "model": "сильная",
+      "status": "pending",
+      "retries": 0,
+      "repairs": 0
     },
     {
       "id": "03",
-      "title": "Установка с той же подписью",
-      "status": "done",
-      "reqs": [
-        "R06",
-        "R07"
+      "title": "Подготовка релиза 2.4.0",
+      "requirements": [
+        "R04"
       ],
-      "startedAt": "2026-10-16T18:57:59+03:00",
-      "finishedAt": "2026-10-16T18:59:38+03:00",
-      "commit": "-",
-      "tests": "DR совпал, хоткей ловится"
+      "blockedBy": [
+        "01",
+        "02"
+      ],
+      "wave": 2,
+      "zone": [
+        "script/check_versions.py",
+        "DECISIONS.md",
+        "RELEASE_NOTES.md"
+      ],
+      "review": "нет",
+      "model": "обычная",
+      "status": "pending",
+      "retries": 0,
+      "repairs": 0
     }
   ],
-  "singlePass": null,
-  "tests": {
-    "passed": 463,
-    "failed": 0
-  },
+  "tests": null,
   "debt": {
     "placeholders": [],
     "assumptions": [],
     "emptyEnv": []
   },
   "additions": [],
-  "coverage": null,
-  "blind": {
-    "verdict": "3 из 4 выполнены, поиск примеров - частично (следов в коде нет, есть в спеке)"
-  }
+  "coverage": {
+    "found": 3,
+    "fixed": 1,
+    "deferred": 2,
+    "items": [
+      "R05 - дистрибутивы с glibc < 2.38: вне рамок (onnxruntime)",
+      "R04 - выпуск ждёт «да» на пуш тега: правило необратимых действий"
+    ]
+  },
+  "concerns": [],
+  "blind": null,
+  "beats": [
+    "2026-10-22T20:11:56+03:00",
+    "2026-10-22T20:12:30+03:00",
+    "2026-10-22T20:14:07+03:00",
+    "2026-10-22T20:17:49+03:00",
+    "2026-10-22T20:18:25+03:00",
+    "2026-10-22T20:26:38+03:00",
+    "2026-10-22T20:26:56+03:00",
+    "2026-10-22T20:26:57+03:00",
+    "2026-10-22T20:27:03+03:00"
+  ],
+  "rev": 15,
+  "waiting": null,
+  "waits": [
+    {
+      "kind": "briefing",
+      "from": "2026-10-22T20:14:07+03:00",
+      "to": "2026-10-22T20:17:49+03:00"
+    }
+  ],
+  "log": [
+    {
+      "t": "2026-10-22T20:11:56+03:00",
+      "k": "init"
+    },
+    {
+      "t": "2026-10-22T20:12:30+03:00",
+      "k": "stage",
+      "id": "manifest",
+      "act": "start"
+    },
+    {
+      "t": "2026-10-22T20:14:07+03:00",
+      "k": "stage",
+      "id": "briefing",
+      "act": "start"
+    },
+    {
+      "t": "2026-10-22T20:14:07+03:00",
+      "k": "ask",
+      "kind": "briefing",
+      "note": "4 вопроса — выгрузка в простое, полная GigaAM, диск, пакет под Arch"
+    },
+    {
+      "t": "2026-10-22T20:17:49+03:00",
+      "k": "answered",
+      "kind": "briefing"
+    },
+    {
+      "t": "2026-10-22T20:18:25+03:00",
+      "k": "gate",
+      "g": "G1",
+      "ok": false,
+      "open": 8,
+      "total": 8
+    },
+    {
+      "t": "2026-10-22T20:18:25+03:00",
+      "k": "stage",
+      "id": "spec",
+      "act": "start"
+    },
+    {
+      "t": "2026-10-22T20:26:38+03:00",
+      "k": "stage",
+      "id": "plan",
+      "act": "start"
+    },
+    {
+      "t": "2026-10-22T20:26:38+03:00",
+      "k": "tier",
+      "v": "T1"
+    },
+    {
+      "t": "2026-10-22T20:26:56+03:00",
+      "k": "gate",
+      "g": "G2",
+      "ok": true,
+      "found": 3,
+      "fixed": 1,
+      "deferred": 2
+    },
+    {
+      "t": "2026-10-22T20:26:56+03:00",
+      "k": "tickets",
+      "n": 3
+    },
+    {
+      "t": "2026-10-22T20:26:57+03:00",
+      "k": "gate",
+      "g": "G3",
+      "ok": false,
+      "problems": 2
+    },
+    {
+      "t": "2026-10-22T20:27:03+03:00",
+      "k": "tickets",
+      "n": 3
+    },
+    {
+      "t": "2026-10-22T20:27:03+03:00",
+      "k": "gate",
+      "g": "G3",
+      "ok": true,
+      "problems": 0
+    }
+  ],
+  "reqList": [
+    {
+      "id": "R01",
+      "text": "«оптимизируй, пожалуйста, потребление оперативной памяти»",
+      "status": "in-ticket"
+    },
+    {
+      "id": "R02",
+      "text": "«и вообще памяти»",
+      "status": "in-ticket"
+    },
+    {
+      "id": "R03",
+      "text": "«оно потребляет 2 ГБ, это очень много»",
+      "status": "in-ticket"
+    },
+    {
+      "id": "R04",
+      "text": "«выпусти обновления для всех операционных систем Linux, MC и Windows»",
+      "status": "in-ticket"
+    },
+    {
+      "id": "R05",
+      "text": "«в основном под все дистрибутивы»",
+      "status": "in-ticket"
+    },
+    {
+      "id": "R06",
+      "text": "«под арч»",
+      "status": "in-ticket"
+    },
+    {
+      "id": "R07i",
+      "text": "(подразумевается) распознавание не становится хуже и заметно медленнее",
+      "status": "in-ticket"
+    },
+    {
+      "id": "R08i",
+      "text": "(подразумевается) обновление доходит до уже установленных копий через встроенное обновление",
+      "status": "in-ticket"
+    }
+  ],
+  "gates": {
+    "G1": {
+      "ok": false,
+      "at": "2026-10-22T20:18:25+03:00",
+      "open": 8,
+      "total": 8
+    },
+    "G2": {
+      "ok": true,
+      "at": "2026-10-22T20:26:56+03:00",
+      "found": 3,
+      "fixed": 1,
+      "deferred": 2
+    },
+    "G3": {
+      "ok": true,
+      "at": "2026-10-22T20:27:03+03:00",
+      "problems": 0
+    }
+  },
+  "result": null
 }
