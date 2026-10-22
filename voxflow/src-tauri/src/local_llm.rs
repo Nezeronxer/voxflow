@@ -19,9 +19,10 @@
 //! Распаковка — системным `tar`: на Windows 10+ bsdtar читает zip, на macOS
 //! tar.gz родной. Ни zip-крейта, ни C-сборок не требуется.
 //!
-//! Сервер живёт, пока живёт приложение (как у Ollama): повторная загрузка
-//! модели стоит секунды, а диктовка ждать не должна. Смена модели или режима
-//! GPU перезапускает процесс.
+//! Сервер живёт, пока им пользуются: после простоя (настройка выгрузки
+//! моделей, D-053) он останавливается и поднимается заново при следующем
+//! запросе или в начале диктовки. Смена модели или режима GPU перезапускает
+//! процесс.
 
 use anyhow::{anyhow, Result};
 use parking_lot::Mutex;
@@ -30,7 +31,7 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
@@ -687,6 +688,8 @@ pub fn server_args(model: &Path, gpu: bool, threads: u32, port: u16) -> Vec<Stri
 
 /// Поднять сервер с нужной моделью (или убедиться, что он уже поднят).
 pub fn ensure_server(model_id: &str, gpu: bool, threads: u32) -> Result<()> {
+    // Прогрев тоже использование: свежеподнятый сервер простой не гасит сразу.
+    mark_used();
     let model = catalog_model(model_id).ok_or_else(|| anyhow!("неизвестная модель: {model_id}"))?;
     let path = model_path(model);
     if !model_installed(model.id) {
@@ -875,6 +878,74 @@ fn kill_pid(pid: u32) {
     }
 }
 
+/// Запросы к серверу в полёте: простой не останавливает сервер посреди ответа.
+static IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+/// Конец последнего запроса, мс от старта процесса.
+static LAST_USE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn process_clock() -> Duration {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+fn idle_since_last_use() -> Duration {
+    process_clock().saturating_sub(Duration::from_millis(LAST_USE_MS.load(Ordering::SeqCst)))
+}
+
+/// Запрос к серверу: держит счётчик и отмечает время использования.
+struct RequestGuard;
+
+impl RequestGuard {
+    fn enter() -> Self {
+        IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        RequestGuard
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        mark_used();
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn mark_used() {
+    LAST_USE_MS.store(process_clock().as_millis() as u64, Ordering::SeqCst);
+}
+
+fn idle_stop_due(in_flight: u32, starting: bool, idle: Duration, after: Duration) -> bool {
+    in_flight == 0 && !starting && idle >= after
+}
+
+/// Остановить сервер, если им не пользовались `after` (D-053). Следующий
+/// запрос поднимет его заново. `true` - сервер был запущен и остановлен.
+pub fn stop_if_idle(after: Duration) -> bool {
+    let starting = STARTING_PID.load(Ordering::SeqCst) != 0;
+    if !idle_stop_due(
+        IN_FLIGHT.load(Ordering::SeqCst),
+        starting,
+        idle_since_last_use(),
+        after,
+    ) {
+        return false;
+    }
+    // Замок занят - сервер как раз поднимается, не мешаем.
+    let Some(mut guard) = SERVER.try_lock() else {
+        return false;
+    };
+    // Под замком запрос не начнётся: ensure_server ждёт этот же замок.
+    if IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+        return false;
+    }
+    let Some(mut run) = guard.take() else {
+        return false;
+    };
+    ACTIVE_PORT.store(0, Ordering::SeqCst);
+    let _ = run.child.kill();
+    let _ = run.child.wait();
+    true
+}
+
 /// Остановить сервер (выход из приложения, удаление модели, выключение ИИ).
 pub fn stop() {
     // Идёт загрузка модели: замок занят потоком запуска, а при выходе ради
@@ -998,6 +1069,7 @@ fn chat(system: &str, user: &str, timeout_s: u64, max_tokens: u32) -> Result<Str
 /// Отрефайнить текст встроенной моделью: поднять сервер при необходимости и
 /// спросить. Сигнатура повторяет [`crate::ollama::refine`] по смыслу.
 pub fn refine(s: &crate::settings::Settings, system: &str, user: &str) -> Result<String> {
+    let _request = RequestGuard::enter();
     let gpu = crate::paths::llm_gpu_active();
     ensure_server(&s.builtin_llm_model, gpu, s.effective_threads())?;
     let input = net::estimate_tokens(system) + net::estimate_tokens(user);
@@ -1007,6 +1079,7 @@ pub fn refine(s: &crate::settings::Settings, system: &str, user: &str) -> Result
 
 /// Короткая проба для кнопки «Проверить».
 pub fn ping(s: &crate::settings::Settings) -> Result<String> {
+    let _request = RequestGuard::enter();
     let gpu = crate::paths::llm_gpu_active();
     ensure_server(&s.builtin_llm_model, gpu, s.effective_threads())?;
     let text = chat(
@@ -1176,6 +1249,29 @@ mod tests {
         assert!(parse_chat_completion(&cut).is_err());
         let err = serde_json::json!({ "error": { "message": "no slot" } });
         assert!(parse_chat_completion(&err).is_err());
+    }
+
+    #[test]
+    fn idle_stop_never_interrupts_a_request() {
+        let min = Duration::from_secs(60);
+        assert!(idle_stop_due(0, false, 10 * min, 10 * min));
+        assert!(!idle_stop_due(0, false, 9 * min, 10 * min));
+        assert!(!idle_stop_due(1, false, 60 * min, 10 * min), "идёт запрос");
+        assert!(
+            !idle_stop_due(0, true, 60 * min, 10 * min),
+            "модель грузится"
+        );
+    }
+
+    #[test]
+    fn request_guard_tracks_in_flight_and_last_use() {
+        let before = IN_FLIGHT.load(Ordering::SeqCst);
+        {
+            let _g = RequestGuard::enter();
+            assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), before + 1);
+        }
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), before);
+        assert!(idle_since_last_use() < Duration::from_secs(5));
     }
 
     #[test]

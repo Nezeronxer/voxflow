@@ -25,6 +25,7 @@ mod macos_permissions;
 mod models;
 mod net;
 mod ollama;
+mod ort_session;
 mod parakeet;
 mod paths;
 mod postprocess;

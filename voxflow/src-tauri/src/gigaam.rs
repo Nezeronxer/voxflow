@@ -129,12 +129,7 @@ impl GigaAm {
     pub fn load_files(dir: &Path, threads: usize, files: &Files) -> Result<Self> {
         let t0 = Instant::now();
         let mk = |file: &str, th: usize| -> Result<Session> {
-            Session::builder()
-                .oc("builder")?
-                .with_intra_threads(th)
-                .oc("intra_threads")?
-                .commit_from_file(dir.join(file))
-                .oc(&format!("загрузка {file}"))
+            crate::ort_session::session_from_file(&dir.join(file), th)
         };
         // Вся тяжесть в энкодере; decoder/joint — крошечные пошаговые вызовы,
         // многопоточность там только мешает (оверхед планировщика на каждый кадр).

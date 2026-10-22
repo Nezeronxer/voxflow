@@ -23,6 +23,44 @@ pub struct ModelInfo {
     /// "gigaam"/"parakeet" — каталог ONNX-файлов, "whisper" — одиночный ggml-*.bin.
     /// Зеркалится в types.ts (ModelInfo.kind) — фронт по нему рисует hero-карточку.
     pub kind: String,
+    /// Сколько модель занимает на диске сейчас (МБ, по настоящим файлам);
+    /// `None` - не скачана.
+    pub disk_mb: Option<u64>,
+    /// Нужна ли модель при текущих настройках (считает `list_models`, D-053).
+    pub in_use: bool,
+}
+
+/// Размер файлов на диске в МБ (вверх до целого), каталоги - рекурсивно.
+/// `None`, если ни одного пути нет. Ссылки не раскрываются.
+pub(crate) fn disk_mb(paths: &[std::path::PathBuf]) -> Option<u64> {
+    fn bytes(p: &std::path::Path) -> Option<u64> {
+        let meta = std::fs::symlink_metadata(p).ok()?;
+        if meta.is_dir() {
+            let total = std::fs::read_dir(p)
+                .ok()?
+                .flatten()
+                .filter_map(|e| bytes(&e.path()))
+                .sum();
+            Some(total)
+        } else {
+            Some(meta.len())
+        }
+    }
+    let found: Vec<u64> = paths.iter().filter_map(|p| bytes(p)).collect();
+    if found.is_empty() {
+        return None;
+    }
+    let total: u64 = found.iter().sum();
+    Some(total.div_ceil(1024 * 1024))
+}
+
+/// Файлы модели на диске - то, что освобождает `delete`.
+fn model_paths(name: &str) -> Vec<std::path::PathBuf> {
+    if let Some(m) = find_dir_model(name) {
+        return vec![(m.dir)()];
+    }
+    let p = crate::paths::model_path(name);
+    vec![marker_path(&p), p.with_extension("part"), p]
 }
 
 /// Имя каталожного пункта GigaAM (это НЕ файл — набор из 4 файлов в models/gigaam/).
@@ -224,19 +262,32 @@ pub fn gigaam_fp32_dir() -> std::path::PathBuf {
 pub fn list() -> Vec<ModelInfo> {
     let mut out = Vec::with_capacity(CATALOG.len() + DIR_MODELS.len());
     // Каталожные ONNX-модели — первыми строками, фронт рисует их hero-карточками.
-    out.extend(DIR_MODELS.iter().map(|m| ModelInfo {
-        name: m.name.to_string(),
-        label: m.label.to_string(),
-        size_mb: m.size_mb,
-        installed: dir_model_ready(m.name),
-        kind: m.kind.to_string(),
-    }));
-    out.extend(CATALOG.iter().map(|e| ModelInfo {
-        name: e.name.to_string(),
-        label: e.label.to_string(),
-        size_mb: e.size_mb,
-        installed: whisper_model_ready(e.name),
-        kind: "whisper".to_string(),
+    let info = |name: &str, label: &str, size_mb: u32, installed: bool, kind: &str| ModelInfo {
+        name: name.to_string(),
+        label: label.to_string(),
+        size_mb,
+        installed,
+        kind: kind.to_string(),
+        disk_mb: if installed {
+            disk_mb(&model_paths(name))
+        } else {
+            None
+        },
+        in_use: false,
+    };
+    out.extend(
+        DIR_MODELS
+            .iter()
+            .map(|m| info(m.name, m.label, m.size_mb, dir_model_ready(m.name), m.kind)),
+    );
+    out.extend(CATALOG.iter().map(|e| {
+        info(
+            e.name,
+            e.label,
+            e.size_mb,
+            whisper_model_ready(e.name),
+            "whisper",
+        )
     }));
     out
 }
@@ -956,6 +1007,25 @@ fn curl_args_for_test(resume: bool) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disk_mb_counts_real_files_and_is_none_when_missing() {
+        let dir = std::env::temp_dir().join(format!("vf-disk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.onnx"), vec![0u8; 3 * 1024 * 1024]).unwrap();
+        std::fs::write(dir.join("sub").join("b.bin"), vec![0u8; 1024 * 1024]).unwrap();
+        let single = dir.join("w.bin");
+        assert_eq!(disk_mb(std::slice::from_ref(&dir)), Some(4));
+        // Отдельный файл и отсутствующий путь рядом с ним.
+        let missing = dir.join("nope");
+        assert_eq!(disk_mb(&[dir.join("a.onnx"), missing.clone()]), Some(3));
+        assert_eq!(disk_mb(&[missing]), None);
+        // Крошечный файл - не «0 МБ».
+        std::fs::write(&single, b"x").unwrap();
+        assert_eq!(disk_mb(&[single]), Some(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// Регрессия: запись Parakeet в каталоге согласована с константами parakeet.rs
     /// (имя, kind, URL, размер каталога соответствует сумме файлов).

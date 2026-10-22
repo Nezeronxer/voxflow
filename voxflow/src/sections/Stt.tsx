@@ -204,6 +204,40 @@ export default function Stt({
         </div>
       </Field>
 
+      {isLocal && (
+        <Field
+          label="Выгружать модели в простое"
+          hint="Освобождает память, если долго не диктуешь: модели распознавания и встроенный ИИ. Первая фраза после перерыва распознается на пару секунд дольше"
+        >
+          <Switch
+            checked={settings.asr_unload_idle}
+            onChange={(v) => update({ asr_unload_idle: v })}
+          />
+        </Field>
+      )}
+
+      {isLocal && settings.asr_unload_idle && (
+        <Field
+          label="Выгружать через, мин"
+          hint="Сколько минут без диктовки держать модели в памяти"
+        >
+          <input
+            type="number"
+            min={1}
+            max={1440}
+            value={settings.asr_unload_after_min}
+            onChange={(e) => {
+              const n = parseInt(e.currentTarget.value, 10);
+              update({
+                asr_unload_after_min: Number.isFinite(n)
+                  ? Math.min(1440, Math.max(1, n))
+                  : 10,
+              });
+            }}
+          />
+        </Field>
+      )}
+
       {!isLocal && (
         <>
           <div className="cloud-preset-grid">

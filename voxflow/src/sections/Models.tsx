@@ -10,6 +10,7 @@ import {
   openExternalUrl,
 } from "../api";
 import { PageHead, Field, Select, Icon } from "../ui";
+import { deleteConfirmText, isUnused, modelSizeText } from "../modelsState";
 import type {
   Settings,
   ModelInfo,
@@ -40,11 +41,6 @@ type Progress = {
 
 // Память для расчёта скорости между событиями прогресса (вне React-состояния).
 type SpeedSample = { received: number; t: number; ema: number };
-
-function fmtSize(mb: number): string {
-  if (mb >= 1024) return `${(mb / 1024).toFixed(1)} ГБ`;
-  return `${mb} МБ`;
-}
 
 // «12 МБ/с» — десятичные мегабайты, одна цифра после запятой на малых скоростях.
 function fmtSpeed(bps: number): string {
@@ -130,23 +126,55 @@ function ModelRow({
   selected: boolean;
   onSelect?: () => void;
   onDownload: (name: string) => void;
-  onDelete: (name: string) => void;
+  onDelete: (name: string) => Promise<void>;
 }) {
   const dl = prog && !prog.error ? prog : undefined;
+  // Удаление только после подтверждения прямо в строке.
+  const [confirming, setConfirming] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   return (
     <div className={`model-row ${selected ? "selected" : ""}`}>
       <div className="model-info">
         <div className="model-name">
           {cleanLabel(model.label || model.name)}
           {selected && <span className="badge accent">Активна</span>}
+          {!selected && isUnused(model) && <span className="badge">Не используется</span>}
         </div>
         <div className="model-size">
-          {KIND_NOTE[model.kind ?? ""] ?? ""} · {fmtSize(model.size_mb)}
+          {KIND_NOTE[model.kind ?? ""] ?? ""} · {modelSizeText(model)}
           {prog?.error ? <span className="model-error">{prog.error}</span> : null}
         </div>
+        {confirming && (
+          <div className="model-size" role="alert">
+            {deleteConfirmText(model)}
+          </div>
+        )}
       </div>
       {dl ? (
         <DownloadProgress name={model.name} prog={dl} />
+      ) : model.installed && confirming ? (
+        <div className="row-flex">
+          <button
+            className="btn btn-sm btn-danger"
+            disabled={deleting}
+            onClick={() => {
+              setDeleting(true);
+              void onDelete(model.name).finally(() => {
+                setDeleting(false);
+                setConfirming(false);
+              });
+            }}
+          >
+            {deleting ? "Удаляю…" : "Удалить"}
+          </button>
+          <button
+            className="btn btn-sm"
+            disabled={deleting}
+            onClick={() => setConfirming(false)}
+          >
+            Отмена
+          </button>
+        </div>
       ) : model.installed ? (
         <div className="row-flex">
           {onSelect && !selected && (
@@ -156,7 +184,7 @@ function ModelRow({
           )}
           <button
             className="btn btn-sm btn-ghost"
-            onClick={() => onDelete(model.name)}
+            onClick={() => setConfirming(true)}
             title="Удалить с диска"
             aria-label={`Удалить ${model.label}`}
           >
@@ -271,8 +299,11 @@ export default function Models({
   }
 
   async function onDelete(name: string) {
-    await deleteModel(name);
-    refresh();
+    try {
+      await deleteModel(name);
+    } finally {
+      await refresh();
+    }
   }
 
   const visible = models;

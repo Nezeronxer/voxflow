@@ -189,9 +189,21 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
     // Язык сменился → фоновый прогрев движка под новые настройки: без него первый
     // Start после переключения на en/auto синхронно грузит ~650 МБ Parakeet и
     // подвешивает начало диктовки на секунды.
-    if lang_changed {
+    let route_changed =
+        lang_changed || settings.engine != previous.engine || settings.model != previous.model;
+    if lang_changed || settings.engine != previous.engine {
         if let Err(e) = state.engine_tx.lock().send(EngineCmd::Warmup) {
             log::warn!("warmup после смены языка не отправился: {e}");
+        }
+    }
+    // Модель, ставшая ненужной после смены языка/движка, освобождает память (D-053).
+    if route_changed {
+        if let Err(e) = state
+            .engine_tx
+            .lock()
+            .send(EngineCmd::Release(crate::engine::ReleaseTarget::Unneeded))
+        {
+            log::warn!("выгрузка ненужных моделей не отправилась: {e}");
         }
     }
     // Сменился язык или движок - подобрать уже установленную модель под маршрут
@@ -228,8 +240,36 @@ pub fn list_audio_devices() -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn list_models() -> Vec<models::ModelInfo> {
-    models::list()
+pub fn list_models(state: State<AppState>) -> Vec<models::ModelInfo> {
+    let s = state.settings.lock().clone();
+    let mut list = models::list();
+    mark_in_use(
+        &mut list,
+        &s,
+        crate::parakeet::dir_ready(&crate::paths::parakeet_dir()),
+        models::gigaam_variant(),
+    );
+    list
+}
+
+/// Пометить модели, нужные при текущих настройках (D-053). Правила маршрута -
+/// в `engine::models_in_use`; Whisper выбирается как в `resolve_model`:
+/// выбранная, если скачана, иначе самая большая скачанная.
+fn mark_in_use(
+    list: &mut [models::ModelInfo],
+    s: &Settings,
+    parakeet_ready: bool,
+    variant: Option<models::GigaVariant>,
+) {
+    let whisper = || list.iter().filter(|m| m.kind == "whisper" && m.installed);
+    let chosen = whisper()
+        .find(|m| m.name == s.model)
+        .or_else(|| whisper().max_by_key(|m| m.disk_mb.unwrap_or(0)))
+        .map(|m| m.name.clone());
+    let used = crate::engine::models_in_use(s, parakeet_ready, variant, chosen.as_deref());
+    for m in list.iter_mut() {
+        m.in_use = m.installed && used.contains(&m.name);
+    }
 }
 
 /// Куда кладутся модели. UI показывает путь и открывает папку — иначе
@@ -251,8 +291,20 @@ pub fn cancel_model_download(name: String) {
 }
 
 #[tauri::command]
-pub fn delete_model(name: String) -> R<()> {
-    models::delete(&name).map_err(err)
+pub fn delete_model(state: State<AppState>, name: String) -> R<()> {
+    models::delete(&name).map_err(err)?;
+    // Удалённая с диска модель уходит и из памяти, как только диктовка её отпустит.
+    if let Err(e) =
+        state
+            .engine_tx
+            .lock()
+            .send(EngineCmd::Release(crate::engine::ReleaseTarget::Model(
+                name,
+            )))
+    {
+        log::warn!("выгрузка удалённой модели не отправилась: {e}");
+    }
+    Ok(())
 }
 
 // ─────────────────────────── Диктовка ───────────────────────────
@@ -1314,6 +1366,82 @@ mod overlay_box_tests {
         // Абсурдный якорь зажимается в границу типа, а не переполняется в панику.
         let (x, y) = overlay_box_position((i32::MIN, i32::MIN), (479, 108));
         assert_eq!((x, y), (i32::MIN, i32::MIN));
+    }
+}
+
+#[cfg(test)]
+mod model_use_tests {
+    use super::mark_in_use;
+    use crate::models::{GigaVariant, ModelInfo, GIGAAM_FP32_NAME, GIGAAM_NAME, PARAKEET_NAME};
+    use crate::settings::Settings;
+
+    fn m(name: &str, kind: &str, installed: bool, disk: u64) -> ModelInfo {
+        ModelInfo {
+            name: name.into(),
+            label: name.into(),
+            size_mb: 1,
+            installed,
+            kind: kind.into(),
+            disk_mb: installed.then_some(disk),
+            in_use: false,
+        }
+    }
+
+    fn used(list: &[ModelInfo]) -> Vec<&str> {
+        list.iter()
+            .filter(|m| m.in_use)
+            .map(|m| m.name.as_str())
+            .collect()
+    }
+
+    fn catalog() -> Vec<ModelInfo> {
+        vec![
+            m(GIGAAM_NAME, "gigaam", true, 217),
+            m(GIGAAM_FP32_NAME, "gigaam", true, 885),
+            m(PARAKEET_NAME, "parakeet", true, 640),
+            m("small.bin", "whisper", true, 500),
+            m("big.bin", "whisper", true, 3000),
+            m("absent.bin", "whisper", false, 0),
+        ]
+    }
+
+    #[test]
+    fn auto_uses_full_gigaam_parakeet_and_selected_whisper() {
+        let s = Settings {
+            engine: "gigaam".into(),
+            language: "auto".into(),
+            model: "small.bin".into(),
+            ..Settings::default()
+        };
+        let mut list = catalog();
+        mark_in_use(&mut list, &s, true, Some(GigaVariant::Fp32));
+        assert_eq!(used(&list), [GIGAAM_FP32_NAME, PARAKEET_NAME, "small.bin"]);
+    }
+
+    #[test]
+    fn missing_selected_whisper_falls_back_to_largest_installed_like_resolve_model() {
+        let s = Settings {
+            engine: "whisper_server".into(),
+            language: "ru".into(),
+            model: "absent.bin".into(),
+            ..Settings::default()
+        };
+        let mut list = catalog();
+        mark_in_use(&mut list, &s, true, Some(GigaVariant::Fp32));
+        assert_eq!(used(&list), ["big.bin"]);
+    }
+
+    #[test]
+    fn russian_on_gigaam_leaves_everything_else_unused() {
+        let s = Settings {
+            engine: "gigaam".into(),
+            language: "ru".into(),
+            model: "small.bin".into(),
+            ..Settings::default()
+        };
+        let mut list = catalog();
+        mark_in_use(&mut list, &s, true, Some(GigaVariant::Int8));
+        assert_eq!(used(&list), [GIGAAM_NAME]);
     }
 }
 

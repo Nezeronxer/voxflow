@@ -247,10 +247,15 @@ export function listModels(): Promise<ModelInfo[]> {
       { name: "ggml-large-v3.bin", label: "Large v3 — максимальная точность, медленнее (3.1 ГБ)", size_mb: 3100, installed: false, kind: "whisper" },
     ];
     return Promise.resolve(
-      models.map((model) => ({
-        ...model,
-        installed: mockInstalledModels.has(model.name),
-      })),
+      models.map((model) => {
+        const installed = mockInstalledModels.has(model.name);
+        return {
+          ...model,
+          installed,
+          disk_mb: installed ? model.size_mb : null,
+          in_use: installed && model.name !== "ggml-large-v3-turbo-q5_0.bin",
+        };
+      }),
     );
   }
   return safe<ModelInfo[]>(() => invoke<ModelInfo[]>("list_models"), []);

@@ -25,12 +25,9 @@ pub struct SileroVad {
 
 impl SileroVad {
     pub fn load(model_path: &Path) -> Result<Self> {
-        let session = Session::builder()
-            .oc("builder")?
-            .with_intra_threads(1)
-            .oc("intra_threads")? // модель крошечная, потоки только мешают
-            .commit_from_file(model_path)
-            .oc(&format!("загрузка Silero VAD: {model_path:?}"))?;
+        // Модель крошечная, потоки только мешают.
+        let session = crate::ort_session::session_from_file(model_path, 1)
+            .map_err(|e| anyhow::anyhow!("загрузка Silero VAD: {e:#}"))?;
         Ok(Self {
             session,
             state: vec![0f32; STATE_LEN],

@@ -175,6 +175,11 @@ pub struct Settings {
     /// `ollama_unload_after_min` минут. Выключено - модель держится всегда (D-044).
     pub ollama_unload_idle: bool,
     pub ollama_unload_after_min: u32,
+    /// Выгружать модели распознавания (GigaAM, Parakeet, whisper-server) и
+    /// встроенную ИИ-модель, если диктовки не было `asr_unload_after_min`
+    /// минут (D-053). Следующая диктовка грузит модель заново при нажатии.
+    pub asr_unload_idle: bool,
+    pub asr_unload_after_min: u32,
 
     /// Прокси для ВСЕХ внешних запросов (STT/LLM). Пусто → curl сам берёт
     /// HTTPS_PROXY/HTTP_PROXY из окружения. Формат: http://host:port.
@@ -305,6 +310,8 @@ impl Default for Settings {
             ai_timeout_s: 20,
             ollama_unload_idle: true,
             ollama_unload_after_min: 15,
+            asr_unload_idle: true,
+            asr_unload_after_min: 10,
             proxy_url: String::new(),
             app_profile_overrides: Vec::new(),
             ai_prompt_rules: Vec::new(),
@@ -368,6 +375,7 @@ impl Settings {
         self.rewrite_max_output_tokens = self.rewrite_max_output_tokens.clamp(256, 32_768);
         self.ai_timeout_s = self.ai_timeout_s.clamp(5, 300);
         self.ollama_unload_after_min = self.ollama_unload_after_min.clamp(1, 1440);
+        self.asr_unload_after_min = self.asr_unload_after_min.clamp(1, 1440);
         self.rewrite_auth_header = sanitized_header_name(&self.rewrite_auth_header);
     }
 
@@ -594,6 +602,22 @@ mod tests {
             rewrite_key_env_order("https://api.openai.com/v1"),
             ["REWRITE_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"]
         );
+    }
+
+    #[test]
+    fn asr_unload_defaults_for_old_settings_and_clamps_minutes() {
+        // Настройки до D-053 не знают о выгрузке: она включена, через 10 минут.
+        let mut s: Settings = serde_json::from_str(r#"{"language":"ru"}"#).expect("parse");
+        s.normalize_user_values();
+        assert!(s.asr_unload_idle);
+        assert_eq!(s.asr_unload_after_min, 10);
+        for (raw, want) in [(0, 1), (1, 1), (10, 10), (1440, 1440), (5000, 1440)] {
+            let json = format!(r#"{{"asr_unload_idle":false,"asr_unload_after_min":{raw}}}"#);
+            let mut s: Settings = serde_json::from_str(&json).expect("parse");
+            s.normalize_user_values();
+            assert!(!s.asr_unload_idle);
+            assert_eq!(s.asr_unload_after_min, want, "{raw}");
+        }
     }
 
     #[test]

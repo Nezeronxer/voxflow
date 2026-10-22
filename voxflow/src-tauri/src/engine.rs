@@ -81,6 +81,9 @@ pub enum EngineCmd {
     /// языка из трея/UI): без него первый Start после переключения на en/auto
     /// синхронно грузит ~650 МБ Parakeet и подвешивает поток движка.
     Warmup,
+    /// Освободить модели распознавания (смена настроек, удаление модели, D-053).
+    /// Ждёт, пока диктовка их отпустит, в отдельном потоке.
+    Release(ReleaseTarget),
     Shutdown,
 }
 
@@ -389,6 +392,11 @@ pub fn spawn(
     // панель или macOS privacy-alert коротко перехватили frontmost.
     let target_watch = ctx.clone();
     std::thread::spawn(move || external_target_watcher(target_watch));
+    // Простой без диктовки освобождает модели (D-053).
+    let idle_watch = ctx.clone();
+    let _ = std::thread::Builder::new()
+        .name("voxflow-idle-unload".into())
+        .spawn(move || idle_unload_watcher(idle_watch));
     std::thread::Builder::new()
         .name("voxflow-engine".into())
         .spawn(move || engine_loop(rx, ctx))
@@ -807,6 +815,316 @@ fn resident_model_ready<T>(engine: &Arc<Mutex<Option<T>>>) -> bool {
         .unwrap_or(false)
 }
 
+// ─────────────── Выгрузка моделей в простое (D-053) ───────────────
+
+/// Как часто поток простоя смотрит на активность. Точность выгрузки - до
+/// этого шага; сама проверка дешёвая (атомики и try_lock).
+const IDLE_POLL: Duration = Duration::from_secs(20);
+
+/// Последняя активность диктовки, мс от старта процесса.
+static LAST_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+
+fn process_clock() -> Duration {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+/// Отметить активность: нажатие хоткея, запись, финал. От неё считается простой.
+fn touch_activity() {
+    LAST_ACTIVITY_MS.store(process_clock().as_millis() as u64, Ordering::SeqCst);
+}
+
+fn idle_for() -> Duration {
+    process_clock().saturating_sub(Duration::from_millis(
+        LAST_ACTIVITY_MS.load(Ordering::SeqCst),
+    ))
+}
+
+/// Пора ли выгружать: выгрузка включена и простой не меньше заданных минут.
+fn idle_unload_due(enabled: bool, after_min: u32, idle: Duration) -> bool {
+    enabled && idle >= Duration::from_secs(u64::from(after_min.clamp(1, 1440)) * 60)
+}
+
+/// Что сейчас пользуется моделями. Любой флаг - выгружать нельзя (D-024).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Activity {
+    recording: bool,
+    /// Финал в полёте или улучшение выделенного (`cancel_active`).
+    final_or_improve: bool,
+    /// Петля живого превью ещё жива.
+    preview: bool,
+}
+
+impl Activity {
+    fn of(ctx: &EngineCtx) -> Self {
+        Activity {
+            recording: ctx.recording.load(Ordering::SeqCst),
+            final_or_improve: ctx.cancel_active.load(Ordering::SeqCst)
+                || ctx.improve_busy.load(Ordering::SeqCst),
+            preview: ctx.partial.try_lock().map(|p| p.is_some()).unwrap_or(true),
+        }
+    }
+
+    fn busy(self) -> bool {
+        self.recording || self.final_or_improve || self.preview
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SlotRelease {
+    /// Модель освобождена.
+    Freed,
+    /// Слот и так пуст.
+    Empty,
+    /// Модель нужна по текущим настройкам - оставлена.
+    Kept,
+    /// Моделью пользуются (диктовка или чужой замок) - попробовать позже.
+    Busy,
+}
+
+/// Освободить модель в слоте, если ей никто не пользуется. Замок берётся
+/// только `try_lock`: финал или тик превью, держащие модель, не ждут выгрузку,
+/// выгрузка ждёт их до следующей попытки.
+fn release_slot<T>(
+    slot: &Mutex<Option<T>>,
+    activity: Activity,
+    wanted: impl Fn(&T) -> bool,
+) -> SlotRelease {
+    release_slot_with(slot, activity, wanted, drop)
+}
+
+/// То же, но освобождённое значение отдаётся `dispose` (процессу нужен kill).
+fn release_slot_with<T>(
+    slot: &Mutex<Option<T>>,
+    activity: Activity,
+    wanted: impl Fn(&T) -> bool,
+    dispose: impl FnOnce(T),
+) -> SlotRelease {
+    if activity.busy() {
+        return SlotRelease::Busy;
+    }
+    let Some(mut guard) = slot.try_lock() else {
+        return SlotRelease::Busy;
+    };
+    match guard.as_ref() {
+        None => SlotRelease::Empty,
+        Some(model) if !wanted(model) => SlotRelease::Kept,
+        Some(_) => {
+            if let Some(model) = guard.take() {
+                dispose(model);
+            }
+            SlotRelease::Freed
+        }
+    }
+}
+
+/// Какие модели распознавания нужны при этих настройках. Те же правила, что у
+/// маршрута финала (`local_route_with_parakeet`) и прогрева (`warmup`).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct NeededModels {
+    pub gigaam: bool,
+    pub parakeet: bool,
+    /// Whisper (`settings.model`): основной движок или запасной в «авто».
+    pub whisper: bool,
+}
+
+pub(crate) fn needed_models(s: &Settings, parakeet_ready: bool) -> NeededModels {
+    match local_route_with_parakeet(s, parakeet_ready) {
+        LocalRoute::GigaAm => NeededModels {
+            gigaam: true,
+            ..NeededModels::default()
+        },
+        LocalRoute::Parakeet => NeededModels {
+            parakeet: true,
+            ..NeededModels::default()
+        },
+        LocalRoute::Whisper if s.engine == "gigaam" && s.language == "auto" => NeededModels {
+            gigaam: true,
+            parakeet: parakeet_ready,
+            whisper: true,
+        },
+        LocalRoute::Whisper => NeededModels {
+            whisper: true,
+            ..NeededModels::default()
+        },
+    }
+}
+
+/// Имена каталожных моделей, которые используются при этих настройках:
+/// по ним «Модели» показывают метку «Не используется».
+/// `whisper_model` - файл, который выберет `resolve_model`.
+pub(crate) fn models_in_use(
+    s: &Settings,
+    parakeet_ready: bool,
+    variant: Option<crate::models::GigaVariant>,
+    whisper_model: Option<&str>,
+) -> BTreeSet<String> {
+    use crate::models::{GigaVariant, GIGAAM_FP32_NAME, GIGAAM_NAME, PARAKEET_NAME};
+    let need = needed_models(s, parakeet_ready);
+    let mut used = BTreeSet::new();
+    if need.gigaam {
+        match variant {
+            Some(GigaVariant::Fp32) => used.insert(GIGAAM_FP32_NAME.to_string()),
+            Some(GigaVariant::Int8) => used.insert(GIGAAM_NAME.to_string()),
+            None => false,
+        };
+    }
+    if need.parakeet {
+        used.insert(PARAKEET_NAME.to_string());
+    }
+    if need.whisper {
+        if let Some(name) = whisper_model {
+            used.insert(name.to_string());
+        }
+    }
+    used
+}
+
+/// Какие модели освобождать.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ReleaseTarget {
+    /// Все модели распознавания - простой.
+    All,
+    /// Те, что не нужны при текущих настройках - смена языка или движка.
+    Unneeded,
+    /// Одна модель по каталожному имени - её удалили с диска.
+    Model(String),
+}
+
+/// Освободить модели распознавания по цели. Возвращает `true`, когда всё
+/// нужное освобождено (или уже пусто), `false` - кто-то занят, повторить позже.
+/// Под `cancel_activity_lock`: Start ставит `cancel_active` под тем же замком,
+/// поэтому новая диктовка не начнётся между проверкой и освобождением.
+fn release_models(ctx: &EngineCtx, target: &ReleaseTarget, reason: &str) -> bool {
+    use crate::models::{GIGAAM_FP32_NAME, GIGAAM_NAME, PARAKEET_NAME};
+    let s = ctx.settings.lock().clone();
+    let need = needed_models(&s, crate::parakeet::dir_ready(&paths::parakeet_dir()));
+    let _activity = ctx.cancel_activity_lock.lock();
+    let activity = Activity::of(ctx);
+    let gigaam = release_slot(&ctx.gigaam, activity, |g| match target {
+        ReleaseTarget::All => true,
+        ReleaseTarget::Unneeded => !need.gigaam,
+        ReleaseTarget::Model(name) => {
+            (name == GIGAAM_FP32_NAME && g.fp32) || (name == GIGAAM_NAME && !g.fp32)
+        }
+    });
+    let parakeet = release_slot(&ctx.parakeet, activity, |_| match target {
+        ReleaseTarget::All => true,
+        ReleaseTarget::Unneeded => !need.parakeet,
+        ReleaseTarget::Model(name) => name == PARAKEET_NAME,
+    });
+    // whisper-server: ещё и asr_lock - через него идут все запросы к серверу.
+    let server = match ctx.asr_lock.try_lock() {
+        Some(_asr) => release_slot_with(
+            &ctx.server,
+            activity,
+            |srv| {
+                let file = srv.model.file_name().and_then(|f| f.to_str()).unwrap_or("");
+                match target {
+                    ReleaseTarget::All => true,
+                    ReleaseTarget::Unneeded => !need.whisper || file != s.model,
+                    ReleaseTarget::Model(name) => file == name,
+                }
+            },
+            |mut srv| {
+                let _ = srv.child.kill();
+                let _ = srv.child.wait();
+            },
+        ),
+        None => SlotRelease::Busy,
+    };
+    drop(_activity);
+    let freed: Vec<&str> = [
+        ("gigaam", gigaam),
+        ("parakeet", parakeet),
+        ("whisper-server", server),
+    ]
+    .iter()
+    .filter(|(_, r)| *r == SlotRelease::Freed)
+    .map(|(n, _)| *n)
+    .collect();
+    if !freed.is_empty() {
+        dbg_log(&format!("выгрузка ({reason}): {}", freed.join(", ")));
+    }
+    ![gigaam, parakeet, server].contains(&SlotRelease::Busy)
+}
+
+/// Повторять освобождение, пока диктовка не отпустит модели. Отдельный поток:
+/// канал команд движка не ждёт.
+fn release_models_when_free(ctx: EngineCtx, target: ReleaseTarget, reason: &'static str) {
+    let _ = std::thread::Builder::new()
+        .name("voxflow-model-release".into())
+        .spawn(move || {
+            // Час с запасом: дольше диктовка не держит модели.
+            for _ in 0..(3600 * 4) {
+                if release_models(&ctx, &target, reason) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        });
+}
+
+/// Выгрузить все модели распознавания (простой). Встроенный llama-server
+/// выгружает свой таймер в `local_llm::stop_if_idle`.
+fn unload_asr_models(ctx: &EngineCtx, reason: &str) -> bool {
+    release_models(ctx, &ReleaseTarget::All, reason)
+}
+
+fn any_asr_resident(ctx: &EngineCtx) -> bool {
+    let resident = |busy_or_some: Option<bool>| busy_or_some.unwrap_or(true);
+    resident(ctx.gigaam.try_lock().map(|g| g.is_some()))
+        || resident(ctx.parakeet.try_lock().map(|p| p.is_some()))
+        || resident(ctx.server.try_lock().map(|srv| srv.is_some()))
+}
+
+/// Поток простоя: раз в `IDLE_POLL` смотрит, не пора ли освободить память.
+fn idle_unload_watcher(ctx: EngineCtx) {
+    touch_activity();
+    loop {
+        std::thread::sleep(IDLE_POLL);
+        if Activity::of(&ctx).busy() {
+            touch_activity();
+            continue;
+        }
+        let (enabled, after_min) = {
+            let s = ctx.settings.lock();
+            (s.asr_unload_idle, s.asr_unload_after_min)
+        };
+        if !enabled {
+            continue;
+        }
+        let after = Duration::from_secs(u64::from(after_min.clamp(1, 1440)) * 60);
+        if crate::local_llm::stop_if_idle(after) {
+            dbg_log("выгрузка (простой): встроенный ИИ");
+        }
+        if idle_unload_due(enabled, after_min, idle_for()) && any_asr_resident(&ctx) {
+            unload_asr_models(&ctx, "простой");
+        }
+    }
+}
+
+/// Start после выгрузки: модели, нужные маршруту, грузятся в фоне, пока
+/// человек говорит. Аудио копится в буфере захвата, финал дождётся модели.
+fn preload_for_dictation(ctx: &EngineCtx) {
+    let s = ctx.settings.lock().clone();
+    let need = needed_models(&s, crate::parakeet::dir_ready(&paths::parakeet_dir()));
+    // try_lock занят - модель уже грузится или работает, второй прогрев не нужен.
+    let empty = |slot: Option<bool>| slot == Some(true);
+    let gigaam_missing = need.gigaam
+        && crate::models::gigaam_available()
+        && empty(ctx.gigaam.try_lock().map(|g| g.is_none()));
+    let parakeet_missing = need.parakeet && empty(ctx.parakeet.try_lock().map(|p| p.is_none()));
+    if gigaam_missing || parakeet_missing {
+        dbg_log("start: модель выгружена - грузим, пока идёт запись");
+        let wctx = ctx.clone();
+        std::thread::spawn(move || warmup(wctx));
+    }
+    if s.ai_backend == "builtin" && !crate::local_llm::server_status().running {
+        crate::local_llm::warmup(&s);
+    }
+}
+
 /// Маршрут локального распознавания по настройкам (роутер языков, PLAN §2).
 /// Считается заново на каждый старт/финал — установка модели Parakeet
 /// подхватывается без перезапуска.
@@ -1030,7 +1348,9 @@ fn warmup(ctx: EngineCtx) {
     dbg_log(&format!("warmup: engine={}, model={}", s.engine, s.model));
     // VAD грузим всегда (2 МБ, мгновенно) — гейт тишины нужен во всех режимах.
     // Два инстанса: петля партиалов (стриминговый state) и финалы — раздельно.
-    {
+    // Уже загружен - не трогаем: warmup зовётся и в начале диктовки, а VAD
+    // превью несёт стриминговый state.
+    if ctx.vad.lock().is_none() || ctx.vad_final.lock().is_none() {
         let t = Instant::now();
         let p = paths::vad_model_path(Some(&ctx.app));
         match (
@@ -1214,6 +1534,14 @@ fn engine_loop(rx: Receiver<EngineCmd>, ctx: EngineCtx) {
                     let wctx = ctx.clone();
                     std::thread::spawn(move || warmup(wctx));
                 }
+                EngineCmd::Release(target) => {
+                    let reason = match target {
+                        ReleaseTarget::All => "по запросу",
+                        ReleaseTarget::Unneeded => "смена настроек",
+                        ReleaseTarget::Model(_) => "модель удалена",
+                    };
+                    release_models_when_free(ctx.clone(), target, reason);
+                }
                 EngineCmd::Shutdown => {
                     let _activity = ctx.cancel_activity_lock.lock();
                     ctx.cancel_active.store(false, Ordering::SeqCst);
@@ -1297,6 +1625,8 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx, latched: b
     // macOS Accessibility может отвечать 150–650 мс, и ожидание до CoreAudio
     // обрезало бы начало короткой фразы.
     let (start_gen, inherited_live_draft) = advance_generation_for_start(ctx);
+    // Простой считается от последней диктовки (D-053).
+    touch_activity();
     // Визуальный отклик также не ждёт CoreAudio/platform context. Overlay не получает
     // фокус, поэтому цель всё равно снимается с внешнего приложения ниже.
     set_status_with_latch(ctx, "recording", latched);
@@ -1390,6 +1720,9 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx, latched: b
             // Запускаем петлю живого стриминга, если GPU whisper-server доступен —
             // пилюля показывает живой текст и при whisper_cli (живой инжект при этом
             // выключен, см. maybe_start_partial_loop). Без GPU/модели — статичное «Слушаю…».
+            // Выгруженная в простое модель начинает грузиться сразу, пока
+            // человек говорит: микрофон уже пишет, финал дождётся модели (D-053).
+            preload_for_dictation(ctx);
             maybe_start_partial_loop(&c, ctx, &target_fp);
             // Петля уровня громкости для orb-визуализатора (событие "level").
             spawn_level_loop(&c, ctx);
@@ -1462,7 +1795,12 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
     // (committed растёт монотонно по построению), активный сегмент
     // перераспознаётся каждый тик (volatile, серый). По тишине ASR не гоняем.
     if s.language == "auto" && s.engine == "gigaam" {
-        if resident_model_ready(&ctx.gigaam) {
+        // Модель на диске, но не в памяти (выгружена в простое или занята
+        // финалом прошлой фразы) - петля всё равно стартует: тики пропускаются,
+        // пока `preload_for_dictation` грузит модель. Whisper-стрим ради превью
+        // не поднимаем - он сам по себе съел бы сотни мегабайт (D-053).
+        let gigaam_resident = resident_model_ready(&ctx.gigaam);
+        if gigaam_resident || crate::models::gigaam_available() {
             // Auto сохраняет все языки в финале, но русскому live-preview нужен
             // быстрый и сильный движок. Whisper auto слишком медленно обновлял
             // кружок, а Parakeet давал мусор по русской речи. Поэтому в auto
@@ -1475,7 +1813,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
                 fixed_lang: Some("ru"),
                 speculative: true,
             };
-            if resident_model_ready(&ctx.parakeet) {
+            if gigaam_resident && resident_model_ready(&ctx.parakeet) {
                 let auto = AutoLangStt {
                     ru: Arc::clone(&ctx.gigaam),
                     en: Arc::clone(&ctx.parakeet),
@@ -1532,7 +1870,7 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
     }
     match local_route(&s) {
         LocalRoute::GigaAm => {
-            if !resident_model_ready(&ctx.gigaam) {
+            if !resident_model_ready(&ctx.gigaam) && !crate::models::gigaam_available() {
                 // Модели ещё нет (первый запуск, докачка) — пилюля статична,
                 // предупреждение по-старому отработает финал/гард старта.
                 dbg_log("partial: gigaam не готов — без живого стрима");
@@ -1556,7 +1894,9 @@ fn maybe_start_partial_loop(capture: &Capture, ctx: &EngineCtx, target_fp: &Targ
             return;
         }
         LocalRoute::Parakeet => {
-            if resident_model_ready(&ctx.parakeet) {
+            // Маршрут выбран - файлы на месте. Не в памяти или замок занят
+            // загрузкой с Start - петля пропускает тики, пока модель не готова.
+            if crate::parakeet::dir_ready(&paths::parakeet_dir()) {
                 // en/auto: партиалы гонит Parakeet БЕЗ двойного прогона (RU-перегон
                 // кириллических сегментов — только в финале); язык бейджа
                 // определяется по скрипту текущего текста.
@@ -7596,6 +7936,202 @@ mod seg_tests {
         drop(loading);
         *model.lock() = None;
         assert!(!resident_model_ready(&model));
+    }
+
+    #[test]
+    fn idle_unload_waits_for_configured_minutes() {
+        let min = |m: u64| Duration::from_secs(m * 60);
+        assert!(!idle_unload_due(true, 10, min(9)));
+        assert!(idle_unload_due(true, 10, min(10)));
+        assert!(idle_unload_due(true, 1, min(1)));
+        assert!(!idle_unload_due(false, 10, min(600)));
+        // Нули из старых настроек не выгружают модель сразу же.
+        assert!(!idle_unload_due(true, 0, Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn model_slot_is_never_released_while_dictation_uses_it() {
+        let slot = Mutex::new(Some(7u8));
+        let all = |_: &u8| true;
+        for busy in [
+            Activity {
+                recording: true,
+                ..Activity::default()
+            },
+            Activity {
+                final_or_improve: true,
+                ..Activity::default()
+            },
+            Activity {
+                preview: true,
+                ..Activity::default()
+            },
+        ] {
+            assert_eq!(release_slot(&slot, busy, all), SlotRelease::Busy);
+            assert_eq!(*slot.lock(), Some(7));
+        }
+        // Финал или тик превью держит модель - ждём, пока отпустит.
+        let held = slot.lock();
+        assert_eq!(
+            release_slot(&slot, Activity::default(), all),
+            SlotRelease::Busy
+        );
+        drop(held);
+        assert_eq!(*slot.lock(), Some(7));
+        assert_eq!(
+            release_slot(&slot, Activity::default(), all),
+            SlotRelease::Freed
+        );
+        assert_eq!(*slot.lock(), None);
+        assert_eq!(
+            release_slot(&slot, Activity::default(), all),
+            SlotRelease::Empty
+        );
+        // Нужная модель остаётся.
+        *slot.lock() = Some(8);
+        assert_eq!(
+            release_slot(&slot, Activity::default(), |_| false),
+            SlotRelease::Kept
+        );
+        assert_eq!(*slot.lock(), Some(8));
+    }
+
+    #[test]
+    fn needed_models_follow_language_and_engine() {
+        let s = |engine: &str, language: &str| Settings {
+            engine: engine.into(),
+            language: language.into(),
+            ..Settings::default()
+        };
+        let only = |gigaam, parakeet, whisper| NeededModels {
+            gigaam,
+            parakeet,
+            whisper,
+        };
+        assert_eq!(
+            needed_models(&s("gigaam", "ru"), true),
+            only(true, false, false)
+        );
+        assert_eq!(
+            needed_models(&s("gigaam", "en"), true),
+            only(false, true, false)
+        );
+        assert_eq!(
+            needed_models(&s("gigaam", "en"), false),
+            only(false, false, true)
+        );
+        assert_eq!(
+            needed_models(&s("gigaam", "auto"), true),
+            only(true, true, true)
+        );
+        assert_eq!(
+            needed_models(&s("gigaam", "auto"), false),
+            only(true, false, true)
+        );
+        assert_eq!(
+            needed_models(&s("gigaam", "de"), true),
+            only(false, false, true)
+        );
+        assert_eq!(
+            needed_models(&s("whisper_server", "ru"), true),
+            only(false, false, true)
+        );
+        assert_eq!(
+            needed_models(&s("whisper_cli", "auto"), true),
+            only(false, false, true)
+        );
+    }
+
+    #[test]
+    fn models_in_use_marks_only_what_current_settings_need() {
+        use crate::models::{GigaVariant, GIGAAM_FP32_NAME, GIGAAM_NAME, PARAKEET_NAME};
+        let auto = Settings {
+            engine: "gigaam".into(),
+            language: "auto".into(),
+            ..Settings::default()
+        };
+        let used = models_in_use(&auto, true, Some(GigaVariant::Fp32), Some("w.bin"));
+        assert!(used.contains(GIGAAM_FP32_NAME));
+        assert!(
+            !used.contains(GIGAAM_NAME),
+            "int8 при готовой fp32 не нужна"
+        );
+        assert!(used.contains(PARAKEET_NAME));
+        assert!(used.contains("w.bin"));
+        assert!(!used.contains("other.bin"));
+
+        let ru = Settings {
+            language: "ru".into(),
+            ..auto.clone()
+        };
+        let used = models_in_use(&ru, true, Some(GigaVariant::Int8), Some("w.bin"));
+        assert_eq!(used.len(), 1);
+        assert!(used.contains(GIGAAM_NAME));
+
+        let whisper = Settings {
+            engine: "whisper_server".into(),
+            ..auto
+        };
+        let used = models_in_use(&whisper, true, Some(GigaVariant::Fp32), Some("w.bin"));
+        assert_eq!(used.len(), 1);
+        assert!(used.contains("w.bin"));
+        assert!(models_in_use(&whisper, true, None, None).is_empty());
+    }
+
+    /// Первая диктовка после выгрузки (D-053): модель грузится в фоне с начала
+    /// записи, финал ждёт её на том же замке и распознаёт весь буфер - текст
+    /// совпадает с распознанным до выгрузки.
+    #[test]
+    #[ignore = "requires fp32 GigaAM and private dataset in VOXFLOW_TEST_DATA_DIR"]
+    fn unloaded_model_reloads_for_next_dictation_without_losing_audio() {
+        let data = std::path::PathBuf::from(std::env::var("VOXFLOW_TEST_DATA_DIR").unwrap());
+        let dir = data.join("models").join(crate::gigaam::GIGAAM_FP32_DIR);
+        let wav = std::fs::read_dir(data.join("dataset"))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .find(|p| {
+                hound::WavReader::open(p).is_ok_and(|r| {
+                    let sec = r.duration() as f32 / r.spec().sample_rate as f32;
+                    r.spec().sample_rate == 16000 && (6.0..=12.0).contains(&sec)
+                })
+            })
+            .expect("запись 6-12 с");
+        let r = hound::WavReader::open(&wav).unwrap();
+        let max = (1i64 << (r.spec().bits_per_sample - 1)) as f32;
+        let audio: Vec<f32> = r
+            .into_samples::<i32>()
+            .map(|x| x.unwrap_or(0) as f32 / max)
+            .collect();
+        let load =
+            move || crate::gigaam::GigaAm::load_files(&dir, 4, &crate::gigaam::FP32_FILES).unwrap();
+        let loader_load = load.clone();
+        let slot = Arc::new(Mutex::new(Some(load())));
+        let before = slot.lock().as_mut().unwrap().transcribe(&audio).unwrap();
+        assert!(!before.trim().is_empty());
+        assert_eq!(
+            release_slot(&slot, Activity::default(), |_| true),
+            SlotRelease::Freed
+        );
+        // Start: загрузка в фоне под замком слота, как ensure_gigaam.
+        let loader_slot = Arc::clone(&slot);
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let loader = std::thread::spawn(move || {
+            let mut g = loader_slot.lock();
+            locked_tx.send(()).unwrap();
+            *g = Some(loader_load());
+        });
+        locked_rx.recv().unwrap();
+        // Человек говорит, пока модель грузится: весь буфер копится.
+        let recorded = audio.clone();
+        // Финал: тот же замок, ждёт готовности модели.
+        let after = slot
+            .lock()
+            .as_mut()
+            .expect("модель загружена к финалу")
+            .transcribe(&recorded)
+            .unwrap();
+        loader.join().unwrap();
+        assert_eq!(after, before);
     }
 
     /// Регрессия фикса «финал не отбрасывается»: второй финал готов раньше

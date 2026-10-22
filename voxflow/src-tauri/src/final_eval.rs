@@ -232,11 +232,7 @@ mod tests {
 
     impl Ctc {
         fn load(dir: &Path, threads: usize) -> Self {
-            let sess = ort::session::Session::builder()
-                .unwrap()
-                .with_intra_threads(threads)
-                .unwrap()
-                .commit_from_file(dir.join("v3_e2e_ctc.onnx"))
+            let sess = crate::ort_session::session_from_file(&dir.join("v3_e2e_ctc.onnx"), threads)
                 .unwrap();
             println!(
                 "ctc inputs {:?} outputs {:?}",
@@ -472,5 +468,227 @@ mod tests {
                 r("short")
             );
         }
+    }
+
+    /// Footprint процесса на macOS: (текущий, пиковый за жизнь), байты.
+    /// `proc_pid_rusage(RUSAGE_INFO_V4)`: phys_footprint - то, что показывает
+    /// «Мониторинг системы» как «Память», а не RSS.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn phys_footprint() -> (u64, u64) {
+        extern "C" {
+            fn proc_pid_rusage(pid: i32, flavor: i32, buffer: *mut u64) -> i32;
+        }
+        // rusage_info_v4: uuid (2 x u64), дальше поля u64; phys_footprint - 8-е,
+        // lifetime_max_phys_footprint - 29-е после uuid.
+        let mut buf = [0u64; 48];
+        let rc = unsafe { proc_pid_rusage(std::process::id() as i32, 4, buf.as_mut_ptr()) };
+        assert_eq!(rc, 0, "proc_pid_rusage");
+        (buf[2 + 7], buf[2 + 28])
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn phys_footprint() -> (u64, u64) {
+        (0, 0)
+    }
+
+    fn mb(b: u64) -> u64 {
+        b / (1024 * 1024)
+    }
+
+    /// Замер памяти и точности моделей (D-053): полная GigaAM + Parakeet грузятся
+    /// как в режиме «авто», распознают `VOXFLOW_BENCH_N` (по умолчанию 60) записей
+    /// из `dataset/` (1-25 с, равномерно по списку), печатают footprint после загрузки,
+    /// пик, установившийся и после освобождения моделей, время энкодеров.
+    /// Тексты пишутся в `VOXFLOW_BENCH_OUT`; если задан `VOXFLOW_BENCH_BASE` -
+    /// сравниваются с ним побуквенно и тест падает на расхождении.
+    /// Запуск строго одним тестом в процессе (пик считается на весь процесс):
+    /// `VOXFLOW_TEST_DATA_DIR=... cargo test --lib memory_footprint_bench -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires fp32 GigaAM, Parakeet and private dataset in VOXFLOW_TEST_DATA_DIR"]
+    fn memory_footprint_bench() {
+        let data = std::path::PathBuf::from(
+            std::env::var("VOXFLOW_TEST_DATA_DIR").expect("VOXFLOW_TEST_DATA_DIR"),
+        );
+        let n: usize = std::env::var("VOXFLOW_BENCH_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60);
+        // Список записей - только чтение каталога пользователя.
+        let mut all: Vec<std::path::PathBuf> = std::fs::read_dir(data.join("dataset"))
+            .expect("dataset")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+            .filter(|p| {
+                hound::WavReader::open(p).is_ok_and(|r| {
+                    let sec = r.duration() as f32 / r.spec().sample_rate as f32;
+                    r.spec().sample_rate == 16000
+                        && r.spec().channels == 1
+                        && (1.0..=25.0).contains(&sec)
+                })
+            })
+            .collect();
+        all.sort();
+        assert!(all.len() >= n, "в dataset мало записей: {}", all.len());
+        let step = all.len() / n;
+        let picked: Vec<_> = (0..n).map(|i| all[i * step].clone()).collect();
+
+        let threads = crate::settings::Settings::default().effective_threads() as usize;
+        let (base, _) = phys_footprint();
+        let t_load = std::time::Instant::now();
+        let mut g = crate::gigaam::GigaAm::load_files(
+            &data.join("models").join(crate::gigaam::GIGAAM_FP32_DIR),
+            threads,
+            &crate::gigaam::FP32_FILES,
+        )
+        .expect("gigaam fp32");
+        let mut p = crate::parakeet::Parakeet::load(
+            &data.join("models").join(crate::parakeet::PARAKEET_DIR),
+            threads,
+        )
+        .expect("parakeet");
+        let load_ms = t_load.elapsed().as_millis();
+        let (loaded, load_peak) = phys_footprint();
+        let _ = g.transcribe(&vec![0.0f32; 8000]);
+        let _ = p.transcribe(&vec![0.0f32; 8000]);
+
+        let (mut g_enc, mut p_enc, mut audio_ms) = (0u64, 0u64, 0u64);
+        let mut lines = Vec::new();
+        for f in &picked {
+            let s = read_wav(f);
+            let tg = g.transcribe(&s).expect("gigaam");
+            g_enc += g.last_stats.encoder_ms;
+            audio_ms += g.last_stats.audio_ms;
+            let tp = p.transcribe(&s).expect("parakeet");
+            p_enc += p.last_stats.encoder_ms;
+            let stem = f.file_stem().unwrap().to_string_lossy().to_string();
+            lines.push(format!("{stem}\t{tg}\t{tp}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (settled, peak) = phys_footprint();
+        drop(g);
+        drop(p);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (freed, _) = phys_footprint();
+        println!(
+            "BENCH записей={n} потоков={threads} загрузка={load_ms}мс звук={audio_ms}мс\n\
+             BENCH footprint МБ: до={} после_загрузки={} пик_загрузки={} пик={} после_распознавания={} после_выгрузки={}\n\
+             BENCH энкодер мс: gigaam={g_enc} parakeet={p_enc}",
+            mb(base),
+            mb(loaded),
+            mb(load_peak),
+            mb(peak),
+            mb(settled),
+            mb(freed)
+        );
+        let out = lines.join("\n");
+        if let Ok(path) = std::env::var("VOXFLOW_BENCH_OUT") {
+            std::fs::write(path, &out).expect("BENCH_OUT");
+        }
+        if let Ok(path) = std::env::var("VOXFLOW_BENCH_BASE") {
+            let prev = std::fs::read_to_string(path).expect("BENCH_BASE");
+            let diff: Vec<_> = prev
+                .lines()
+                .zip(out.lines())
+                .filter(|(a, b)| a != b)
+                .collect();
+            for (a, b) in &diff {
+                println!("BENCH было: {a}\nBENCH стало: {b}");
+            }
+            println!("BENCH расхождений текстов: {} из {n}", diff.len());
+            assert!(diff.is_empty(), "тексты разошлись с базой");
+            assert_eq!(prev.lines().count(), out.lines().count());
+        }
+    }
+
+    /// A/B времени энкодера (D-053): одна и та же модель с опциями
+    /// `VOXFLOW_AB_A` и `VOXFLOW_AB_B` в одном процессе, записи по очереди -
+    /// фоновая нагрузка машины делится поровну. `VOXFLOW_AB_MODEL=gigaam|parakeet`.
+    #[test]
+    #[ignore = "requires fp32 GigaAM, Parakeet and private dataset in VOXFLOW_TEST_DATA_DIR"]
+    fn ort_option_timing_ab() {
+        let data = std::path::PathBuf::from(std::env::var("VOXFLOW_TEST_DATA_DIR").unwrap());
+        let a_opts = std::env::var("VOXFLOW_AB_A").unwrap_or_default();
+        let b_opts = std::env::var("VOXFLOW_AB_B").unwrap_or_default();
+        let model = std::env::var("VOXFLOW_AB_MODEL").unwrap_or_else(|_| "gigaam".into());
+        let rounds: usize = std::env::var("VOXFLOW_AB_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2);
+        let threads = crate::settings::Settings::default().effective_threads() as usize;
+        let mut all: Vec<std::path::PathBuf> = std::fs::read_dir(data.join("dataset"))
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+            .filter(|p| {
+                hound::WavReader::open(p).is_ok_and(|r| {
+                    let sec = r.duration() as f32 / r.spec().sample_rate as f32;
+                    r.spec().sample_rate == 16000 && (1.0..=25.0).contains(&sec)
+                })
+            })
+            .collect();
+        all.sort();
+        let step = all.len() / 60;
+        let audio: Vec<Vec<f32>> = (0..60).map(|i| read_wav(&all[i * step])).collect();
+        let mut times = [0u64; 2];
+        let mut totals = [0u64; 2];
+        if model == "gigaam" {
+            let load = |o: &str| {
+                crate::ort_session::with_bench_opts(o, || {
+                    crate::gigaam::GigaAm::load_files(
+                        &data.join("models").join(crate::gigaam::GIGAAM_FP32_DIR),
+                        threads,
+                        &crate::gigaam::FP32_FILES,
+                    )
+                    .unwrap()
+                })
+            };
+            let mut m = [load(&a_opts), load(&b_opts)];
+            for g in m.iter_mut() {
+                let _ = g.transcribe(&vec![0.0f32; 8000]);
+            }
+            for _ in 0..rounds {
+                for (i, s) in audio.iter().enumerate() {
+                    // Чередуем порядок, чтобы ни один вариант не шёл всегда первым.
+                    for k in [i % 2, 1 - i % 2] {
+                        m[k].transcribe(s).unwrap();
+                        times[k] += m[k].last_stats.encoder_ms;
+                        totals[k] += m[k].last_stats.total_ms;
+                    }
+                }
+            }
+        } else {
+            let load = |o: &str| {
+                crate::ort_session::with_bench_opts(o, || {
+                    crate::parakeet::Parakeet::load(
+                        &data.join("models").join(crate::parakeet::PARAKEET_DIR),
+                        threads,
+                    )
+                    .unwrap()
+                })
+            };
+            let mut m = [load(&a_opts), load(&b_opts)];
+            for p in m.iter_mut() {
+                let _ = p.transcribe(&vec![0.0f32; 8000]);
+            }
+            for _ in 0..rounds {
+                for (i, s) in audio.iter().enumerate() {
+                    for k in [i % 2, 1 - i % 2] {
+                        m[k].transcribe(s).unwrap();
+                        times[k] += m[k].last_stats.encoder_ms;
+                        totals[k] += m[k].last_stats.total_ms;
+                    }
+                }
+            }
+        }
+        println!(
+            "AB {model}: энкодер A[{a_opts}]={} мс B[{b_opts}]={} мс B/A={:.3}; \
+             всё распознавание A={} мс B={} мс B/A={:.3}",
+            times[0],
+            times[1],
+            times[1] as f64 / times[0].max(1) as f64,
+            totals[0],
+            totals[1],
+            totals[1] as f64 / totals[0].max(1) as f64
+        );
     }
 }

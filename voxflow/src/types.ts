@@ -55,6 +55,9 @@ export interface Settings {
   // Выгружать модель Ollama после N минут простоя (выключено - держать всегда).
   ollama_unload_idle: boolean;
   ollama_unload_after_min: number;
+  // Выгрузка моделей распознавания и встроенного ИИ в простое (D-053).
+  asr_unload_idle: boolean;
+  asr_unload_after_min: number;
   cloud_asr: boolean;
   tone_by_app: boolean;
   stream_mode: string;
@@ -289,6 +292,8 @@ export const DEFAULT_SETTINGS: Settings = {
   ai_timeout_s: 20,
   ollama_unload_idle: true,
   ollama_unload_after_min: 15,
+  asr_unload_idle: true,
+  asr_unload_after_min: 10,
   cloud_asr: false,
   tone_by_app: true,
   stream_mode: "never",
@@ -340,6 +345,10 @@ export interface ModelInfo {
   // "parakeet" — EN/auto ONNX-модель, "whisper" — одиночный ggml-*.bin.
   // Отсутствует у старых бэкендов → whisper.
   kind?: string;
+  // Сколько занимает на диске сейчас, МБ; null - не скачана (D-053).
+  disk_mb?: number | null;
+  // Нужна при текущих настройках - правила маршрута в Rust (D-053).
+  in_use?: boolean;
 }
 
 export interface Stats {
