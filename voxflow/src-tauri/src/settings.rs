@@ -171,6 +171,10 @@ pub struct Settings {
     /// применяется увеличенный (см. `Settings::backend_timeout_s`): CPU-модель
     /// с промптом на тысячи токенов в 10 секунд не укладывается.
     pub ai_timeout_s: u32,
+    /// Выгружать модель Ollama из памяти, если ей не пользовались
+    /// `ollama_unload_after_min` минут. Выключено - модель держится всегда (D-044).
+    pub ollama_unload_idle: bool,
+    pub ollama_unload_after_min: u32,
 
     /// Прокси для ВСЕХ внешних запросов (STT/LLM). Пусто → curl сам берёт
     /// HTTPS_PROXY/HTTP_PROXY из окружения. Формат: http://host:port.
@@ -299,6 +303,8 @@ impl Default for Settings {
             rewrite_max_output_tokens: 4096,
             rewrite_min_recall: 0.9,
             ai_timeout_s: 20,
+            ollama_unload_idle: true,
+            ollama_unload_after_min: 15,
             proxy_url: String::new(),
             app_profile_overrides: Vec::new(),
             ai_prompt_rules: Vec::new(),
@@ -361,6 +367,7 @@ impl Settings {
         };
         self.rewrite_max_output_tokens = self.rewrite_max_output_tokens.clamp(256, 32_768);
         self.ai_timeout_s = self.ai_timeout_s.clamp(5, 300);
+        self.ollama_unload_after_min = self.ollama_unload_after_min.clamp(1, 1440);
         self.rewrite_auth_header = sanitized_header_name(&self.rewrite_auth_header);
     }
 

@@ -52,6 +52,9 @@ export interface Settings {
   rewrite_min_recall: number;
   // Таймаут запроса к ИИ, секунды (локальная модель получает минимум 60).
   ai_timeout_s: number;
+  // Выгружать модель Ollama после N минут простоя (выключено - держать всегда).
+  ollama_unload_idle: boolean;
+  ollama_unload_after_min: number;
   cloud_asr: boolean;
   tone_by_app: boolean;
   stream_mode: string;
@@ -284,6 +287,8 @@ export const DEFAULT_SETTINGS: Settings = {
   rewrite_max_output_tokens: 4096,
   rewrite_min_recall: 0.9,
   ai_timeout_s: 20,
+  ollama_unload_idle: true,
+  ollama_unload_after_min: 15,
   cloud_asr: false,
   tone_by_app: true,
   stream_mode: "never",

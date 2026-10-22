@@ -216,6 +216,7 @@ pub fn run() {
             // Выбранная локальная ИИ-модель не установлена - взять установленную (D-043).
             local_ai::spawn_adopt_installed(handle.clone(), startup_settings.clone());
             local_llm::warmup(&startup_settings);
+            ollama::set_keep_alive(&startup_settings);
             ollama::warmup(&startup_settings);
 
             // Показать окно настроек при запуске, НО не при автозапуске (тогда — в трей).

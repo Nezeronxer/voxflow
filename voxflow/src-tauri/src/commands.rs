@@ -171,6 +171,7 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
     if settings.ai_backend == "builtin" && previous.ai_backend != "builtin" {
         crate::local_llm::warmup(&settings);
     }
+    crate::ollama::set_keep_alive(&settings);
     // Ollama (D-044): модель держится в памяти, поэтому прежнюю выгружаем,
     // а новую греем сразу - первая диктовка не ждёт загрузку.
     let ollama_changed = settings.ai_backend != previous.ai_backend

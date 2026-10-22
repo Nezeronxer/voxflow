@@ -370,6 +370,38 @@ export default function Ai({
                 )}
               />
             </Field>
+
+            <Field
+              label="Выгружать модель в простое"
+              hint="Освобождает память, если долго не диктуешь. Первая фраза после перерыва обработается на несколько секунд дольше"
+            >
+              <Switch
+                checked={settings.ollama_unload_idle}
+                onChange={(v) => update({ ollama_unload_idle: v })}
+              />
+            </Field>
+
+            {settings.ollama_unload_idle && (
+              <Field
+                label="Выгружать через, мин"
+                hint="Сколько минут без диктовки держать модель в памяти"
+              >
+                <input
+                  type="number"
+                  min={1}
+                  max={1440}
+                  value={settings.ollama_unload_after_min}
+                  onChange={(e) => {
+                    const n = parseInt(e.currentTarget.value, 10);
+                    update({
+                      ollama_unload_after_min: Number.isFinite(n)
+                        ? Math.min(1440, Math.max(1, n))
+                        : 15,
+                    });
+                  }}
+                />
+              </Field>
+            )}
           </>
         )}
 

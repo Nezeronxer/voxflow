@@ -346,6 +346,26 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str, timeout_s: u64) 
     Ok(cleaned)
 }
 
+/// `keep_alive` для запросов: -1 держит модель всегда, иначе Ollama сама выгрузит
+/// её через столько минут простоя. Ставится из настроек при старте и сохранении.
+static KEEP_ALIVE_MIN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
+
+pub fn set_keep_alive(s: &crate::settings::Settings) {
+    let v = if s.ollama_unload_idle {
+        s.ollama_unload_after_min as i64
+    } else {
+        -1
+    };
+    KEEP_ALIVE_MIN.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn keep_alive() -> serde_json::Value {
+    match KEEP_ALIVE_MIN.load(std::sync::atomic::Ordering::Relaxed) {
+        m if m > 0 => format!("{m}m").into(),
+        _ => (-1).into(),
+    }
+}
+
 /// Тело `POST /api/chat`. Размышления глушим нативным `think: false` +
 /// пост-очисткой; директиву `/no_think` в систему НЕ добавляем - у qwen3:4b она
 /// reasoning не глушит, а протекает эхом в ответ. `keep_alive: -1` держит модель
@@ -363,7 +383,7 @@ fn chat_body(model: &str, system: &str, user: &str) -> serde_json::Value {
         ],
         "stream": false,
         "think": false,
-        "keep_alive": -1,
+        "keep_alive": keep_alive(),
         "options": {
             "temperature": 0.1,   // правка, а не сочинение - почти детерминированно
             "top_p": 0.8,
@@ -593,7 +613,6 @@ mod tests {
         let b = chat_body("gemma4:e2b-it-qat", "sys", "<text>x</text>");
         assert_eq!(b["think"], false);
         assert_eq!(b["stream"], false);
-        assert_eq!(b["keep_alive"], -1);
         assert_eq!(b["options"]["temperature"], 0.1);
         assert_eq!(b["messages"][0]["role"], "system");
         assert_eq!(b["messages"][1]["content"], "<text>x</text>");
@@ -609,6 +628,20 @@ mod tests {
             "<text>длинная фраза</text>",
         );
         assert_eq!(warm["options"]["num_ctx"], real["options"]["num_ctx"]);
+    }
+
+    #[test]
+    fn keep_alive_follows_unload_setting() {
+        let mut s = crate::settings::Settings {
+            ollama_unload_idle: true,
+            ollama_unload_after_min: 15,
+            ..Default::default()
+        };
+        set_keep_alive(&s);
+        assert_eq!(keep_alive(), "15m");
+        s.ollama_unload_idle = false;
+        set_keep_alive(&s);
+        assert_eq!(keep_alive(), -1);
     }
 
     #[test]
