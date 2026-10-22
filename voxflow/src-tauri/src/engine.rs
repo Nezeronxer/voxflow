@@ -849,7 +849,7 @@ fn idle_unload_due(enabled: bool, after_min: u32, idle: Duration) -> bool {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct Activity {
     recording: bool,
-    /// Финал в полёте или улучшение выделенного (`cancel_active`).
+    /// Финал в полёте (`cancel_active` или билет `final_queue`) или улучшение выделенного.
     final_or_improve: bool,
     /// Петля живого превью ещё жива.
     preview: bool,
@@ -857,11 +857,26 @@ struct Activity {
 
 impl Activity {
     fn of(ctx: &EngineCtx) -> Self {
+        Self::from_parts(
+            ctx.recording.load(Ordering::SeqCst),
+            ctx.cancel_active.load(Ordering::SeqCst) || ctx.improve_busy.load(Ordering::SeqCst),
+            ctx.partial.try_lock().map(|p| p.is_some()).unwrap_or(true),
+            &ctx.final_queue,
+        )
+    }
+
+    fn from_parts(
+        recording: bool,
+        cancel_or_improve: bool,
+        preview: bool,
+        finals: &FinalQueue,
+    ) -> Self {
         Activity {
-            recording: ctx.recording.load(Ordering::SeqCst),
-            final_or_improve: ctx.cancel_active.load(Ordering::SeqCst)
-                || ctx.improve_busy.load(Ordering::SeqCst),
-            preview: ctx.partial.try_lock().map(|p| p.is_some()).unwrap_or(true),
+            recording,
+            // Финал прошлой фразы держит билет, даже когда новая фраза уже сняла
+            // cancel_active: между ensure_* и lock() модель должна остаться (D-024).
+            final_or_improve: cancel_or_improve || finals.any_in_flight(),
+            preview,
         }
     }
 
@@ -3363,6 +3378,11 @@ impl FinalQueue {
             queue: Arc::clone(queue),
             gen,
         }
+    }
+
+    /// Идёт ли ещё финал хоть какого-то поколения.
+    fn any_in_flight(&self) -> bool {
+        !self.pending.lock().is_empty()
     }
 
     /// Идёт ли ещё финал поколения `gen` (билет не освобождён).
@@ -7994,6 +8014,21 @@ mod seg_tests {
             SlotRelease::Kept
         );
         assert_eq!(*slot.lock(), Some(8));
+    }
+
+    /// Финал фразы A ещё в полёте, а фраза B уже сняла `cancel_active`:
+    /// модель нельзя освобождать между ensure_* и повторным lock() финала A.
+    #[test]
+    fn model_slot_is_kept_while_an_older_final_is_in_flight() {
+        let queue = Arc::new(FinalQueue::default());
+        let slot = Mutex::new(Some(7u8));
+        let ticket = FinalQueue::enter(&queue, 1);
+        let activity = Activity::from_parts(false, false, false, &queue);
+        assert_eq!(release_slot(&slot, activity, |_| true), SlotRelease::Busy);
+        assert_eq!(*slot.lock(), Some(7));
+        drop(ticket);
+        let activity = Activity::from_parts(false, false, false, &queue);
+        assert_eq!(release_slot(&slot, activity, |_| true), SlotRelease::Freed);
     }
 
     #[test]
