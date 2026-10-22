@@ -26,8 +26,10 @@ const ARCH_PACKAGE_SUFFIX: &str = ".pkg.tar.zst";
 /// Имя пакета в PKGBUILD (`script/arch/PKGBUILD`).
 #[cfg(target_os = "linux")]
 const ARCH_PACKAGE_NAME: &str = "voxflow";
-#[cfg(target_os = "linux")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const PACMAN: &str = "/usr/bin/pacman";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const PKEXEC: &str = "/usr/bin/pkexec";
 
 #[cfg(target_os = "macos")]
 const MACOS_BUNDLE_IDS: [&str; 2] = [
@@ -538,20 +540,22 @@ fn spawn_linux_relaunch(exe: &Path) {
         .spawn();
 }
 
-/// Arch: поставить проверенный `.pkg.tar.zst` через `pkexec pacman -U`.
-/// Нет pkexec, нет агента polkit или пароль не введён - файл остаётся на
-/// месте, а ошибка несёт команду для терминала.
-#[cfg(target_os = "linux")]
-fn apply_arch_package(dest: &Path) -> Result<UpdateInstallResult> {
-    // Путь берём до установки: после pacman -U /proc/self/exe смотрит на удалённый файл.
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/voxflow"));
-    let out = Command::new("pkexec")
-        .arg(PACMAN)
+/// Команда установки пакета Arch. pkexec - по абсолютному пути, как и pacman:
+/// по PATH его можно подменить (D-054).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn arch_install_command(pkexec: &Path, pkg: &Path) -> Command {
+    let mut cmd = Command::new(pkexec);
+    cmd.arg(PACMAN)
         .args(["-U", "--noconfirm"])
-        .arg(dest)
-        .stdin(std::process::Stdio::null())
-        .output();
-    let reason = match out {
+        .arg(pkg)
+        .stdin(std::process::Stdio::null());
+    cmd
+}
+
+/// Почему установка пакета Arch не удалась; `None` - удалась.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn arch_install_failure(out: std::io::Result<std::process::Output>) -> Option<String> {
+    match out {
         Ok(out) if out.status.success() => None,
         // 126 - окно пароля закрыто, 127 - не авторизовано или нет агента polkit.
         Ok(out) if matches!(out.status.code(), Some(126 | 127)) => Some(
@@ -563,8 +567,18 @@ fn apply_arch_package(dest: &Path) -> Result<UpdateInstallResult> {
             String::from_utf8_lossy(&out.stderr).trim()
         )),
         Err(e) => Some(format!("не удалось запустить pkexec: {e}")),
-    };
-    if let Some(reason) = reason {
+    }
+}
+
+/// Arch: поставить проверенный `.pkg.tar.zst` через `pkexec pacman -U`.
+/// Нет pkexec, нет агента polkit или пароль не введён - файл остаётся на
+/// месте, а ошибка несёт команду для терминала.
+#[cfg(target_os = "linux")]
+fn apply_arch_package(dest: &Path) -> Result<UpdateInstallResult> {
+    // Путь берём до установки: после pacman -U /proc/self/exe смотрит на удалённый файл.
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("/usr/bin/voxflow"));
+    let out = arch_install_command(Path::new(PKEXEC), dest).output();
+    if let Some(reason) = arch_install_failure(out) {
         // Вызывающий стирает `dest` при ошибке, поэтому уносим файл под постоянное имя.
         let kept = dest.with_file_name("VoxFlow-update-linux-x64.pkg.tar.zst");
         let path = if std::fs::rename(dest, &kept).is_ok() {
@@ -1293,6 +1307,22 @@ fn _is_exe_path(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn arch_install_runs_pkexec_by_absolute_path() {
+        let cmd = arch_install_command(Path::new(PKEXEC), Path::new("/tmp/v.pkg.tar.zst"));
+        assert_eq!(cmd.get_program(), "/usr/bin/pkexec");
+        let args: Vec<_> = cmd.get_args().collect();
+        assert_eq!(args[0], "/usr/bin/pacman");
+    }
+
+    #[test]
+    fn arch_install_without_pkexec_is_an_error() {
+        let missing = std::env::temp_dir().join("voxflow-no-such-pkexec");
+        let out = arch_install_command(&missing, Path::new("/tmp/v.pkg.tar.zst")).output();
+        let reason = arch_install_failure(out).expect("без pkexec установка - ошибка");
+        assert!(reason.contains("pkexec"), "{reason}");
+    }
 
     #[test]
     fn compares_dotted_versions_numerically() {

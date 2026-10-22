@@ -840,6 +840,16 @@ fn idle_for() -> Duration {
     ))
 }
 
+/// Прогрев в своём потоке. Отметка активности до и после загрузки: иначе после
+/// долгого простоя поток выгрузки снимет только что прогретую модель (D-053).
+fn spawn_warmup(job: impl FnOnce() + Send + 'static) -> std::thread::JoinHandle<()> {
+    touch_activity();
+    std::thread::spawn(move || {
+        job();
+        touch_activity();
+    })
+}
+
 /// Пора ли выгружать: выгрузка включена и простой не меньше заданных минут.
 fn idle_unload_due(enabled: bool, after_min: u32, idle: Duration) -> bool {
     enabled && idle >= Duration::from_secs(u64::from(after_min.clamp(1, 1440)) * 60)
@@ -1547,7 +1557,7 @@ fn engine_loop(rx: Receiver<EngineCmd>, ctx: EngineCtx) {
                     // В отдельном потоке: warmup сам спит и грузит модели —
                     // канал команд блокировать нельзя (Start/Stop должны жить).
                     let wctx = ctx.clone();
-                    std::thread::spawn(move || warmup(wctx));
+                    spawn_warmup(move || warmup(wctx));
                 }
                 EngineCmd::Release(target) => {
                     let reason = match target {
@@ -7956,6 +7966,35 @@ mod seg_tests {
         drop(loading);
         *model.lock() = None;
         assert!(!resident_model_ready(&model));
+    }
+
+    #[test]
+    fn warmup_marks_activity_before_and_after_loading() {
+        // Старая отметка (0) - простой с начала процесса; часы уходят от нуля.
+        process_clock();
+        std::thread::sleep(Duration::from_millis(5));
+        LAST_ACTIVITY_MS.store(0, Ordering::SeqCst);
+        let before = process_clock().as_millis() as u64;
+        let touched_before = Arc::new(AtomicBool::new(false));
+        let seen = touched_before.clone();
+        spawn_warmup(move || {
+            seen.store(
+                LAST_ACTIVITY_MS.load(Ordering::SeqCst) >= before,
+                Ordering::SeqCst,
+            );
+            // Загрузка модели долгая - имитируем старую отметку на её конце.
+            LAST_ACTIVITY_MS.store(0, Ordering::SeqCst);
+        })
+        .join()
+        .unwrap();
+        assert!(
+            touched_before.load(Ordering::SeqCst),
+            "нет отметки перед загрузкой"
+        );
+        assert!(
+            LAST_ACTIVITY_MS.load(Ordering::SeqCst) >= before,
+            "нет отметки после загрузки"
+        );
     }
 
     #[test]
