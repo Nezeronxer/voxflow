@@ -1264,6 +1264,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Веса читаются прямо из проверенного файла (D-053, отображение в память),
+    /// поэтому подмена файла той же длины после проверки должна ловиться снова.
+    #[test]
+    fn verify_artifact_catches_same_size_swap_after_marker() {
+        let dir = std::env::temp_dir().join(format!("voxflow-model-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        let path = dir.join("fixture.bin");
+        let artifact = Artifact {
+            name: "fixture.bin",
+            size_bytes: 3,
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        };
+        std::fs::write(&path, b"abc").expect("valid");
+        verify_artifact(&path, artifact).expect("valid file passes");
+        std::fs::write(&path, b"abd").expect("swap");
+        // Подмена позже маркера, даже если часы ФС грубые.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(later))
+            .expect("mtime");
+        assert!(verify_artifact(&path, artifact).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn sha256_verifier_accepts_known_payload_and_rejects_mismatch() {
         let nonce = std::time::SystemTime::now()
