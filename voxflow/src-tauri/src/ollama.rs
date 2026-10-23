@@ -375,7 +375,7 @@ fn chat_body(model: &str, system: &str, user: &str) -> serde_json::Value {
     // МЕНЬШЕ одного системного промпта (~21 КБ ≈ 6k токенов): Ollama молча
     // срезала его начало, а на генерацию места не оставалось.
     let (num_ctx, num_predict) = plan_context_budget(system, user);
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": [
             { "role": "system", "content": system },
@@ -392,7 +392,15 @@ fn chat_body(model: &str, system: &str, user: &str) -> serde_json::Value {
             "num_ctx": num_ctx,
             "num_predict": num_predict
         }
-    })
+    });
+    // Ollama на Metal выключает mmap, когда по её прикидке модель не влезает в
+    // свободную память, и тогда копирует веса целиком: gemma4 e4b - 5,4 ГБ вместо
+    // ~0,5 ГБ. Явный use_mmap отключает эту прикидку (D-057). На Windows не трогаем:
+    // там у Ollama своя причина выключать mmap.
+    if cfg!(target_os = "macos") {
+        body["options"]["use_mmap"] = true.into();
+    }
+    body
 }
 
 /// Фоновый прогрев выбранной модели Ollama коротким запросом тем же промптом,
@@ -634,6 +642,10 @@ mod tests {
             "<text>длинная фраза</text>",
         );
         assert_eq!(warm["options"]["num_ctx"], real["options"]["num_ctx"]);
+        assert_eq!(
+            b["options"]["use_mmap"].as_bool(),
+            cfg!(target_os = "macos").then_some(true)
+        );
     }
 
     #[test]
