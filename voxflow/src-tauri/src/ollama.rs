@@ -456,8 +456,14 @@ fn plan_context_budget(system: &str, user: &str) -> (u32, u32) {
     // Верхняя граница вывода локальной модели — тот же порядок, что у облака.
     let predict = net::output_token_budget(input, 4096);
     let needed = input.saturating_add(predict).saturating_add(512);
-    (needed.max(16_384), predict)
+    // Окно с запасом под длинную диктовку, но не 16k: KV-кэш на 16k держал
+    // ~6 ГБ при реальном промпте ~600 токенов. Шаг 2048 - чтобы размер окна не
+    // менялся от фразы к фразе: Ollama перегружает модель на каждом новом num_ctx.
+    (needed.max(MIN_CTX).next_multiple_of(2048), predict)
 }
+
+/// Нижняя граница окна контекста для Ollama.
+const MIN_CTX: u32 = 4096;
 
 /// Достать текст ответа чат-эндпоинта, отвергнув обрыв по лимиту токенов.
 /// `done_reason == "length"` означает обрубок: вставлять его в поле нельзя,
@@ -553,7 +559,7 @@ mod tests {
         let (num_ctx, num_predict) = plan_context_budget(SYSTEM_PROMPT, "[ДИКТОВКА]: привет");
         let input =
             net::estimate_tokens(SYSTEM_PROMPT) + net::estimate_tokens("[ДИКТОВКА]: привет");
-        assert!(num_ctx >= 16_384, "окно меньше минимума: {num_ctx}");
+        assert!(num_ctx >= MIN_CTX, "окно меньше минимума: {num_ctx}");
         assert!(
             num_ctx > input + num_predict,
             "окно {num_ctx} не вмещает вход {input} + вывод {num_predict}"
@@ -699,10 +705,23 @@ mod tests {
     }
 
     #[test]
+    fn dictation_keeps_small_stable_window() {
+        let short = "привет";
+        let phrase = "слово ".repeat(60);
+        let a = plan_context_budget(&local_system_prompt(short, None), short).0;
+        let b = plan_context_budget(&local_system_prompt(&phrase, None), &phrase).0;
+        assert_eq!(a, MIN_CTX);
+        assert_eq!(
+            a, b,
+            "окно скачет между фразами - Ollama будет перегружать модель"
+        );
+    }
+
+    #[test]
     fn long_input_grows_the_window_above_the_minimum() {
         let long = "слово ".repeat(20_000);
         let (num_ctx, num_predict) = plan_context_budget(SYSTEM_PROMPT, &long);
-        assert!(num_ctx > 16_384);
+        assert!(num_ctx > MIN_CTX);
         assert!(num_ctx > net::estimate_tokens(&long) + num_predict);
     }
 
