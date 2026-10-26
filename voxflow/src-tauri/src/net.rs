@@ -84,7 +84,7 @@ fn curl_config_line(option: &str, value: &str) -> String {
     format!("{option} = \"{esc}\"")
 }
 
-fn proxy_config_line(proxy: &str) -> Option<String> {
+pub fn proxy_config_line(proxy: &str) -> Option<String> {
     let p = proxy.trim();
     if p.is_empty() {
         None

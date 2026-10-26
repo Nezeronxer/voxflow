@@ -1748,6 +1748,9 @@ fn start_capture_into(capture: &mut Option<Capture>, ctx: &EngineCtx, latched: b
             // Выгруженная в простое модель начинает грузиться сразу, пока
             // человек говорит: микрофон уже пишет, финал дождётся модели (D-053).
             preload_for_dictation(ctx);
+            // Облачной постобработке - соединение заранее, пока человек говорит (D-059).
+            let rewrite_settings = ctx.settings.lock().clone();
+            std::thread::spawn(move || crate::rewrite::prewarm(&rewrite_settings));
             maybe_start_partial_loop(&c, ctx, &target_fp);
             // Петля уровня громкости для orb-визуализатора (событие "level").
             spawn_level_loop(&c, ctx);
@@ -4697,7 +4700,10 @@ fn process_utterance(
     // локальные правила этого не умеют. Обработка одна для всех программ (D-046).
     let (smart_instruction, ai_prompt_context) =
         effective_smart_instruction_for_app(&s, &actx, &tone);
-    let context_hint = rewrite_context_hint(ctx, &actx, None, &field_before_context, live_inserted);
+    // Контекст поля в модель не идёт (D-058): одни программы отдают текст поля,
+    // другие нет, и одна и та же фраза выходила по-разному. Стык с текстом слева
+    // от курсора ставит детерминированный continue_from_previous_context ниже.
+    let context_hint: Option<String> = None;
     let rewrite_tone = if ai_prompt_context {
         "ai"
     } else {
@@ -6905,30 +6911,54 @@ mod seg_tests {
         report("стало", &after);
     }
 
-    /// Прогон одной записи через финальный локальный путь (GigaAM +
-    /// сегментация по паузам + постобработка). Путь к WAV — в VOXFLOW_EVAL_WAV.
+    /// Прогон записи через финальный локальный путь (GigaAM той же версии, что
+    /// у диктовки, + сегментация по паузам + постобработка). VOXFLOW_EVAL_WAV -
+    /// путь к WAV или к .txt со списком WAV (по строке); на каждую запись
+    /// строка `EVAL_JSON {"wav","raw","processed"}` для внешних замеров.
     ///
     /// `VOXFLOW_EVAL_WAV=... cargo test --lib eval_wav_pipeline -- --ignored --nocapture`
     #[test]
     #[ignore = "requires local GigaAM models and a private WAV"]
     fn eval_wav_pipeline() {
-        let wav = std::env::var("VOXFLOW_EVAL_WAV").expect("VOXFLOW_EVAL_WAV");
-        let dir = crate::paths::gigaam_dir();
-        assert!(
-            crate::gigaam::dir_ready(&dir),
-            "модели GigaAM не найдены в {dir:?}"
-        );
+        let arg = std::env::var("VOXFLOW_EVAL_WAV").expect("VOXFLOW_EVAL_WAV");
+        let wavs: Vec<String> = if arg.ends_with(".txt") {
+            std::fs::read_to_string(&arg)
+                .expect("список WAV")
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        } else {
+            vec![arg]
+        };
         let threads = Settings::default().effective_threads() as usize;
-        let mut g = crate::gigaam::GigaAm::load(&dir, threads).expect("gigaam");
+        let mut g = if crate::models::gigaam_variant() == Some(crate::models::GigaVariant::Fp32) {
+            load_gigaam_fp32(threads).expect("gigaam fp32")
+        } else {
+            let dir = crate::paths::gigaam_dir();
+            assert!(
+                crate::gigaam::dir_ready(&dir),
+                "модели GigaAM не найдены в {dir:?}"
+            );
+            crate::gigaam::GigaAm::load(&dir, threads).expect("gigaam")
+        };
         let vad = crate::vad::SileroVad::load(&crate::paths::vad_model_path(None)).expect("vad");
         let vad = Arc::new(Mutex::new(Some(vad)));
         let _ = g.transcribe(&vec![0.0f32; 8000]);
+        for wav in &wavs {
+            eval_one_wav(&mut g, &vad, wav);
+        }
+    }
 
-        let samples = read_wav_16k(std::path::Path::new(&wav));
+    fn eval_one_wav(
+        g: &mut crate::gigaam::GigaAm,
+        vad: &Arc<Mutex<Option<crate::vad::SileroVad>>>,
+        wav: &str,
+    ) {
+        let samples = read_wav_16k(std::path::Path::new(wav));
         println!("audio: {:.1}c", samples.len() as f32 / 16000.0);
-        let single = g.transcribe(&samples).unwrap_or_default();
-        println!("single-shot: {single:?}");
-        let long = local_transcribe_long(&vad, &samples, &mut |seg| {
+        let long = local_transcribe_long(vad, &samples, &mut |seg| {
             let t = g.transcribe(seg);
             println!("  seg {:.1}c -> {:?}", seg.len() as f32 / 16000.0, t);
             t
@@ -6942,6 +6972,10 @@ mod seg_tests {
         let s = Settings::default();
         let processed = process_dictation_text(&deduped, &s, &[], &[], &[]);
         println!("processed: {:?}", processed.text);
+        println!(
+            "EVAL_JSON {}",
+            serde_json::json!({ "wav": wav, "raw": long, "processed": processed.text })
+        );
     }
 
     /// Замер auto-языка: каждая запись из VOXFLOW_EVAL_DIR через GigaAM и
@@ -10034,6 +10068,15 @@ fn refine_text_with_fallback(
                 crate::gemini::refine(&key, &model, &instruction, &input, timeout_s, cap)
             }));
         }
+        Some(RewriteBackendRoute::OpenAiCompat) if !force => {
+            // Диктовка - тот же стенографист, что у локальных моделей (D-058): старый
+            // промпт выбирал стиль по программе, и текст в окнах выходил разный.
+            let settings = s.clone();
+            let (system, user) = local_rewrite_prompt(s, actx, text, context_hint);
+            attempts.push(Box::new(move || {
+                crate::rewrite::refine(&settings, &system, &user)
+            }));
+        }
         Some(RewriteBackendRoute::OpenAiCompat) => {
             let settings = s.clone();
             let user = build_voiceflow_payload(text, target_tone, smart_instruction, context_hint);
@@ -10055,12 +10098,12 @@ fn refine_text_with_fallback(
 
     // Поле нейросети: ответ — это промпт со структурой, он законно длиннее
     // диктовки. Проверка «ничего из сказанного не пропало» при этом не слабеет.
-    // Локальная модель - стенографист (D-044): структуру не строит, раздувать нечему.
-    let local = matches!(
+    // Стенографист (D-044, D-058) структуру не строит, раздувать нечему.
+    let stenographer = matches!(
         route,
         Some(RewriteBackendRoute::Builtin | RewriteBackendRoute::Ollama)
-    );
-    let max_expansion = if target_tone == "ai" && !local {
+    ) || (route == Some(RewriteBackendRoute::OpenAiCompat) && !force);
+    let max_expansion = if target_tone == "ai" && !stenographer {
         PROMPT_REBUILD_MAX_EXPANSION
     } else {
         REWRITE_MAX_EXPANSION
@@ -10415,6 +10458,84 @@ mod smart_prompt_tests {
 
         let (bare, _) = local_rewrite_prompt(&Settings::default(), &app("Notes"), "x", None);
         assert!(bare.contains("стенографист") && !bare.contains("Дополнительные правила"));
+    }
+
+    /// Живой рерайт диктовки настройками пользователя (бэкенд, модель, ключ из
+    /// его базы) - тот же путь, что у финала. VOXFLOW_EVAL_WAV - JSONL с полем
+    /// `processed` (вывод `eval_wav_pipeline`).
+    ///
+    /// `VOXFLOW_TEST_DATA_DIR=... VOXFLOW_EVAL_WAV=raw.jsonl cargo test --lib live_dictation_rewrite -- --ignored --nocapture`
+    #[test]
+    #[ignore = "requires the user's settings with a cloud key and network"]
+    fn live_dictation_rewrite() {
+        let path = std::env::var("VOXFLOW_EVAL_WAV").expect("VOXFLOW_EVAL_WAV");
+        let s = crate::settings::load(&crate::db::open_readonly().expect("db"));
+        if crate::rewrite::is_openrouter_base(&s.rewrite_base_url) {
+            let catalog = crate::rewrite::openrouter_models(&s).expect("каталог OpenRouter");
+            println!("каталог: {} моделей", catalog.len());
+            for m in catalog.iter().take(6) {
+                println!("  {}", m.label);
+            }
+        }
+        let (mut used, mut total) = (0, 0);
+        for line in std::fs::read_to_string(path).expect("jsonl").lines() {
+            let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let text = row["processed"].as_str().unwrap_or_default();
+            // VOXFLOW_EVAL_IDLE=<с> - пауза между диктовками (сеть успевает остыть).
+            if let Some(idle) = std::env::var("VOXFLOW_EVAL_IDLE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            {
+                std::thread::sleep(Duration::from_secs(idle));
+            }
+            // VOXFLOW_EVAL_PREWARM=1 - как на диктовке: соединение открыто, пока человек говорит.
+            if std::env::var_os("VOXFLOW_EVAL_PREWARM").is_some() {
+                crate::rewrite::prewarm(&s);
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            let t = Instant::now();
+            let (out, used_model, failure) = refine_text_with_fallback(
+                &s,
+                RewriteRequest {
+                    actx: &app_exe("telegram", "Telegram"),
+                    text,
+                    tone: "neutral",
+                    smart_instruction: None,
+                    context_hint: None,
+                    corrections: &[],
+                    force: false,
+                },
+            );
+            total += 1;
+            used += usize::from(used_model);
+            println!(
+                "{} {} мс {failure:?}\n  ВХОД : {text}\n  ВЫХОД: {out}",
+                if used_model { "OK " } else { "REJ" },
+                t.elapsed().as_millis()
+            );
+        }
+        println!("модель {}: принято {used} из {total}", s.rewrite_model);
+    }
+
+    /// D-058: без своих правил пользователя промпт диктовки не зависит от
+    /// программы - даже с пересборкой промптов для окон нейросетей.
+    #[test]
+    fn dictation_prompt_is_the_same_in_every_app() {
+        let s = Settings {
+            prompt_rebuild: true,
+            ..Settings::default()
+        };
+        let text = "ну короче отправь отчёт завтра";
+        let telegram = local_rewrite_prompt(&s, &app("Telegram"), text, None);
+        for title in ["kitty", "Google Chrome", "Claude", "✳ Claude Code"] {
+            assert_eq!(
+                local_rewrite_prompt(&s, &app(title), text, None),
+                telegram,
+                "{title}"
+            );
+        }
     }
 
     #[test]

@@ -528,6 +528,13 @@ fn fp32_opt_out_path() -> std::path::PathBuf {
     crate::paths::models_dir().join("gigaam-fp32.skip")
 }
 
+/// Метка «Whisper удалил сам»: при авто-языке с GigaAM запасная Whisper не
+/// докачивается заново при каждом старте (английский берёт Parakeet, D-048).
+/// Снимается любой загрузкой Whisper.
+fn whisper_opt_out_path() -> std::path::PathBuf {
+    crate::paths::models_dir().join("whisper.skip")
+}
+
 pub fn verify_dir_model(name: &str) -> Result<()> {
     let model = find_dir_model(name).ok_or_else(|| anyhow!("Неизвестная модель: {name}"))?;
     let dir = (model.dir)();
@@ -557,6 +564,7 @@ pub fn delete(name: &str) -> Result<()> {
     let p = crate::paths::model_path(name);
     remove_artifact(&p);
     let _ = std::fs::remove_file(p.with_extension("part"));
+    let _ = std::fs::write(whisper_opt_out_path(), b"");
     Ok(())
 }
 
@@ -580,6 +588,8 @@ pub(crate) struct InstalledModels {
     pub whisper: Vec<(String, u64)>,
     /// Пользователь сам удалил полную GigaAM (метка `gigaam-fp32.skip`).
     pub fp32_opted_out: bool,
+    /// Пользователь сам удалил Whisper (метка `whisper.skip`).
+    pub whisper_opted_out: bool,
     /// Настроенная Whisper качается или лежит недокачанной (`.part`).
     pub configured_pending: bool,
 }
@@ -626,7 +636,10 @@ pub(crate) fn plan_local_models(
     } else {
         None
     };
-    let download = if (!gigaam_engine || auto) && !whisper_any {
+    // Авто-язык на GigaAM обходится без Whisper (без неё отдаёт текст GigaAM),
+    // поэтому удалённую пользователем Whisper не возвращаем.
+    let whisper_declined = gigaam_engine && gigaam_any && installed.whisper_opted_out;
+    let download = if (!gigaam_engine || auto) && !whisper_any && !whisper_declined {
         Some(if is_whisper_catalog_name(configured_model) {
             configured_model.to_string()
         } else {
@@ -703,6 +716,7 @@ pub fn ensure_default_models(app: AppHandle, settings: &crate::settings::Setting
             gigaam_int8: verify_dir_model(GIGAAM_NAME).is_ok(),
             whisper: installed_whisper_models(),
             fp32_opted_out: fp32_opt_out_path().exists(),
+            whisper_opted_out: whisper_opt_out_path().exists(),
             configured_pending: crate::paths::model_path(&settings.model)
                 .with_extension("part")
                 .exists()
@@ -797,6 +811,9 @@ pub fn start_download(app: AppHandle, name: String, proxy: String) -> Result<()>
 fn spawn_download(app: AppHandle, name: String, proxy: String) -> Result<()> {
     if name == GIGAAM_FP32_NAME {
         let _ = std::fs::remove_file(fp32_opt_out_path());
+    }
+    if is_whisper_catalog_name(&name) {
+        let _ = std::fs::remove_file(whisper_opt_out_path());
     }
     if let Some(m) = find_dir_model(&name) {
         // Уже качается → молча выходим: события прогресса и так летят от первого
@@ -1386,8 +1403,20 @@ mod tests {
             gigaam_int8: int8,
             whisper: whisper.iter().map(|(n, s)| (n.to_string(), *s)).collect(),
             fp32_opted_out: false,
+            whisper_opted_out: false,
             configured_pending: false,
         }
+    }
+
+    #[test]
+    fn plan_auto_gigaam_respects_deleted_whisper() {
+        let mut inst = installed(true, false, &[]);
+        inst.whisper_opted_out = true;
+        let plan = plan_local_models("auto", "gigaam", "local", TURBO, &inst);
+        assert_eq!(plan.download, None);
+        // Движок Whisper без Whisper не работает - там качаем, метка не мешает.
+        let whisper = plan_local_models("auto", "whisper_server", "local", TURBO, &inst);
+        assert_eq!(whisper.download.as_deref(), Some(TURBO));
     }
 
     #[test]

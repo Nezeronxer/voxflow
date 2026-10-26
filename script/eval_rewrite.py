@@ -12,6 +12,21 @@ import argparse, json, os, sqlite3, sys, time, urllib.request, pathlib, re
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROMPT = (ROOT / "voxflow/src-tauri/prompts/voiceflow_ru.txt").read_text(encoding="utf-8")
+STENOGRAPHER = (ROOT / "voxflow/src-tauri/prompts/stenographer_ru.txt").read_text(encoding="utf-8")
+
+
+def stenographer_system(text: str) -> str:
+    """Реплика ollama::local_system_prompt без правил пользователя."""
+    latin = sum(c.isascii() and c.isalpha() for c in text)
+    cyr = sum(c.lower() in "абвгдеёжзийклмнопрстуфхцчшщъыьэюя" for c in text)
+    lang = ("Язык текста: английский. Ответ - на английском, не переводи." if latin > cyr
+            else "Язык текста: русский. Ответ - на русском, не переводи.")
+    return STENOGRAPHER.rstrip() + "\n\n" + lang
+
+
+def stenographer_user(text: str) -> str:
+    """Реплика ollama::local_user_message без контекста поля."""
+    return "<text>" + text.strip().replace("</text>", "</ text>") + "</text>"
 # База приложения: macOS — Application Support, Windows — %APPDATA%\VoxFlow.
 DB = pathlib.Path(os.environ.get("VOXFLOW_DB") or (
     pathlib.Path(os.environ["APPDATA"]) / "VoxFlow/voxflow.db" if sys.platform == "win32"
@@ -113,6 +128,10 @@ def main():
     ap.add_argument("--min-words", type=int, default=4)
     ap.add_argument("--extra", default="", help="JSON с доп. полями тела запроса")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--prompt", choices=["voiceflow", "stenographer"], default="voiceflow",
+                    help="stenographer - промпт диктовки (один для всех программ)")
+    ap.add_argument("--input", default="",
+                    help="JSONL с полем processed (вывод eval_wav_pipeline) вместо истории")
     a = ap.parse_args()
     key = os.environ.get("EVAL_KEY", "")
     if not key:
@@ -120,7 +139,10 @@ def main():
     extra = json.loads(a.extra) if a.extra else None
 
     conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
-    if a.ids:
+    if a.input:
+        with open(a.input, encoding="utf-8") as f:
+            rows = [(i, "-", json.loads(l)["processed"]) for i, l in enumerate(f) if l.strip()][: a.n]
+    elif a.ids:
         ids = [int(x) for x in a.ids.split(",")]
         rows = conn.execute(f"select id, app, text from history where id in ({','.join('?'*len(ids))}) order by id desc", ids).fetchall()
     else:
@@ -133,7 +155,11 @@ def main():
     for rid, app, text in rows:
         text = text.strip()
         try:
-            out, dt, fin, usage = call(a.base, a.model, key, PROMPT, payload(app, text), extra=extra)
+            if a.prompt == "stenographer":
+                system, user = stenographer_system(text), stenographer_user(text)
+            else:
+                system, user = PROMPT, payload(app, text)
+            out, dt, fin, usage = call(a.base, a.model, key, system, user, extra=extra)
         except Exception as e:  # noqa
             print(f"#{rid} [{app}] ОШИБКА: {e}")
             continue

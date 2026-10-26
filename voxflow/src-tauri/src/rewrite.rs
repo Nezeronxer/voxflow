@@ -25,6 +25,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::net;
 
+/// Модель постобработки, которую советуем в OpenRouter (D-058): самая дешёвая из
+/// тех, что на диктовках не теряют слов, не вырезают мат и чинят ослышки.
+pub const OPENROUTER_RECOMMENDED_MODEL: &str = "anthropic/claude-haiku-5.5";
+
 /// Нормализует базовый адрес: trim + срез хвостового `/`
 /// (`https://api.groq.com/openai/v1/` → `https://api.groq.com/openai/v1`).
 fn base(url: &str) -> String {
@@ -115,9 +119,9 @@ pub fn configured(s: &crate::settings::Settings) -> bool {
 /// Отрефайнить текст: `system` (инструкция) + `user` (исходный текст) через
 /// POST {rewrite_base_url}/chat/completions (stream=false, temperature=0.2).
 ///
-/// Зовётся из engine.rs как ветка `ai_backend == "openai_compat"` ровно тем же
-/// набором аргументов, что и [`crate::ollama::refine`]: `system` =
-/// [`crate::ollama::SYSTEM_PROMPT`], `user` = `build_voiceflow_payload(...)`.
+/// Зовётся из engine.rs как ветка `ai_backend == "openai_compat"` тем же
+/// промптом стенографиста, что и локальные модели (D-058): один для всех
+/// программ. «Улучшить выделенное» шлёт сюда `SYSTEM_PROMPT` со стилем «doc».
 ///
 /// Ключ берём из [`crate::settings::Settings::resolve_rewrite_key`] (настройки →
 /// env REWRITE_API_KEY → OPENROUTER_API_KEY → OPENAI_API_KEY).
@@ -149,7 +153,8 @@ pub fn refine(s: &crate::settings::Settings, system: &str, user: &str) -> Result
 /// Лёгкая проверка chat-модели: короткий запрос, маленький лимит токенов, без
 /// production cleanup. Используется кнопкой «Проверить» в UI.
 pub fn ping(s: &crate::settings::Settings) -> Result<String> {
-    let content = chat_completion(s, "Reply with exactly one word: OK.", "OK", 0.0, Some(8))?;
+    // 32, а не 8: модели с обязательным рассуждением тратят пару токенов и на него.
+    let content = chat_completion(s, "Reply with exactly one word: OK.", "OK", 0.0, Some(32))?;
     let text = content.trim();
     if text.is_empty() {
         Err(anyhow!("OpenAI-совместимый рерайт вернул пустой ответ"))
@@ -162,7 +167,10 @@ pub fn ping(s: &crate::settings::Settings) -> Result<String> {
 ///
 /// UI вызывает это через кнопку «Проверить»: до успешной проверки ключа список
 /// моделей не показывается. Ключ уходит в curl через stdin-конфиг, не через argv.
-pub fn openrouter_free_models(s: &crate::settings::Settings) -> Result<Vec<ModelOption>> {
+/// Каталог текстовых моделей OpenRouter: рекомендованная первой, дальше платные
+/// от дешёвых к дорогим, бесплатные (с лимитами, часто недоступны) - в конце.
+/// Цена в подписи: для постобработки хватает самых дешёвых (D-058).
+pub fn openrouter_models(s: &crate::settings::Settings) -> Result<Vec<ModelOption>> {
     if !is_openrouter_base(&s.rewrite_base_url) {
         return Err(anyhow!("OpenRouter: выбран не OpenRouter Base URL"));
     }
@@ -185,9 +193,7 @@ pub fn openrouter_free_models(s: &crate::settings::Settings) -> Result<Vec<Model
     )?;
     let response: OpenRouterModelsResponse = serde_json::from_value(v)
         .map_err(|e| anyhow!("OpenRouter models: неожиданный JSON: {e}"))?;
-    let mut out = free_model_options(response.data);
-    out.sort_by_key(|a| a.label.to_lowercase());
-    Ok(out)
+    Ok(text_model_options(response.data))
 }
 
 /// Каталог моделей провайдера: `GET {base}/models` по ключу. Ответ ждём в
@@ -298,34 +304,66 @@ fn get_json_authed(
     Ok(v)
 }
 
-fn free_model_options(models: Vec<OpenRouterModel>) -> Vec<ModelOption> {
-    models
+fn text_model_options(models: Vec<OpenRouterModel>) -> Vec<ModelOption> {
+    // (рекомендована, бесплатна, цена за 1M вход+выход, id) - ключ сортировки.
+    let mut rows: Vec<(bool, bool, f64, ModelOption)> = models
         .into_iter()
-        .filter(is_free_text_model)
-        .map(|m| {
+        .filter(is_text_model)
+        .filter_map(|m| {
+            let free = is_free_model(&m);
+            let (prompt, completion) = per_million(m.pricing.as_ref());
+            // Цена неизвестна или отрицательна (роутеры вроде openrouter/auto) - не
+            // показываем: человек выбирает по цене, а её нет.
+            if !free && (prompt? < 0.0 || completion? < 0.0) {
+                return None;
+            }
+            let (prompt, completion) = (prompt.unwrap_or(0.0), completion.unwrap_or(0.0));
+            let recommended = m.id == OPENROUTER_RECOMMENDED_MODEL;
             let name = m.name.unwrap_or_else(|| m.id.clone());
-            let label = if name == m.id {
-                name
+            let price = if free {
+                "бесплатно, с лимитами".to_string()
             } else {
-                format!("{name} · {}", m.id)
+                format!("${prompt:.2} / ${completion:.2} за 1M")
             };
-            ModelOption { value: m.id, label }
+            let label = format!(
+                "{name} · {price}{}",
+                if recommended {
+                    " · рекомендуем"
+                } else {
+                    ""
+                }
+            );
+            Some((
+                recommended,
+                free,
+                prompt + completion,
+                ModelOption { value: m.id, label },
+            ))
         })
-        .collect()
+        .collect();
+    rows.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(a.1.cmp(&b.1))
+            .then(a.2.total_cmp(&b.2))
+            .then_with(|| a.3.value.cmp(&b.3.value))
+    });
+    rows.into_iter().map(|row| row.3).collect()
 }
 
-fn is_free_text_model(model: &OpenRouterModel) -> bool {
-    if model.is_ready == Some(false) {
+/// Готовая модель, отвечает текстом. `:batch` - пакетные эндпоинты, на
+/// синхронный запрос диктовки не отвечают.
+fn is_text_model(model: &OpenRouterModel) -> bool {
+    if model.is_ready == Some(false) || model.id.ends_with(":batch") {
         return false;
     }
-    if !model.output_modalities.is_empty()
-        && !model
+    model.output_modalities.is_empty()
+        || model
             .output_modalities
             .iter()
             .any(|m| m.eq_ignore_ascii_case("text"))
-    {
-        return false;
-    }
+}
+
+fn is_free_model(model: &OpenRouterModel) -> bool {
     model.is_free == Some(true)
         || model.id.to_ascii_lowercase().ends_with(":free")
         || model
@@ -333,6 +371,12 @@ fn is_free_text_model(model: &OpenRouterModel) -> bool {
             .as_ref()
             .map(pricing_prompt_completion_zero)
             .unwrap_or(false)
+}
+
+/// Цена за 1M токенов (вход, выход); в API она за один токен строкой.
+fn per_million(pricing: Option<&OpenRouterPricing>) -> (Option<f64>, Option<f64>) {
+    let parse = |v: &Option<String>| v.as_deref()?.trim().parse::<f64>().ok().map(|p| p * 1e6);
+    pricing.map_or((None, None), |p| (parse(&p.prompt), parse(&p.completion)))
 }
 
 fn pricing_prompt_completion_zero(pricing: &OpenRouterPricing) -> bool {
@@ -377,20 +421,175 @@ fn chat_completion(
     if let Some(max_tokens) = max_tokens {
         body["max_tokens"] = serde_json::json!(max_tokens);
     }
+    // Рассуждения правке не нужны: с ними ответ медленнее, а Haiku при
+    // `effort: minimal` пишет их прямо в текст (D-058). Модели с обязательным
+    // рассуждением отказывают на `enabled: false` - им повтор с самым коротким.
+    let openrouter = is_openrouter_base(&base_url);
+    if openrouter {
+        body["reasoning"] = serde_json::json!({ "enabled": false });
+    }
+    let first = match take_warm(s, &endpoint, &key) {
+        // Соединение могло закрыться на стороне сервера - тогда обычный запрос.
+        Some(warm) => warm.send(&body).or_else(|e| {
+            log::warn!("прогретое соединение не сработало ({e}), обычный запрос");
+            post_chat(s, &base_url, &endpoint, &key, &body)
+        }),
+        None => post_chat(s, &base_url, &endpoint, &key, &body),
+    };
+    match first {
+        Err(e) if openrouter && reasoning_is_mandatory(&e) => {
+            body["reasoning"] = serde_json::json!({ "effort": "minimal" });
+            post_chat(s, &base_url, &endpoint, &key, &body)
+        }
+        result => result,
+    }
+}
 
+/// Сколько прогретое соединение ждёт текст. Сервер OpenRouter держит открытый
+/// запрос без тела не меньше минуты (60 с - работает, 150 с - закрыт).
+const WARM_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// Запрос к OpenRouter, открытый при нажатии клавиши: curl уже прошёл TLS и
+/// ждёт тело на stdin (`-T -`, chunked). Через прокси этого мака рукопожатие
+/// стоит 1,5-3,8 с - на диктовке его больше не ждём (D-059).
+struct Warm {
+    // None - процесс уже отдан в send() и ждётся там.
+    child: Option<std::process::Child>,
+    endpoint: String,
+    key: String,
+    proxy: String,
+    started: std::time::Instant,
+    timeout_s: u64,
+    // Конфиг curl с ключом: приватный файл, удаляется вместе с Warm.
+    _config: crate::paths::TempFileGuard,
+}
+
+impl Warm {
+    fn send(mut self, body: &serde_json::Value) -> Result<String> {
+        use std::io::Write;
+        let payload = serde_json::to_vec(body).map_err(|e| anyhow!("сериализация тела: {e}"))?;
+        let mut child = self.child.take().ok_or_else(|| anyhow!("curl уже отдан"))?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow!("stdin уже закрыт"))?;
+            stdin.write_all(&payload)?;
+        } // EOF - конец тела
+        parse_curl_chat(child.wait_with_output()?, self.timeout_s)
+    }
+}
+
+impl Drop for Warm {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+static WARM: std::sync::Mutex<Option<Warm>> = std::sync::Mutex::new(None);
+
+/// Открыть соединение к OpenRouter заранее (зовётся на старте диктовки).
+/// Прошлое неиспользованное закрывается. Ошибки молча: тогда обычный запрос.
+pub fn prewarm(s: &crate::settings::Settings) {
+    let base_url = base(&s.rewrite_base_url);
+    let key = s.resolve_rewrite_key();
+    if s.ai_backend != "openai_compat"
+        || !configured(s)
+        || !is_openrouter_base(&base_url)
+        || key.trim().is_empty()
+    {
+        return;
+    }
+    let endpoint = format!("{base_url}/chat/completions");
+    let timeout_s = s.backend_timeout_s(false);
+    let config_path = crate::paths::unique_tmp_path("curl_cfg", "txt");
+    let guard = crate::paths::TempFileGuard::new(config_path.clone());
+    let mut lines = vec![
+        net::secret_header_line(&auth_header_line(&s.rewrite_auth_header, &key)),
+        net::secret_header_line("X-OpenRouter-Title: VoxFlow"),
+    ];
+    lines.extend(net::proxy_config_line(&s.proxy_url));
+    let written = crate::paths::create_private_file(&config_path).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all((lines.join("\n") + "\n").as_bytes())
+    });
+    if written.is_err() {
+        return;
+    }
+    let mut cmd = net::curl();
+    cmd.arg("-s")
+        .arg("-m")
+        .arg((WARM_MAX_AGE.as_secs() + timeout_s).to_string())
+        .arg("-K")
+        .arg(&config_path)
+        .arg("-H")
+        .arg("Content-Type: application/json")
+        .arg("-X")
+        .arg("POST")
+        .arg("-T")
+        .arg("-")
+        .arg(&endpoint)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let Ok(child) = cmd.spawn() else {
+        return;
+    };
+    let warm = Warm {
+        child: Some(child),
+        endpoint,
+        key,
+        proxy: s.proxy_url.clone(),
+        started: std::time::Instant::now(),
+        timeout_s,
+        _config: guard,
+    };
+    *WARM.lock().unwrap_or_else(|e| e.into_inner()) = Some(warm);
+}
+
+/// Прогретое соединение для этого запроса, если оно свежее и к тому же адресу,
+/// с тем же ключом и прокси. Иначе закрываем его и идём обычным путём.
+fn take_warm(s: &crate::settings::Settings, endpoint: &str, key: &str) -> Option<Warm> {
+    let mut warm = WARM.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+    let alive = matches!(warm.child.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
+    (alive
+        && warm.started.elapsed() < WARM_MAX_AGE
+        && warm.endpoint == endpoint
+        && warm.key == key
+        && warm.proxy == s.proxy_url)
+        .then_some(warm)
+}
+
+fn reasoning_is_mandatory(e: &anyhow::Error) -> bool {
+    e.to_string()
+        .to_lowercase()
+        .contains("reasoning is mandatory")
+}
+
+/// Один POST /chat/completions: тело во временный файл, ключ через stdin curl.
+fn post_chat(
+    s: &crate::settings::Settings,
+    base_url: &str,
+    endpoint: &str,
+    key: &str,
+    body: &serde_json::Value,
+) -> Result<String> {
     // Тело запроса — во временный файл (как в gemini.rs/ollama.rs): не упираемся в argv.
-    let payload = serde_json::to_vec(&body).map_err(|e| anyhow!("сериализация тела: {e}"))?;
+    let payload = serde_json::to_vec(body).map_err(|e| anyhow!("сериализация тела: {e}"))?;
     let req = net::TempPayload::write_json("rewrite_req", &payload)?;
     let data_arg = req.curl_data_arg();
-    let mut secret_headers = vec![auth_header_line(&s.rewrite_auth_header, &key)];
-    if is_openrouter_base(&base_url) {
+    let mut secret_headers = vec![auth_header_line(&s.rewrite_auth_header, key)];
+    if is_openrouter_base(base_url) {
         secret_headers.push("X-OpenRouter-Title: VoxFlow".to_string());
     }
 
     // Прокси-aware curl из общего модуля net (CREATE_NO_WINDOW уже внутри).
     // Облако из РФ: прокси берём из настроек (s.proxy_url); пустой → net::apply_proxy
     // не добавляет -x, и curl сам читает HTTPS_PROXY/HTTP_PROXY из окружения.
-    let timeout_s = s.backend_timeout_s(net::is_loopback_base_url(&base_url));
+    let timeout_s = s.backend_timeout_s(net::is_loopback_base_url(base_url));
     let mut cmd = net::curl();
     cmd.arg("-s")
         .arg("-m")
@@ -404,13 +603,16 @@ fn chat_completion(
         .arg("POST")
         .arg("--data-binary")
         .arg(&data_arg)
-        .arg(&endpoint);
+        .arg(endpoint);
 
     // Ключ (Bearer) — через stdin-конфиг curl (-K -), НЕ в argv:
     // командная строка процесса видна другим процессам пользователя.
     let out = net::curl_secret_with_proxy(cmd, &secret_headers, &s.proxy_url)
         .map_err(|e| anyhow!("не удалось запустить curl: {e}"))?;
+    parse_curl_chat(out, timeout_s)
+}
 
+fn parse_curl_chat(out: std::process::Output, timeout_s: u64) -> Result<String> {
     if !out.status.success() && out.stdout.is_empty() {
         if net::curl_timed_out(&out.status) {
             return Err(anyhow!(
@@ -606,61 +808,68 @@ mod tests {
     }
 
     #[test]
-    fn openrouter_free_filter_keeps_only_free_text_models() {
+    fn mandatory_reasoning_error_is_recognized() {
+        let e = anyhow!(
+            "Rewrite API error: Reasoning is mandatory for this endpoint and cannot be disabled."
+        );
+        assert!(reasoning_is_mandatory(&e));
+        assert!(!reasoning_is_mandatory(&anyhow!(
+            "Rewrite API error: invalid model"
+        )));
+    }
+
+    fn or_model(
+        id: &str,
+        prompt: &str,
+        completion: &str,
+        out: &str,
+        ready: bool,
+    ) -> OpenRouterModel {
+        OpenRouterModel {
+            id: id.into(),
+            name: Some(id.to_uppercase()),
+            pricing: Some(OpenRouterPricing {
+                prompt: Some(prompt.into()),
+                completion: Some(completion.into()),
+            }),
+            output_modalities: vec![out.into()],
+            is_ready: Some(ready),
+            is_free: None,
+        }
+    }
+
+    #[test]
+    fn openrouter_catalog_lists_paid_text_models_cheapest_first() {
         let models = vec![
-            OpenRouterModel {
-                id: "deepseek/deepseek-r1:free".into(),
-                name: Some("DeepSeek R1 Free".into()),
-                pricing: Some(OpenRouterPricing {
-                    prompt: Some("0".into()),
-                    completion: Some("0.000000".into()),
-                }),
-                output_modalities: vec!["text".into()],
-                is_ready: Some(true),
-                is_free: Some(true),
-            },
-            OpenRouterModel {
-                id: "paid/model".into(),
-                name: Some("Paid".into()),
-                pricing: Some(OpenRouterPricing {
-                    prompt: Some("0.000001".into()),
-                    completion: Some("0".into()),
-                }),
-                output_modalities: vec!["text".into()],
-                is_ready: Some(true),
-                is_free: Some(false),
-            },
-            OpenRouterModel {
-                id: "image/free:free".into(),
-                name: Some("Image".into()),
-                pricing: Some(OpenRouterPricing {
-                    prompt: Some("0".into()),
-                    completion: Some("0".into()),
-                }),
-                output_modalities: vec!["image".into()],
-                is_ready: Some(true),
-                is_free: Some(true),
-            },
-            OpenRouterModel {
-                id: "not-ready:free".into(),
-                name: Some("Not Ready".into()),
-                pricing: Some(OpenRouterPricing {
-                    prompt: Some("0".into()),
-                    completion: Some("0".into()),
-                }),
-                output_modalities: vec!["text".into()],
-                is_ready: Some(false),
-                is_free: Some(true),
-            },
+            or_model("big/expensive", "0.000003", "0.000015", "text", true),
+            or_model("deepseek/deepseek-r1:free", "0", "0", "text", true),
+            or_model("small/cheap", "0.00000005", "0.0000002", "text", true),
+            or_model(
+                OPENROUTER_RECOMMENDED_MODEL,
+                "0.0000001",
+                "0.0000005",
+                "text",
+                true,
+            ),
+            or_model("small/cheap:batch", "0.00000002", "0.0000001", "text", true),
+            or_model("image/model", "0.000001", "0", "image", true),
+            or_model("not/ready", "0.000001", "0.000001", "text", false),
+            or_model("openrouter/auto", "-1", "-1", "text", true),
         ];
 
-        let out = free_model_options(models);
+        let out = text_model_options(models);
+        let ids: Vec<&str> = out.iter().map(|m| m.value.as_str()).collect();
         assert_eq!(
-            out,
-            vec![ModelOption {
-                value: "deepseek/deepseek-r1:free".into(),
-                label: "DeepSeek R1 Free · deepseek/deepseek-r1:free".into(),
-            }]
+            ids,
+            vec![
+                OPENROUTER_RECOMMENDED_MODEL,
+                "small/cheap",
+                "big/expensive",
+                "deepseek/deepseek-r1:free",
+            ]
         );
+        assert!(out[0].label.ends_with("$0.10 / $0.50 за 1M · рекомендуем"));
+        assert_eq!(out[1].label, "SMALL/CHEAP · $0.05 / $0.20 за 1M");
+        assert!(out[3].label.ends_with("бесплатно, с лимитами"));
     }
 }

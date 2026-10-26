@@ -28,10 +28,11 @@ export const OPENAI_COMPAT_PROVIDERS: readonly CompatProvider[] = [
     value: "openrouter",
     label: "OpenRouter",
     baseUrl: "https://openrouter.ai/api/v1",
-    hint: "Много моделей через один OpenAI-compatible API, есть бесплатные.",
+    hint: "Сотни моделей через один ключ, оплата за токены; бесплатные - с лимитами.",
     keyUrl: "https://openrouter.ai/keys",
     keyHint: "OPENROUTER_API_KEY",
-    models: [],
+    // Совпадает с rewrite::OPENROUTER_RECOMMENDED_MODEL (D-058).
+    models: [{ value: "anthropic/claude-haiku-5.5", label: "Claude Haiku 5.5 - рекомендуем" }],
   },
   {
     value: "groq",

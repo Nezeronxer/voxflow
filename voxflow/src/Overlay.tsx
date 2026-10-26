@@ -100,6 +100,8 @@ const BOX: Record<PillMode, { w: number; h: number }> = {
   notice: { w: 346, h: 74 },
 };
 const DRAG_HIT_PADDING = 6;
+// Сколько итог диктовки виден после вставки (D-061).
+const FINAL_HOLD_MS = 2000;
 
 // Раскладка громкости по 5 полоскам: центр громче краёв. В stream показываются
 // только средние три (индексы 1..3) - те же ref'ы, тот же rAF-цикл.
@@ -127,6 +129,11 @@ export default function Overlay() {
   const noticeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [latchNotice, setLatchNotice] = useState<HotkeyLatchEvent | null>(null);
   const latchTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Итог диктовки (ровно вставленная строка) держится в плашке после вставки,
+  // чтобы видно было то, что ушло в поле, а не сырое распознавание (D-061).
+  const [finalHold, setFinalHold] = useState(false);
+  const finalHoldRef = useRef(false);
+  const finalHoldTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [hotkeyTip, setHotkeyTip] = useState(prettyHotkey(DEFAULT_HOTKEY));
   const [overlayScale, setOverlayScale] = useState(1);
   // D: метка «оффлайн» — облако было недоступно, сработал авто-fallback на
@@ -315,6 +322,12 @@ export default function Overlay() {
     };
     // Полный сброс потока (новая диктовка / уход в покой).
     const resetTextEngine = () => showText("", 0);
+    const endFinalHold = () => {
+      if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
+      finalHoldTimer.current = null;
+      finalHoldRef.current = false;
+      setFinalHold(false);
+    };
 
     // --- rAF-цикл громкости: устойчивое экспоненциальное сглаживание полосок.
     // Работает, только пока есть свежие "level" или уровни не успокоились; в покое
@@ -419,6 +432,7 @@ export default function Overlay() {
         // Повторный status=recording внутри одной диктовки не имеет права стирать
         // уже показанный partial. Полный сброс делаем только на реальном входе.
         if (prev !== "recording") {
+          endFinalHold();
           setOffline(false);
           setModel(undefined);
           setAi(null);
@@ -433,9 +447,9 @@ export default function Overlay() {
         // продолжает видеть сказанное, а кольцо на орбе показывает обработку.
         kickLevel();
       } else {
-        // Готовый текст в плашке не показываем: после вставки она сворачивается.
         clearLatch();
-        resetTextEngine();
+        // Итог ещё на виду - плашка свернётся по таймеру удержания.
+        if (!finalHoldRef.current) resetTextEngine();
         kickLevel(); // дать уровням опасть, цикл сам заснёт
       }
       // Метка из самого события - ПОСЛЕ сброса на recording, чтобы model/ai,
@@ -454,8 +468,18 @@ export default function Overlay() {
       currentSeqRef.current = resolved.currentSeq;
       finalSeqRef.current = resolved.finalSeq;
       const preview = resolved.preview;
-      // Финал (вставленный текст) в плашке не показываем — только то, что слышно.
-      if (preview == null || preview.isFinal) return;
+      if (preview == null) return;
+      if (preview.isFinal) {
+        showText(preview.text, preview.committedLen);
+        finalHoldRef.current = true;
+        setFinalHold(true);
+        if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
+        finalHoldTimer.current = setTimeout(() => {
+          endFinalHold();
+          if (statusRef.current === "idle") resetTextEngine();
+        }, FINAL_HOLD_MS);
+        return;
+      }
       if (textRef.current === preview.text && committedLenRef.current === preview.committedLen) {
         return;
       }
@@ -520,6 +544,7 @@ export default function Overlay() {
       stopLevelRaf();
       if (noticeTimer.current) clearTimeout(noticeTimer.current);
       if (latchTimer.current) clearTimeout(latchTimer.current);
+      if (finalHoldTimer.current) clearTimeout(finalHoldTimer.current);
       for (const fn of unlisteners) fn();
       motionQuery.removeEventListener("change", syncMotionPreference);
     };
@@ -533,7 +558,7 @@ export default function Overlay() {
       ? "notice"
       : latchNotice != null
         ? "latch"
-        : previewPillMode(status, hasPreview, false);
+        : previewPillMode(status, hasPreview, finalHold);
   // Метка «GigaAM · ИИ gemma4:e2b» живёт только во время диктовки.
   const metaLabel =
     mode === "rec" || mode === "stream" || mode === "trans"

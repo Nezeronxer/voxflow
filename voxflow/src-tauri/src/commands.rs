@@ -679,19 +679,34 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
         }
         "openai_compat" => {
             if crate::rewrite::is_openrouter_base(&settings.rewrite_base_url) {
-                return match crate::rewrite::openrouter_free_models(&settings) {
+                return match crate::rewrite::openrouter_models(&settings) {
                     Ok(models) if models.is_empty() => ai_test_plain(
                         false,
-                        "OpenRouter ключ принят, но бесплатные текстовые модели не найдены",
+                        "OpenRouter ключ принят, но текстовые модели не найдены",
                     ),
-                    Ok(models) => AiTestResult {
-                        ok: true,
-                        message: format!(
-                            "OpenRouter: найдено бесплатных моделей: {}",
-                            models.len()
-                        ),
-                        models: Some(models),
-                    },
+                    Ok(models) => {
+                        // Каталог по ключу - ещё не ответ модели: выбранную проверяем
+                        // настоящим запросом, иначе «ок» при модели без доступа.
+                        let checked = if crate::rewrite::configured(&settings) {
+                            match crate::rewrite::ping(&settings) {
+                                Ok(_) => format!(", {} отвечает", settings.rewrite_model.trim()),
+                                Err(e) => {
+                                    return AiTestResult {
+                                        ok: false,
+                                        message: format!("Ошибка модели: {e}"),
+                                        models: Some(models),
+                                    }
+                                }
+                            }
+                        } else {
+                            String::new()
+                        };
+                        AiTestResult {
+                            ok: true,
+                            message: format!("OpenRouter: моделей {}{checked}", models.len()),
+                            models: Some(models),
+                        }
+                    }
                     Err(e) => ai_test_plain(false, format!("Ошибка: {e}")),
                 };
             }
@@ -745,7 +760,7 @@ fn list_models_for(settings: &crate::settings::Settings) -> R<Vec<crate::rewrite
             .map_err(err),
         "openai_compat" => {
             if crate::rewrite::is_openrouter_base(&settings.rewrite_base_url) {
-                return crate::rewrite::openrouter_free_models(settings).map_err(err);
+                return crate::rewrite::openrouter_models(settings).map_err(err);
             }
             crate::rewrite::list_models(settings).map_err(err)
         }

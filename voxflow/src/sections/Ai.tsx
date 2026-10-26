@@ -166,7 +166,6 @@ export default function Ai({
     const provider =
       OPENAI_COMPAT_PROVIDERS.find((item) => item.value === providerValue) ??
       OPENAI_COMPAT_PROVIDERS[0];
-    const providerIsOpenRouter = provider.value === "openrouter";
     const keepModel = provider.models.some(
       (model) => model.value === settings.rewrite_model,
     );
@@ -181,9 +180,7 @@ export default function Ai({
     }
     update({
       rewrite_base_url: provider.baseUrl,
-      rewrite_model: providerIsOpenRouter
-        ? ""
-        : keepModel
+      rewrite_model: keepModel
         ? settings.rewrite_model
         : provider.models[0]?.value ?? "",
       // У пресетов ключ всегда уходит как Authorization: Bearer. Оставшийся
@@ -249,17 +246,15 @@ export default function Ai({
                   settings.rewrite_base_url.trim() ||
                   OPENAI_COMPAT_PROVIDERS[0].baseUrl;
                 const provider = providerFromBaseUrl(baseUrl);
-                const providerIsOpenRouter = provider.value === "openrouter";
                 update({
                   ai_backend: v,
                   ai_backend_behavior_version: 1,
                   cloud_asr: false,
                   rewrite_base_url: baseUrl,
-                  rewrite_model: providerIsOpenRouter
-                    ? ""
-                    : settings.rewrite_model.trim() ||
-                      provider.models[0]?.value ||
-                      "",
+                  rewrite_model:
+                    settings.rewrite_model.trim() ||
+                    provider.models[0]?.value ||
+                    "",
                 });
               } else {
                 update(
@@ -516,29 +511,7 @@ export default function Ai({
               </Field>
             )}
 
-            {isOpenRouter ? (
-              catalog.length > 0 ? (
-                <Field
-                  label="Бесплатная модель"
-                  hint={catalogNote ?? `Base URL: ${rewriteProvider.baseUrl}`}
-                >
-                  <Select
-                    value={settings.rewrite_model}
-                    onChange={(v) => update({ rewrite_model: v })}
-                    options={withCurrentOption(catalog, settings.rewrite_model)}
-                  />
-                </Field>
-              ) : (
-                <Field
-                  label="Бесплатная модель"
-                  hint={catalogNote ?? "Список читается по ключу OpenRouter"}
-                >
-                  <span className="field-hint" style={{ maxWidth: 280 }}>
-                    {catalogNote ?? "Вставьте ключ — список появится сам."}
-                  </span>
-                </Field>
-              )
-            ) : catalog.length > 0 ? (
+            {catalog.length > 0 ? (
               <Field
                 label="Модель"
                 hint={catalogNote ?? `Base URL: ${rewriteProvider.baseUrl}`}
@@ -583,6 +556,14 @@ export default function Ai({
                   ))}
                 </datalist>
               </Field>
+            )}
+            {!isLoopbackUrl(settings.rewrite_base_url) && (
+              <div className="field-hint">
+                Для постобработки хватает самых дешёвых моделей
+                {isOpenRouter ? " - они в начале списка, цена за 1M токенов" : ""}: дорогие
+                пишут не лучше, только медленнее и дороже. Одна диктовка на дешёвой модели
+                стоит сотые доли цента.
+              </div>
             )}
           </>
         )}

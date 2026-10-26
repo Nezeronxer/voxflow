@@ -1473,6 +1473,20 @@ fn setup_overlay(app: &tauri::AppHandle) {
         #[cfg(not(any(windows, target_os = "macos")))]
         let _ = ov.set_ignore_cursor_events(false);
         let _ = ov.set_always_on_top(true);
+        // Без этих флагов окно живёт на одном рабочем столе: сменил стол или
+        // открыл приложение на весь экран - плашка «пропала», хотя диктовка идёт.
+        #[cfg(target_os = "macos")]
+        if let Ok(ptr) = ov.ns_window() {
+            use objc2_app_kit::{NSWindow, NSWindowCollectionBehavior as B};
+            // SAFETY: setup идёт в главном потоке, указатель - живое NSWindow оверлея.
+            let ns = unsafe { &*ptr.cast::<NSWindow>() };
+            ns.setCollectionBehavior(
+                ns.collectionBehavior()
+                    | B::CanJoinAllSpaces
+                    | B::FullScreenAuxiliary
+                    | B::Stationary,
+            );
+        }
         // Wayland с layer-shell: слой задаётся до первого show(), снизу тот же
         // отступ, что у позиции по умолчанию ниже. Позицию тогда ведёт
         // композитор: set_position и сохранённое место не используются.

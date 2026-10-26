@@ -135,8 +135,10 @@ test("live preview survives transcribing and word updates bypass React state", (
   // Слова пишутся в DOM напрямую, совпавший префикс не пересоздаётся.
   assert.match(overlaySource, /host\.appendChild\(el\)/);
   assert.match(overlaySource, /sharedWordPrefix\(tokensRef\.current, tokens\)/);
-  // Вставленный финал в плашке не показывается.
-  assert.match(overlaySource, /if \(preview == null \|\| preview\.isFinal\) return;/);
+  // D-061: вставленный итог заменяет сырое распознавание и держится после вставки.
+  assert.match(overlaySource, /if \(preview\.isFinal\) \{\s*showText\(preview\.text/);
+  assert.match(overlaySource, /previewPillMode\(status, hasPreview, finalHold\)/);
+  assert.match(overlaySource, /if \(!finalHoldRef\.current\) resetTextEngine\(\)/);
   assert.match(overlaySource, /el\.style\.transform = `scaleY/);
   assert.match(overlaySource, /seq\?: number/);
   assert.match(overlaySource, /p\?\.latched === true/);

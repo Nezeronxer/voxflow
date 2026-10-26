@@ -39,3 +39,12 @@ test("every preset carries a usable https endpoint", () => {
     if (provider.keyUrl) assert.ok(provider.keyUrl.startsWith("https://"));
   }
 });
+
+test("openrouter preset suggests the backend's recommended model (D-058)", async () => {
+  const { readFile } = await import("node:fs/promises");
+  const rust = await readFile(new URL("../src-tauri/src/rewrite.rs", import.meta.url), "utf8");
+  const recommended = rust.match(/OPENROUTER_RECOMMENDED_MODEL: &str = "([^"]+)"/)?.[1];
+  const openrouter = OPENAI_COMPAT_PROVIDERS.find((p) => p.value === "openrouter");
+  assert.ok(recommended);
+  assert.equal(openrouter.models[0]?.value, recommended);
+});
