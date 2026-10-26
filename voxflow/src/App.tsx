@@ -41,8 +41,6 @@ import { ErrorBoundary } from "./ErrorBoundary";
 const Models = lazy(() => import("./sections/Models"));
 const History = lazy(() => import("./sections/History"));
 const Dictionary = lazy(() => import("./sections/Dictionary"));
-const Snippets = lazy(() => import("./sections/Snippets"));
-const Prompts = lazy(() => import("./sections/Prompts"));
 const SettingsHub = lazy(() => import("./sections/SettingsHub"));
 
 export type TabId =
@@ -50,8 +48,6 @@ export type TabId =
   | "asr"
   | "history"
   | "dictionary"
-  | "snippets"
-  | "prompts"
   | "settings";
 
 // Меню по пути голоса: запись → распознавание → история, затем всё про текст.
@@ -76,8 +72,6 @@ const NAV_GROUPS: {
     title: "Текст",
     items: [
       { id: "dictionary", label: "Словарь", icon: Icon.Book },
-      { id: "snippets", label: "Сниппеты", icon: Icon.Code },
-      { id: "prompts", label: "Промпты", icon: Icon.Wand },
     ],
   },
 ];
@@ -452,11 +446,7 @@ export default function App() {
               )}
               {tab === "asr" && <Models settings={settings} update={update} />}
               {tab === "history" && <History />}
-              {tab === "dictionary" && <Dictionary />}
-              {tab === "snippets" && <Snippets />}
-              {tab === "prompts" && (
-                <Prompts settings={settings} update={update} />
-              )}
+              {tab === "dictionary" && <Dictionary settings={settings} update={update} />}
               {tab === "settings" && (
                 <SettingsHub
                   page={settingsPage}

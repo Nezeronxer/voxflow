@@ -108,3 +108,12 @@ test("meta label shows recognizer and AI model, warns when missing", () => {
   assert.equal(label(undefined, undefined), null);
   assert.equal(label(undefined, { kind: "unknown" }), null);
 });
+
+test("raw preview is hidden until final only when AI rewrites the text", () => {
+  assert.equal(previewState.hidesRawUntilFinal({ kind: "cloud" }), true);
+  assert.equal(previewState.hidesRawUntilFinal({ kind: "local", name: "gemma4:e2b" }), true);
+  assert.equal(previewState.hidesRawUntilFinal({ kind: "off" }), false);
+  assert.equal(previewState.hidesRawUntilFinal({ kind: "missing" }), false);
+  assert.equal(previewState.hidesRawUntilFinal(null), false);
+  assert.equal(previewState.hidesRawUntilFinal(undefined), false);
+});

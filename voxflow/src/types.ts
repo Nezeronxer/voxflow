@@ -53,8 +53,6 @@ export interface Settings {
   // Таймаут запроса к ИИ, секунды (локальная модель получает минимум 60).
   ai_timeout_s: number;
   // Выгружать модель Ollama после N минут простоя (выключено - держать всегда).
-  ollama_unload_idle: boolean;
-  ollama_unload_after_min: number;
   // Выгрузка моделей распознавания и встроенного ИИ в простое (D-053).
   asr_unload_idle: boolean;
   asr_unload_after_min: number;
@@ -290,8 +288,6 @@ export const DEFAULT_SETTINGS: Settings = {
   rewrite_max_output_tokens: 4096,
   rewrite_min_recall: 0.9,
   ai_timeout_s: 20,
-  ollama_unload_idle: true,
-  ollama_unload_after_min: 15,
   asr_unload_idle: true,
   asr_unload_after_min: 10,
   cloud_asr: false,

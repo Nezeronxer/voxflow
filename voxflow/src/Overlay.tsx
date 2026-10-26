@@ -25,6 +25,7 @@ import "./overlay.css";
 import {
   overlayMetaLabel,
   type OverlayAi,
+  hidesRawUntilFinal,
   previewPillMode,
   resolveOverlayPreviewEvent,
   sharedWordPrefix,
@@ -133,6 +134,8 @@ export default function Overlay() {
   // чтобы видно было то, что ушло в поле, а не сырое распознавание (D-061).
   const [finalHold, setFinalHold] = useState(false);
   const finalHoldRef = useRef(false);
+  // Сырой текст спрятан до итога: идёт обработка нейросетью.
+  const hideRawRef = useRef(false);
   const finalHoldTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [hotkeyTip, setHotkeyTip] = useState(prettyHotkey(DEFAULT_HOTKEY));
   const [overlayScale, setOverlayScale] = useState(1);
@@ -433,6 +436,7 @@ export default function Overlay() {
         // уже показанный partial. Полный сброс делаем только на реальном входе.
         if (prev !== "recording") {
           endFinalHold();
+          hideRawRef.current = false;
           setOffline(false);
           setModel(undefined);
           setAi(null);
@@ -443,8 +447,13 @@ export default function Overlay() {
           lastLevelAtRef.current = 0;
         }
       } else if (v === "transcribing") {
-        // Не стираем live-preview во время финального распознавания: пользователь
-        // продолжает видеть сказанное, а кольцо на орбе показывает обработку.
+        // Без нейросети live-preview остаётся на время финала: пользователь видит
+        // сказанное, кольцо на орбе показывает обработку. С нейросетью сырой
+        // текст не совпадёт с итогом - прячем его, итог придёт событием final.
+        if (hidesRawUntilFinal(typeof p === "object" && p !== null ? p.ai : undefined)) {
+          hideRawRef.current = true;
+          resetTextEngine();
+        }
         kickLevel();
       } else {
         clearLatch();
@@ -469,6 +478,7 @@ export default function Overlay() {
       finalSeqRef.current = resolved.finalSeq;
       const preview = resolved.preview;
       if (preview == null) return;
+      if (hideRawRef.current && !preview.isFinal) return;
       if (preview.isFinal) {
         showText(preview.text, preview.committedLen);
         finalHoldRef.current = true;

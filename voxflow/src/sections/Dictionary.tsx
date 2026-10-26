@@ -5,9 +5,19 @@ import {
   dictionaryDelete,
 } from "../api";
 import { PageHead, Icon } from "../ui";
-import type { DictionaryEntry } from "../types";
+import type { DictionaryEntry, Settings } from "../types";
+import Corrections from "./Corrections";
+import Snippets from "./Snippets";
 
-export default function Dictionary() {
+// Всё, что меняет слова перед вставкой, на одной странице: замены, исправления
+// (в том числе выученные на правках) и сниппеты.
+export default function Dictionary({
+  settings,
+  update,
+}: {
+  settings: Settings;
+  update: (patch: Partial<Settings>) => void;
+}) {
   const [entries, setEntries] = useState<DictionaryEntry[]>([]);
   const [term, setTerm] = useState("");
   const [replacement, setReplacement] = useState("");
@@ -77,7 +87,7 @@ export default function Dictionary() {
     <div className="content-inner">
       <PageHead
         title="Словарь"
-        desc="Замены распознанных слов: имена, термины, бренды, написание."
+        desc="Замены распознанных слов, исправления и сниппеты."
       />
 
       <div className="card">
@@ -161,6 +171,8 @@ export default function Dictionary() {
           Если замену не указывать, VoxFlow запомнит точное написание термина.
         </div>
       </div>
+      <Corrections settings={settings} update={update} embedded />
+      <Snippets embedded />
     </div>
   );
 }

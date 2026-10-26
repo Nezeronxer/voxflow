@@ -204,19 +204,17 @@ export default function Stt({
         </div>
       </Field>
 
-      {isLocal && (
-        <Field
-          label="Выгружать модели в простое"
-          hint="Освобождает память, если долго не диктуешь: модели распознавания и встроенный ИИ. Первая фраза после перерыва распознается на пару секунд дольше"
-        >
-          <Switch
-            checked={settings.asr_unload_idle}
-            onChange={(v) => update({ asr_unload_idle: v })}
-          />
-        </Field>
-      )}
+      <Field
+        label="Выгружать модели в простое"
+        hint="Освобождает память, если долго не диктуешь: модели распознавания и нейросеть на устройстве (встроенная или Ollama). Первая фраза после перерыва обработается на пару секунд дольше"
+      >
+        <Switch
+          checked={settings.asr_unload_idle}
+          onChange={(v) => update({ asr_unload_idle: v })}
+        />
+      </Field>
 
-      {isLocal && settings.asr_unload_idle && (
+      {settings.asr_unload_idle && (
         <Field
           label="Выгружать через, мин"
           hint="Сколько минут без диктовки держать модели в памяти"

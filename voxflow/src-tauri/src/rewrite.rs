@@ -428,13 +428,15 @@ fn chat_completion(
     if openrouter {
         body["reasoning"] = serde_json::json!({ "enabled": false });
     }
-    let first = match take_warm(s, &endpoint, &key) {
+    let warm = take_warm(s, &endpoint, &key);
+    let first = if warm.is_empty() {
+        post_chat(s, &base_url, &endpoint, &key, &body)
+    } else {
         // Соединение могло закрыться на стороне сервера - тогда обычный запрос.
-        Some(warm) => warm.send(&body).or_else(|e| {
+        send_first(warm, &body).or_else(|e| {
             log::warn!("прогретое соединение не сработало ({e}), обычный запрос");
             post_chat(s, &base_url, &endpoint, &key, &body)
-        }),
-        None => post_chat(s, &base_url, &endpoint, &key, &body),
+        })
     };
     match first {
         Err(e) if openrouter && reasoning_is_mandatory(&e) => {
@@ -489,10 +491,44 @@ impl Drop for Warm {
     }
 }
 
-static WARM: std::sync::Mutex<Option<Warm>> = std::sync::Mutex::new(None);
+static WARM: std::sync::Mutex<Vec<Warm>> = std::sync::Mutex::new(Vec::new());
 
-/// Открыть соединение к OpenRouter заранее (зовётся на старте диктовки).
-/// Прошлое неиспользованное закрывается. Ошибки молча: тогда обычный запрос.
+/// Сколько одинаковых запросов уходит наперегонки. Ответ OpenRouter обычно
+/// 1,0-1,5 с, но изредка 5-10 с; второй запрос срезает такой хвост (замер:
+/// пара 1,3/5,4 с даёт 1,3 с). Стоит вторых токенов - у дешёвых моделей копейки,
+/// бесплатным (`:free`) не шлём: у них лимит запросов (D-064).
+fn race_width(model: &str) -> usize {
+    if model.trim().ends_with(":free") {
+        1
+    } else {
+        2
+    }
+}
+
+/// Первый успешный ответ из прогретых соединений; проигравшие дорабатывают в
+/// своих потоках, их ответ выбрасывается. Ошибка - только если упали все.
+fn send_first(warm: Vec<Warm>, body: &serde_json::Value) -> Result<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    for w in warm {
+        let tx = tx.clone();
+        let body = body.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(w.send(&body));
+        });
+    }
+    drop(tx);
+    let mut last = Err(anyhow!("нет прогретых соединений"));
+    for result in rx {
+        if result.is_ok() {
+            return result;
+        }
+        last = result;
+    }
+    last
+}
+
+/// Открыть соединения к OpenRouter заранее (зовётся на старте диктовки).
+/// Прошлые неиспользованные закрываются. Ошибки молча: тогда обычный запрос.
 pub fn prewarm(s: &crate::settings::Settings) {
     let base_url = base(&s.rewrite_base_url);
     let key = s.resolve_rewrite_key();
@@ -504,11 +540,18 @@ pub fn prewarm(s: &crate::settings::Settings) {
         return;
     }
     let endpoint = format!("{base_url}/chat/completions");
+    let warm: Vec<Warm> = (0..race_width(&s.rewrite_model))
+        .filter_map(|_| open_warm(s, &endpoint, &key))
+        .collect();
+    *WARM.lock().unwrap_or_else(|e| e.into_inner()) = warm;
+}
+
+fn open_warm(s: &crate::settings::Settings, endpoint: &str, key: &str) -> Option<Warm> {
     let timeout_s = s.backend_timeout_s(false);
     let config_path = crate::paths::unique_tmp_path("curl_cfg", "txt");
     let guard = crate::paths::TempFileGuard::new(config_path.clone());
     let mut lines = vec![
-        net::secret_header_line(&auth_header_line(&s.rewrite_auth_header, &key)),
+        net::secret_header_line(&auth_header_line(&s.rewrite_auth_header, key)),
         net::secret_header_line("X-OpenRouter-Title: VoxFlow"),
     ];
     lines.extend(net::proxy_config_line(&s.proxy_url));
@@ -517,7 +560,7 @@ pub fn prewarm(s: &crate::settings::Settings) {
         f.write_all((lines.join("\n") + "\n").as_bytes())
     });
     if written.is_err() {
-        return;
+        return None;
     }
     let mut cmd = net::curl();
     cmd.arg("-s")
@@ -531,36 +574,37 @@ pub fn prewarm(s: &crate::settings::Settings) {
         .arg("POST")
         .arg("-T")
         .arg("-")
-        .arg(&endpoint)
+        .arg(endpoint)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let Ok(child) = cmd.spawn() else {
-        return;
-    };
-    let warm = Warm {
+    let child = cmd.spawn().ok()?;
+    Some(Warm {
         child: Some(child),
-        endpoint,
-        key,
+        endpoint: endpoint.to_string(),
+        key: key.to_string(),
         proxy: s.proxy_url.clone(),
         started: std::time::Instant::now(),
         timeout_s,
         _config: guard,
-    };
-    *WARM.lock().unwrap_or_else(|e| e.into_inner()) = Some(warm);
+    })
 }
 
-/// Прогретое соединение для этого запроса, если оно свежее и к тому же адресу,
-/// с тем же ключом и прокси. Иначе закрываем его и идём обычным путём.
-fn take_warm(s: &crate::settings::Settings, endpoint: &str, key: &str) -> Option<Warm> {
-    let mut warm = WARM.lock().unwrap_or_else(|e| e.into_inner()).take()?;
-    let alive = matches!(warm.child.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
-    (alive
-        && warm.started.elapsed() < WARM_MAX_AGE
-        && warm.endpoint == endpoint
-        && warm.key == key
-        && warm.proxy == s.proxy_url)
-        .then_some(warm)
+/// Прогретые соединения для этого запроса: свежие, к тому же адресу, с тем же
+/// ключом и прокси. Остальные закрываются (Drop), запрос идёт обычным путём.
+fn take_warm(s: &crate::settings::Settings, endpoint: &str, key: &str) -> Vec<Warm> {
+    let all = std::mem::take(&mut *WARM.lock().unwrap_or_else(|e| e.into_inner()));
+    all.into_iter()
+        .filter_map(|mut warm| {
+            let alive = matches!(warm.child.as_mut().map(|c| c.try_wait()), Some(Ok(None)));
+            (alive
+                && warm.started.elapsed() < WARM_MAX_AGE
+                && warm.endpoint == endpoint
+                && warm.key == key
+                && warm.proxy == s.proxy_url)
+                .then_some(warm)
+        })
+        .collect()
 }
 
 fn reasoning_is_mandatory(e: &anyhow::Error) -> bool {
@@ -805,6 +849,59 @@ mod tests {
         assert!(long > short);
         assert!(long <= 4096);
         assert!(short >= 256);
+    }
+
+    /// Поддельный curl: читает тело, ждёт `delay` и печатает `reply`.
+    #[cfg(unix)]
+    fn fake_warm(delay: &str, reply: &str) -> Warm {
+        let child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(r#"cat >/dev/null; sleep "$0"; printf '%s' "$1""#)
+            .arg(delay)
+            .arg(reply)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        Warm {
+            child: Some(child),
+            endpoint: String::new(),
+            key: String::new(),
+            proxy: String::new(),
+            started: std::time::Instant::now(),
+            timeout_s: 20,
+            _config: crate::paths::TempFileGuard::new(crate::paths::unique_tmp_path("t", "txt")),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn race_takes_first_successful_answer() {
+        let ok = |t: &str| format!(r#"{{"choices":[{{"message":{{"content":"{t}"}}}}]}}"#);
+        let body = serde_json::json!({});
+        let t = std::time::Instant::now();
+        let got = send_first(
+            vec![
+                fake_warm("3", &ok("медленно")),
+                fake_warm("0", &ok("быстро")),
+            ],
+            &body,
+        );
+        assert_eq!(got.unwrap(), "быстро");
+        assert!(t.elapsed() < std::time::Duration::from_secs(2));
+        // Быстрый с ошибкой не мешает дождаться медленного.
+        let got = send_first(
+            vec![
+                fake_warm("0", r#"{"error":"x"}"#),
+                fake_warm("1", &ok("второй")),
+            ],
+            &body,
+        );
+        assert_eq!(got.unwrap(), "второй");
+        assert!(send_first(vec![fake_warm("0", "мусор")], &body).is_err());
+        assert_eq!(race_width("anthropic/claude-haiku-5.5"), 2);
+        assert_eq!(race_width("deepseek/deepseek-v4:free"), 1);
     }
 
     #[test]

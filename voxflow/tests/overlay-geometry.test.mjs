@@ -130,7 +130,12 @@ test("live preview survives transcribing and word updates bypass React state", (
     overlaySource,
   );
   assert.ok(transcribingBranch, "missing transcribing status branch");
-  assert.doesNotMatch(transcribingBranch[1], /resetTextEngine\(\)/);
+  // D-064: сырой текст стирается на обработке только когда итог перепишет нейросеть.
+  assert.match(
+    transcribingBranch[1],
+    /if \(hidesRawUntilFinal\([^)]*\)\) \{\s*hideRawRef\.current = true;\s*resetTextEngine\(\);/,
+  );
+  assert.match(overlaySource, /if \(hideRawRef\.current && !preview\.isFinal\) return;/);
   assert.doesNotMatch(overlaySource, /const \[shown,\s*setShown\]/);
   // Слова пишутся в DOM напрямую, совпавший префикс не пересоздаётся.
   assert.match(overlaySource, /host\.appendChild\(el\)/);

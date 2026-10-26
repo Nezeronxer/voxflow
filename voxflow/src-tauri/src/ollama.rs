@@ -351,8 +351,9 @@ pub fn refine(url: &str, model: &str, system: &str, user: &str, timeout_s: u64) 
 static KEEP_ALIVE_MIN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(-1);
 
 pub fn set_keep_alive(s: &crate::settings::Settings) {
-    let v = if s.ollama_unload_idle {
-        s.ollama_unload_after_min as i64
+    // Один переключатель выгрузки на всё: модели распознавания, встроенный ИИ и Ollama.
+    let v = if s.asr_unload_idle {
+        s.asr_unload_after_min as i64
     } else {
         -1
     };
@@ -651,13 +652,13 @@ mod tests {
     #[test]
     fn keep_alive_follows_unload_setting() {
         let mut s = crate::settings::Settings {
-            ollama_unload_idle: true,
-            ollama_unload_after_min: 15,
+            asr_unload_idle: true,
+            asr_unload_after_min: 15,
             ..Default::default()
         };
         set_keep_alive(&s);
         assert_eq!(keep_alive(), "15m");
-        s.ollama_unload_idle = false;
+        s.asr_unload_idle = false;
         set_keep_alive(&s);
         assert_eq!(keep_alive(), -1);
     }

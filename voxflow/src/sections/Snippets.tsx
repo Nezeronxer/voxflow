@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { snippetList, snippetUpsert, snippetDelete } from "../api";
-import { PageHead, Switch, Icon } from "../ui";
+import { PageHead, SectionShell, Switch, Icon } from "../ui";
 import type { SnippetEntry } from "../types";
 
-export default function Snippets() {
+export default function Snippets({ embedded }: { embedded?: boolean }) {
   const [entries, setEntries] = useState<SnippetEntry[]>([]);
   const [trigger, setTrigger] = useState("");
   const [content, setContent] = useState("");
@@ -72,11 +72,13 @@ export default function Snippets() {
   }
 
   return (
-    <div className="content-inner">
-      <PageHead
-        title="Сниппеты"
-        desc="Короткие триггеры, которые разворачиваются в готовый текст."
-      />
+    <SectionShell embedded={embedded}>
+      {!embedded && (
+        <PageHead
+          title="Сниппеты"
+          desc="Короткие триггеры, которые разворачиваются в готовый текст."
+        />
+      )}
 
       <div className="card">
         <div className="card-head">
@@ -181,7 +183,7 @@ export default function Snippets() {
           </div>
         </div>
       </div>
-    </div>
+    </SectionShell>
   );
 }
 

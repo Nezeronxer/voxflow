@@ -171,13 +171,10 @@ pub struct Settings {
     /// применяется увеличенный (см. `Settings::backend_timeout_s`): CPU-модель
     /// с промптом на тысячи токенов в 10 секунд не укладывается.
     pub ai_timeout_s: u32,
-    /// Выгружать модель Ollama из памяти, если ей не пользовались
-    /// `ollama_unload_after_min` минут. Выключено - модель держится всегда (D-044).
-    pub ollama_unload_idle: bool,
-    pub ollama_unload_after_min: u32,
     /// Выгружать модели распознавания (GigaAM, Parakeet, whisper-server) и
     /// встроенную ИИ-модель, если диктовки не было `asr_unload_after_min`
-    /// минут (D-053). Следующая диктовка грузит модель заново при нажатии.
+    /// минут (D-053). Им же Ollama получает `keep_alive` (раньше - отдельный
+    /// `ollama_unload_*`, D-044). Следующая диктовка грузит модель заново при нажатии.
     pub asr_unload_idle: bool,
     pub asr_unload_after_min: u32,
 
@@ -308,8 +305,6 @@ impl Default for Settings {
             rewrite_max_output_tokens: 4096,
             rewrite_min_recall: 0.9,
             ai_timeout_s: 20,
-            ollama_unload_idle: true,
-            ollama_unload_after_min: 15,
             asr_unload_idle: true,
             asr_unload_after_min: 10,
             proxy_url: String::new(),
@@ -325,6 +320,10 @@ impl Default for Settings {
 
 impl Settings {
     pub fn normalize_user_values(&mut self) {
+        // Переключатель «Распознавать речь через Gemini» убран из интерфейса:
+        // облачное распознавание выбирается в «Где распознавать», а старый флаг
+        // иначе остался бы включённым без способа выключить.
+        self.cloud_asr = false;
         if !matches!(self.gpu_mode.as_str(), "auto" | "on" | "off") {
             self.gpu_mode = "auto".into();
         }
@@ -374,7 +373,6 @@ impl Settings {
         };
         self.rewrite_max_output_tokens = self.rewrite_max_output_tokens.clamp(256, 32_768);
         self.ai_timeout_s = self.ai_timeout_s.clamp(5, 300);
-        self.ollama_unload_after_min = self.ollama_unload_after_min.clamp(1, 1440);
         self.asr_unload_after_min = self.asr_unload_after_min.clamp(1, 1440);
         self.rewrite_auth_header = sanitized_header_name(&self.rewrite_auth_header);
     }

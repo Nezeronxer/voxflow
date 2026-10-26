@@ -6,7 +6,6 @@ import Recognition from "./Recognition";
 import Control from "./Control";
 import Ai from "./Ai";
 import Stt from "./Stt";
-import Corrections from "./Corrections";
 import LocalLlm from "./LocalLlm";
 
 /**
@@ -37,7 +36,7 @@ const SETTINGS_NAV: {
     id: "text",
     label: "Обработка текста",
     title: "Обработка текста",
-    desc: "Что делать с текстом перед вставкой: чистка, нейросеть и её модели, исправления.",
+    desc: "Что делать с текстом перед вставкой: чистка, нейросеть и её модели.",
     icon: Icon.Wand,
   },
   {
@@ -132,7 +131,6 @@ export default function SettingsHub({
               <Recognition settings={settings} update={update} part="main" />
               <Ai settings={settings} update={update} persist={persist} part="main" />
               <LocalLlm settings={settings} update={update} />
-              <Corrections settings={settings} update={update} embedded />
               <Advanced>
                 <Recognition settings={settings} update={update} part="advanced" />
                 <Ai settings={settings} update={update} persist={persist} part="advanced" />
@@ -161,7 +159,7 @@ export default function SettingsHub({
           )}
           {egress.summary}
         </span>
-        <span>VoxFlow 2.4.3</span>
+        <span>VoxFlow 2.4.4</span>
       </footer>
     </div>
   );

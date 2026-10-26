@@ -6,7 +6,7 @@ import {
   saveSettings,
   type AiModelOption,
 } from "../api";
-import { PageHead, SectionShell, Field, Select, Switch, Icon } from "../ui";
+import { PageHead, SectionShell, Field, Select, Icon } from "../ui";
 import type { Settings } from "../types";
 import {
   CUSTOM_PROVIDER,
@@ -84,8 +84,6 @@ export default function Ai({
   const isCustom = customPicked || savedProvider.value === "custom";
   const rewriteProvider = isCustom ? CUSTOM_PROVIDER : savedProvider;
   const isOpenRouter = rewriteProvider.value === "openrouter";
-  // Облачный ASR доступен только для Gemini — локальный ИИ работает с текстом.
-  const cloudAsrDisabled = backend !== "gemini";
   // Каталог читается только у тех, кто его отдаёт по ключу или адресу.
   // Встроенный ИИ выбирает модель в своём разделе, здесь его не спрашиваем.
   const hasCatalog =
@@ -365,38 +363,6 @@ export default function Ai({
                 )}
               />
             </Field>
-
-            <Field
-              label="Выгружать модель в простое"
-              hint="Освобождает память, если долго не диктуешь. Первая фраза после перерыва обработается на несколько секунд дольше"
-            >
-              <Switch
-                checked={settings.ollama_unload_idle}
-                onChange={(v) => update({ ollama_unload_idle: v })}
-              />
-            </Field>
-
-            {settings.ollama_unload_idle && (
-              <Field
-                label="Выгружать через, мин"
-                hint="Сколько минут без диктовки держать модель в памяти"
-              >
-                <input
-                  type="number"
-                  min={1}
-                  max={1440}
-                  value={settings.ollama_unload_after_min}
-                  onChange={(e) => {
-                    const n = parseInt(e.currentTarget.value, 10);
-                    update({
-                      ollama_unload_after_min: Number.isFinite(n)
-                        ? Math.min(1440, Math.max(1, n))
-                        : 15,
-                    });
-                  }}
-                />
-              </Field>
-            )}
           </>
         )}
 
@@ -596,25 +562,6 @@ export default function Ai({
 
   const advanced = (
     <>
-      {backend === "gemini" && (
-        <Field
-          label="Распознавать речь через Gemini"
-          hint="Звук уходит в Google вместо распознавания на устройстве"
-        >
-          <span
-            style={
-              cloudAsrDisabled
-                ? { opacity: 0.4, pointerEvents: "none" }
-                : undefined
-            }
-          >
-            <Switch
-              checked={cloudAsrDisabled ? false : settings.cloud_asr}
-              onChange={(v) => update({ cloud_asr: v })}
-            />
-          </span>
-        </Field>
-      )}
       {!aiOff && (
         <>
         <Field
