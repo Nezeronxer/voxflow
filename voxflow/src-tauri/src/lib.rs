@@ -1,7 +1,6 @@
 //! VoxFlow — локальный голосовой ввод. Точка сборки Tauri-приложения.
 
 mod app_context;
-mod asr;
 mod audio;
 mod cloud_stt;
 mod commands;
@@ -33,6 +32,7 @@ mod prompt_rules;
 mod rewrite;
 mod settings;
 mod system_audio;
+mod transcript;
 mod updater;
 mod vad;
 mod voice_cmds;
@@ -480,199 +480,6 @@ fn cli_load_settings(tag: &str) -> settings::Settings {
     }
 }
 
-/// Диагностический прогон ASR + постобработки на готовом 16 кГц WAV (без GUI/микрофона).
-/// Используется как `voxflow.exe --selftest <wav>` для проверки пайплайна кодом приложения.
-pub fn selftest(wav_path: &str) {
-    use std::path::Path;
-    let s = cli_load_settings("selftest");
-    let whisper_dir = paths::whisper_dir_standalone();
-    let model = {
-        let m = paths::model_path(&s.model);
-        if m.exists() {
-            m
-        } else {
-            std::fs::read_dir(paths::models_dir())
-                .ok()
-                .and_then(|rd| {
-                    rd.flatten()
-                        .map(|e| e.path())
-                        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("bin"))
-                })
-                .expect("нет ни одной модели в models_dir")
-        }
-    };
-    eprintln!("[selftest] whisper_dir = {whisper_dir:?}");
-    eprintln!("[selftest] model       = {model:?}");
-    eprintln!("[selftest] wav         = {wav_path}");
-    eprintln!(
-        "[selftest] language    = {}, threads = {}",
-        s.language,
-        s.effective_threads()
-    );
-
-    let params = asr::AsrParams {
-        whisper_dir: &whisper_dir,
-        model_path: &model,
-        wav_path: Path::new(wav_path),
-        language: &s.language,
-        threads: s.effective_threads(),
-        initial_prompt: None,
-    };
-    let raw = asr::transcribe_cli(&params).expect("ASR failed");
-    println!("RAW   : {raw}");
-    let clean = postprocess::process(&raw, &s, &[], &[]);
-    println!("CLEAN : {clean}");
-}
-
-/// Headless-проверка ЖИВОГО стриминга (без GUI/микрофона): на готовом 16 кГц WAV
-/// имитирует петлю частичных результатов, прогоняя НАРАСТАЮЩИЕ срезы аудио
-/// (1 c, 2 c, 3 c … до полного) через `asr::transcribe_server_partial` (UNGATED,
-/// как в реальной петле), печатая каждый partial + затраченные мс. Затем —
-/// финальный ГЕЙТОВАННЫЙ проход (`transcribe_server` + postprocess) с замером.
-///
-/// Запуск: `voxflow.exe --stream-selftest <16k_mono.wav>`. НЕ открывает окно Tauri.
-pub fn stream_selftest(wav_path: &str) {
-    use std::time::Instant;
-
-    let s = cli_load_settings("stream");
-    let whisper_dir = paths::whisper_dir_standalone();
-    let model = {
-        let m = paths::model_path(&s.model);
-        if m.exists() {
-            m
-        } else {
-            std::fs::read_dir(paths::models_dir())
-                .ok()
-                .and_then(|rd| {
-                    rd.flatten()
-                        .map(|e| e.path())
-                        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("bin"))
-                })
-                .expect("нет ни одной модели в models_dir")
-        }
-    };
-    let threads = s.effective_threads();
-    eprintln!("[stream] whisper_dir = {whisper_dir:?}");
-    eprintln!("[stream] model       = {model:?}");
-    eprintln!("[stream] wav         = {wav_path}");
-    eprintln!(
-        "[stream] engine={} nvidia={} language={} threads={}",
-        s.engine,
-        paths::has_nvidia(),
-        s.language,
-        threads
-    );
-
-    // Считываем WAV целиком в моно f32 16 кГц (hound). Ресэмпл на всякий случай,
-    // если кто-то подсунул не 16 кГц.
-    let reader = hound::WavReader::open(wav_path).expect("открыть WAV");
-    let spec = reader.spec();
-    let in_rate = spec.sample_rate;
-    let channels = spec.channels as usize;
-    let raw_samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .into_samples::<f32>()
-            .map(|x| x.unwrap_or(0.0))
-            .collect(),
-        hound::SampleFormat::Int => {
-            let max = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            reader
-                .into_samples::<i32>()
-                .map(|x| x.unwrap_or(0) as f32 / max)
-                .collect()
-        }
-    };
-    // Сводим в моно (среднее по каналам).
-    let mono: Vec<f32> = if channels <= 1 {
-        raw_samples
-    } else {
-        raw_samples
-            .chunks(channels)
-            .map(|fr| fr.iter().sum::<f32>() / fr.len() as f32)
-            .collect()
-    };
-    let full16 = audio::resample_to_16k(&mono, in_rate);
-    let dur_s = full16.len() as f32 / 16000.0;
-    eprintln!(
-        "[stream] длительность аудио ≈ {dur_s:.2} c, сэмплов(16к)={}",
-        full16.len()
-    );
-
-    // Поднимаем whisper-server напрямую (вне Tauri-контекста) и ждём готовности.
-    const PORT: u16 = 8771;
-    eprintln!("[stream] поднимаю whisper-server на :{PORT} …");
-    let t_boot = Instant::now();
-    let mut srv = match asr::start_server(&whisper_dir, &model, PORT, threads) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("[stream] ОШИБКА: сервер не поднялся: {e:#}");
-            eprintln!("[stream] (в этом окружении GPU-сборки нет; CPU-сервер может стартовать долго либо упасть)");
-            return;
-        }
-    };
-    eprintln!(
-        "[stream] сервер готов за {} мс",
-        t_boot.elapsed().as_millis()
-    );
-
-    // Прогрев (как в warmup): первый запрос грузит/инициализирует модель.
-    {
-        let warm = paths::tmp_dir().join("ss_warmup.wav");
-        let _ = audio::write_wav_16k_mono(&warm, &vec![0.0f32; 8000]);
-        let tw = Instant::now();
-        let _ = asr::transcribe_server(PORT, &warm, &s.language, None);
-        eprintln!("[stream] прогрев модели: {} мс", tw.elapsed().as_millis());
-    }
-
-    // Имитация петли: нарастающие срезы 1 c, 2 c, 3 c … до полного.
-    println!("──────── PARTIALS (UNGATED, нарастающие срезы) ────────");
-    let step = 16000usize; // 1 секунда
-    let mut cut = step;
-    let mut tick = 0u32;
-    // Тот же стабилизатор, что и в реальной петле — проверяем, что COMMIT растёт
-    // монотонно и НЕ переписывает уже показанное (VOL — изменчивый хвост).
-    let mut stab = crate::engine::PrefixStabilizer::new(6, 2);
-    loop {
-        let end = cut.min(full16.len());
-        let slice = &full16[..end];
-        let trimmed = audio::trim_silence(slice, 16000);
-        let wav = paths::tmp_dir().join("ss_partial.wav");
-        if audio::write_wav_16k_mono(&wav, &trimmed).is_err() {
-            break;
-        }
-        tick += 1;
-        let t = Instant::now();
-        let txt = asr::transcribe_server_partial(PORT, &wav, &s.language)
-            .unwrap_or_else(|e| format!("<err: {e}>"));
-        let ms = t.elapsed().as_millis();
-        let sec = end as f32 / 16000.0;
-        let (committed, volatile) = stab.push(&txt);
-        println!("[p{tick:02} @ {sec:>4.1}c | {ms:>6} мс] COMMIT={committed:?} | VOL={volatile:?}");
-        if end >= full16.len() {
-            break;
-        }
-        cut += step;
-    }
-
-    // Финальный ГЕЙТОВАННЫЙ проход — как в process_utterance.
-    println!("──────── FINAL (gated + postprocess) ────────");
-    let final16 = audio::trim_silence(&full16, 16000);
-    let wav = paths::tmp_dir().join("ss_final.wav");
-    audio::write_wav_16k_mono(&wav, &final16).expect("записать финальный WAV");
-    let tf = Instant::now();
-    let raw = asr::transcribe_server(PORT, &wav, &s.language, None).unwrap_or_default();
-    let ms = tf.elapsed().as_millis();
-    println!("[final | {ms} мс] RAW(gated): {raw:?}");
-    let clean = postprocess::process(&raw, &s, &[], &[]);
-    println!("[final] CLEAN: {clean:?}");
-    if raw.trim().is_empty() {
-        println!("[final] гейт ОТКЛОНИЛ (пусто) — для тишины/мусора это норма");
-    }
-
-    let _ = srv.child.kill();
-    eprintln!("[stream] сервер остановлен. Готово.");
-}
-
 /// Headless-проверка ОБЛАЧНОГО STT (без GUI/микрофона): на готовом WAV прогоняет
 /// `cloud_stt::transcribe` согласно текущему `stt_provider` в настройках, печатает
 /// провайдера, RAW-ответ и затраченное время.
@@ -1020,7 +827,7 @@ fn wer(reference: &str, hypothesis: &str) -> Option<f64> {
 /// Без эталонов бенч печатает расхождение маршрутов между собой — этого хватает,
 /// чтобы увидеть выпадающий маршрут и написать эталоны только для спорных файлов.
 pub fn wer_bench(dir: &str, limit: Option<usize>) {
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::Instant;
 
     let s = cli_load_settings("wer");
@@ -1065,14 +872,10 @@ pub fn wer_bench(dir: &str, limit: Option<usize>) {
     let mut parakeet = parakeet::dir_ready(&paths::parakeet_dir())
         .then(|| parakeet::Parakeet::load(&paths::parakeet_dir(), threads).ok())
         .flatten();
-    let whisper_dir = paths::whisper_dir_standalone();
-    let whisper_model = paths::model_path(&s.model);
-    let whisper_ready = whisper_model.exists();
     eprintln!(
-        "[wer] маршруты: gigaam={} parakeet={} whisper={}",
+        "[wer] маршруты: gigaam={} parakeet={}",
         gigaam.is_some(),
-        parakeet.is_some(),
-        whisper_ready
+        parakeet.is_some()
     );
     if let (Some(g), Some(p)) = (gigaam.as_mut(), parakeet.as_mut()) {
         let _ = g.transcribe(&vec![0.0f32; 8000]);
@@ -1146,28 +949,6 @@ pub fn wer_bench(dir: &str, limit: Option<usize>) {
                 hyps.push(("parakeet".into(), text));
             }
         }
-        if whisper_ready {
-            let t = Instant::now();
-            let out = asr::transcribe_cli(&asr::AsrParams {
-                whisper_dir: &whisper_dir,
-                model_path: &whisper_model,
-                wav_path: Path::new(wav),
-                language: &s.language,
-                threads: s.effective_threads(),
-                initial_prompt: None,
-            });
-            if let Some(text) = run("whisper", t.elapsed().as_millis(), out) {
-                // Постобработка меряется отдельно: она уже один раз съедала слова
-                // (см. PROMPT_OPUS5_TEXT_LOSS.md), и по одной цифре «итогового»
-                // WER было бы не понять, ASR это или правила.
-                let clean = postprocess::process(&text, &s, &[], &[]);
-                if clean.trim() != text.trim() {
-                    run("whisper+post", 0, Ok(clean));
-                }
-                hyps.push(("whisper".into(), text));
-            }
-        }
-
         // Эталона нет — показываем расхождение маршрутов между собой.
         if reference.is_none() && hyps.len() > 1 {
             let (base_name, base_text) = &hyps[0];

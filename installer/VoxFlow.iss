@@ -19,7 +19,7 @@
 ; ============================================================================
 
 #define AppName    "VoxFlow"
-#define AppVersion "2.4.4"
+#define AppVersion "2.4.5"
 #define Publisher  "Крылов Анатолий Евгеньевич"
 #define AppExe     "voxflow.exe"
 #define SrcDir     "..\voxflow\src-tauri\target\release"
@@ -30,7 +30,7 @@ AppId={{B2F1A9E0-7C4D-4E8A-9F3B-1A2C5D6E7F80}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#Publisher}
-VersionInfoVersion=2.4.4.0
+VersionInfoVersion=2.4.5.0
 
 ; --- Per-user install: no elevation, current user only. ---
 PrivilegesRequired=lowest
@@ -85,18 +85,15 @@ Source: "assets\progress-grad.bmp"; Flags: dontcopy noencryption
 ; Main executable.
 Source: "{#SrcDir}\voxflow.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; App-local Microsoft VC++ CRT/OpenMP. This keeps the per-user install free of a
-; VC_redist elevation/UAC step. The same DLLs are already copied into both
-; whisper Release folders by fetch_windows_runtime.ps1 and travel with the
-; wildcard resource entries below.
+; VC_redist elevation/UAC step.
 Source: "..\voxflow\src-tauri\resources\windows-redist\*"; DestDir: "{app}"; Flags: ignoreversion
-; Whisper runtime — MUST land at {app}\resources\whisper\Release\* (paths.rs
-; resolves resource_dir() == exe directory).
-Source: "{#SrcDir}\resources\whisper\Release\*"; DestDir: "{app}\resources\whisper\Release"; Flags: ignoreversion recursesubdirs createallsubdirs
-; GPU (CUDA) whisper runtime (~698 MB). paths.rs prefers this over the CPU build
-; when NVIDIA nvcuda.dll is present. Lands at {app}\resources\whisper-cuda\Release\*.
-Source: "{#SrcDir}\resources\whisper-cuda\Release\*"; DestDir: "{app}\resources\whisper-cuda\Release"; Flags: ignoreversion recursesubdirs createallsubdirs
 ; Silero VAD (~2.3 МБ) — берём напрямую из проверенного runtime-каталога.
 Source: "..\voxflow\src-tauri\resources\vad\*"; DestDir: "{app}\resources\vad"; Flags: ignoreversion
+[InstallDelete]
+; Whisper убран (D-065): рантаймы прошлых версий (CUDA ~698 МБ) больше не нужны.
+Type: filesandordirs; Name: "{app}\resources\whisper"
+Type: filesandordirs; Name: "{app}\resources\whisper-cuda"
+
 [Icons]
 Name: "{autoprograms}\VoxFlow"; Filename: "{app}\voxflow.exe"
 Name: "{autodesktop}\VoxFlow"; Filename: "{app}\voxflow.exe"; Tasks: desktopicon

@@ -128,7 +128,8 @@ fn transcribe_openai_compat_inner(
         .arg(request_timeout_secs(wav, profile).to_string())
         .arg("-F")
         .arg(&file_arg)
-        .arg("-F")
+        // --form-string: значение с «@» или «<» curl иначе читает как путь к файлу.
+        .arg("--form-string")
         .arg(&model_arg);
 
     // language — только если язык задан явно. auto/all/any/multi = автоопределение:
@@ -179,7 +180,7 @@ fn transcribe_openai_compat_inner(
         .get("text")
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow!("openai_compat STT: нет поля text"))?;
-    Ok(crate::asr::sanitize_transcript_text(text))
+    Ok(crate::transcript::sanitize_transcript_text(text))
 }
 
 /// Deepgram: бинарный POST на `{base}/v1/listen?...`. Ответ — JSON, транскрипт
@@ -201,7 +202,8 @@ fn transcribe_deepgram_inner(s: &Settings, wav: &Path, profile: RequestProfile) 
     let lang = deepgram_language_param(&s.language);
     let url = format!(
         "{base}/v1/listen?model={}&smart_format=true&punctuate=true&language={}",
-        s.deepgram_model, lang
+        url_token(&s.deepgram_model),
+        url_token(&lang)
     );
 
     let auth = format!("Authorization: Token {key}");
@@ -256,7 +258,7 @@ fn parse_deepgram_response(body: &str) -> Result<String> {
         .get("transcript")
         .and_then(|t| t.as_str())
         .ok_or_else(|| anyhow!("deepgram STT: нет транскрипта в ответе"))?;
-    let text = crate::asr::sanitize_transcript_text(transcript);
+    let text = crate::transcript::sanitize_transcript_text(transcript);
     if text.is_empty() {
         return Ok(text);
     }
@@ -299,9 +301,27 @@ fn sanitized_stt_prompt(prompt: Option<&str>) -> Option<String> {
     Some(collapsed.chars().take(MAX_STT_PROMPT_CHARS).collect())
 }
 
+/// Значение для query Deepgram: только символы имени модели/языка, иначе
+/// «nova-3&callback=…» из настроек дописало бы чужой параметр.
+fn url_token(v: &str) -> String {
+    v.trim()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deepgram_query_values_cannot_add_parameters() {
+        assert_eq!(url_token("nova-3"), "nova-3");
+        assert_eq!(
+            url_token("nova-3&callback=https://x"),
+            "nova-3callbackhttpsx"
+        );
+    }
 
     #[test]
     fn cloud_language_aliases_keep_auto_detection() {

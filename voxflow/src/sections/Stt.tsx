@@ -4,7 +4,7 @@ import { PageHead, SectionShell, Field, Select, Switch, Icon } from "../ui";
 import type { Settings } from "../types";
 import SecretControl from "../components/SecretControl";
 
-// Облачный STT (D-022). Локальный роутер GigaAM/Parakeet/Whisper остаётся
+// Облачный STT (D-022). Локальный роутер GigaAM/Parakeet остаётся
 // дефолтом и приватен — аудио не покидает устройство. Облачные провайдеры
 // подключаются здесь как альтернатива с авто-fallback на локальное распознавание.
 //
@@ -79,25 +79,11 @@ const STT_PRESETS: SttPreset[] = [
   },
 ];
 
-// Языки распознавания. «Авто» — Whisper для всех языков; явный RU/EN включают
-// быстрые специализированные GigaAM/Parakeet (если установлены).
+// Языки распознавания (D-065): «Авто» — GigaAM, английскую фразу берёт Parakeet.
 const LANGUAGE_OPTIONS = [
-  { value: "auto", label: "Все языки (авто)" },
+  { value: "auto", label: "Русский + English (авто)" },
   { value: "ru", label: "Русский" },
   { value: "en", label: "English" },
-  { value: "uk", label: "Українська" },
-  { value: "de", label: "Deutsch" },
-  { value: "fr", label: "Français" },
-  { value: "es", label: "Español" },
-  { value: "it", label: "Italiano" },
-  { value: "pt", label: "Português" },
-  { value: "pl", label: "Polski" },
-  { value: "tr", label: "Türkçe" },
-  { value: "zh", label: "中文" },
-  { value: "ja", label: "日本語" },
-  { value: "ko", label: "한국어" },
-  { value: "ar", label: "العربية" },
-  { value: "hi", label: "हिन्दी" },
 ];
 
 /**
@@ -165,7 +151,7 @@ export default function Stt({
 
       <Field
         label="Язык"
-        hint="«Авто» понимает все языки и смешанную речь. Русский и English работают быстрее."
+        hint="«Авто» - русский и английский, в том числе вперемешку. Русский и English по отдельности работают быстрее."
       >
         <Select
           value={settings.language}
@@ -397,7 +383,7 @@ export default function Stt({
       {!embedded && (
         <PageHead
           title="Облако"
-          desc="Облачный движок распознавания речи. Локальный GigaAM/Parakeet/Whisper остаётся по умолчанию и приватен — аудио не покидает устройство."
+          desc="Облачный движок распознавания речи. Локальный GigaAM/Parakeet остаётся по умолчанию и приватен — аудио не покидает устройство."
         />
       )}
       {main}

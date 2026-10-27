@@ -69,7 +69,7 @@ type StatusPayload =
       lang?: DetectedLang;
       seq?: number;
       latched?: boolean;
-      // Короткое имя распознавателя ("GigaAM" | "Parakeet" | "Whisper" | "Облако").
+      // Короткое имя распознавателя ("GigaAM" | "Parakeet" | "Облако").
       // Нет поля - старый бэкенд, метку не трогаем; null - модели нет.
       model?: string | null;
       // ИИ-обработка: { kind: local | cloud | off | missing, name }.

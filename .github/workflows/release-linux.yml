@@ -78,7 +78,7 @@ jobs:
         run: npm audit --audit-level=high
 
       # Tauri проверяет glob'ы ресурсов уже в build.rs, поэтому рантайм
-      # (whisper.cpp + Silero VAD, версии и SHA-256 закреплены) нужен до clippy.
+      # (Silero VAD, версия и SHA-256 закреплены) нужен до clippy.
       - name: Build verified Linux runtime resources
         run: bash script/build_linux_runtime.sh
 
@@ -146,7 +146,6 @@ jobs:
               exit 1
             fi
           }
-          check "deb: whisper-cli" "$deb_list" 'whisper-linux-x64/whisper-cli'
           check "deb: silero_vad.onnx" "$deb_list" 'vad/silero_vad.onnx'
           check "deb: Depends libwebkit2gtk-4.1-0" "$deb_info" 'libwebkit2gtk-4.1-0'
           check "deb: .desktop Categories" "$desktop" '^Categories=Utility;Audio;'

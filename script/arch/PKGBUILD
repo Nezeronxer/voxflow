@@ -12,7 +12,7 @@ arch=('x86_64')
 url="https://github.com/Nezeronxer/voxflow"
 license=('LicenseRef-VoxFlow-Proprietary')
 # NEEDED бинарника voxflow (objdump -p) по пакетам Arch; libayatana-appindicator
-# грузится через dlopen для значка в трее. whisper-cli/whisper-server - только glibc.
+# грузится через dlopen для значка в трее.
 # CI ставит пакет в чистый контейнер и проверяет ldd на «not found».
 depends=(
   'webkit2gtk-4.1'

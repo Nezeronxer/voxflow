@@ -48,7 +48,6 @@ on:
       - ".github/workflows/release.yml"
       - "script/build_macos_arm64_release.sh"
       - "script/check_versions.py"
-      - "script/patches/whisper.cpp-v1.8.6-macos11.patch"
       - "voxflow/package.json"
       - "voxflow/package-lock.json"
       - "voxflow/src/**"

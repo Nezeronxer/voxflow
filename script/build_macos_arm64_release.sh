@@ -18,29 +18,15 @@ readonly TARGET_TRIPLE="aarch64-apple-darwin"
 readonly TARGET_ARCH="arm64"
 readonly MIN_MACOS_VERSION="11.0"
 
-readonly WHISPER_VERSION="1.8.6"
-readonly WHISPER_COMMIT="23ee03506a91ac3d3f0071b40e66a430eebdfa1d"
-readonly WHISPER_SOURCE_DATE_EPOCH="1780314980"
-readonly WHISPER_ARCHIVE_SHA256="c8b0de473e9ec47a74bdf6104425c709261beeada8d6d7c1fec7432be701d032"
-readonly WHISPER_ARCHIVE_URL="https://codeload.github.com/ggml-org/whisper.cpp/tar.gz/${WHISPER_COMMIT}"
-readonly WHISPER_MACOS11_PATCH="script/patches/whisper.cpp-v1.8.6-macos11.patch"
-readonly WHISPER_MACOS11_PATCH_SHA256="8ebc327129c2d5e2e970fc06080c6218034d412f2dcc8499544ffdab2a45ffe7"
-readonly WHISPER_PATCHED_METAL_SHA256="276500e84ede862135a8bfd430f616f4e88daacaa5f04287f19028f0c37edbdd"
-
 readonly SILERO_COMMIT="b163605b3f44c3aadf28f97b125a2f7c461e9a7f"
 readonly SILERO_SHA256="1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
 readonly SILERO_URL="https://raw.githubusercontent.com/snakers4/silero-vad/${SILERO_COMMIT}/src/silero_vad/data/silero_vad.onnx"
-
-readonly CMAKE_VERSION="3.31.6"
-readonly CMAKE_SHA256="330b9514f5112e5ed4fb08b8b05803b776fd9b539a6ae12927d14dcc0ee2ba8d"
-readonly CMAKE_URL="https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-macos-universal.tar.gz"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$ROOT_DIR/voxflow"
 TAURI_DIR="$APP_DIR/src-tauri"
 MACOS_TAURI_CONFIG="$TAURI_DIR/tauri.macos.conf.json"
 RESOURCES_DIR="$TAURI_DIR/resources"
-ARM_RUNTIME_DIR="$RESOURCES_DIR/whisper-darwin-arm64"
 VAD_DIR="$RESOURCES_DIR/vad"
 TARGET_RELEASE_DIR="$TAURI_DIR/target/$TARGET_TRIPLE/release"
 APP_BUNDLE="$TARGET_RELEASE_DIR/bundle/macos/VoxFlow.app"
@@ -254,87 +240,22 @@ frontend_gates() {
   )
 }
 
-prepare_pinned_cmake() {
-  local archive="$TEMP_ROOT/cmake.tar.gz"
-  local cmake_root="$TEMP_ROOT/cmake"
-  download_verified "$CMAKE_URL" "$CMAKE_SHA256" "$archive"
-  mkdir -p "$cmake_root"
-  /usr/bin/tar -xzf "$archive" -C "$cmake_root" --strip-components=1
-  CMAKE_BIN="$cmake_root/CMake.app/Contents/bin/cmake"
-  [[ -x "$CMAKE_BIN" ]] || die "pinned CMake executable is missing"
-  [[ "$($CMAKE_BIN --version | awk 'NR == 1 {print $3}')" == "$CMAKE_VERSION" ]] \
-    || die "unexpected CMake version"
-}
-
+# Рантайм бандла - только Silero VAD: Whisper убран (D-065), ONNX Runtime
+# линкуется в бинарник крейтом ort.
 prepare_runtime() {
-  local whisper_archive="$TEMP_ROOT/whisper.cpp.tar.gz"
-  local whisper_source="$TEMP_ROOT/whisper.cpp"
-  local whisper_build="$TEMP_ROOT/whisper-build"
   local vad_model="$TEMP_ROOT/silero_vad.onnx"
-  local jobs
-  local reproducible_flags
 
-  prepare_pinned_cmake
-  download_verified "$WHISPER_ARCHIVE_URL" "$WHISPER_ARCHIVE_SHA256" "$whisper_archive"
   download_verified "$SILERO_URL" "$SILERO_SHA256" "$vad_model"
-
-  mkdir -p "$whisper_source"
-  /usr/bin/tar -xzf "$whisper_archive" -C "$whisper_source" --strip-components=1
-  [[ -s "$whisper_source/CMakeLists.txt" ]] || die "whisper.cpp source extraction failed"
-  assert_sha256 "$ROOT_DIR/$WHISPER_MACOS11_PATCH" "$WHISPER_MACOS11_PATCH_SHA256"
-  /usr/bin/patch --directory="$whisper_source" --strip=1 --fuzz=0 \
-    < "$ROOT_DIR/$WHISPER_MACOS11_PATCH"
-  assert_sha256 "$whisper_source/ggml/src/ggml-metal/ggml-metal-device.m" \
-    "$WHISPER_PATCHED_METAL_SHA256"
-
-  export MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS_VERSION"
-  jobs="$(/usr/sbin/sysctl -n hw.logicalcpu)"
-  reproducible_flags="-Werror=unguarded-availability-new -ffile-prefix-map=$TEMP_ROOT=/voxflow-build -fdebug-prefix-map=$TEMP_ROOT=/voxflow-build"
-  SOURCE_DATE_EPOCH="$WHISPER_SOURCE_DATE_EPOCH" \
-  "$CMAKE_BIN" -S "$whisper_source" -B "$whisper_build" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_C_FLAGS="$reproducible_flags" \
-    -DCMAKE_CXX_FLAGS="$reproducible_flags" \
-    -DCMAKE_OSX_ARCHITECTURES="$TARGET_ARCH" \
-    -DCMAKE_OSX_DEPLOYMENT_TARGET="$MIN_MACOS_VERSION" \
-    -DBUILD_SHARED_LIBS=OFF \
-    -DGIT_EXECUTABLE=/usr/bin/true \
-    -DGIT_EXE=/usr/bin/true \
-    -DGGML_ACCELERATE=ON \
-    -DGGML_BLAS=OFF \
-    -DGGML_CCACHE=OFF \
-    -DGGML_METAL=ON \
-    -DGGML_METAL_EMBED_LIBRARY=ON \
-    -DGGML_METAL_MACOSX_VERSION_MIN="$MIN_MACOS_VERSION" \
-    -DGGML_METAL_NDEBUG=ON \
-    -DGGML_NATIVE=OFF \
-    -DGGML_OPENMP=OFF \
-    -DWHISPER_BUILD_EXAMPLES=ON \
-    -DWHISPER_BUILD_SERVER=ON \
-    -DWHISPER_BUILD_TESTS=OFF
-  SOURCE_DATE_EPOCH="$WHISPER_SOURCE_DATE_EPOCH" \
-  "$CMAKE_BIN" --build "$whisper_build" --config Release \
-    --target whisper-cli whisper-server --parallel "$jobs"
-
-  rm -rf "$ARM_RUNTIME_DIR" "$VAD_DIR"
-  mkdir -p "$ARM_RUNTIME_DIR" "$VAD_DIR"
-  /usr/bin/install -m 0755 "$whisper_build/bin/whisper-cli" "$ARM_RUNTIME_DIR/whisper-cli"
-  /usr/bin/install -m 0755 "$whisper_build/bin/whisper-server" "$ARM_RUNTIME_DIR/whisper-server"
+  rm -rf "$VAD_DIR"
+  mkdir -p "$VAD_DIR"
   /usr/bin/install -m 0644 "$vad_model" "$VAD_DIR/silero_vad.onnx"
-
   validate_runtime "$RESOURCES_DIR"
-  "$ARM_RUNTIME_DIR/whisper-cli" --help >/dev/null 2>&1
-  "$ARM_RUNTIME_DIR/whisper-server" --help >/dev/null 2>&1
 }
 
 validate_runtime() {
   local root="$1"
-  local arm_dir="$root/whisper-darwin-arm64"
   local vad="$root/vad/silero_vad.onnx"
 
-  for binary in "$arm_dir/whisper-cli" "$arm_dir/whisper-server"; do
-    validate_native_binary "$binary"
-  done
   [[ -s "$vad" ]] || die "Silero VAD model is missing: $vad"
   assert_sha256 "$vad" "$SILERO_SHA256"
 }
@@ -450,7 +371,6 @@ targets = set(bundle.get("targets", []))
 resources = set(bundle.get("resources", []))
 expected_targets = {"app", "dmg"}
 expected_resources = {
-    "resources/whisper-darwin-arm64/*",
     "resources/vad/*",
 }
 
@@ -467,41 +387,11 @@ if resources != expected_resources:
 PY
 }
 
-sign_runtime_binaries() {
-  local identity="$APPLE_SIGNING_IDENTITY"
-  local timestamp_args=(--timestamp)
-  local binary identifier details
-  if [[ "$identity" == "-" || "$SELF_SIGNED" == "1" ]]; then
-    # A self-signed certificate gains nothing from Apple's timestamp server.
-    timestamp_args=(--timestamp=none)
-  fi
-
-  while IFS='|' read -r binary identifier; do
-    /usr/bin/codesign --force --sign "$identity" \
-      --identifier "$identifier" --options runtime "${timestamp_args[@]}" "$binary"
-    /usr/bin/codesign --verify --strict --verbose=4 "$binary"
-    details="$(/usr/bin/codesign -dvvv "$binary" 2>&1)"
-    grep -q 'flags=.*runtime' <<< "$details" \
-      || die "runtime sidecar is missing hardened runtime: $binary"
-    ! grep -q 'linker-signed' <<< "$details" \
-      || die "runtime sidecar still has only a linker signature: $binary"
-    if [[ "$SIGNING_LABEL" == "adhoc" ]]; then
-      grep -q '^Signature=adhoc$' <<< "$details" \
-        || die "runtime sidecar is not ad-hoc signed: $binary"
-    fi
-  done <<EOF
-$ARM_RUNTIME_DIR/whisper-cli|com.nezeronxer.voxflow.whisper-cli
-$ARM_RUNTIME_DIR/whisper-server|com.nezeronxer.voxflow.whisper-server
-EOF
-}
-
 validate_signing_state() {
   local app="$1"
   local details
   local embedded_entitlements="$TEMP_ROOT/embedded-entitlements.plist"
   local team_identifier
-  local nested_details
-  local nested_binary
   details="$(/usr/bin/codesign -dvvv "$app" 2>&1)" \
     || die "app bundle has no complete code signature: $app"
   /usr/bin/codesign --verify --strict --verbose=4 "$app"
@@ -553,21 +443,6 @@ PY
     [[ -n "$team_identifier" && "$team_identifier" != "not set" ]] \
       || die "signed app has no TeamIdentifier"
   fi
-
-  for nested_binary in \
-    "$app/Contents/Resources/resources/whisper-darwin-arm64/whisper-cli" \
-    "$app/Contents/Resources/resources/whisper-darwin-arm64/whisper-server"; do
-    /usr/bin/codesign --verify --strict --verbose=4 "$nested_binary"
-    nested_details="$(/usr/bin/codesign -dvvv "$nested_binary" 2>&1)"
-    grep -q 'flags=.*runtime' <<< "$nested_details" \
-      || die "bundled runtime sidecar is missing hardened runtime: $nested_binary"
-    ! grep -q 'linker-signed' <<< "$nested_details" \
-      || die "bundled runtime sidecar has only a linker signature: $nested_binary"
-    if [[ "$SIGNING_LABEL" == "adhoc" ]]; then
-      grep -q '^Signature=adhoc$' <<< "$nested_details" \
-        || die "bundled runtime sidecar is not ad-hoc signed: $nested_binary"
-    fi
-  done
 
   # syspolicy_check still reports the expected Adhoc Signed App / missing
   # notarization ticket in the secret-free build. A structural Codesign Error,
@@ -683,16 +558,9 @@ validate_app_bundle() {
   [[ -s "$contents/Resources/icon.icns" ]] || die "app icon is missing"
   validate_native_binary "$contents/MacOS/voxflow"
   validate_runtime "$bundled_resources"
-  unexpected_runtime="$(find "$bundled_resources" -maxdepth 1 -type d \
-    -name 'whisper-darwin-*' ! -name 'whisper-darwin-arm64' -print -quit)"
+  unexpected_runtime="$(find "$bundled_resources" -maxdepth 1 -name 'whisper*' -print -quit)"
   [[ -z "$unexpected_runtime" ]] \
-    || die "non-ARM64 whisper runtime was bundled: $unexpected_runtime"
-  for unexpected_runtime in whisper whisper-cuda; do
-    [[ ! -e "$bundled_resources/$unexpected_runtime" ]] \
-      || die "Windows whisper runtime polluted the macOS bundle: $bundled_resources/$unexpected_runtime"
-  done
-  /usr/bin/cmp "$ARM_RUNTIME_DIR/whisper-cli" "$bundled_resources/whisper-darwin-arm64/whisper-cli"
-  /usr/bin/cmp "$ARM_RUNTIME_DIR/whisper-server" "$bundled_resources/whisper-darwin-arm64/whisper-server"
+    || die "whisper runtime must not be bundled (D-065): $unexpected_runtime"
 
   plist_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")"
   plist_minimum="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$plist")"
@@ -846,16 +714,8 @@ package_outputs() {
     echo "notarization_auth=$NOTARIZATION_AUTH"
     echo "microphone_entitlement=true"
     echo "apple_events_entitlement=true"
-    echo "whisper_version=$WHISPER_VERSION"
-    echo "whisper_commit=$WHISPER_COMMIT"
-    echo "whisper_source_date_epoch=$WHISPER_SOURCE_DATE_EPOCH"
-    echo "whisper_source_sha256=$WHISPER_ARCHIVE_SHA256"
-    echo "whisper_macos11_patch_sha256=$WHISPER_MACOS11_PATCH_SHA256"
-    echo "whisper_cli_sha256=$(sha256_of "$ARM_RUNTIME_DIR/whisper-cli")"
-    echo "whisper_server_sha256=$(sha256_of "$ARM_RUNTIME_DIR/whisper-server")"
     echo "silero_commit=$SILERO_COMMIT"
     echo "silero_sha256=$SILERO_SHA256"
-    echo "cmake_version=$CMAKE_VERSION"
     echo "package_lock_sha256=$(sha256_of "$APP_DIR/package-lock.json")"
     echo "cargo_lock_sha256=$(sha256_of "$TAURI_DIR/Cargo.lock")"
     echo "tauri_macos_config_sha256=$(sha256_of "$MACOS_TAURI_CONFIG")"
@@ -877,7 +737,7 @@ main() {
   TEMP_ROOT="$(/usr/bin/mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/voxflow-macos-arm64.XXXXXX")"
   if [[ "$RUNTIME_ONLY" == 1 ]]; then
     prepare_runtime
-    echo "Verified macOS ARM64 runtime: $ARM_RUNTIME_DIR"
+    echo "Verified macOS ARM64 runtime: $VAD_DIR"
     return
   fi
   require_command node
@@ -890,7 +750,6 @@ main() {
   prepare_runtime
   rust_gates
   configure_signing
-  sign_runtime_binaries
 
   local version
   version="$(cd "$APP_DIR" && node -p "require('./package.json').version")"

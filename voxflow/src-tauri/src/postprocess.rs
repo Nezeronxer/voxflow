@@ -1676,83 +1676,6 @@ fn expand_template_with(content: &str, date: &str, time: &str, clipboard: Option
     out
 }
 
-/// Короткая русская затравка по умолчанию. Даёт декодеру контекст языка/стиля
-/// (грамотный русский с пунктуацией) и подавляет дрейф в латиницу, когда словарь
-/// пользователя пуст. Намеренно нейтральная и КОРОТКАЯ, чтобы не «протекать» в
-/// распознанный текст. Применяется только для русского языка (см. engine.rs).
-pub const DEFAULT_RU_PROMPT: &str = "Распознавание русской речи. Грамотный текст с пунктуацией. Окончание записи не означает окончание предложения: не ставь финальную точку, если фраза грамматически не закончена.";
-
-/// Короткий local-ASR bias из желаемых словарных форм и голосовых триггеров.
-/// Тела сниппетов не включаются, чтобы decoder не галлюцинировал их в тишине.
-///
-/// `base` — необязательная языковая затравка (для ru — `DEFAULT_RU_PROMPT`),
-/// чтобы и при ПУСТОМ словаре декодер получал контекст (раньше затравка была
-/// пустой → бесполезной). Для не-русского языка `base` передаётся как None.
-pub fn asr_bias_prompt(dict: &[Dict], snippets: &[Snippet], base: Option<&str>) -> Option<String> {
-    const TERM_LIMIT: usize = 32;
-    const TRIGGER_LIMIT: usize = 12;
-    const MAX_CHARS: usize = 900;
-
-    let mut terms = Vec::new();
-    let mut seen = HashSet::new();
-    for entry in dict {
-        for value in [&entry.replacement, &entry.term] {
-            let value = value.trim();
-            if value.is_empty() {
-                continue;
-            }
-            if seen.insert(value.to_lowercase()) {
-                terms.push(value);
-                if terms.len() >= TERM_LIMIT {
-                    break;
-                }
-            }
-        }
-        if terms.len() >= TERM_LIMIT {
-            break;
-        }
-    }
-
-    let mut triggers = Vec::new();
-    let mut seen_triggers = HashSet::new();
-    for snippet in snippets {
-        let trigger = snippet.trigger.trim();
-        if trigger.is_empty() {
-            continue;
-        }
-        for value in [Some(trigger), trigger.strip_prefix('/').map(str::trim)]
-            .into_iter()
-            .flatten()
-        {
-            if !value.is_empty() && seen_triggers.insert(value.to_lowercase()) {
-                triggers.push(value);
-                if triggers.len() >= TRIGGER_LIMIT {
-                    break;
-                }
-            }
-        }
-        if triggers.len() >= TRIGGER_LIMIT {
-            break;
-        }
-    }
-
-    let mut parts = Vec::new();
-    if let Some(base) = base.map(str::trim).filter(|value| !value.is_empty()) {
-        parts.push(base.to_string());
-    }
-    if !terms.is_empty() {
-        parts.push(format!("Словарь: {}.", terms.join(", ")));
-    }
-    if !triggers.is_empty() {
-        parts.push(format!("Голосовые триггеры: {}.", triggers.join(", ")));
-    }
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join(" ").chars().take(MAX_CHARS).collect())
-    }
-}
-
 #[cfg(test)]
 mod filler_tests {
     use super::*;
@@ -2593,33 +2516,6 @@ mod filler_tests {
             process("wispr flow and wispr", &s, &dict, &[]),
             "Wispr Flow and X"
         );
-    }
-
-    #[test]
-    fn local_asr_bias_contains_terms_and_triggers_but_not_snippet_body() {
-        let dict = vec![
-            Dict {
-                term: "виспр флоу".into(),
-                replacement: "Wispr Flow".into(),
-            },
-            Dict {
-                term: "WISPR FLOW".into(),
-                replacement: "Wispr Flow".into(),
-            },
-        ];
-        let snippets = vec![Snippet {
-            trigger: "/адрес".into(),
-            content: "Секретное тело сниппета".into(),
-            is_template: false,
-        }];
-        let prompt = asr_bias_prompt(&dict, &snippets, Some(DEFAULT_RU_PROMPT)).expect("prompt");
-        assert!(prompt.contains("Wispr Flow"));
-        assert!(prompt.contains("виспр флоу"));
-        assert_eq!(prompt.matches("Wispr Flow").count(), 1);
-        assert!(prompt.contains("/адрес"));
-        assert!(prompt.contains("адрес"));
-        assert!(!prompt.contains("Секретное тело сниппета"));
-        assert!(prompt.chars().count() <= 900);
     }
 }
 

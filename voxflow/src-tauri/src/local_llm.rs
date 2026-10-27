@@ -730,7 +730,7 @@ pub fn ensure_server(model_id: &str, gpu: bool, threads: u32) -> Result<()> {
         },
         None => (Stdio::null(), Stdio::null()),
     };
-    let port = crate::asr::reserve_loopback_port()?;
+    let port = crate::net::reserve_loopback_port()?;
     let mut cmd = Command::new(&bin);
     cmd.args(server_args(&path, gpu, threads, port))
         .stdin(Stdio::null())

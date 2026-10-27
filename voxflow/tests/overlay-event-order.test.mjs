@@ -101,7 +101,7 @@ test("meta label shows recognizer and AI model, warns when missing", () => {
   assert.equal(label("GigaAM", { kind: "local", name: "gemma4:e2b" }), "GigaAM · ИИ gemma4:e2b");
   assert.equal(label("Облако", { kind: "off", name: null }), "Облако · ИИ выкл.");
   assert.equal(label("GigaAM", { kind: "missing", name: null }), "GigaAM · !ИИ не найдена");
-  assert.equal(label("Whisper", { kind: "cloud" }), "Whisper · ИИ облако");
+  assert.equal(label("Parakeet", { kind: "cloud" }), "Parakeet · ИИ облако");
   assert.equal(label(null, { kind: "local", name: "" }), "!Нет модели · ИИ локально");
   assert.equal(label("  ", undefined), "!Нет модели");
   // Старый бэкенд без полей - метки нет.

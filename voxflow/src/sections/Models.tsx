@@ -9,7 +9,7 @@ import {
   revealPath,
   openExternalUrl,
 } from "../api";
-import { PageHead, Field, Select, Icon } from "../ui";
+import { PageHead, Field, Icon } from "../ui";
 import { deleteConfirmText, isUnused, modelSizeText } from "../modelsState";
 import type {
   Settings,
@@ -21,15 +21,6 @@ import type {
 
 // Коэффициент EMA-сглаживания мгновенной скорости: резкие скачки сети не дёргают ETA.
 const SPEED_EMA = 0.3;
-
-const PRIMARY_ENGINE_OPTIONS = [
-  { value: "whisper_server", label: "Whisper Server (все языки)" },
-  { value: "gigaam", label: "GigaAM RU / Parakeet EN" },
-];
-const LEGACY_CLI_OPTION = {
-  value: "whisper_cli",
-  label: "Whisper CLI (устаревший, медленнее)",
-};
 
 type Progress = {
   received: number;
@@ -55,8 +46,7 @@ function fmtEta(sec: number): string {
   return `осталось ${m}:${String(s % 60).padStart(2, "0")}`;
 }
 
-// Прогресс загрузки: полоска, «12 МБ/с · осталось 0:18» и отмена. Общий для
-// hero-карточек и строк Whisper.
+// Прогресс загрузки: полоска, «12 МБ/с · осталось 0:18» и отмена.
 function DownloadProgress({
   name,
   prog,
@@ -108,23 +98,18 @@ function cleanLabel(label: string): string {
 const KIND_NOTE: Record<string, string> = {
   gigaam: "Русский",
   parakeet: "English",
-  whisper: "Все языки",
 };
 
 // Строка модели: название, язык и размер, справа — действие по состоянию:
-// прогресс с отменой, «Выбрать»/«Активна» для Whisper, удалить, скачать.
+// прогресс с отменой, удалить, скачать.
 function ModelRow({
   model,
   prog,
-  selected,
-  onSelect,
   onDownload,
   onDelete,
 }: {
   model: ModelInfo;
   prog?: Progress;
-  selected: boolean;
-  onSelect?: () => void;
   onDownload: (name: string) => void;
   onDelete: (name: string) => Promise<void>;
 }) {
@@ -133,12 +118,11 @@ function ModelRow({
   const [confirming, setConfirming] = useState(false);
   const [deleting, setDeleting] = useState(false);
   return (
-    <div className={`model-row ${selected ? "selected" : ""}`}>
+    <div className="model-row">
       <div className="model-info">
         <div className="model-name">
           {cleanLabel(model.label || model.name)}
-          {selected && <span className="badge accent">Активна</span>}
-          {!selected && isUnused(model) && <span className="badge">Не используется</span>}
+          {isUnused(model) && <span className="badge">Не используется</span>}
         </div>
         <div className="model-size">
           {KIND_NOTE[model.kind ?? ""] ?? ""} · {modelSizeText(model)}
@@ -177,11 +161,6 @@ function ModelRow({
         </div>
       ) : model.installed ? (
         <div className="row-flex">
-          {onSelect && !selected && (
-            <button className="btn btn-sm" onClick={onSelect}>
-              Выбрать
-            </button>
-          )}
           <button
             className="btn btn-sm btn-ghost"
             onClick={() => setConfirming(true)}
@@ -310,20 +289,12 @@ export default function Models({
   // Наверху — то, что уже на диске или качается; остальное свёрнуто.
   const inUse = visible.filter((m) => m.installed || progress[m.name]);
   const others = visible.filter((m) => !m.installed && !progress[m.name]);
-  // Новому выбору CLI не предлагаем. Если он уже сохранён, option остаётся
-  // видимым, чтобы select не получил неизвестный value и переход был явным.
-  const engineOptions =
-    settings.engine === "whisper_cli"
-      ? [...PRIMARY_ENGINE_OPTIONS, LEGACY_CLI_OPTION]
-      : PRIMARY_ENGINE_OPTIONS;
 
   const row = (m: ModelInfo) => (
     <ModelRow
       key={m.name}
       model={m}
       prog={progress[m.name]}
-      selected={m.kind === "whisper" && settings.model === m.name}
-      onSelect={m.kind === "whisper" ? () => update({ model: m.name }) : undefined}
       onDownload={onDownload}
       onDelete={onDelete}
     />
@@ -336,7 +307,7 @@ export default function Models({
         <div className="sub">
           {settings.stt_provider !== "local"
             ? "Сейчас распознаёт облако — модели нужны для офлайна и живого текста в плашке."
-            : "Работают без интернета. Русский — GigaAM, English — Parakeet, остальные языки — Whisper."}
+            : "Работают без интернета. Русский — GigaAM, English — Parakeet, «Авто» — обе."}
         </div>
       </div>
 
@@ -380,16 +351,6 @@ export default function Models({
 
   const advanced = (
     <>
-      <Field
-        label="Движок на устройстве"
-        hint="Whisper — все языки; GigaAM/Parakeet — быстрее для русского и английского"
-      >
-        <Select
-          value={settings.engine}
-          onChange={(v) => update({ engine: v })}
-          options={engineOptions}
-        />
-      </Field>
       <Field label="Потоки процессора" hint="0 — автоматически">
         <input
           type="number"

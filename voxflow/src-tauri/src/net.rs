@@ -263,9 +263,30 @@ pub fn proxy_configured(settings_proxy: &str) -> bool {
     })
 }
 
+/// Свободный loopback-порт для локального сервера (встроенная LLM).
+pub fn reserve_loopback_port() -> anyhow::Result<u16> {
+    use anyhow::Context;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .context("не удалось подобрать свободный loopback-порт")?;
+    let port = listener
+        .local_addr()
+        .context("не удалось прочитать loopback-порт")?
+        .port();
+    Ok(port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reserve_loopback_port_returns_reusable_port() {
+        let port = reserve_loopback_port().expect("reserve loopback port");
+        assert_ne!(port, 0);
+        let listener = std::net::TcpListener::bind(("127.0.0.1", port))
+            .expect("reserved port should be reusable after listener drop");
+        drop(listener);
+    }
 
     #[test]
     fn secret_header_line_простой_заголовок() {

@@ -1,7 +1,7 @@
 //! Resolution of data/model/tmp/resource paths.
 //!
-//! ВАЖНО (R5): whisper.cpp открывает файлы через ANSI-codepage, поэтому пути к
-//! МОДЕЛИ и временным WAV должны быть ASCII. Их кладём в %LOCALAPPDATA%\VoxFlow
+//! ВАЖНО (R5): пути к МОДЕЛЯМ и временным WAV держим ASCII (так было нужно
+//! whisper.cpp с ANSI-codepage, данные пользователей уже лежат здесь). Их кладём в %LOCALAPPDATA%\VoxFlow
 //! (юзернейм ASCII). Сами exe/DLL грузятся ОС по wide-пути — им кириллица ок.
 
 use std::fs::{File, OpenOptions};
@@ -161,6 +161,17 @@ fn cleanup_stale_temp_files_in(
                 .is_some_and(|name| {
                     name.starts_with("VoxFlow-Setup-") || name.starts_with("VoxFlow-macOS-")
                 });
+        // Конфиг curl с ключом от прогретого соединения (rewrite.rs): процесс,
+        // который его создал, мёртв - файл ничей, ждать сутки с ключом незачем.
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.starts_with("curl_cfg-")
+            && !name.starts_with(&format!("curl_cfg-{}-", std::process::id()))
+        {
+            if std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+            continue;
+        }
         if !sensitive_temp && !stale_update_package {
             continue;
         }
@@ -214,25 +225,7 @@ pub fn db_path() -> PathBuf {
     data_dir().join("voxflow.db")
 }
 
-pub fn model_path(name: &str) -> PathBuf {
-    models_dir().join(name)
-}
-
-/// Каталог ресурсов с whisper-cli/whisper-server для macOS и Linux
-/// (на Windows они лежат в `whisper/Release`).
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn unix_whisper_resource_dir() -> &'static str {
-    if cfg!(target_os = "linux") {
-        "whisper-linux-x64"
-    } else if cfg!(target_arch = "aarch64") {
-        "whisper-darwin-arm64"
-    } else {
-        "whisper-darwin-x64"
-    }
-}
-
-/// Каталог моделей GigaAM (models/gigaam, ASCII-путь — ort открывает по wide,
-/// но единообразие с whisper-моделями дешевле, чем особые случаи).
+/// Каталог моделей GigaAM (models/gigaam, ASCII-путь — ort открывает по wide).
 pub fn gigaam_dir() -> PathBuf {
     private_dir(models_dir().join(crate::gigaam::GIGAAM_DIR))
 }
@@ -272,33 +265,26 @@ pub fn vad_model_path(app: Option<&AppHandle>) -> PathBuf {
     PathBuf::from(DEV_VAD)
 }
 
-/// Dev-копии бинарей whisper (вшиты на этапе компиляции): CPU и CUDA.
-const DEV_WHISPER_CPU: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/resources/whisper/Release");
-const DEV_WHISPER_CUDA: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/resources/whisper-cuda/Release"
-);
-
 /// Пользователь выключил графическое ускорение (настройка `gpu_mode = "off"`).
 static GPU_DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Применить настройку ускорения: зовётся при загрузке настроек и при каждом
-/// сохранении. "off" прячет NVIDIA от всех потребителей (whisper-сборка,
-/// живой стрим, ярусы локального ИИ); "auto"/"on" — по факту наличия карты.
+/// сохранении. "off" прячет видеокарту от встроенного ИИ (ярусы, слои на GPU);
+/// "auto"/"on" — по факту наличия карты.
 pub fn set_gpu_mode(mode: &str) {
     GPU_DISABLED.store(mode.trim() == "off", std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Можно ли считать на NVIDIA: карта есть И ускорение не выключено.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn gpu_active() -> bool {
     !GPU_DISABLED.load(std::sync::atomic::Ordering::SeqCst) && has_nvidia()
 }
 
 /// Можно ли встроенному ИИ (llama.cpp) отдавать слои на видеокарту. На
 /// Windows — NVIDIA, как и раньше; на Apple Silicon — всегда Metal, если
-/// ускорение не выключено. `gpu_active` для этого не годится: он про
-/// CUDA-сборку whisper и на macOS всегда ложь, из-за чего модель на Mac
-/// считалась только процессором.
+/// ускорение не выключено. `gpu_active` для этого не годится: он только про
+/// NVIDIA и на macOS всегда ложь.
 pub fn llm_gpu_active() -> bool {
     !GPU_DISABLED.load(std::sync::atomic::Ordering::SeqCst)
         && (cfg!(all(target_os = "macos", target_arch = "aarch64")) || has_nvidia())
@@ -317,102 +303,6 @@ pub fn has_nvidia() -> bool {
             .join("System32")
             .join("nvcuda.dll")
             .exists()
-    }
-}
-
-/// Каталог с whisper-cli.exe / whisper-server.exe + DLL.
-/// При наличии NVIDIA приоритет у CUDA-сборки (whisper-cuda), иначе CPU (whisper).
-/// В проде — из resource_dir, в dev — из dev-копий.
-pub fn whisper_dir(app: &AppHandle) -> PathBuf {
-    let cli = whisper_cli_name();
-    let res = app.path().resource_dir().ok();
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    // GPU-сборки имеют приоритет (и resource, и dev) над CPU.
-    if gpu_active() {
-        if let Some(r) = &res {
-            candidates.push(r.join("resources").join("whisper-cuda").join("Release"));
-            candidates.push(r.join("whisper-cuda"));
-        }
-        candidates.push(PathBuf::from(DEV_WHISPER_CUDA));
-    }
-    for candidate in candidates {
-        if candidate.join(cli).exists() {
-            return candidate;
-        }
-    }
-    whisper_cpu_dir(app)
-}
-
-/// Заведомо не-CUDA runtime. Используется как рабочий fallback, когда Windows
-/// содержит nvcuda.dll, но установленный драйвер несовместим с bundled CUDA DLL.
-pub fn whisper_cpu_dir(app: &AppHandle) -> PathBuf {
-    let cli = whisper_cli_name();
-    let res = app.path().resource_dir().ok();
-    let mut candidates: Vec<PathBuf> = Vec::new();
-
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let dir = unix_whisper_resource_dir();
-        if let Some(r) = &res {
-            candidates.push(r.join("resources").join(dir));
-            candidates.push(r.join(dir));
-        }
-        candidates.push(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("resources")
-                .join(dir),
-        );
-    }
-
-    if let Some(r) = &res {
-        candidates.push(r.join("resources").join("whisper").join("Release"));
-        candidates.push(r.join("whisper"));
-    }
-    candidates.push(PathBuf::from(DEV_WHISPER_CPU));
-
-    for candidate in candidates {
-        if candidate.join(cli).exists() {
-            return candidate;
-        }
-    }
-    PathBuf::from(DEV_WHISPER_CPU)
-}
-
-/// Dev-каталог whisper (для `--selftest` без Tauri-контекста): CUDA при наличии GPU.
-pub fn whisper_dir_standalone() -> PathBuf {
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("resources")
-            .join(unix_whisper_resource_dir());
-        if p.join(whisper_cli_name()).exists() {
-            return p;
-        }
-    }
-    if gpu_active() {
-        let p = PathBuf::from(DEV_WHISPER_CUDA);
-        if p.join(whisper_cli_name()).exists() {
-            return p;
-        }
-    }
-    PathBuf::from(DEV_WHISPER_CPU)
-}
-
-pub fn whisper_cli_name() -> &'static str {
-    if cfg!(windows) {
-        "whisper-cli.exe"
-    } else {
-        "whisper-cli"
-    }
-}
-
-#[allow(dead_code)] // задел под whisper-server (persistent), пока используем cli one-shot
-pub fn whisper_server_name() -> &'static str {
-    if cfg!(windows) {
-        "whisper-server.exe"
-    } else {
-        "whisper-server"
     }
 }
 
@@ -448,6 +338,10 @@ mod tests {
         let installer = dir.join("VoxFlow-Setup-1_0_8-123.exe");
         let foreign_exe = dir.join("keep-me.exe");
         let keep = dir.join("model.part");
+        let orphan_cfg = dir.join("curl_cfg-1-2-3.txt");
+        let own_cfg = dir.join(format!("curl_cfg-{}-2-3.txt", std::process::id()));
+        std::fs::write(&orphan_cfg, b"key").unwrap();
+        std::fs::write(&own_cfg, b"key").unwrap();
         std::fs::write(&wav, b"speech").unwrap();
         std::fs::write(&json, b"private text").unwrap();
         std::fs::write(&installer, b"old installer").unwrap();
@@ -463,7 +357,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(removed, 3);
+        assert_eq!(removed, 4);
+        assert!(
+            !orphan_cfg.exists(),
+            "ключ мёртвого процесса удаляется сразу"
+        );
+        assert!(own_cfg.exists(), "своё живое соединение не трогаем");
         assert!(!wav.exists());
         assert!(!json.exists());
         assert!(!installer.exists());

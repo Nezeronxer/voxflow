@@ -11,18 +11,7 @@ if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) {
   $RuntimeRoot = Join-Path $repoRoot "voxflow/src-tauri/resources"
 }
 
-# GitHub release asset digests for whisper.cpp v1.8.6 and a commit-pinned
-# Silero VAD model. Update URL and SHA256 together after compatibility testing.
-$cpuSource = @{
-  Url = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.6/whisper-bin-x64.zip"
-  Sha256 = "b07ea0b1b4115a38e1a7b07debf581f0b77d999925f8acb8f39d322b0ba0a822"
-  File = "whisper-bin-x64.zip"
-}
-$cudaSource = @{
-  Url = "https://github.com/ggml-org/whisper.cpp/releases/download/v1.8.6/whisper-cublas-12.4.0-bin-x64.zip"
-  Sha256 = "63b70c91fe2fd7449865c45f6422ab628439eacc6985d8309c77bfb65cc68a19"
-  File = "whisper-cublas-12.4.0-bin-x64.zip"
-}
+# Commit-pinned Silero VAD model. Update URL and SHA256 together.
 $vadSource = @{
   Url = "https://raw.githubusercontent.com/snakers4/silero-vad/b163605b3f44c3aadf28f97b125a2f7c461e9a7f/src/silero_vad/data/silero_vad.onnx"
   Sha256 = "1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3"
@@ -41,29 +30,6 @@ $requiredVcRuntimeFiles = @(
   "vcruntime140.dll",
   "vcruntime140_1.dll",
   "vcomp140.dll"
-)
-
-$cpuFiles = @(
-  "ggml.dll",
-  "ggml-base.dll",
-  "ggml-cpu.dll",
-  "whisper.dll",
-  "whisper-cli.exe",
-  "whisper-server.exe"
-)
-$cudaFiles = @(
-  "cublas64_12.dll",
-  "cublasLt64_12.dll",
-  "cudart64_12.dll",
-  "ggml.dll",
-  "ggml-base.dll",
-  "ggml-cpu.dll",
-  "ggml-cuda.dll",
-  "nvrtc-builtins64_124.dll",
-  "nvrtc64_120_0.dll",
-  "whisper.dll",
-  "whisper-cli.exe",
-  "whisper-server.exe"
 )
 
 function Assert-Sha256 {
@@ -193,35 +159,15 @@ function Copy-AppLocalRuntime {
   }
 }
 
-function Copy-RequiredFiles {
-  param(
-    [Parameter(Mandatory = $true)][string]$SourceDir,
-    [Parameter(Mandatory = $true)][string]$DestinationDir,
-    [Parameter(Mandatory = $true)][string[]]$Files
-  )
-  New-Item -ItemType Directory -Force -Path $DestinationDir | Out-Null
-  foreach ($file in $Files) {
-    $sourcePath = Join-Path $SourceDir $file
-    if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
-      throw "Verified archive is missing required file: $sourcePath"
-    }
-    Copy-Item -LiteralPath $sourcePath -Destination (Join-Path $DestinationDir $file) -Force
-  }
-}
-
 $tempBase = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
 $tempRoot = Join-Path $tempBase ("voxflow-runtime-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
 
 try {
-  $cpuZip = Join-Path $tempRoot $cpuSource.File
-  $cudaZip = Join-Path $tempRoot $cudaSource.File
   $vadModel = Join-Path $tempRoot $vadSource.File
   $webViewBootstrapper = Join-Path $tempRoot $webViewSource.File
   $vcRuntimeFiles = @(Get-VcRuntimeFiles)
 
-  Download-Verified -Source $cpuSource -Destination $cpuZip
-  Download-Verified -Source $cudaSource -Destination $cudaZip
   Download-Verified -Source $vadSource -Destination $vadModel
   # The official Evergreen bootstrapper is currently versioned as
   # "Microsoft Edge Update" even though the downloaded payload installs the
@@ -230,25 +176,14 @@ try {
   # remains the trust boundary.
   Download-MicrosoftSigned -Source $webViewSource -Destination $webViewBootstrapper -ExpectedProduct "WebView2|^Microsoft Edge Update$"
 
-  $cpuExtract = Join-Path $tempRoot "cpu"
-  $cudaExtract = Join-Path $tempRoot "cuda"
-  Expand-Archive -LiteralPath $cpuZip -DestinationPath $cpuExtract -Force
-  Expand-Archive -LiteralPath $cudaZip -DestinationPath $cudaExtract -Force
-
-  $cpuDest = Join-Path $RuntimeRoot "whisper/Release"
-  $cudaDest = Join-Path $RuntimeRoot "whisper-cuda/Release"
   $vadDest = Join-Path $RuntimeRoot "vad"
   $redistDest = Join-Path $RuntimeRoot "windows-redist"
   $prereqDest = Join-Path $RuntimeRoot "windows-prerequisites"
-  foreach ($destination in @($cpuDest, $cudaDest, $vadDest, $redistDest, $prereqDest)) {
+  foreach ($destination in @($vadDest, $redistDest, $prereqDest)) {
     Remove-Item -LiteralPath $destination -Recurse -Force -ErrorAction SilentlyContinue
   }
-  Copy-RequiredFiles -SourceDir (Join-Path $cpuExtract "Release") -DestinationDir $cpuDest -Files $cpuFiles
-  Copy-RequiredFiles -SourceDir (Join-Path $cudaExtract "Release") -DestinationDir $cudaDest -Files $cudaFiles
-  # App-local deployment avoids an elevated VC_redist install. Keep one source
-  # directory for {app}, and duplicate the DLLs beside both whisper sidecars so
-  # Windows' normal DLL search resolves their CRT/OpenMP dependencies reliably.
-  Copy-AppLocalRuntime -Files $vcRuntimeFiles -Destinations @($redistDest, $cpuDest, $cudaDest)
+  # App-local deployment avoids an elevated VC_redist install.
+  Copy-AppLocalRuntime -Files $vcRuntimeFiles -Destinations @($redistDest)
   New-Item -ItemType Directory -Force -Path $vadDest | Out-Null
   Copy-Item -LiteralPath $vadModel -Destination (Join-Path $vadDest "silero_vad.onnx") -Force
   Assert-Sha256 -Path (Join-Path $vadDest "silero_vad.onnx") -Expected $vadSource.Sha256
@@ -258,10 +193,6 @@ try {
   Assert-MicrosoftAuthenticode -Path $webViewInstalledPath -ExpectedProduct "WebView2|^Microsoft Edge Update$"
 
   foreach ($required in @(
-    (Join-Path $cpuDest "whisper-cli.exe"),
-    (Join-Path $cpuDest "whisper-server.exe"),
-    (Join-Path $cudaDest "whisper-cli.exe"),
-    (Join-Path $cudaDest "whisper-server.exe"),
     (Join-Path $vadDest "silero_vad.onnx"),
     $webViewInstalledPath
   )) {
@@ -269,7 +200,7 @@ try {
       throw "Runtime resource is missing or empty: $required"
     }
   }
-  foreach ($destination in @($redistDest, $cpuDest, $cudaDest)) {
+  foreach ($destination in @($redistDest)) {
     foreach ($required in $requiredVcRuntimeFiles) {
       $path = Join-Path $destination $required
       if (-not (Test-Path -LiteralPath $path -PathType Leaf) -or (Get-Item $path).Length -eq 0) {

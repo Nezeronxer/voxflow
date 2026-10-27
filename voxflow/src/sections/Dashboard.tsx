@@ -47,9 +47,9 @@ function modelLabel(settings: Settings): string {
   if (settings.stt_provider === "openai_compat") {
     return settings.oai_stt_model || "Облачное STT";
   }
-  if (settings.language === "ru" || settings.engine === "gigaam") return "GigaAM v3";
   if (settings.language === "en") return "Parakeet TDT v3";
-  return settings.model.includes("turbo") ? "Whisper Turbo" : "Whisper";
+  if (settings.language === "ru") return "GigaAM v3";
+  return "GigaAM v3 + Parakeet";
 }
 
 function aiLabel(settings: Settings, llm: LocalLlmState | null): string {
@@ -170,7 +170,8 @@ export default function Dashboard({
       subscribe<LevelPayload>("level", (event) => {
         const payload = event.payload;
         const seq = payload?.seq;
-        if (seq != null && seq <= levelSeqRef.current) return;
+        // seq = поколение диктовки, у всех событий одной записи он один (как в Overlay).
+        if (seq != null && seq < levelSeqRef.current) return;
         if (seq != null) levelSeqRef.current = seq;
         const rms = typeof payload?.rms === "number" ? payload.rms : 0;
         // лог-кривая: тихая речь тоже видна, пик не упирается в потолок

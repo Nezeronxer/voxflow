@@ -62,7 +62,6 @@ in_container_build() { # /in/voxflow.deb /in/LICENSE /scripts/arch/PKGBUILD -> /
   require_match "бинарник" "$files" '^/usr/bin/voxflow$'
   require_match ".desktop" "$files" '^/usr/share/applications/VoxFlow\.desktop$'
   require_match "иконка" "$files" '^/usr/share/icons/hicolor/.*/apps/voxflow\.png$'
-  require_match "whisper-cli" "$files" '/whisper-linux-x64/whisper-cli$'
   require_match "silero_vad.onnx" "$files" '/vad/silero_vad\.onnx$'
   chown "$host_owner" "$pkg"
 }
@@ -81,17 +80,13 @@ in_container_verify() { # /out/<pkg>
   owner="$(pacman -Qqo /usr/bin/voxflow)"
   [[ "$owner" == "voxflow" ]] || die "/usr/bin/voxflow принадлежит '$owner', а не voxflow"
 
-  local bin out
-  for bin in /usr/bin/voxflow \
-    /usr/lib/VoxFlow/resources/whisper-linux-x64/whisper-cli \
-    /usr/lib/VoxFlow/resources/whisper-linux-x64/whisper-server; do
-    [[ -x "$bin" ]] || die "нет исполняемого $bin"
-    out="$(ldd "$bin" 2>&1)" || die "ldd $bin: $out"
-    if grep -q 'not found' <<<"$out"; then
-      echo "$out" >&2
-      die "$bin: не хватает библиотек - допишите пакеты в depends script/arch/PKGBUILD"
-    fi
-  done
+  local bin=/usr/bin/voxflow out
+  [[ -x "$bin" ]] || die "нет исполняемого $bin"
+  out="$(ldd "$bin" 2>&1)" || die "ldd $bin: $out"
+  if grep -q 'not found' <<<"$out"; then
+    echo "$out" >&2
+    die "$bin: не хватает библиотек - допишите пакеты в depends script/arch/PKGBUILD"
+  fi
   echo "Пакет $pkg ставится в чистый archlinux, библиотеки на месте"
 }
 

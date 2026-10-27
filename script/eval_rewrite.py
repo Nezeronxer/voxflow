@@ -12,11 +12,14 @@ import argparse, json, os, sqlite3, sys, time, urllib.request, pathlib, re
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PROMPT = (ROOT / "voxflow/src-tauri/prompts/voiceflow_ru.txt").read_text(encoding="utf-8")
-STENOGRAPHER = (ROOT / "voxflow/src-tauri/prompts/stenographer_ru.txt").read_text(encoding="utf-8")
+# Облачный стенографист (ollama::cloud_system_prompt) - база + сведение самоисправлений (D-066).
+# Реплика гарда ниже прощения самоисправлений не знает: их мерить live_cloud_self_corrections в engine.rs.
+STENOGRAPHER = ((ROOT / "voxflow/src-tauri/prompts/stenographer_ru.txt").read_text(encoding="utf-8").rstrip()
+                + "\n\n" + (ROOT / "voxflow/src-tauri/prompts/stenographer_logic_ru.txt").read_text(encoding="utf-8"))
 
 
 def stenographer_system(text: str) -> str:
-    """Реплика ollama::local_system_prompt без правил пользователя."""
+    """Реплика ollama::cloud_system_prompt без правил пользователя."""
     latin = sum(c.isascii() and c.isalpha() for c in text)
     cyr = sum(c.lower() in "абвгдеёжзийклмнопрстуфхцчшщъыьэюя" for c in text)
     lang = ("Язык текста: английский. Ответ - на английском, не переводи." if latin > cyr

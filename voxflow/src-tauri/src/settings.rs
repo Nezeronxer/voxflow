@@ -40,17 +40,13 @@ pub struct Settings {
     pub double_tap_behavior_version: u8,
     /// Имя устройства ввода ("" = системное по умолчанию).
     pub input_device: String,
-    /// Язык ASR: "ru" | "en" | "auto" | ...
+    /// Язык ASR: "ru" (GigaAM) | "en" (Parakeet) | "auto" (оба, D-065).
     pub language: String,
-    /// Имя файла модели в models_dir.
-    pub model: String,
-    /// Локальный движок ASR: "gigaam" (русский, ONNX, CPU) | "whisper_cli" | "whisper_server".
-    pub engine: String,
     /// Тема интерфейса: "system" | "light" | "dark".
     pub theme: String,
     /// Графическое ускорение: "auto" (есть NVIDIA — используем) | "on" | "off".
-    /// Управляет выбором CUDA-сборки whisper и выгрузкой слоёв встроенной
-    /// локальной модели ИИ на GPU. GigaAM/Parakeet считают на CPU всегда.
+    /// Управляет выгрузкой слоёв встроенной локальной модели ИИ на GPU.
+    /// GigaAM/Parakeet считают на CPU всегда.
     pub gpu_mode: String,
     /// Масштаб плавающей плашки (0.75..1.50).
     pub overlay_scale: f64,
@@ -249,11 +245,6 @@ impl Default for Settings {
             double_tap_behavior_version: DOUBLE_TAP_BEHAVIOR_VERSION,
             input_device: String::new(),
             language: "auto".into(),
-            model: "ggml-large-v3-turbo-q5_0.bin".into(),
-            // Свежая установка сразу работает в multilingual-режиме: Whisper
-            // large-v3-turbo + language=auto. GigaAM/Parakeet остаются быстрыми
-            // локальными спец-маршрутами, если пользователь выберет их в UI.
-            engine: "whisper_server".into(),
             theme: "system".into(),
             gpu_mode: "auto".into(),
             overlay_scale: OVERLAY_SCALE_DEFAULT,
@@ -337,12 +328,10 @@ impl Settings {
             self.double_tap_latch = true;
             self.double_tap_behavior_version = DOUBLE_TAP_BEHAVIOR_VERSION;
         }
-        // Tiny/Base/Small/Medium убраны из каталога: переводим на рекомендуемую.
-        if matches!(
-            self.model.as_str(),
-            "ggml-tiny.bin" | "ggml-base.bin" | "ggml-small.bin" | "ggml-medium.bin"
-        ) {
-            self.model = crate::models::RECOMMENDED_WHISPER_NAME.into();
+        // Whisper убран (D-065): прочие языки распознаются как «авто».
+        // Облачное распознавание понимает любой язык - явный выбор там не трогаем.
+        if !matches!(self.language.as_str(), "ru" | "en") && !self.cloud_stt_active() {
+            self.language = "auto".into();
         }
         if self.ai_backend_behavior_version < AI_BACKEND_BEHAVIOR_VERSION {
             // 2.0.0 сохраняла Ollama/Qwen3 как дефолт даже без явного
@@ -657,22 +646,18 @@ mod tests {
     }
 
     #[test]
-    fn removed_whisper_models_migrate_to_recommended() {
-        for old in [
-            "ggml-tiny.bin",
-            "ggml-base.bin",
-            "ggml-small.bin",
-            "ggml-medium.bin",
-        ] {
-            let mut s: Settings =
-                serde_json::from_str(&format!(r#"{{"model":"{old}"}}"#)).expect("parse");
-            s.normalize_user_values();
-            assert_eq!(s.model, crate::models::RECOMMENDED_WHISPER_NAME);
-        }
-        let mut s: Settings =
-            serde_json::from_str(r#"{"model":"ggml-large-v3.bin"}"#).expect("parse");
+    fn whisper_settings_migrate_to_auto_language() {
+        let mut s: Settings = serde_json::from_str(
+            r#"{"model":"ggml-large-v3.bin","engine":"whisper_server","language":"de"}"#,
+        )
+        .expect("старые поля Whisper не ломают разбор");
         s.normalize_user_values();
-        assert_eq!(s.model, "ggml-large-v3.bin");
+        assert_eq!(s.language, "auto");
+        for lang in ["ru", "en"] {
+            s.language = lang.into();
+            s.normalize_user_values();
+            assert_eq!(s.language, lang);
+        }
     }
 
     #[test]
@@ -765,22 +750,6 @@ mod tests {
         chosen.overlay_scale = f64::NAN;
         chosen.normalize_user_values();
         assert_eq!(chosen.overlay_scale, OVERLAY_SCALE_DEFAULT);
-    }
-
-    #[test]
-    fn platform_normalization_preserves_explicit_whisper_auto_route() {
-        let mut chosen = Settings {
-            engine: "whisper_server".into(),
-            language: "auto".into(),
-            model: "ggml-large-v3-turbo-q5_0.bin".into(),
-            ..Settings::default()
-        };
-
-        chosen.normalize_user_values();
-
-        assert_eq!(chosen.engine, "whisper_server");
-        assert_eq!(chosen.language, "auto");
-        assert_eq!(chosen.model, "ggml-large-v3-turbo-q5_0.bin");
     }
 
     #[test]

@@ -409,10 +409,11 @@ fn chat_completion(
     net::ensure_https_or_loopback_base(&base_url, "Rewrite Base URL")?;
     let endpoint = format!("{base_url}/chat/completions");
 
+    let openrouter = is_openrouter_base(&base_url);
     let mut body = serde_json::json!({
         "model": s.rewrite_model.trim(),
         "messages": [
-            { "role": "system", "content": system },
+            { "role": "system", "content": system_content(openrouter, &s.rewrite_model, system) },
             { "role": "user",   "content": user }
         ],
         "temperature": temperature,
@@ -424,7 +425,6 @@ fn chat_completion(
     // Рассуждения правке не нужны: с ними ответ медленнее, а Haiku при
     // `effort: minimal` пишет их прямо в текст (D-058). Модели с обязательным
     // рассуждением отказывают на `enabled: false` - им повтор с самым коротким.
-    let openrouter = is_openrouter_base(&base_url);
     if openrouter {
         body["reasoning"] = serde_json::json!({ "enabled": false });
     }
@@ -433,7 +433,12 @@ fn chat_completion(
         post_chat(s, &base_url, &endpoint, &key, &body)
     } else {
         // Соединение могло закрыться на стороне сервера - тогда обычный запрос.
-        send_first(warm, &body).or_else(|e| {
+        let timeout_s = s.backend_timeout_s(false);
+        send_first(warm, &body, timeout_s).or_else(|e| {
+            // Ответ API (ключ, лимит, модель) повторный запрос не изменит.
+            if is_api_error(&e) || is_rewrite_timeout(&e) {
+                return Err(e);
+            }
             log::warn!("прогретое соединение не сработало ({e}), обычный запрос");
             post_chat(s, &base_url, &endpoint, &key, &body)
         })
@@ -444,6 +449,20 @@ fn chat_completion(
             post_chat(s, &base_url, &endpoint, &key, &body)
         }
         result => result,
+    }
+}
+
+/// Системный промпт. Claude через OpenRouter сам не кэширует: с `cache_control`
+/// промпт стенографиста (~670 токенов) читается из кэша по 0,1 цены - диктовка
+/// $0,000022 вместо $0,000082, запись в кэш +20%, кэш живёт 5 мин от последнего
+/// попадания (замер D-065). OpenAI, DeepSeek и Gemini кэшируют сами.
+fn system_content(openrouter: bool, model: &str, system: &str) -> serde_json::Value {
+    if openrouter && model.trim().starts_with("anthropic/") {
+        serde_json::json!([
+            { "type": "text", "text": system, "cache_control": { "type": "ephemeral" } }
+        ])
+    } else {
+        serde_json::json!(system)
     }
 }
 
@@ -493,10 +512,9 @@ impl Drop for Warm {
 
 static WARM: std::sync::Mutex<Vec<Warm>> = std::sync::Mutex::new(Vec::new());
 
-/// Сколько одинаковых запросов уходит наперегонки. Ответ OpenRouter обычно
-/// 1,0-1,5 с, но изредка 5-10 с; второй запрос срезает такой хвост (замер:
-/// пара 1,3/5,4 с даёт 1,3 с). Стоит вторых токенов - у дешёвых моделей копейки,
-/// бесплатным (`:free`) не шлём: у них лимит запросов (D-064).
+/// Сколько соединений открывается заранее. Второе - запасное: тело в него уходит,
+/// только если первое не ответило за [`HEDGE_AFTER`] или упало (D-064, D-065).
+/// Бесплатным (`:free`) запасное не открываем: у них лимит запросов.
 fn race_width(model: &str) -> usize {
     if model.trim().ends_with(":free") {
         1
@@ -505,24 +523,88 @@ fn race_width(model: &str) -> usize {
     }
 }
 
-/// Первый успешный ответ из прогретых соединений; проигравшие дорабатывают в
-/// своих потоках, их ответ выбрасывается. Ошибка - только если упали все.
-fn send_first(warm: Vec<Warm>, body: &serde_json::Value) -> Result<String> {
-    let (tx, rx) = std::sync::mpsc::channel();
-    for w in warm {
-        let tx = tx.clone();
-        let body = body.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(w.send(&body));
-        });
-    }
-    drop(tx);
-    let mut last = Err(anyhow!("нет прогретых соединений"));
-    for result in rx {
-        if result.is_ok() {
-            return result;
+/// Через сколько без ответа тело уходит в запасное соединение. По `llm=` в логе
+/// 300 диктовок: медиана 1,1 с, дольше 2 с - 16%, хвост 3-10 с. Гонка двух на
+/// каждой диктовке стоила двойных токенов; запасной запрос после 2 с - ~1,16x.
+const HEDGE_AFTER: std::time::Duration = std::time::Duration::from_millis(2000);
+
+/// Первый успешный ответ: тело уходит в первое соединение, в следующее - если
+/// ответа нет [`HEDGE_AFTER`] или прошлое упало. Неиспользованные соединения
+/// закрываются без тела (Drop) - сервер их не считает. Ошибка - если упали все.
+fn send_first(warm: Vec<Warm>, body: &serde_json::Value, timeout_s: u64) -> Result<String> {
+    let body = body.clone();
+    let deadline = std::time::Duration::from_secs(timeout_s);
+    send_hedged(warm, HEDGE_AFTER, deadline, move |w: Warm| w.send(&body)).map_err(|e| {
+        if is_rewrite_timeout(&e) {
+            anyhow!(
+                "Модель рерайта не ответила за {timeout_s} с. Увеличьте таймаут ИИ в настройках"
+            )
+        } else {
+            e
         }
-        last = result;
+    })
+}
+
+/// Ошибка, которую вернул сам API: повтор в другое соединение даст то же самое
+/// и только потратит лимит запросов.
+fn is_api_error(e: &anyhow::Error) -> bool {
+    e.to_string().starts_with("Rewrite API error")
+}
+
+const HEDGE_TIMEOUT: &str = "hedge: истёк срок ответа";
+
+fn is_rewrite_timeout(e: &anyhow::Error) -> bool {
+    let m = e.to_string();
+    m == HEDGE_TIMEOUT || m.starts_with("Модель рерайта не ответила")
+}
+
+/// `deadline` - от отправки текста: curl прогретого соединения живёт по своему
+/// `-m` от нажатия клавиши (90 с + таймаут), ждать его до конца нельзя.
+fn send_hedged<W: Send + 'static>(
+    warm: Vec<W>,
+    hedge_after: std::time::Duration,
+    deadline: std::time::Duration,
+    send: impl Fn(W) -> Result<String> + Send + Sync + Clone + 'static,
+) -> Result<String> {
+    use std::sync::mpsc::RecvTimeoutError;
+    let until = std::time::Instant::now() + deadline;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut spare = warm.into_iter();
+    let launch = |w: W| {
+        let tx = tx.clone();
+        let send = send.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(send(w));
+        });
+    };
+    let mut in_flight = 0usize;
+    if let Some(w) = spare.next() {
+        launch(w);
+        in_flight += 1;
+    }
+    let mut last = Err(anyhow!("нет прогретых соединений"));
+    while in_flight > 0 {
+        let left = until.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            // shortcut: опоздавший curl доживает свой -m в фоне, ответ выбрасывается.
+            return Err(anyhow!(HEDGE_TIMEOUT));
+        }
+        match rx.recv_timeout(hedge_after.min(left)) {
+            Ok(Ok(text)) => return Ok(text),
+            Ok(Err(e)) => {
+                in_flight -= 1;
+                if is_api_error(&e) {
+                    return Err(e);
+                }
+                last = Err(e);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+        if let Some(w) = spare.next() {
+            launch(w);
+            in_flight += 1;
+        }
     }
     last
 }
@@ -718,7 +800,7 @@ fn parse_chat_completion(v: &serde_json::Value) -> Result<String> {
 }
 
 fn cleanup_rewrite_output(text: &str, input: &str) -> String {
-    let mut s = strip_think(text);
+    let mut s = crate::ollama::strip_think(text);
     for prefix in [
         "Готовый текст:",
         "Вот готовый текст:",
@@ -736,26 +818,6 @@ fn cleanup_rewrite_output(text: &str, input: &str) -> String {
         return String::new();
     }
     s.trim_matches('"').trim().to_string()
-}
-
-fn strip_think(text: &str) -> String {
-    let mut s = text.to_string();
-    while let Some(start) = s.find("<think>") {
-        match s[start..].find("</think>") {
-            Some(end_rel) => {
-                let end = start + end_rel + "</think>".len();
-                s.replace_range(start..end, "");
-            }
-            None => {
-                s.truncate(start);
-                break;
-            }
-        }
-    }
-    if let Some(end_rel) = s.find("</think>") {
-        s.replace_range(0..end_rel + "</think>".len(), "");
-    }
-    s.replace("/no_think", "").trim().to_string()
 }
 
 fn looks_like_reasoning(out: &str, input: &str) -> bool {
@@ -851,57 +913,73 @@ mod tests {
         assert!(short >= 256);
     }
 
-    /// Поддельный curl: читает тело, ждёт `delay` и печатает `reply`.
-    #[cfg(unix)]
-    fn fake_warm(delay: &str, reply: &str) -> Warm {
-        let child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(r#"cat >/dev/null; sleep "$0"; printf '%s' "$1""#)
-            .arg(delay)
-            .arg(reply)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        Warm {
-            child: Some(child),
-            endpoint: String::new(),
-            key: String::new(),
-            proxy: String::new(),
-            started: std::time::Instant::now(),
-            timeout_s: 20,
-            _config: crate::paths::TempFileGuard::new(crate::paths::unique_tmp_path("t", "txt")),
-        }
-    }
-
-    #[cfg(unix)]
+    /// Запасной запрос: тело уходит во второе соединение, только если первое
+    /// молчит дольше порога или упало; иначе второе закрывается без тела.
     #[test]
-    fn race_takes_first_successful_answer() {
-        let ok = |t: &str| format!(r#"{{"choices":[{{"message":{{"content":"{t}"}}}}]}}"#);
-        let body = serde_json::json!({});
+    fn spare_connection_is_used_only_when_first_is_slow_or_fails() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        let hedge = Duration::from_millis(100);
+        // (задержка мс, ответ) - «соединение»; счётчик - сколько тел ушло.
+        let run = |conns: Vec<(u64, Result<&'static str, &'static str>)>| {
+            let sent = Arc::new(AtomicUsize::new(0));
+            let counter = Arc::clone(&sent);
+            let got = send_hedged(conns, hedge, Duration::from_secs(5), move |(ms, r)| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(ms));
+                r.map(str::to_string).map_err(|e| anyhow!(e))
+            });
+            (got.ok(), sent.load(Ordering::SeqCst))
+        };
+        // Быстрый первый - второе тело не уходит (не платим дважды).
+        assert_eq!(run(vec![(0, Ok("a")), (0, Ok("b"))]), (Some("a".into()), 1));
+        // Первый молчит дольше порога - запасной отвечает раньше.
+        assert_eq!(
+            run(vec![(600, Ok("a")), (0, Ok("b"))]),
+            (Some("b".into()), 2)
+        );
+        // Первый упал быстро - запасной сразу, без ожидания порога.
         let t = std::time::Instant::now();
-        let got = send_first(
-            vec![
-                fake_warm("3", &ok("медленно")),
-                fake_warm("0", &ok("быстро")),
-            ],
-            &body,
+        assert_eq!(
+            run(vec![(0, Err("x")), (0, Ok("b"))]),
+            (Some("b".into()), 2)
         );
-        assert_eq!(got.unwrap(), "быстро");
-        assert!(t.elapsed() < std::time::Duration::from_secs(2));
-        // Быстрый с ошибкой не мешает дождаться медленного.
-        let got = send_first(
-            vec![
-                fake_warm("0", r#"{"error":"x"}"#),
-                fake_warm("1", &ok("второй")),
-            ],
-            &body,
+        assert!(t.elapsed() < hedge);
+        // Упали все - ошибка.
+        assert_eq!(run(vec![(0, Err("x")), (0, Err("y"))]), (None, 2));
+        // Ошибка самого API (ключ, лимит) в запасное не повторяется.
+        assert_eq!(
+            run(vec![(0, Err("Rewrite API error: 429")), (0, Ok("b"))]),
+            (None, 1)
         );
-        assert_eq!(got.unwrap(), "второй");
-        assert!(send_first(vec![fake_warm("0", "мусор")], &body).is_err());
+        // Общий срок от отправки: оба молчат - ошибка срока, а не ожидание curl -m.
+        let t = std::time::Instant::now();
+        let late = send_hedged(
+            vec![3000u64, 3000],
+            hedge,
+            Duration::from_millis(300),
+            |ms| {
+                std::thread::sleep(Duration::from_millis(ms));
+                Ok("поздно".to_string())
+            },
+        );
+        assert!(late.as_ref().is_err_and(is_rewrite_timeout), "{late:?}");
+        assert!(t.elapsed() < Duration::from_millis(1000));
         assert_eq!(race_width("anthropic/claude-haiku-5.5"), 2);
         assert_eq!(race_width("deepseek/deepseek-v4:free"), 1);
+    }
+
+    #[test]
+    fn claude_system_prompt_is_cached_others_stay_plain() {
+        let cached = system_content(true, "anthropic/claude-haiku-5.5", "p");
+        assert_eq!(cached[0]["text"], "p");
+        assert_eq!(cached[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(system_content(true, "deepseek/deepseek-v4", "p"), "p");
+        assert_eq!(
+            system_content(false, "anthropic/claude-haiku-5.5", "p"),
+            "p"
+        );
     }
 
     #[test]

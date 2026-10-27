@@ -97,10 +97,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           $requiredFiles = @(
             "voxflow/src-tauri/target/release/voxflow.exe",
-            "voxflow/src-tauri/target/release/resources/whisper/Release/whisper-cli.exe",
-            "voxflow/src-tauri/target/release/resources/whisper/Release/whisper-server.exe",
-            "voxflow/src-tauri/target/release/resources/whisper-cuda/Release/whisper-cli.exe",
-            "voxflow/src-tauri/target/release/resources/whisper-cuda/Release/whisper-server.exe",
             "voxflow/src-tauri/resources/vad/silero_vad.onnx"
           )
           foreach ($path in $requiredFiles) {
@@ -117,9 +113,7 @@ jobs:
             "vcomp140.dll"
           )
           $vcDestinations = @(
-            "voxflow/src-tauri/resources/windows-redist",
-            "voxflow/src-tauri/target/release/resources/whisper/Release",
-            "voxflow/src-tauri/target/release/resources/whisper-cuda/Release"
+            "voxflow/src-tauri/resources/windows-redist"
           )
           foreach ($destination in $vcDestinations) {
             foreach ($file in $requiredVcRuntime) {
@@ -274,10 +268,6 @@ jobs:
             (Join-Path $installRoot "vcruntime140.dll"),
             (Join-Path $installRoot "vcruntime140_1.dll"),
             (Join-Path $installRoot "vcomp140.dll"),
-            (Join-Path $installRoot "resources\whisper\Release\whisper-cli.exe"),
-            (Join-Path $installRoot "resources\whisper\Release\whisper-server.exe"),
-            (Join-Path $installRoot "resources\whisper-cuda\Release\whisper-cli.exe"),
-            (Join-Path $installRoot "resources\whisper-cuda\Release\whisper-server.exe"),
             (Join-Path $installRoot "resources\vad\silero_vad.onnx")
           )
           foreach ($path in $requiredInstalledFiles) {

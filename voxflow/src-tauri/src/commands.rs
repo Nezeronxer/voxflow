@@ -189,15 +189,13 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
     // Язык сменился → фоновый прогрев движка под новые настройки: без него первый
     // Start после переключения на en/auto синхронно грузит ~650 МБ Parakeet и
     // подвешивает начало диктовки на секунды.
-    let route_changed =
-        lang_changed || settings.engine != previous.engine || settings.model != previous.model;
-    if lang_changed || settings.engine != previous.engine {
+    if lang_changed {
         if let Err(e) = state.engine_tx.lock().send(EngineCmd::Warmup) {
             log::warn!("warmup после смены языка не отправился: {e}");
         }
     }
-    // Модель, ставшая ненужной после смены языка/движка, освобождает память (D-053).
-    if route_changed {
+    // Модель, ставшая ненужной после смены языка, освобождает память (D-053).
+    if lang_changed {
         if let Err(e) = state
             .engine_tx
             .lock()
@@ -206,13 +204,13 @@ pub fn save_settings(app: AppHandle, state: State<AppState>, mut settings: Setti
             log::warn!("выгрузка ненужных моделей не отправилась: {e}");
         }
     }
-    // Сменился язык или движок - подобрать уже установленную модель под маршрут
+    // Сменился язык - подобрать уже установленную модель под маршрут
     // (D-042), качать только если для него нет ни одной.
     // Сменился ИИ-бэкенд - подобрать установленную локальную модель (D-043).
     if settings.ai_backend != previous.ai_backend {
         crate::local_ai::spawn_adopt_installed(app.clone(), settings.clone());
     }
-    if lang_changed || settings.engine != previous.engine {
+    if lang_changed {
         models::ensure_default_models(app, &settings);
     }
     Ok(())
@@ -253,20 +251,14 @@ pub fn list_models(state: State<AppState>) -> Vec<models::ModelInfo> {
 }
 
 /// Пометить модели, нужные при текущих настройках (D-053). Правила маршрута -
-/// в `engine::models_in_use`; Whisper выбирается как в `resolve_model`:
-/// выбранная, если скачана, иначе самая большая скачанная.
+/// в `engine::models_in_use`.
 fn mark_in_use(
     list: &mut [models::ModelInfo],
     s: &Settings,
     parakeet_ready: bool,
     variant: Option<models::GigaVariant>,
 ) {
-    let whisper = || list.iter().filter(|m| m.kind == "whisper" && m.installed);
-    let chosen = whisper()
-        .find(|m| m.name == s.model)
-        .or_else(|| whisper().max_by_key(|m| m.disk_mb.unwrap_or(0)))
-        .map(|m| m.name.clone());
-    let used = crate::engine::models_in_use(s, parakeet_ready, variant, chosen.as_deref());
+    let used = crate::engine::models_in_use(s, parakeet_ready, variant);
     for m in list.iter_mut() {
         m.in_use = m.installed && used.contains(&m.name);
     }
@@ -1414,44 +1406,24 @@ mod model_use_tests {
             m(GIGAAM_NAME, "gigaam", true, 217),
             m(GIGAAM_FP32_NAME, "gigaam", true, 885),
             m(PARAKEET_NAME, "parakeet", true, 640),
-            m("small.bin", "whisper", true, 500),
-            m("big.bin", "whisper", true, 3000),
-            m("absent.bin", "whisper", false, 0),
         ]
     }
 
     #[test]
-    fn auto_uses_full_gigaam_parakeet_and_selected_whisper() {
+    fn auto_uses_full_gigaam_and_parakeet() {
         let s = Settings {
-            engine: "gigaam".into(),
             language: "auto".into(),
-            model: "small.bin".into(),
             ..Settings::default()
         };
         let mut list = catalog();
         mark_in_use(&mut list, &s, true, Some(GigaVariant::Fp32));
-        assert_eq!(used(&list), [GIGAAM_FP32_NAME, PARAKEET_NAME, "small.bin"]);
-    }
-
-    #[test]
-    fn missing_selected_whisper_falls_back_to_largest_installed_like_resolve_model() {
-        let s = Settings {
-            engine: "whisper_server".into(),
-            language: "ru".into(),
-            model: "absent.bin".into(),
-            ..Settings::default()
-        };
-        let mut list = catalog();
-        mark_in_use(&mut list, &s, true, Some(GigaVariant::Fp32));
-        assert_eq!(used(&list), ["big.bin"]);
+        assert_eq!(used(&list), [GIGAAM_FP32_NAME, PARAKEET_NAME]);
     }
 
     #[test]
     fn russian_on_gigaam_leaves_everything_else_unused() {
         let s = Settings {
-            engine: "gigaam".into(),
             language: "ru".into(),
-            model: "small.bin".into(),
             ..Settings::default()
         };
         let mut list = catalog();

@@ -13,7 +13,6 @@
       "icons/icon.png"
     ],
     "resources": [
-      "resources/whisper-linux-x64/*",
       "resources/vad/*"
     ],
     "linux": {

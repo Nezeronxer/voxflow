@@ -140,7 +140,7 @@ export default function Control({
   const gpuField = (
     <Field
       label="Графическое ускорение"
-      hint="Для Whisper и встроенного ИИ. «Авто» — если видеокарта есть"
+      hint="Для встроенного ИИ. «Авто» — если видеокарта есть"
     >
       <div className="seg" role="radiogroup" aria-label="Графическое ускорение">
         {[

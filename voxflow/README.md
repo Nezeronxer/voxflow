@@ -25,7 +25,7 @@ From the repository root:
 cargo fmt --manifest-path voxflow/src-tauri/Cargo.toml --all -- --check
 cargo clippy --locked --manifest-path voxflow/src-tauri/Cargo.toml --all-targets -- -D warnings
 cargo test --locked --manifest-path voxflow/src-tauri/Cargo.toml --lib
-python3 script/check_versions.py --tag v2.4.4
+python3 script/check_versions.py --tag v2.4.5
 ```
 
 ## Packaging
@@ -46,8 +46,8 @@ orchestrator verifies all artifact sets and their checksums in a draft, then
 publishes the shared GitHub Release only after the complete set is present.
 
 Windows uses the existing per-user Inno installer after `tauri build
---no-bundle`. macOS produces a thin ARM64 app/DMG with checksum-pinned Whisper
-and VAD resources. With no Apple secrets it is completely ad-hoc sealed and
+--no-bundle`. macOS produces a thin ARM64 app/DMG with the checksum-pinned
+Silero VAD resource. With no Apple secrets it is completely ad-hoc sealed and
 strict-verified. With a Developer ID certificate plus one complete Apple ID or
 App Store Connect notarization credential set, the same workflow produces and
 verifies Developer ID signed, notarized, and stapled artifacts. Partial secret
@@ -60,9 +60,8 @@ openSUSE) and `.AppImage` (everything else, including Arch/Manjaro). The
 packages come from the release page; `deb`/`rpm` pull in webkit2gtk-4.1, GTK 3,
 gtk-layer-shell, ALSA and the Ayatana AppIndicator tray library automatically.
 ONNX Runtime (GigaAM, Parakeet, Silero VAD) is linked statically by the `ort`
-crate, so nothing extra is installed for it. Whisper (`whisper-cli`) is built
-from the pinned whisper.cpp sources by `script/build_linux_runtime.sh`, CPU only
-and needs an AVX2 CPU. NVIDIA/CUDA acceleration is Windows-only.
+crate, so nothing extra is installed for it. NVIDIA/CUDA acceleration (built-in
+AI only) is Windows-only.
 
 Data lives in `~/.local/share/VoxFlow` (`$XDG_DATA_HOME`), autostart is a
 `~/.config/autostart/*.desktop` entry written by the Settings toggle. The tray
@@ -152,8 +151,7 @@ Settings button opens the release page: install the new package with `apt`,
 
 - Explicit Russian: GigaAM v3.
 - Explicit English: Parakeet TDT v3 when installed.
-- Auto/mixed language and universal fallback: Whisper, with Large v3 Turbo Q5
-  recommended. Turbo Q8/full and Large v3 remain available; the weak
-  Tiny/Base/Small/Medium models were removed (saved choice migrates to Q5).
+- Auto: GigaAM v3; a phrase Parakeet hears as English goes to Parakeet
+  (Whisper was removed in D-065).
 - Cloud STT/rewrite: optional BYOK; local fallback preserves the selected local
   router.

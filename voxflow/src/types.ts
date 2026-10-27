@@ -7,9 +7,7 @@ export interface Settings {
   double_tap_latch: boolean;
   double_tap_behavior_version: number;
   input_device: string;
-  language: string;
-  model: string;
-  engine: string; // "gigaam" | "whisper_server" | "whisper_cli"
+  language: string; // "auto" | "ru" | "en"
   theme: string; // "system" | "light" | "dark"
   gpu_mode: string; // "auto" | "on" | "off"
   // Масштаб плавающей плашки: 0.75..1.5 (75..150%).
@@ -251,10 +249,6 @@ export const DEFAULT_SETTINGS: Settings = {
   double_tap_behavior_version: 1,
   input_device: "",
   language: "auto",
-  // Зеркало Rust-дефолтов (settings.rs). Расхождение раньше позволяло UI
-  // застампить в БД engine=whisper_cli и навсегда выключить живой ввод (B2).
-  model: "ggml-large-v3-turbo-q5_0.bin",
-  engine: "whisper_server",
   theme: "system",
   gpu_mode: "auto",
   overlay_scale: 1,
@@ -338,8 +332,7 @@ export interface ModelInfo {
   size_mb: number;
   installed: boolean;
   // "gigaam" — русская ONNX-модель (набор файлов в models/gigaam/),
-  // "parakeet" — EN/auto ONNX-модель, "whisper" — одиночный ggml-*.bin.
-  // Отсутствует у старых бэкендов → whisper.
+  // "parakeet" — EN/auto ONNX-модель.
   kind?: string;
   // Сколько занимает на диске сейчас, МБ; null - не скачана (D-053).
   disk_mb?: number | null;

@@ -72,7 +72,7 @@ export default function LocalAiCard({ settings, update }: Props) {
   const [percent, setPercent] = useState(0);
   const [note, setNote] = useState<string | null>(null);
   // События model:* общие с загрузкой моделей распознавания. Без сверки имени
-  // скачивание whisper показывало бы прогресс здесь, в чужой карточке.
+  // скачивание GigaAM показывало бы прогресс здесь, в чужой карточке.
   const pullingRef = useRef<string | null>(null);
   const mine = (name: string) => pullingRef.current !== null && name === pullingRef.current;
 
