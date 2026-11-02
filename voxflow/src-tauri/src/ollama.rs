@@ -485,7 +485,8 @@ pub fn unload(url: &str, model: &str) {
 fn plan_context_budget(system: &str, user: &str) -> (u32, u32) {
     let input = net::estimate_tokens(system) + net::estimate_tokens(user);
     // Верхняя граница вывода локальной модели — тот же порядок, что у облака.
-    let predict = net::output_token_budget(input, 4096);
+    // Instructions consume input context, but are never part of the rewritten output.
+    let predict = net::output_token_budget(net::estimate_tokens(user), 4096);
     let needed = input.saturating_add(predict).saturating_add(512);
     // Окно с запасом под длинную диктовку, но не 16k: KV-кэш на 16k держал
     // ~6 ГБ при реальном промпте ~600 токенов. Шаг 2048 - чтобы размер окна не

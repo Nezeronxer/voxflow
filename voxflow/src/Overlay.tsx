@@ -21,6 +21,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { cursorPosition, getCurrentWindow, PhysicalPosition } from "@tauri-apps/api/window";
 import { getSettings, IS_TAURI_RUNTIME, subscribe } from "./api";
 import FpsMeter from "./components/FpsMeter";
+import { layerDragPosition, type LayerGrab, type LayerPosition } from "./overlayDragState";
 import "./overlay.css";
 import {
   overlayMetaLabel,
@@ -82,6 +83,7 @@ type DragPointer = {
   t: number;
   dragging: boolean;
   fromPill: boolean;
+  layerGrab?: LayerGrab;
   cursorStart?: { x: number; y: number };
   raf?: number | null;
   applyChain?: Promise<void> | null;
@@ -100,7 +102,7 @@ const BOX: Record<PillMode, { w: number; h: number }> = {
   latch: { w: 306, h: 56 },
   notice: { w: 346, h: 74 },
 };
-const DRAG_HIT_PADDING = 6;
+const DRAG_HIT_PADDING = 2;
 // Сколько итог диктовки виден после вставки (D-061).
 const FINAL_HOLD_MS = 2000;
 
@@ -173,6 +175,9 @@ export default function Overlay() {
   const pillRef = useRef<HTMLDivElement>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const pointerRef = useRef<DragPointer | null>(null);
+  const nativeDragRef = useRef(false);
+  const layerPositionRef = useRef<LayerPosition>({ x: 0, y: -156 });
+  const stageRef = useRef<HTMLDivElement>(null);
   // D (FPS): автоскролл хвоста — НЕ в useEffect([shown]) (там запись scrollTop на
   // КАЖДЫЙ символ форсит синхронный reflow). Вместо этого ставим флаг и сбрасываем
   // его одним rAF-тиком (≤1 запись scrollTop за кадр), коалесцируя пачку символов.
@@ -600,6 +605,40 @@ export default function Overlay() {
     return !!hit && x >= hit.x && x <= hit.x + hit.w && y >= hit.y && y <= hit.y + hit.h;
   };
 
+  const applyLayerPosition = (position: LayerPosition) => {
+    layerPositionRef.current = position;
+    if (stageRef.current) stageRef.current.style.translate = `${position.x}px ${position.y}px`;
+    reportPillHit();
+  };
+  const clampLayerToViewport = () => {
+    if (!nativeDragRef.current || pointerRef.current) return;
+    const rect = pillRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    const current = layerPositionRef.current;
+    const position = layerDragPosition({ position: current, pointer: { x: 0, y: 0 }, rect }, { x: 0, y: 0 }, {
+      width: window.innerWidth, height: window.innerHeight,
+    });
+    if (position.x !== current.x || position.y !== current.y) applyLayerPosition(position);
+  };
+  const moveLayerPill = (p: DragPointer, x: number, y: number) => {
+    if (!p.layerGrab) return;
+    applyLayerPosition(layerDragPosition(p.layerGrab, { x, y }, {
+      width: window.innerWidth, height: window.innerHeight,
+    }));
+  };
+  const saveLayerPosition = () => {
+    void invoke("overlay_layer_position", layerPositionRef.current).catch(() => {});
+  };
+  useEffect(() => {
+    let alive = true;
+    void invoke<[number, number] | null>("overlay_layer_position").then((saved) => {
+      if (!alive || !saved) return;
+      nativeDragRef.current = true;
+      applyLayerPosition({ x: saved[0], y: saved[1] });
+    }).catch(() => {});
+    return () => { alive = false; };
+  }, []);
+
   // Сообщаем бэкенду желаемый размер окна под режим. Команду overlay_box реализует
   // интегратор; до интеграции команды нет — это НЕ ошибка, глушим оба пути отказа.
   useEffect(() => {
@@ -627,15 +666,18 @@ export default function Overlay() {
     const report = () => {
       if (t) clearTimeout(t);
       t = setTimeout(() => {
+        clampLayerToViewport();
         reportPillHit();
       }, 80);
     };
     const ro = new ResizeObserver(report);
     ro.observe(rootEl);
     ro.observe(pillEl);
+    pillEl.addEventListener("transitionend", report);
     report();
     return () => {
       ro.disconnect();
+      pillEl.removeEventListener("transitionend", report);
       if (t) clearTimeout(t);
     };
   }, []);
@@ -644,6 +686,7 @@ export default function Overlay() {
   // вьюпорте съезжает при том же размере — перемеряем по таймеру за CSS-переход.
   useEffect(() => {
     const id = setTimeout(() => {
+      clampLayerToViewport();
       reportPillHit();
     }, 220);
     return () => clearTimeout(id);
@@ -708,7 +751,14 @@ export default function Overlay() {
       applyChain: null,
     };
     pointerRef.current = state;
+    if (nativeDragRef.current) {
+      const rect = pillRef.current?.getBoundingClientRect();
+      if (rect) state.layerGrab = {
+        position: { ...layerPositionRef.current }, pointer: { x: e.clientX, y: e.clientY }, rect,
+      };
+    }
     e.currentTarget.setPointerCapture?.(e.pointerId);
+    if (nativeDragRef.current) return;
     // Один pointer-путь для macOS и Windows. Tauri cursorPosition +
     // setPosition не требуют macOS Input Monitoring и, в отличие от
     // прежнего CGEvent-поллера, не конкурирует с pointer capture WebView.
@@ -730,6 +780,13 @@ export default function Overlay() {
     if (!p.dragging && Math.hypot(dx, dy) >= 4) {
       p.dragging = true;
     }
+    if (nativeDragRef.current) {
+      if (p.dragging) {
+        e.preventDefault();
+        moveLayerPill(p, e.clientX, e.clientY);
+      }
+      return;
+    }
     if (p.dragging) {
       e.preventDefault();
       scheduleManualDrag(p);
@@ -747,6 +804,16 @@ export default function Overlay() {
     const moved = Math.hypot(e.clientX - p.x, e.clientY - p.y);
     const elapsed = performance.now() - p.t;
     const finish = async () => {
+      if (nativeDragRef.current) {
+        if (p.dragging || moved >= 4) {
+          moveLayerPill(p, e.clientX, e.clientY);
+          clampLayerToViewport();
+          saveLayerPosition();
+        } else if (p.fromPill && elapsed < 550) {
+          await invoke("overlay_click").catch(() => {});
+        }
+        return;
+      }
       const cursor = await cursorPosition().catch(() => null);
       const physicalMoved =
         cursor && p.cursorStart
@@ -767,6 +834,13 @@ export default function Overlay() {
     if (p?.id === e.pointerId) {
       if (p.raf != null) cancelAnimationFrame(p.raf);
       pointerRef.current = null;
+      if (nativeDragRef.current) {
+        if (p.dragging) {
+          clampLayerToViewport();
+          saveLayerPosition();
+        }
+        return;
+      }
       if (p.dragging) {
         void (p.applyChain ?? Promise.resolve())
           .catch(() => {})
@@ -788,6 +862,7 @@ export default function Overlay() {
       <FpsMeter />
       <div
         className="aq-scale-stage"
+        ref={stageRef}
         style={{ transform: `scale(${overlayScale})` }}
         data-scale={overlayScale.toFixed(2)}
       >

@@ -53,6 +53,18 @@ const OVERLAY_IDLE_BOX: (i32, i32) = (266, 60);
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    if let Some(backend) = linux_env::appimage_backend(
+        std::env::var_os("APPIMAGE").is_some(),
+        linux_env::session(),
+        std::env::var_os("APPIMAGE").is_some()
+            && linux_env::session() == linux_env::Session::Wayland
+            && std::env::var("GDK_BACKEND").ok().as_deref() == Some("x11")
+            && linux_env::layer_shell_available(),
+        std::env::var("GDK_BACKEND").ok().as_deref(),
+    ) {
+        std::env::set_var("GDK_BACKEND", backend);
+    }
     // WebKitGTK 2.42+ с DMA-BUF рендерером даёт пустое окно или краш на части
     // драйверов (NVIDIA, VM). Программный путь чуть медленнее, но надёжен;
     // пользователь может выставить переменную сам, и тогда мы её не трогаем.
@@ -288,6 +300,7 @@ pub fn run() {
             commands::corrections_delete,
             commands::overlay_box,
             commands::overlay_hit,
+            commands::overlay_layer_position,
             commands::overlay_commit_position,
         ])
         .build(tauri::generate_context!())
@@ -1253,6 +1266,8 @@ fn setup_overlay(app: &tauri::AppHandle) {
         let _ = ov.set_ignore_cursor_events(true);
         #[cfg(not(any(windows, target_os = "macos")))]
         let _ = ov.set_ignore_cursor_events(false);
+        #[cfg(target_os = "linux")]
+        linux_overlay::set_hit(&ov, (0.0, 0.0, 0.0, 0.0));
         let _ = ov.set_always_on_top(true);
         // Без этих флагов окно живёт на одном рабочем столе: сменил стол или
         // открыл приложение на весь экран - плашка «пропала», хотя диктовка идёт.
@@ -1268,11 +1283,10 @@ fn setup_overlay(app: &tauri::AppHandle) {
                     | B::Stationary,
             );
         }
-        // Wayland с layer-shell: слой задаётся до первого show(), снизу тот же
-        // отступ, что у позиции по умолчанию ниже. Позицию тогда ведёт
-        // композитор: set_position и сохранённое место не используются.
+        // Wayland layer-shell stretches a fixed input surface before show().
+        // The capsule restores its independent CSS offset in Overlay.tsx.
         #[cfg(target_os = "linux")]
-        let layered = linux_overlay::apply(&ov, OVERLAY_BOTTOM_MARGIN);
+        let layered = linux_overlay::apply(&ov);
         #[cfg(not(target_os = "linux"))]
         let layered = false;
         let scale = ov.scale_factor().unwrap_or(1.0);
@@ -1281,7 +1295,9 @@ fn setup_overlay(app: &tauri::AppHandle) {
         // запасом под тень; контракт защищён overlay-geometry.test.mjs.
         let win_w = f64::from(OVERLAY_IDLE_BOX.0) * scale * user_scale;
         let win_h = f64::from(OVERLAY_IDLE_BOX.1) * scale * user_scale;
-        let _ = ov.set_size(PhysicalSize::new(win_w as u32, win_h as u32));
+        if !layered {
+            let _ = ov.set_size(PhysicalSize::new(win_w as u32, win_h as u32));
+        }
         // Сохранённая позиция, если она остаётся видимой на одном из экранов;
         // иначе низ-центр. На macOS координаты могут быть глобальными для
         // нескольких мониторов, поэтому нельзя валидировать только через

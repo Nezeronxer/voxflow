@@ -1,6 +1,6 @@
 [package]
 name = "voxflow"
-version = "2.4.5"
+version = "2.4.6"
 description = "Local-first voice dictation for desktop"
 authors = ["Nezeronxer"]
 license = "LicenseRef-Proprietary"
@@ -62,6 +62,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 # Плашка поверх окон на Wayland (layer surface); обёртка над gtk 0.18 из Tauri.
 # Уже в дереве через tao/wry (та же 0.18.2); прямая зависимость нужна ради WidgetExt.
+wayland-client = "0.31"
 gtk = "0.18"
 gtk-layer-shell = { version = "0.8.2", features = ["v0_6"] }
 

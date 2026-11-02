@@ -1551,6 +1551,14 @@ pub fn overlay_box(app: AppHandle, state: State<AppState>, w: f64, h: f64) -> R<
     let scale = ov.scale_factor().unwrap_or(1.0);
     let new_w = (w * scale).round().max(1.0) as i32;
     let new_h = (h * scale).round().max(1.0) as i32;
+    #[cfg(target_os = "linux")]
+    {
+        use gtk_layer_shell::LayerShell;
+        if ov.gtk_window().is_ok_and(|win| win.is_layer_window()) {
+            // The Wayland input surface is fixed; the capsule changes inside it.
+            return Ok(());
+        }
+    }
     let (old_pos, old_size) = match (ov.outer_position(), ov.outer_size()) {
         (Ok(p), Ok(s)) => (p, s),
         _ => return Ok(()),
@@ -1578,9 +1586,21 @@ pub fn overlay_box(app: AppHandle, state: State<AppState>, w: f64, h: f64) -> R<
 /// окна). Windows-поллер курсора в lib.rs включает мышь только над этой зоной;
 /// на macOS окно интерактивно, а тот же rect ограничивает pointer-drag в Overlay.tsx.
 #[tauri::command]
-pub fn overlay_hit(state: State<AppState>, x: f64, y: f64, w: f64, h: f64) -> R<()> {
+pub fn overlay_hit(
+    app: AppHandle,
+    state: State<AppState>,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+) -> R<bool> {
     *state.overlay_hit.lock() = Some((x, y, w, h));
-    Ok(())
+    #[cfg(target_os = "linux")]
+    if let Some(ov) = app.get_webview_window("overlay") {
+        return Ok(crate::linux_overlay::set_hit(&ov, (x, y, w, h)));
+    }
+    let _ = app;
+    Ok(false)
 }
 
 /// Завершить drag: применить мягкие экранные магниты и сохранить устойчивый
@@ -1588,4 +1608,46 @@ pub fn overlay_hit(state: State<AppState>, x: f64, y: f64, w: f64, h: f64) -> R<
 #[tauri::command]
 pub fn overlay_commit_position(app: AppHandle) -> R<()> {
     crate::commit_overlay_position(&app)
+}
+
+/// Layer-shell uses CSS offsets from bottom-center, independently of global
+/// Windows/macOS anchors. None keeps the existing native-window drag path.
+#[tauri::command]
+pub fn overlay_layer_position(
+    app: AppHandle,
+    state: State<AppState>,
+    x: Option<f64>,
+    y: Option<f64>,
+) -> R<Option<(f64, f64)>> {
+    #[cfg(target_os = "linux")]
+    {
+        use gtk_layer_shell::LayerShell;
+        if app
+            .get_webview_window("overlay")
+            .and_then(|ov| ov.gtk_window().ok())
+            .is_some_and(|win| win.is_layer_window())
+        {
+            let conn = state.db.lock();
+            if let (Some(x), Some(y)) = (x, y) {
+                if !x.is_finite() || !y.is_finite() {
+                    return Err("Invalid overlay position".into());
+                }
+                db::kv_set(
+                    &conn,
+                    "overlay_layer_offset",
+                    &serde_json::to_string(&(x, y)).map_err(err)?,
+                )
+                .map_err(err)?;
+                return Ok(Some((x, y)));
+            }
+            let saved = db::kv_get(&conn, "overlay_layer_offset")
+                .and_then(|json| serde_json::from_str::<(f64, f64)>(&json).ok())
+                .filter(|(x, y)| x.is_finite() && y.is_finite());
+            return Ok(Some(
+                saved.unwrap_or((0.0, -f64::from(crate::OVERLAY_BOTTOM_MARGIN))),
+            ));
+        }
+    }
+    let _ = (app, state, x, y);
+    Ok(None)
 }

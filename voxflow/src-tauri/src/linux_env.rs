@@ -44,6 +44,47 @@ pub fn session() -> Session {
     )
 }
 
+/// linuxdeploy's GTK AppImage hook forces X11, hiding layer-shell even on a
+/// native Wayland desktop. Choose the native backend before GTK initializes.
+pub fn appimage_backend(
+    appimage: bool,
+    session: Session,
+    layer_shell_supported: bool,
+    backend: Option<&str>,
+) -> Option<&'static str> {
+    (appimage && session == Session::Wayland && layer_shell_supported && backend == Some("x11"))
+        .then_some("wayland,x11")
+}
+
+/// Read advertised interfaces before choosing GTK's display backend. GNOME
+/// lacks layer-shell and keeps the working AppImage XWayland path.
+#[cfg(target_os = "linux")]
+pub fn layer_shell_available() -> bool {
+    use wayland_client::{protocol::wl_registry, Connection, Dispatch, QueueHandle};
+    struct Probe(bool);
+    impl Dispatch<wl_registry::WlRegistry, ()> for Probe {
+        fn event(
+            state: &mut Self,
+            _: &wl_registry::WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global { interface, .. } = event {
+                state.0 |= interface == "zwlr_layer_shell_v1";
+            }
+        }
+    }
+    let Ok(connection) = Connection::connect_to_env() else {
+        return false;
+    };
+    let mut queue = connection.new_event_queue::<Probe>();
+    let _registry = connection.display().get_registry(&queue.handle(), ());
+    let mut probe = Probe(false);
+    queue.roundtrip(&mut probe).is_ok() && probe.0
+}
+
 // ───────────────────────────── пакеты дистрибутива ─────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -440,6 +481,27 @@ pub fn set_sink_mute(mute: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn appimage_prefers_wayland_without_affecting_other_backends() {
+        use super::{appimage_backend, Session};
+        assert_eq!(
+            appimage_backend(true, Session::Wayland, true, Some("x11")),
+            Some("wayland,x11")
+        );
+        assert_eq!(
+            appimage_backend(true, Session::Wayland, false, Some("x11")),
+            None
+        );
+        for (image, session, backend) in [
+            (false, Session::Wayland, Some("x11")),
+            (true, Session::X11, Some("x11")),
+            (true, Session::Wayland, Some("wayland")),
+            (true, Session::Wayland, None),
+        ] {
+            assert_eq!(appimage_backend(image, session, true, backend), None);
+        }
+    }
+
     use super::*;
 
     #[test]

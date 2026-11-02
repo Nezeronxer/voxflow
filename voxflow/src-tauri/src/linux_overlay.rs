@@ -26,7 +26,7 @@ pub fn pick_mode(session: Session, layer_shell_supported: bool) -> OverlayMode {
 /// Делает окно плашки layer surface, если сессия и композитор это позволяют.
 /// Звать до первого `show()`; возвращает `true`, когда слой задан.
 #[cfg(target_os = "linux")]
-pub fn apply(ov: &tauri::WebviewWindow, bottom_margin: i32) -> bool {
+pub fn apply(ov: &tauri::WebviewWindow) -> bool {
     use gtk::prelude::*;
     use gtk_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 
@@ -47,12 +47,14 @@ pub fn apply(ov: &tauri::WebviewWindow, bottom_margin: i32) -> bool {
     win.set_layer(Layer::Overlay);
     win.set_keyboard_mode(KeyboardMode::None);
     win.set_exclusive_zone(0);
-    // Якорь только снизу: по горизонтали композитор центрирует поверхность сам.
-    for edge in [Edge::Left, Edge::Right, Edge::Top] {
-        win.set_anchor(edge, false);
+    // A fixed, stretched surface gives pointer events stable local coordinates.
+    // Only the DOM capsule moves. Native input shape leaves the rest click-through.
+    win.set_resizable(true);
+    win.set_default_size(0, 0);
+    for edge in [Edge::Left, Edge::Right, Edge::Top, Edge::Bottom] {
+        win.set_anchor(edge, true);
+        win.set_layer_shell_margin(edge, 0);
     }
-    win.set_anchor(Edge::Bottom, true);
-    win.set_layer_shell_margin(Edge::Bottom, bottom_margin);
     if !win.is_layer_window() {
         log::warn!("плашка: layer-shell не включился, остаётся обычное окно");
         return false;
@@ -60,9 +62,55 @@ pub fn apply(ov: &tauri::WebviewWindow, bottom_margin: i32) -> bool {
     true
 }
 
+/// Only the capsule receives input; transparent WebView margins pass through.
+#[cfg(target_os = "linux")]
+pub fn set_hit(ov: &tauri::WebviewWindow, rect: (f64, f64, f64, f64)) -> bool {
+    use gtk::prelude::*;
+    use gtk_layer_shell::LayerShell;
+    let Ok(win) = ov.gtk_window() else {
+        return false;
+    };
+    let region = hit_region(rect);
+    win.input_shape_combine_region(Some(&region));
+    win.is_layer_window()
+}
+
+#[cfg(target_os = "linux")]
+fn hit_region((x, y, w, h): (f64, f64, f64, f64)) -> gtk::cairo::Region {
+    let region = gtk::cairo::Region::create();
+    if [x, y, w, h].iter().all(|v| v.is_finite()) && w > 0.0 && h > 0.0 {
+        let left = x.floor().max(0.0) as i32;
+        let top = y.floor().max(0.0) as i32;
+        let right = (x + w).ceil().max(f64::from(left)) as i32;
+        let bottom = (y + h).ceil().max(f64::from(top)) as i32;
+        let _ = region.union_rectangle(&gtk::cairo::RectangleInt::new(
+            left,
+            top,
+            right.saturating_sub(left),
+            bottom.saturating_sub(top),
+        ));
+    }
+    region
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn input_region_passes_transparent_window_margins_through() {
+        let region = hit_region((111.5, 38.5, 44.0, 14.0));
+        assert!(region.contains_point(133, 45));
+        for (x, y) in [(10, 45), (90, 45), (133, 10), (133, 75)] {
+            assert!(
+                !region.contains_point(x, y),
+                "transparent pixel ({x},{y}) captured"
+            );
+        }
+        assert!(hit_region((f64::NAN, 0.0, 20.0, 20.0)).is_empty());
+        assert!(hit_region((0.0, 0.0, -1.0, 20.0)).is_empty());
+    }
 
     #[test]
     fn wayland_with_protocol_gets_layer_shell() {

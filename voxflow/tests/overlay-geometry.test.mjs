@@ -230,3 +230,8 @@ test("overlay drag uses one captured-pointer path without a macOS CGEvent poller
   assert.ok(capabilities.includes("core:window:allow-outer-position"));
   assert.ok(capabilities.includes("core:window:allow-set-position"));
 });
+
+test("capture area stays within two CSS pixels of the visible capsule", () => {
+  const padding = Number(/const DRAG_HIT_PADDING = (\d+)/.exec(overlaySource)?.[1]);
+  assert.ok(padding <= 2, `invisible capture padding is ${padding}px`);
+});
