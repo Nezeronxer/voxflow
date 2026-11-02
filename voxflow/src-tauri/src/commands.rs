@@ -716,8 +716,8 @@ pub fn ai_test(state: State<AppState>) -> AiTestResult {
 
 /// Каталог моделей выбранного бэкенда по сохранённому ключу. Зовётся с фронта
 /// сразу после ввода ключа: человек должен выбирать модель из того, что ему
-/// реально доступно, а не вписывать идентификатор по памяти. Ошибка — это
-/// не отказ, а «каталога нет»: фронт остаётся на встроенном списке.
+/// реально доступно, а не вписывать идентификатор по памяти. Ошибка
+/// отображается на фронте с возможностью повторить загрузку.
 ///
 /// Асинхронная и с `spawn_blocking`: синхронные команды Tauri выполняются на
 /// UI-потоке, а фронт зовёт эту сам после каждой паузы в наборе ключа —
@@ -752,7 +752,7 @@ fn list_models_for(settings: &crate::settings::Settings) -> R<Vec<crate::rewrite
             .map_err(err),
         "openai_compat" => {
             if crate::rewrite::is_openrouter_base(&settings.rewrite_base_url) {
-                return crate::rewrite::openrouter_models(settings).map_err(err);
+                return crate::rewrite::openrouter_catalog(settings).map_err(err);
             }
             crate::rewrite::list_models(settings).map_err(err)
         }

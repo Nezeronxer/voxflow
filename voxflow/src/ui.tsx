@@ -122,13 +122,15 @@ export function Select({
   value,
   onChange,
   options,
+  ariaLabel,
 }: {
   value: string;
   onChange: (v: string) => void;
   options: { value: string; label: string }[];
+  ariaLabel?: string;
 }) {
   return (
-    <select value={value} onChange={(e) => onChange(e.currentTarget.value)}>
+    <select aria-label={ariaLabel} value={value} onChange={(e) => onChange(e.currentTarget.value)}>
       {options.map((o) => (
         <option key={o.value} value={o.value}>
           {o.label}

@@ -121,3 +121,8 @@ jobs:
         working-directory: voxflow
         # На Linux GTK/WebKit-тестам нужен X-дисплей: xvfb-run даёт виртуальный.
         run: ${{ runner.os == 'Linux' && 'xvfb-run -a ' || '' }}cargo test --locked --manifest-path src-tauri/Cargo.toml --lib
+
+      - name: Linux clipboard ownership without a clipboard manager
+        if: runner.os == 'Linux'
+        working-directory: voxflow
+        run: xvfb-run -a cargo test --locked --manifest-path src-tauri/Cargo.toml --lib native_clipboard_owner_survives -- --ignored

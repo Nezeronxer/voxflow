@@ -606,7 +606,17 @@ fn macos_incremental_keys(prev: &str, next: &str) -> Result<()> {
     Ok(())
 }
 
-/// Clipboard-операция с ретраями: clipboard на Windows — глобальный ресурс,
+#[cfg(target_os = "linux")]
+thread_local! {
+    // X11 хранит данные у владельца selection. Последний drop Clipboard
+    // освобождает selection ещё до Ctrl+V, если менеджера буфера нет.
+    // Владелец остаётся на том же выделенном потоке, что и операции вставки.
+    static LINUX_CLIPBOARD: std::cell::RefCell<Option<arboard::Clipboard>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Clipboard-операция с ретраями: clipboard на Windows - глобальный ресурс,
 /// его может коротко держать другое приложение (ERROR_CLIPBOARD_BUSY и т.п.).
 /// 3 попытки с паузой 30мс между ними.
 fn clipboard_retry(mut op: impl FnMut(&mut arboard::Clipboard) -> Result<()>) -> Result<()> {
@@ -615,12 +625,22 @@ fn clipboard_retry(mut op: impl FnMut(&mut arboard::Clipboard) -> Result<()>) ->
         if attempt > 0 {
             thread::sleep(Duration::from_millis(30));
         }
-        match arboard::Clipboard::new() {
-            Ok(mut cb) => match op(&mut cb) {
-                Ok(()) => return Ok(()),
-                Err(e) => last = Some(e),
-            },
-            Err(e) => last = Some(anyhow!("clipboard open: {e}")),
+        #[cfg(target_os = "linux")]
+        let result = LINUX_CLIPBOARD.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot.is_none() {
+                *slot =
+                    Some(arboard::Clipboard::new().map_err(|e| anyhow!("clipboard open: {e}"))?);
+            }
+            op(slot.as_mut().expect("clipboard initialized"))
+        });
+        #[cfg(not(target_os = "linux"))]
+        let result = arboard::Clipboard::new()
+            .map_err(|e| anyhow!("clipboard open: {e}"))
+            .and_then(|mut cb| op(&mut cb));
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) => last = Some(e),
         }
     }
     Err(last.unwrap_or_else(|| anyhow!("clipboard: неизвестная ошибка")))
@@ -897,6 +917,17 @@ fn send_copy_chord(e: &mut Enigo) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an isolated X11 display without a clipboard manager"]
+    fn native_clipboard_owner_survives_until_the_target_reads() {
+        let text = "VoxFlow clipboard lifetime regression";
+        clipboard_set_retry(text).expect("write clipboard");
+        thread::sleep(Duration::from_millis(50));
+        let mut target = arboard::Clipboard::new().expect("target clipboard");
+        assert_eq!(target.get_text().expect("target reads clipboard"), text);
+    }
+
     use super::*;
     use std::sync::Arc;
 

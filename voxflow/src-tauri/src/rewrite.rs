@@ -98,6 +98,8 @@ struct OpenRouterModel {
     #[serde(default)]
     output_modalities: Vec<String>,
     #[serde(default)]
+    architecture: OpenRouterArchitecture,
+    #[serde(default)]
     is_ready: Option<bool>,
     #[serde(default)]
     is_free: Option<bool>,
@@ -107,6 +109,12 @@ struct OpenRouterModel {
 struct OpenRouterPricing {
     prompt: Option<String>,
     completion: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenRouterArchitecture {
+    #[serde(default)]
+    output_modalities: Vec<String>,
 }
 
 /// Настроен ли OpenAI-совместимый рефайн: непустые `rewrite_base_url` И
@@ -163,13 +171,7 @@ pub fn ping(s: &crate::settings::Settings) -> Result<String> {
     }
 }
 
-/// Проверить OpenRouter-ключ и вернуть только бесплатные текстовые модели.
-///
-/// UI вызывает это через кнопку «Проверить»: до успешной проверки ключа список
-/// моделей не показывается. Ключ уходит в curl через stdin-конфиг, не через argv.
-/// Каталог текстовых моделей OpenRouter: рекомендованная первой, дальше платные
-/// от дешёвых к дорогим, бесплатные (с лимитами, часто недоступны) - в конце.
-/// Цена в подписи: для постобработки хватает самых дешёвых (D-058).
+/// Проверка ключа для кнопки «Проверить», затем публичный каталог.
 pub fn openrouter_models(s: &crate::settings::Settings) -> Result<Vec<ModelOption>> {
     if !is_openrouter_base(&s.rewrite_base_url) {
         return Err(anyhow!("OpenRouter: выбран не OpenRouter Base URL"));
@@ -185,10 +187,20 @@ pub fn openrouter_models(s: &crate::settings::Settings) -> Result<Vec<ModelOptio
     // /key даёт понятный отказ для fake/пустых ключей и не зависит от модели.
     let api_base = base(&s.rewrite_base_url);
     let _ = openrouter_get_json(s, &format!("{api_base}/key"), &key, 10)?;
+    openrouter_catalog(s)
+}
+
+/// Публичный каталог не требует ключа: выбор модели доступен ещё до его ввода.
+/// Рекомендованная первой, дальше платные от дешёвых к дорогим, бесплатные в конце.
+pub fn openrouter_catalog(s: &crate::settings::Settings) -> Result<Vec<ModelOption>> {
+    if !is_openrouter_base(&s.rewrite_base_url) {
+        return Err(anyhow!("OpenRouter: выбран не OpenRouter Base URL"));
+    }
+    let api_base = base(&s.rewrite_base_url);
     let v = openrouter_get_json(
         s,
         &format!("{api_base}/models?output_modalities=text&sort=pricing-low-to-high"),
-        &key,
+        "",
         15,
     )?;
     let response: OpenRouterModelsResponse = serde_json::from_value(v)
@@ -356,11 +368,12 @@ fn is_text_model(model: &OpenRouterModel) -> bool {
     if model.is_ready == Some(false) || model.id.ends_with(":batch") {
         return false;
     }
-    model.output_modalities.is_empty()
-        || model
-            .output_modalities
-            .iter()
-            .any(|m| m.eq_ignore_ascii_case("text"))
+    let modalities = if model.output_modalities.is_empty() {
+        &model.architecture.output_modalities
+    } else {
+        &model.output_modalities
+    };
+    modalities.is_empty() || modalities.iter().any(|m| m.eq_ignore_ascii_case("text"))
 }
 
 fn is_free_model(model: &OpenRouterModel) -> bool {
@@ -1008,9 +1021,34 @@ mod tests {
                 completion: Some(completion.into()),
             }),
             output_modalities: vec![out.into()],
+            architecture: OpenRouterArchitecture::default(),
             is_ready: Some(ready),
             is_free: None,
         }
+    }
+
+    #[test]
+    fn public_catalog_reads_architecture_modalities() {
+        let response: OpenRouterModelsResponse = serde_json::from_str(r#"{"data":[
+            {"id":"text/model","name":"Text","pricing":{"prompt":"0.000001","completion":"0.000001"},"architecture":{"output_modalities":["text"]}},
+            {"id":"image/model","name":"Image","pricing":{"prompt":"0.000001","completion":"0.000001"},"architecture":{"output_modalities":["image"]}}
+        ]}"#).unwrap();
+        let options = text_model_options(response.data);
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].value, "text/model");
+    }
+
+    #[test]
+    #[ignore = "requires network access to the public OpenRouter catalog"]
+    fn public_catalog_loads_without_a_valid_api_key() {
+        let s = crate::settings::Settings {
+            rewrite_base_url: "https://openrouter.ai/api/v1".into(),
+            rewrite_key: "invalid-test-key-not-sent".into(),
+            ..Default::default()
+        };
+        let models = openrouter_catalog(&s).expect("public catalog request");
+        assert!(models.len() > 20);
+        println!("Public catalog: {} text models", models.len());
     }
 
     #[test]

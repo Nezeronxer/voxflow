@@ -16,6 +16,7 @@ import {
 import { isLoopbackUrl } from "../privacyState";
 import SecretControl from "../components/SecretControl";
 import LocalAiCard from "../components/LocalAiCard";
+import openrouterCatalog from "../openrouter-catalog.json";
 
 type Option = AiModelOption;
 
@@ -73,6 +74,8 @@ export default function Ai({
   // подсказках.
   const [catalog, setCatalog] = useState<Option[]>([]);
   const [catalogNote, setCatalogNote] = useState<string | null>(null);
+  const [catalogLoading, setCatalogLoading] = useState(false);
+  const [catalogRevision, setCatalogRevision] = useState(0);
 
   const backend = settings.ai_backend;
   const aiOff = backend === "off";
@@ -84,6 +87,11 @@ export default function Ai({
   const isCustom = customPicked || savedProvider.value === "custom";
   const rewriteProvider = isCustom ? CUSTOM_PROVIDER : savedProvider;
   const isOpenRouter = rewriteProvider.value === "openrouter";
+  const fallbackModels = isOpenRouter
+    ? [...rewriteProvider.models, ...openrouterCatalog.models.filter(
+        (model) => !rewriteProvider.models.some((preset) => preset.value === model.value),
+      )]
+    : rewriteProvider.models;
   // Каталог читается только у тех, кто его отдаёт по ключу или адресу.
   // Встроенный ИИ выбирает модель в своём разделе, здесь его не спрашиваем.
   const hasCatalog =
@@ -107,9 +115,11 @@ export default function Ai({
   useEffect(() => {
     setCatalog([]);
     setCatalogNote(null);
+    setCatalogLoading(false);
     if (!hasCatalog) return;
     if (
       backend === "openai_compat" &&
+      !isOpenRouter &&
       !settings.rewrite_key.trim() &&
       settings.rewrite_base_url.trim() !== keyBaseUrl.current &&
       // Локальный сервер (LM Studio) ключа не требует и живёт на этой машине.
@@ -120,27 +130,33 @@ export default function Ai({
     }
     let alive = true;
     const timer = window.setTimeout(async () => {
+      setCatalogLoading(true);
       setCatalogNote("Читаю список моделей…");
-      const snapshot = latestSettings.current;
-      const saved = await (persist ? persist(snapshot) : saveSettings(snapshot));
-      if (!alive) return;
-      if (!saved) {
-        setCatalogNote(null);
-        return;
-      }
-      const models = await aiListModels();
-      if (!alive) return;
-      setCatalog(models);
-      setCatalogNote(models.length > 0 ? `Найдено моделей: ${models.length}` : null);
-      // Модель ещё не выбрана (свежий пресет OpenRouter, LM Studio, «Своё») —
-      // берём первую из каталога, как это делает «Проверить». Без модели
-      // обработка текста молча не включается.
-      if (
-        backend === "openai_compat" &&
-        models.length > 0 &&
-        !latestSettings.current.rewrite_model.trim()
-      ) {
-        update({ rewrite_model: models[0].value });
+      try {
+        const snapshot = latestSettings.current;
+        const saved = await (persist ? persist(snapshot) : saveSettings(snapshot));
+        if (!alive) return;
+        if (!saved) {
+          setCatalogNote("Не удалось сохранить настройки. Повторите загрузку списка.");
+          return;
+        }
+        const models = await aiListModels();
+        if (!alive) return;
+        setCatalog(models);
+        setCatalogNote(models.length > 0 ? `Найдено моделей: ${models.length}`
+          : "Сервис вернул пустой список. Показываю встроенные модели.");
+        // Пустую модель заполняем первой из каталога, существующий выбор сохраняем.
+        if (
+          backend === "openai_compat" &&
+          models.length > 0 &&
+          !latestSettings.current.rewrite_model.trim()
+        ) {
+          update({ rewrite_model: models[0].value });
+        }
+      } catch {
+        if (alive) setCatalogNote("Не удалось загрузить список. Проверьте подключение и настройки прокси. Показываю встроенные модели.");
+      } finally {
+        if (alive) setCatalogLoading(false);
       }
     }, CATALOG_DEBOUNCE_MS);
     return () => {
@@ -158,6 +174,7 @@ export default function Ai({
     settings.rewrite_auth_header,
     settings.ai_api_key,
     settings.ollama_url,
+    catalogRevision,
   ]);
 
   function applyOpenAiCompatProvider(providerValue: string) {
@@ -198,11 +215,11 @@ export default function Ai({
       }
       const r = await aiTest();
       setResult(r);
-      if (isOpenRouter && r.ok && r.models?.length) {
+      if (isOpenRouter && r.models?.length) {
         setCatalog(r.models);
         setCatalogNote(`Найдено моделей: ${r.models.length}`);
         const current = settings.rewrite_model.trim();
-        if (!r.models.some((model) => model.value === current)) {
+        if (!current) {
           update({ rewrite_model: r.models[0].value });
         }
       }
@@ -477,19 +494,32 @@ export default function Ai({
               </Field>
             )}
 
-            {catalog.length > 0 ? (
+            {isOpenRouter || catalog.length > 0 ? (
               <Field
                 label="Модель"
-                hint={catalogNote ?? `Base URL: ${rewriteProvider.baseUrl}`}
+                hint={catalogNote ?? (isOpenRouter
+                  ? `Встроенный список от ${openrouterCatalog.updated}. Загружаю актуальные модели и цены…`
+                  : `Base URL: ${rewriteProvider.baseUrl}`)}
               >
-                <Select
-                  value={settings.rewrite_model}
-                  onChange={(v) => {
-                    setResult(null);
-                    update({ rewrite_model: v });
-                  }}
-                  options={withCurrentOption(catalog, settings.rewrite_model)}
-                />
+                <div style={{ display: "grid", gap: 8, width: "100%" }}>
+                  <Select
+                    ariaLabel="Модель"
+                    value={settings.rewrite_model}
+                    onChange={(v) => {
+                      setResult(null);
+                      update({ rewrite_model: v });
+                    }}
+                    options={withCurrentOption(catalog.length ? catalog : fallbackModels, settings.rewrite_model)}
+                  />
+                  {isOpenRouter && (
+                    <button className="btn btn-sm" type="button"
+                      style={{ justifySelf: "end" }}
+                      disabled={catalogLoading}
+                      onClick={() => setCatalogRevision((revision) => revision + 1)}>
+                      {catalogLoading ? "Загрузка…" : "Обновить список"}
+                    </button>
+                  )}
+                </div>
               </Field>
             ) : (
               <Field
@@ -526,7 +556,7 @@ export default function Ai({
             {!isLoopbackUrl(settings.rewrite_base_url) && (
               <div className="field-hint">
                 Для постобработки хватает самых дешёвых моделей
-                {isOpenRouter ? " - они в начале списка, цена за 1M токенов" : ""}: дорогие
+                {isOpenRouter && catalog.length > 0 ? " - они в начале списка, цена за 1M токенов" : ""}: дорогие
                 пишут не лучше, только медленнее и дороже. Одна диктовка на дешёвой модели
                 стоит сотые доли цента.
               </div>

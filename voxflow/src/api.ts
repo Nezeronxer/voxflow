@@ -533,13 +533,12 @@ export type AiTestResult = {
 };
 
 /**
- * Каталог моделей выбранного бэкенда по сохранённому ключу. Пустой список —
- * каталог недоступен (нет ключа, сервис не отвечает); UI остаётся на
- * встроенных подсказках.
+ * Ошибки каталога обрабатывает вызывающий экран: пустой список не должен
+ * скрывать отказ сети или авторизации и превращать выбор в текстовое поле.
  */
 export function aiListModels(): Promise<AiModelOption[]> {
   if (!IS_TAURI_RUNTIME) return Promise.resolve([]);
-  return safe<AiModelOption[]>(() => invoke<AiModelOption[]>("ai_list_models"), []);
+  return invoke<AiModelOption[]>("ai_list_models");
 }
 
 export function aiTest(): Promise<AiTestResult> {
