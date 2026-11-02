@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
 // Render the real settings section before its asynchronous catalog has loaded.
@@ -17,7 +18,7 @@ const built = await build({
           update: () => {}, part: 'main'
         }));
       }`,
-    resolveDir: new URL("..", import.meta.url).pathname,
+    resolveDir: fileURLToPath(new URL("..", import.meta.url)),
   },
   bundle: true, platform: "node", format: "cjs", packages: "external", write: false,
 });
