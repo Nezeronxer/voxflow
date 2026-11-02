@@ -1,151 +1,45 @@
-name: Release macOS ARM64 (Developer ID, self-signed or ad-hoc)
+name: Build verified macOS 26 fallback for v2.4.8
 
+# Manual fallback for exhausted macOS 15 runner capacity. Application sources
+# remain pinned to the already tested release tag; signing is owner-only.
 on:
-  workflow_call:
-    inputs:
-      release_build:
-        description: Enables the trusted tag-release job; callers must also run from a v* tag
-        required: true
-        type: boolean
-    secrets:
-      MACOS_SELF_SIGNED_P12_BASE64:
-        description: Base64-encoded self-signed code-signing .p12 (script/setup-macos-signing.sh)
-        required: false
-      MACOS_SELF_SIGNED_P12_PASSWORD:
-        description: Password for the self-signed .p12
-        required: false
-      APPLE_CERTIFICATE:
-        description: Base64-encoded Developer ID Application .p12 certificate
-        required: false
-      APPLE_CERTIFICATE_PASSWORD:
-        description: Password for the Developer ID .p12 certificate
-        required: false
-      APPLE_SIGNING_IDENTITY:
-        description: Optional identity name or SHA-1 hash used to disambiguate the imported certificate
-        required: false
-      APPLE_ID:
-        description: Optional Apple ID used with an app-specific password for notarization
-        required: false
-      APPLE_PASSWORD:
-        description: Optional app-specific Apple ID password for notarization
-        required: false
-      APPLE_TEAM_ID:
-        description: Optional Apple Developer Team ID for notarization
-        required: false
-      APPLE_API_ISSUER:
-        description: Optional App Store Connect API issuer ID
-        required: false
-      APPLE_API_KEY:
-        description: Optional App Store Connect API key ID
-        required: false
-      APPLE_API_PRIVATE_KEY_BASE64:
-        description: Optional base64-encoded App Store Connect AuthKey .p8 contents
-        required: false
   workflow_dispatch:
-  pull_request:
-    paths:
-      - ".github/workflows/release-macos-arm64.yml"
-      - ".github/workflows/release.yml"
-      - "script/build_macos_arm64_release.sh"
-      - "script/check_versions.py"
-      - "voxflow/package.json"
-      - "voxflow/package-lock.json"
-      - "voxflow/src/**"
-      - "voxflow/src-tauri/**"
 
 permissions:
   contents: read
 
 concurrency:
-  group: macos-arm64-release-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: voxflow-macos26-v2.4.8
+  cancel-in-progress: false
 
 jobs:
-  build-adhoc:
-    name: macOS 15 ARM64 / forced ad-hoc validation
-    if: ${{ github.event_name == 'pull_request' || inputs.release_build != true || github.ref_type != 'tag' || !startsWith(github.ref_name, 'v') }}
-    runs-on: macos-15
-    timeout-minutes: 90
-    env:
-      CI: "true"
-      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
-      MACOSX_DEPLOYMENT_TARGET: "11.0"
-      VOXFLOW_XCODE_BUILD: "16F6"
-      VOXFLOW_XCODE_VERSION: "16.4"
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-
-      - name: Set up Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
-        with:
-          node-version: "22.23.1"
-          cache: npm
-          cache-dependency-path: voxflow/package-lock.json
-
-      - name: Set up Python
-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.13.5"
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
-        with:
-          toolchain: "1.96.1"
-          targets: aarch64-apple-darwin
-          components: rustfmt, clippy
-
-      - name: Verify native ARM64 runner and pinned Xcode
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$(uname -m)" == "arm64" ]]
-          [[ -x "$DEVELOPER_DIR/usr/bin/xcodebuild" ]]
-          [[ "$(xcodebuild -version | awk 'NR == 1 {print $2}')" == "$VOXFLOW_XCODE_VERSION" ]]
-          [[ "$(xcodebuild -version | awk 'NR == 2 {print $3}')" == "$VOXFLOW_XCODE_BUILD" ]]
-          rustc --version --verbose
-          node --version
-          python3 --version
-
-      - name: Build, test, package, and verify forced ad-hoc release
-        shell: bash
-        run: |
-          set -euo pipefail
-          unset VOXFLOW_SIGNING_IDENTITY
-          unset APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY
-          unset APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID
-          unset APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_PATH
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            ./script/build_macos_arm64_release.sh --tag "$GITHUB_REF_NAME"
-          else
-            ./script/build_macos_arm64_release.sh
-          fi
-
-      - name: Upload app, DMG, manifest, and SHA256 checksums
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: VoxFlow-macOS-arm64-${{ github.sha }}
-          path: voxflow/release/macos/*/
-          if-no-files-found: error
-          compression-level: 0
-          retention-days: 14
-
-  build-release:
-    name: macOS 15 ARM64 / verified distribution bundle
-    if: ${{ github.event_name != 'pull_request' && inputs.release_build == true && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') }}
-    runs-on: macos-15
+  build-fallback:
+    name: macOS 26 ARM64 / verified v2.4.8 bundle
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/release/macos26-2.4.8' && github.actor == github.repository_owner }}
+    runs-on: macos-26
     timeout-minutes: 120
     env:
       CI: "true"
-      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      DEVELOPER_DIR: /Applications/Xcode_26.0.1.app/Contents/Developer
       MACOSX_DEPLOYMENT_TARGET: "11.0"
-      VOXFLOW_XCODE_BUILD: "16F6"
-      VOXFLOW_XCODE_VERSION: "16.4"
+      VOXFLOW_XCODE_BUILD: "17A400"
+      VOXFLOW_XCODE_VERSION: "26.0.1"
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          ref: 7e7bd5ea4e78282423e9748138a22468b87f8b58
+          fetch-depth: 0
+
+      - name: Verify immutable release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=7e7bd5ea4e78282423e9748138a22468b87f8b58
+          [[ "$(git rev-parse HEAD)" == "$expected" ]]
+          [[ "$(git rev-parse 'v2.4.8^{}')" == "$expected" ]]
+          python3 script/check_versions.py --tag v2.4.8
 
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -381,16 +275,12 @@ jobs:
           APPLE_API_KEY_PATH: ${{ steps.signing.outputs.api_key_path }}
         run: |
           set -euo pipefail
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            ./script/build_macos_arm64_release.sh --tag "$GITHUB_REF_NAME"
-          else
-            ./script/build_macos_arm64_release.sh
-          fi
+          ./script/build_macos_arm64_release.sh --tag v2.4.8
 
       - name: Upload app, DMG, manifest, and SHA256 checksums
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: VoxFlow-macOS-arm64-${{ github.sha }}
+          name: VoxFlow-macOS-arm64-7e7bd5ea4e78282423e9748138a22468b87f8b58
           path: voxflow/release/macos/*/
           if-no-files-found: error
           compression-level: 0
