@@ -109,11 +109,14 @@ test("meta label shows recognizer and AI model, warns when missing", () => {
   assert.equal(label(undefined, { kind: "unknown" }), null);
 });
 
-test("raw preview is hidden until final only when AI rewrites the text", () => {
-  assert.equal(previewState.hidesRawUntilFinal({ kind: "cloud" }), true);
-  assert.equal(previewState.hidesRawUntilFinal({ kind: "local", name: "gemma4:e2b" }), true);
-  assert.equal(previewState.hidesRawUntilFinal({ kind: "off" }), false);
-  assert.equal(previewState.hidesRawUntilFinal({ kind: "missing" }), false);
-  assert.equal(previewState.hidesRawUntilFinal(null), false);
-  assert.equal(previewState.hidesRawUntilFinal(undefined), false);
+test("changed words reveal in a short bounded wave without delaying long text", () => {
+  assert.equal(previewState.wordRevealDelay(0, 0), 0);
+  assert.equal(previewState.wordRevealDelay(4, 3), 18);
+  assert.equal(previewState.wordRevealDelay(100, 0), 120);
+  assert.equal(previewState.wordRevealDelay(100, 100), 0);
+});
+
+test("recording preview never starts background AI rewriting", async () => {
+  const engine = await readFile(new URL("../src-tauri/src/engine.rs", import.meta.url), "utf8");
+  assert.doesNotMatch(engine, /voxflow-preview-ai|struct LivePreview/);
 });

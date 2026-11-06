@@ -26,10 +26,10 @@ import "./overlay.css";
 import {
   overlayMetaLabel,
   type OverlayAi,
-  hidesRawUntilFinal,
   previewPillMode,
   resolveOverlayPreviewEvent,
   sharedWordPrefix,
+  wordRevealDelay,
   wordTokens,
 } from "./overlayPreviewState";
 import { DEFAULT_HOTKEY, normalizeOverlayScale } from "./types";
@@ -98,7 +98,7 @@ const BOX: Record<PillMode, { w: number; h: number }> = {
   idle: { w: 266, h: 60 },
   rec: { w: 320, h: 56 },
   trans: { w: 320, h: 56 },
-  stream: { w: 446, h: 82 },
+  stream: { w: 446, h: 218 },
   latch: { w: 306, h: 56 },
   notice: { w: 346, h: 74 },
 };
@@ -136,8 +136,6 @@ export default function Overlay() {
   // чтобы видно было то, что ушло в поле, а не сырое распознавание (D-061).
   const [finalHold, setFinalHold] = useState(false);
   const finalHoldRef = useRef(false);
-  // Сырой текст спрятан до итога: идёт обработка нейросетью.
-  const hideRawRef = useRef(false);
   const finalHoldTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [hotkeyTip, setHotkeyTip] = useState(prettyHotkey(DEFAULT_HOTKEY));
   const [overlayScale, setOverlayScale] = useState(1);
@@ -220,6 +218,7 @@ export default function Overlay() {
         }
         const el = document.createElement("span");
         el.className = cls;
+        el.style.animationDelay = `${wordRevealDelay(idx, same)}ms`;
         el.textContent = token;
         host.appendChild(el);
       });
@@ -310,8 +309,6 @@ export default function Overlay() {
         const el = scrollRef.current;
         if (!el) return;
         el.scrollTop = el.scrollHeight;
-        // Маска по верхнему краю нужна, только когда начало фразы ушло вверх.
-        el.classList.toggle("aq-clip", el.scrollHeight > el.clientHeight + 1);
       });
     };
     const stopScrollRaf = () => {
@@ -441,7 +438,6 @@ export default function Overlay() {
         // уже показанный partial. Полный сброс делаем только на реальном входе.
         if (prev !== "recording") {
           endFinalHold();
-          hideRawRef.current = false;
           setOffline(false);
           setModel(undefined);
           setAi(null);
@@ -452,13 +448,7 @@ export default function Overlay() {
           lastLevelAtRef.current = 0;
         }
       } else if (v === "transcribing") {
-        // Без нейросети live-preview остаётся на время финала: пользователь видит
-        // сказанное, кольцо на орбе показывает обработку. С нейросетью сырой
-        // текст не совпадёт с итогом - прячем его, итог придёт событием final.
-        if (hidesRawUntilFinal(typeof p === "object" && p !== null ? p.ai : undefined)) {
-          hideRawRef.current = true;
-          resetTextEngine();
-        }
+        // Последний текст остаётся виден до готового итога.
         kickLevel();
       } else {
         clearLatch();
@@ -483,7 +473,6 @@ export default function Overlay() {
       finalSeqRef.current = resolved.finalSeq;
       const preview = resolved.preview;
       if (preview == null) return;
-      if (hideRawRef.current && !preview.isFinal) return;
       if (preview.isFinal) {
         showText(preview.text, preview.committedLen);
         finalHoldRef.current = true;

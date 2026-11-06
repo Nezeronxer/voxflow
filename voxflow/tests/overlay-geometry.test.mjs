@@ -53,7 +53,7 @@ test("capsule stays compact and every CSS state fits its Tauri window box", () =
     idle: { w: 266, h: 60 },
     rec: { w: 320, h: 56 },
     trans: { w: 320, h: 56 },
-    stream: { w: 446, h: 82 },
+    stream: { w: 446, h: 218 },
     latch: { w: 306, h: 56 },
     notice: { w: 346, h: 74 },
   };
@@ -111,7 +111,7 @@ test("capsule stays compact and every CSS state fits its Tauri window box", () =
   assert.equal(declaration(finalRule(".aq-stream"), "min-width"), "160px");
   assert.equal(declaration(finalRule(".aq-stream"), "max-width"), "420px");
   assert.equal(declaration(finalRule(".aq-stream"), "min-height"), "34px");
-  assert.equal(declaration(finalRule(".aq-stream"), "max-height"), "60px");
+  assert.equal(declaration(finalRule(".aq-stream"), "max-height"), "196px");
   // Однострочный stream = rec по высоте: паддинги + строка 18 + рамка 2.
   const [padY] = declaration(finalRule(".aq-stream"), "padding").split(" ");
   const lineH = px(declaration(finalRule(".aq-text"), "line-height"));
@@ -130,12 +130,10 @@ test("live preview survives transcribing and word updates bypass React state", (
     overlaySource,
   );
   assert.ok(transcribingBranch, "missing transcribing status branch");
-  // D-064: сырой текст стирается на обработке только когда итог перепишет нейросеть.
-  assert.match(
-    transcribingBranch[1],
-    /if \(hidesRawUntilFinal\([^)]*\)\) \{\s*hideRawRef\.current = true;\s*resetTextEngine\(\);/,
-  );
-  assert.match(overlaySource, /if \(hideRawRef\.current && !preview\.isFinal\) return;/);
+  assert.doesNotMatch(transcribingBranch[1], /resetTextEngine\(\)/);
+  assert.doesNotMatch(overlaySource, /hideRawRef|hidesRawUntilFinal/);
+  assert.equal(declaration(finalRule(".aq-text"), "max-height"), "180px");
+  assert.equal(declaration(finalRule(".aq-text"), "overflow-y"), "auto");
   assert.doesNotMatch(overlaySource, /const \[shown,\s*setShown\]/);
   // Слова пишутся в DOM напрямую, совпавший префикс не пересоздаётся.
   assert.match(overlaySource, /host\.appendChild\(el\)/);

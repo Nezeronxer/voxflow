@@ -4208,6 +4208,12 @@ fn process_utterance(
         return Ok(());
     }
 
+    // Готовый результат меняет сохранённое превью до вставки, без пустой плашки.
+    let _ = ctx.app.emit(
+        "partial",
+        settled_partial_payload(&text, &text, my_gen, lang_badge),
+    );
+
     // ── Финальная вставка ──
     // always/auto (и live-текст уже физически вставлен): реконсиляция
     // напечатанного → финальный текст

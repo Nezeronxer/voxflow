@@ -116,7 +116,7 @@
   justify-content: space-between;
 }
 
-/* stream: растёт по тексту, одна строка (34) или две (до 60). width/height auto
+/* stream: растёт по тексту, до десяти строк с прокруткой. width/height auto
    не интерполируются - допустимый одиночный скачок на смене состояния. */
 .aq-stream {
   width: auto;
@@ -124,7 +124,7 @@
   max-width: 420px;
   height: auto;
   min-height: 34px;
-  max-height: 60px;
+  max-height: 196px;
   /* 7+18+7 + рамка 2 = 34: одна строка ровно по высоте rec, без скачка. */
   padding: 7px 14px 7px 12px;
   justify-content: flex-start;
@@ -293,7 +293,7 @@
 .aq-text {
   flex: 1;
   min-width: 0;
-  max-height: 36px; /* две строки по 18 px */
+  max-height: 180px; /* десять строк; остальное доступно прокруткой */
   overflow-y: auto;
   scrollbar-width: none;
   white-space: pre-wrap;
@@ -307,12 +307,6 @@
 .aq-text::-webkit-scrollbar {
   display: none;
 }
-/* Начало длинной фразы уходит вверх под мягкую маску (класс ставит Overlay.tsx). */
-.aq-text.aq-clip {
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 16px);
-  mask-image: linear-gradient(to bottom, transparent 0, #000 16px);
-}
-
 /* Новое или переписанное слово проявляется (только компосит), совпавший префикс
    не трогается. inline-block - чтобы работал сдвиг transform. */
 .aq-w {

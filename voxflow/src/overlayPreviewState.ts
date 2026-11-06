@@ -120,14 +120,14 @@ export function sharedWordPrefix(prev: string[], next: string[]): number {
   return same;
 }
 
+// Короткая волна появления: длинный итог не ждёт пословного «набирания».
+export function wordRevealDelay(index: number, firstChanged: number): number {
+  return Math.min(Math.max(0, index - firstChanged) * 18, 120);
+}
+
 // Метка ИИ-обработки из "status".ai: kind - local | cloud | off | missing.
 export type OverlayAi = { kind?: string; name?: string | null };
 
-// Итог перепишет нейросеть - сырое распознавание после отпускания клавиши
-// с ним расходится, и плашка его не показывает до финала (D-064).
-export function hidesRawUntilFinal(ai: OverlayAi | null | undefined): boolean {
-  return ai?.kind === "local" || ai?.kind === "cloud";
-}
 export type OverlayMetaPart = { text: string; warn: boolean };
 
 // Подпись капсулы «GigaAM · ИИ gemma4:e2b»: распознавание из "status".model и
