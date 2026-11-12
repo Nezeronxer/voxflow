@@ -65,6 +65,17 @@ test("a detached settled preview cannot replace the final text for the same seq"
   assert.equal(lateSettled.preview, null);
 });
 
+test("after Stop a detached silence preview cannot overwrite the prepared insertion", () => {
+  const prepared = previewState.resolveOverlayPreviewEvent("transcribing", 43, -1, {
+    text: "Исправленный итог.", settled: true, prepared: true, seq: 43,
+  });
+  assert.equal(prepared.preview.text, "Исправленный итог.");
+  const late = previewState.resolveOverlayPreviewEvent("transcribing", 43, -1, {
+    text: "старый текст до обработки", settled: true, seq: 43,
+  });
+  assert.equal(late.preview, null);
+});
+
 test("stale final and idle settled previews remain rejected", () => {
   const staleFinal = previewState.resolveOverlayPreviewEvent("idle", 42, 42, {
     text: "старый финал",

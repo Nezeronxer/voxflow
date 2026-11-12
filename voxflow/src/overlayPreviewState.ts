@@ -7,6 +7,7 @@ export type OverlayPreviewPayload = {
   seq?: number;
   final?: boolean;
   settled?: boolean;
+  prepared?: boolean;
 };
 
 export type ResolvedOverlayPreview = {
@@ -44,7 +45,7 @@ export function resolveOverlayPreviewEvent(
   if (!isFinal && seq != null && seq === finalSeq) {
     return { currentSeq: nextSeq, finalSeq, preview: null };
   }
-  if (status === "transcribing" && !isFinal && !isSettled) {
+  if (status === "transcribing" && !isFinal && payload.prepared !== true) {
     return { currentSeq: nextSeq, finalSeq, preview: null };
   }
   const isSameSeqFinalAfterIdle =

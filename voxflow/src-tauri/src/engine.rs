@@ -1141,8 +1141,7 @@ fn word_count(text: &str) -> usize {
 }
 
 fn has_cyrillic(text: &str) -> bool {
-    text.chars()
-        .any(|c| ('а'..='я').contains(&c.to_ascii_lowercase()) || c == 'ё' || c == 'Ё')
+    text.chars().any(|c| ('\u{0400}'..='\u{04FF}').contains(&c))
 }
 
 /// Сколько слов текста написано кириллицей.
@@ -1195,12 +1194,12 @@ impl LocalStt for AutoLangStt {
             Some(g) => g.transcribe(samples_16k)?,
             None => String::new(),
         };
-        if t.trim().is_empty() || gigaam_auto_final_trusted(&t) {
+        if !auto_needs_parakeet(&t, samples_16k.len()) {
             return Ok(t);
         }
         if let Some(p) = self.en.try_lock().as_mut().and_then(|g| g.as_mut()) {
             let pt = p.transcribe(samples_16k)?;
-            if parakeet_auto_final_trusted(&pt) {
+            if auto_takes_parakeet(&t, &pt, samples_16k.len()) {
                 return Ok(pt);
             }
         }
@@ -4211,7 +4210,7 @@ fn process_utterance(
     // Готовый результат меняет сохранённое превью до вставки, без пустой плашки.
     let _ = ctx.app.emit(
         "partial",
-        settled_partial_payload(&text, &text, my_gen, lang_badge),
+        prepared_partial_payload(&text, my_gen, lang_badge),
     );
 
     // ── Финальная вставка ──
@@ -4857,6 +4856,12 @@ fn emit_final_preview(app: &AppHandle, text: &str, seq: u64, lang: Option<&'stat
     let _ = app.emit("partial", final_preview_payload(text, seq, lang));
 }
 
+fn prepared_partial_payload(text: &str, seq: u64, lang: Option<&'static str>) -> serde_json::Value {
+    let mut payload = settled_partial_payload(text, text, seq, lang);
+    payload["prepared"] = true.into();
+    payload
+}
+
 /// Настроенный бэкенд — и есть согласие ждать модель: она исправляет ослышки
 /// распознавания по смыслу, а без неё в поле уходит то, что услышал ASR.
 /// До 2.0.18 нейтральные окна и поля нейросети LLM не звали ради мгновенной
@@ -4872,6 +4877,19 @@ fn final_rewrite_eligible(s: &Settings, rewrite_tone: &str) -> bool {
 #[cfg(test)]
 mod overlay_event_tests {
     use super::*;
+
+    #[test]
+    fn prepared_preview_is_distinct_from_a_silence_draft() {
+        let payload = prepared_partial_payload("Текст для вставки.", 44, Some("ru"));
+        assert_eq!(payload["prepared"], true);
+        assert_eq!(payload["text"], "Текст для вставки.");
+        assert_eq!(payload["committed"], payload["text"]);
+        assert_ne!(payload["final"], true);
+        assert_ne!(
+            settled_partial_payload("Черновик", "", 44, None)["prepared"],
+            true
+        );
+    }
 
     #[test]
     fn live_partial_payload_is_marked_processed() {
@@ -6094,9 +6112,17 @@ mod seg_tests {
     fn eval_auto_language() {
         let dir = std::env::var("VOXFLOW_EVAL_DIR").expect("VOXFLOW_EVAL_DIR");
         let threads = Settings::default().effective_threads() as usize;
-        let mut g = load_gigaam_fp32(threads).expect("gigaam fp32");
-        let mut p = crate::parakeet::Parakeet::load(&crate::paths::parakeet_dir(), threads)
-            .expect("parakeet");
+        let ru = Arc::new(Mutex::new(Some(
+            load_gigaam_fp32(threads).expect("gigaam fp32"),
+        )));
+        let en = Arc::new(Mutex::new(Some(
+            crate::parakeet::Parakeet::load(&crate::paths::parakeet_dir(), threads)
+                .expect("parakeet"),
+        )));
+        let mut preview = AutoLangStt {
+            ru: ru.clone(),
+            en: en.clone(),
+        };
         let mut wavs: Vec<_> = std::fs::read_dir(&dir)
             .expect("dir")
             .filter_map(|e| e.ok().map(|e| e.path()))
@@ -6108,13 +6134,35 @@ mod seg_tests {
         let (mut flips, mut total, mut parakeet_ms) = (0, 0, 0u128);
         for w in wavs {
             let samples = read_wav_16k(&w);
-            let gt = g.transcribe(&samples).unwrap_or_default();
+            let gt = ru
+                .lock()
+                .as_mut()
+                .unwrap()
+                .transcribe(&samples)
+                .expect("gigaam inference");
             let t = Instant::now();
-            let pt = p.transcribe(&samples).unwrap_or_default();
+            let pt = en
+                .lock()
+                .as_mut()
+                .unwrap()
+                .transcribe(&samples)
+                .expect("parakeet inference");
             parakeet_ms += t.elapsed().as_millis();
             total += 1;
             let flip = auto_takes_parakeet(&gt, &pt, samples.len());
             flips += usize::from(flip);
+            if std::env::var_os("VOXFLOW_EVAL_PREVIEW").is_some() {
+                let actual = preview.transcribe(&samples).expect("auto preview");
+                let expected = if flip { &pt } else { &gt };
+                assert_eq!(&actual, expected, "preview/final routing: {}", w.display());
+            }
+            println!(
+                "EVAL_JSON {}",
+                serde_json::json!({
+                    "wav": w, "gigaam": gt, "english": pt,
+                    "auto": if flip { &pt } else { &gt }, "takes_english": flip,
+                })
+            );
             if quiet && !flip {
                 continue;
             }
@@ -6129,6 +6177,25 @@ mod seg_tests {
             "записей {total}, auto взял бы Parakeet: {flips}; Parakeet в среднем {} мс",
             parakeet_ms / total.max(1) as u128
         );
+    }
+
+    #[test]
+    #[ignore = "requires local Parakeet and a known English WAV in VOXFLOW_EVAL_WAV"]
+    fn auto_preview_uses_english_while_russian_model_is_not_resident() {
+        let wav = std::env::var("VOXFLOW_EVAL_WAV").expect("English fixture path");
+        let samples = read_wav_16k(std::path::Path::new(&wav));
+        let mut english = crate::parakeet::Parakeet::load(
+            &crate::paths::parakeet_dir(),
+            Settings::default().effective_threads() as usize,
+        )
+        .expect("parakeet");
+        let expected = english.transcribe(&samples).expect("English transcription");
+        assert!(auto_takes_parakeet("", &expected, samples.len()));
+        let mut preview = AutoLangStt {
+            ru: Arc::new(Mutex::new(None)),
+            en: Arc::new(Mutex::new(Some(english))),
+        };
+        assert_eq!(preview.transcribe(&samples).unwrap(), expected);
     }
 
     #[test]
@@ -8596,11 +8663,17 @@ fn rewrite_stem(token: &str) -> String {
 
 fn rewrite_content_stems(value: &str) -> Vec<String> {
     value
+        .to_lowercase()
+        .replace('’', "'")
+        .replace("cannot", "can not")
+        .replace("can't", "can not")
+        .replace("won't", "will not")
+        .replace("shan't", "shall not")
+        .replace("n't", " not")
         .split(|c: char| !c.is_alphanumeric())
         .filter(|part| !part.is_empty())
-        .map(str::to_lowercase)
         .filter(|token| !rewrite_structural_token(token))
-        .map(|token| rewrite_stem(&token))
+        .map(rewrite_stem)
         .collect()
 }
 
@@ -8999,6 +9072,23 @@ fn context_echo_words(input: &str, output: &str, context: &str) -> usize {
         .len()
 }
 
+fn dictation_has_added_content(input: &str, output: &str) -> bool {
+    let source: HashSet<String> = rewrite_content_stems(input).into_iter().collect();
+    let result: HashSet<String> = rewrite_content_stems(output).into_iter().collect();
+    let replaced = source.difference(&result).count();
+    let novel: Vec<_> = result.difference(&source).collect();
+    // A product name can split during transliteration: «АкваVoice» → «Aqua Voice».
+    let split_name = usize::from(
+        replaced > 0
+            && !novel.is_empty()
+            && novel
+                .iter()
+                .all(|s| s.chars().all(|c| c.is_ascii_alphabetic())),
+    );
+    // shortcut: lexical substitutions can hide additions; semantic verification needs a reference.
+    novel.len() > replaced + split_name
+}
+
 /// Та же защита для UI-команд (`transform_text`, переработка промпта) — там
 /// раньше не было вообще ничего, и обрезанный ответ затирал текст пользователя.
 /// `min_recall = 0.0` для намеренно сокращающих преобразований: остаётся только
@@ -9185,6 +9275,11 @@ fn refine_text_with_fallback(
                 }
                 let grounding =
                     rewrite_grounding(text, &refined, s.rewrite_min_recall, max_expansion);
+                if stenographer && dictation_has_added_content(text, &refined) {
+                    failure = Some("модель добавила содержание, которого нет в диктовке".into());
+                    log::warn!("рерайт отклонён: добавлено содержание вне диктовки");
+                    continue;
+                }
                 if grounding.grounded {
                     return (refined, true, None);
                 }
@@ -9277,6 +9372,97 @@ fn build_tone_instruction(
 
 #[cfg(test)]
 mod smart_prompt_tests {
+    #[test]
+    fn dictation_rewrite_rejects_added_requirements_but_keeps_asr_corrections() {
+        use std::io::{Read, Write};
+        for (input, output, accepted) in [
+            (
+                "I do not want any extra words",
+                "I don't want any extra words.",
+                true,
+            ),
+            (
+                "We cannot change the file",
+                "We can't change the file.",
+                true,
+            ),
+            ("I can open the file", "I can't open the file.", false),
+            (
+                "Исправь ошибку в плашке",
+                "Исправь ошибку в плашке и добавь автоматические тесты.",
+                false,
+            ),
+            ("Пришли отчёт", "Пришли отчёт завтра к 15 часам.", false),
+            (
+                "испанский север удали из памяти",
+                "Испанский сервер удали из памяти.",
+                true,
+            ),
+            (
+                "как это сделано в АкваVoice",
+                "Как это сделано в Aqua Voice?",
+                true,
+            ),
+            (
+                "встретимся в три нет в четыре",
+                "Встретимся в четыре.",
+                true,
+            ),
+        ] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = serde_json::json!({"choices": [{"message": {"content": output}, "finish_reason": "stop"}]}).to_string();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = socket.read(&mut buf).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buf[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]).to_lowercase();
+                        let length: usize = headers
+                            .lines()
+                            .find_map(|l| l.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                }
+                write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+            });
+            let s = Settings {
+                ai_backend: "openai_compat".into(),
+                rewrite_base_url: format!("http://{address}/v1"),
+                rewrite_key: "test-only".into(),
+                rewrite_model: "fixture".into(),
+                ..Settings::default()
+            };
+            let (text, used, _) = refine_text_with_fallback(
+                &s,
+                RewriteRequest {
+                    actx: &app("Notes"),
+                    text: input,
+                    tone: "neutral",
+                    smart_instruction: None,
+                    context_hint: None,
+                    corrections: &[],
+                    force: false,
+                },
+            );
+            server.join().unwrap();
+            assert_eq!(used, accepted, "{input:?} -> {output:?}");
+            assert_eq!(text, if accepted { output } else { input });
+        }
+    }
     use super::*;
 
     fn app(title: &str) -> crate::app_context::AppContext {
@@ -9341,6 +9527,16 @@ mod smart_prompt_tests {
             ..Settings::default()
         };
         assert!(!potentially_remote_rewrite(&local_compat));
+    }
+
+    #[test]
+    fn auto_language_never_accepts_cyrillic_as_english() {
+        for text in ["ДА, OK", "ПРИВЕТ John", "ЇЇ test", "ЁЖ test"] {
+            assert!(!parakeet_auto_final_trusted(text), "{text}");
+        }
+        for text in ["Send me the report", "OK", "I'll check the API"] {
+            assert!(parakeet_auto_final_trusted(text), "{text}");
+        }
     }
 
     #[test]
